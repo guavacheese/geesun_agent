@@ -128,19 +128,31 @@ async def main():
         system_prompt=plc_audit_instructions,
     )
 
-    result = await agent.ainvoke(
+    # result = await agent.ainvoke(
+    async for mode, data in agent.astream(
         {
             "messages": [
                 {
                     "role": "user",
-                    "content": "如果我要求你执行PLC代码审查工具，你将会在哪个目录下执行skill里面的脚本？是否会污染我本机的开发环境？",
+                    "content": "理解PLC代码审查skill内容，如果我要求你执行该PLC代码审查工具，你将会在哪个目录下执行skill里面的脚本？是否会污染我本机的开发环境？",
                 }
             ]
         },
         config={"configurable": {"thread_id": "xx12345"}},
-    )
+        stream_mode=["updates", "messages", "custom"],
+    ):
+        if mode == "messages":
+            token, _ = data
+            if hasattr(token, "content"):
+                print(token.content, end="", flush=True)
+        elif mode == "updates":
+            # 仅打印节点名
+            for node_name, node_output in data.items():
+                print(f"\n[节点完成:{node_name}]", flush=True)
+        elif mode == "custom":
+            print(f"\n[自定义：{data}]", flush=True)
 
-    print(result["messages"][-1].content)
+    # print(result["messages"][-1].content)
 
     # from langchain_google_genai import ChatGoogleGenerativeAI
     # from deepagents import create_deep_agent
