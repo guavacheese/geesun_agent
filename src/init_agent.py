@@ -5,6 +5,7 @@ from deepagents import create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
+    LocalShellBackend,
     StateBackend,
     # StoreBackend,
 )
@@ -16,6 +17,8 @@ from langchain_openai import ChatOpenAI
 
 # from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
 
 load_dotenv()
 
@@ -23,8 +26,6 @@ BASE_URL = os.getenv("BASE_URL")
 API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
 WORKSPACE = os.getenv("AGENT_WORKSPACE")
-
-checkpointer = MemorySaver()
 
 
 async def main():
@@ -60,6 +61,7 @@ async def main():
         max_retries=5,
         # 如需关闭 thinking：
         # model_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        timeout=300,  # ← 5 分钟，给长文本生成留足时间
     )
 
     # System prompt to steer the agent to be an expert researcher
@@ -101,56 +103,82 @@ async def main():
     #     store=InMemoryStore(),  # Good for local dev; omit for LangSmith Deployment
     # )
 
-    agent = create_deep_agent(
-        # model="google_genai:gemini-3.1-pro-preview",
-        # tools=[file_decrypt],
-        model=model,
-        tools=mcp_tools,
-        backend=CompositeBackend(
-            default=StateBackend(),
-            routes={
-                "/memories/": FilesystemBackend(
-                    root_dir=f"{WORKSPACE}/myagent", virtual_mode=True
+    db_path = f"{WORKSPACE}/checkpoints.db"
+    os.makedirs(WORKSPACE, exist_ok=True)
+
+    async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
+        agent = create_deep_agent(
+            # model="google_genai:gemini-3.1-pro-preview",
+            # tools=[file_decrypt],
+            model=model,
+            tools=mcp_tools,
+            backend=CompositeBackend(
+                # default=StateBackend(),
+                # default=FilesystemBackend(root_dir=f"{WORKSPACE}", virtual_mode=False),
+                default=LocalShellBackend(
+                    root_dir=f"{WORKSPACE}",
+                    virtual_mode=False,
+                    env={
+                        **os.environ
+                    },  # 继承当前 shell 的 PATH，让 Agent 能找到 uv/python
                 ),
-                "/skills/": FilesystemBackend(
-                    root_dir=f"{WORKSPACE}/skills",  # skills 目录
-                    virtual_mode=True,
-                ),
+                routes={
+                    "/memories/": FilesystemBackend(
+                        root_dir=f"{WORKSPACE}/myagent", virtual_mode=True
+                    ),
+                    "/skills/": FilesystemBackend(
+                        root_dir=f"{WORKSPACE}/skills",  # skills 目录
+                        virtual_mode=True,
+                    ),
+                },
+            ),
+            skills=[f"{WORKSPACE}/skills/plc-code-auditor"],  # 具体 skill 路径
+            interrupt_on={
+                "write_file": False,  # Default: approve, edit, reject
+                "read_file": False,  # No interrupts needed
+                "edit_file": False,  # Default: approve, edit, reject
             },
-        ),
-        skills=[f"{WORKSPACE}/skills/plc-code-auditor"],  # 具体 skill 路径
-        interrupt_on={
-            "write_file": True,  # Default: approve, edit, reject
-            "read_file": False,  # No interrupts needed
-            "edit_file": True,  # Default: approve, edit, reject
-        },
-        checkpointer=checkpointer,  # Required!
-        system_prompt=plc_audit_instructions,
-    )
+            checkpointer=checkpointer,  # Required!
+            system_prompt=plc_audit_instructions,
+            debug=True,
+        )
+
+        # result = await agent.ainvoke(
+        async for mode, data in agent.astream(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "根据PLC代码审查skill在当前workspace输出分析报告",
+                    }
+                ]
+            },
+            config={"configurable": {"thread_id": "xx12345"}},
+            stream_mode=["updates", "messages", "custom"],
+        ):
+            if mode == "messages":
+                token, _ = data
+                if hasattr(token, "content"):
+                    print(token.content, end="", flush=True)
+            elif mode == "updates":
+                # 仅打印节点名
+                for node_name, node_output in data.items():
+                    print(f"\n[节点完成:{node_name}]", flush=True)
+            elif mode == "custom":
+                print(f"\n[自定义：{data}]", flush=True)
 
     # result = await agent.ainvoke(
-    async for mode, data in agent.astream(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "理解PLC代码审查skill内容，如果我要求你执行该PLC代码审查工具，你将会在哪个目录下执行skill里面的脚本？是否会污染我本机的开发环境？",
-                }
-            ]
-        },
-        config={"configurable": {"thread_id": "xx12345"}},
-        stream_mode=["updates", "messages", "custom"],
-    ):
-        if mode == "messages":
-            token, _ = data
-            if hasattr(token, "content"):
-                print(token.content, end="", flush=True)
-        elif mode == "updates":
-            # 仅打印节点名
-            for node_name, node_output in data.items():
-                print(f"\n[节点完成:{node_name}]", flush=True)
-        elif mode == "custom":
-            print(f"\n[自定义：{data}]", flush=True)
+    #     {
+    #         "messages": [
+    #             {
+    #                 "role": "user",
+    #                 "content": "根据PLC代码审查skill在当前workspace输出分析报告",
+    #             }
+    #         ]
+    #     },
+    #     config={"configurable": {"thread_id": "xx12345"}},
+    #     # stream_mode=["updates", "messages", "custom"],
+    # )
 
     # print(result["messages"][-1].content)
 

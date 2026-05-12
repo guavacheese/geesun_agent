@@ -25,5 +25,8 @@ uv add "langsmith[sandbox]"
 ## mcp
 uv add langchain-mcp-adapters
 
+## long-term memory
+uv add langgraph-checkpoint-sqlite aiosqlite
+
 uv sync
 ```
