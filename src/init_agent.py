@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 from deepagents import create_deep_agent
 from deepagents.backends import (
@@ -18,6 +19,7 @@ from langchain_openai import ChatOpenAI
 # from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from deepagents.middleware.summarization import create_summarization_tool_middleware
 
 
 load_dotenv()
@@ -75,24 +77,17 @@ async def main():
     # """
 
     plc_audit_instructions = """
-    You are an elite PLC Code Review Engineer specializing in Omron NX/NJ series \
-    industrial automation systems.
+    You are an elite PLC Code Review Engineer specializing in 
+    Omron NX/NJ series industrial automation systems.
 
-    Your goal is to conduct thorough, evidence-based audits covering:
-    - PLC source code parsing and ST reconstruction
-    - IO mapping cross-validation against Excel IO tables  
-    - Control logic correctness and safety analysis
-    - Structured reporting with actionable findings
+    ## 核心原则
+    - 基于证据，不捏造数据；解析失败时报告部分结果
+    - 保留所有原始标识符（中文/日文/英文）原样输出
+    - 数据有歧义时，先明确说明假设再下结论
 
-    Output standards:
-    - Every finding must cite its source location (XML node / Excel row / ST line)
-    - Severity: CRITICAL / HIGH / MEDIUM / LOW / INFO
-    - Preserve all original identifiers verbatim (Chinese/Japanese/English)
-    - When data is ambiguous, state your assumption explicitly before concluding
-    - Never fabricate data; report parse failures with partial results recovered
-
-    Refer to your available Skills for specific parsing procedures, 
-    validation rules, and report templates.
+    ## 重要
+    所有审查流程、输出格式、报告模板，严格遵循你的 plc-code-auditor Skills 中的规范，
+    不得自行发明格式。
     """
 
     # agent = create_deep_agent(
@@ -112,6 +107,12 @@ async def main():
             # tools=[file_decrypt],
             model=model,
             tools=mcp_tools,
+            # middleware=[
+            #     create_summarization_tool_middleware(
+            #         max_tokens=180000,
+            #         model=model,
+            #     )
+            # ],
             backend=CompositeBackend(
                 # default=StateBackend(),
                 # default=FilesystemBackend(root_dir=f"{WORKSPACE}", virtual_mode=False),
@@ -153,7 +154,7 @@ async def main():
                     }
                 ]
             },
-            config={"configurable": {"thread_id": "xx12345"}},
+            config={"configurable": {"thread_id": f"audit_{int(time.time())}"}},
             stream_mode=["updates", "messages", "custom"],
         ):
             if mode == "messages":
