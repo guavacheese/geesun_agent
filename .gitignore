@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+*.xlsx
+*.xml
+plc*.md
+plc*.txt
+sheet_io*
