@@ -30,3 +30,17 @@ uv add langgraph-checkpoint-sqlite aiosqlite
 
 uv sync
 ```
+
+
+## Install CubeSandbox locally
+```
+cd /mnt/d/workspace/geesun_agent
+source .venv/bin/activate
+uv pip install -e ../langchain-cubesandbox
+```
+
+## Install cubesandbox certificat
+```
+export SSL_CERT_FILE=/home/dhp/projects/cube-cert/cube-ca.pem
+
+```
