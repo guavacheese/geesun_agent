@@ -8,13 +8,20 @@ logging.basicConfig(level=logging.DEBUG)
 
 from langchain_cubesandbox import CubeSandbox
 
-sandbox = CubeSandbox(
+
+# 用户发消息时 — 有就复用，没有就新建
+sandbox = CubeSandbox.get_or_create(
     template=os.environ["CUBE_TEMPLATE_ID"],
+    thread_id="conv-12345",
     api_url=os.environ["CUBE_API_URL"],
-    api_key=os.environ["CUBE_API_KEY"],
-    ssl_cert=os.environ["SSL_CERT_FILE"],
+    api_key="dummy",
 )
+print(f"=============Created sandbox: {sandbox.id}")
+print(f"======================={sandbox._sandbox}")
 
-result = sandbox.execute("写一个java冒牌排序")
+result = CubeSandbox.list(metadata={"thread_id": "conv-12345"}, state="running")
+print(f"=============List result: {result}")
 
-print(result)
+# 执行代码
+result = sandbox.execute("echo 'hello kitty'")
+print(f"================{result.output}")
