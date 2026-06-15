@@ -1,4 +1,5 @@
 from __future__ import annotations
+from urllib.parse import quote_plus
 
 import asyncio
 import os
@@ -9,6 +10,7 @@ from deepagents import create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
+    LocalShellBackend,
     StateBackend,
     StoreBackend,
 )
@@ -17,6 +19,7 @@ from langchain.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from langchain_cubesandbox import CubeSandbox
 
 load_dotenv()
@@ -67,6 +70,11 @@ Omron NX/NJ series industrial automation systems.
 所有审查流程、输出格式、报告模板，严格遵循你的 plc-code-auditor Skills 中的规范，
 不得自行发明格式。"""
 
+
+def _user_id_safe(user_id: str) -> str:
+    return user_id or "default-user"
+
+
 # ─── MCP Client Cache ─────────────────────────────────────────────────────────
 
 _cached_tools: list[BaseTool] | None = None
@@ -77,21 +85,23 @@ async def mcp_tools() -> list[BaseTool]:
     if _cached_tools is not None:
         return _cached_tools
 
-    client = MultiServerMCPClient(
-        {
-            "decrypt-file": {
-                "transport": "streamable-http",
-                "url": "http://localhost:8000/mcp",
-                "headers": {
-                    "Authorization": f"Bearer {MCP_TOKEN}",
-                    "X-customer-header": "custom-value",
-                },
+    try:
+        client = MultiServerMCPClient(
+            {
+                "decrypt-file": {
+                    "transport": "streamable-http",
+                    "url": "http://localhost:8000/mcp",
+                    "headers": {
+                        "Authorization": f"Bearer {MCP_TOKEN}",
+                        "X-customer-header": "custom-value",
+                    },
+                }
             }
-        }
-    )
-
-    _cached_tools = await client.get_tools()
-    return _cached_tools
+        )
+        _cached_tools = await client.get_tools()
+        return _cached_tools
+    except Exception:
+        return []
 
 
 # ─── Sandbox Factory ──────────────────────────────────────────────────────────
@@ -110,7 +120,13 @@ def _make_sandbox(thread_id: str) -> Any:
 # ─── Backend ──────────────────────────────────────────────────────────────────
 
 
-def build_backend(user_id: str, session_id: str, thread_id: str) -> CompositeBackend:
+def build_backend(
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+    store: AsyncPostgresStore,
+    sandbox: Any,
+) -> CompositeBackend:
     routes: dict[str, Any] = {
         f"/uploads/{user_id}/{session_id}": FilesystemBackend(
             root_dir=f"{UPLOAD_ROOT}/{user_id}/{session_id}/",
@@ -120,18 +136,42 @@ def build_backend(user_id: str, session_id: str, thread_id: str) -> CompositeBac
             root_dir=f"{REPORT_ROOT}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
-        "/memories/": StoreBackend(namespace=lambda rt: ("memories", user_id)),
+        "/memories/": StoreBackend(
+            namespace=lambda rt: ("memories", _user_id_safe(user_id)),
+            store=store,  # 或者 AsyncPgStore
+        ),
     }
-    sandbox = _make_sandbox(thread_id)
-    routes["/code/"] = sandbox
-    return CompositeBackend(default=StateBackend, routes=routes)
+    if sandbox:
+        routes["/code/"] = sandbox
+
+    return CompositeBackend(
+        default=LocalShellBackend(
+            root_dir=WORKSPACE,
+            virtual_mode=False,
+            env={**os.environ},
+        ),
+        routes=routes,
+    )
 
 
 # ─── Agent Creation ───────────────────────────────────────────────────────────
 
 
-async def create_my_agent(user_id: str, session_id: str, thread_id: str, checkpointer):
-    backend = build_backend(user_id, session_id, thread_id)
+async def create_my_agent(
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+    store: AsyncPostgresStore,
+    sandbox: Any,
+    checkpointer,
+):
+    backend = build_backend(
+        user_id,
+        session_id,
+        thread_id,
+        store,
+        sandbox,
+    )
     tools = await mcp_tools()
 
     agent = create_deep_agent(
@@ -160,40 +200,51 @@ async def main(user_id: str = "", session_id: str = ""):
 
     pg_dsn = (
         f"postgresql://{os.getenv('POSTGRES_USER')}:"
-        f"{os.getenv('POSTGRES_PASSWORD')}@"
+        f"{quote_plus(os.getenv('POSTGRES_PASSWORD'))}@"
         f"{os.getenv('POSTGRES_HOST')}:"
         f"{os.getenv('POSTGRES_PORT')}/"
         f"{os.getenv('POSTGRES_DB')}"
     )
-    async with AsyncPostgresSaver.from_conn_string(pg_dsn) as checkpointer:
-        # 首次运行需要建表（幂等，可重复执行）
-        await checkpointer.setup()
 
-        agent = await create_my_agent(
-            user_id, session_id, thread_id, checkpointer=checkpointer
-        )
+    sandbox = _make_sandbox(thread_id)
 
-        async for mode, data in agent.astream(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "根据PLC代码审查skill在当前workspace输出分析报告",
-                    }
-                ]
-            },
-            config={"configurable": {"thread_id": thread_id}},
-            stream_mode=["updates", "messages", "custom"],
-        ):
-            if mode == "messages":
-                token, _ = data
-                if hasattr(token, "content"):
-                    print(token.content, end="", flush=True)
-            elif mode == "updates":
-                for node_name, node_output in data.items():
-                    print(f"\n[节点完成:{node_name}]", flush=True)
-            elif mode == "custom":
-                print(f"\n[自定义：{data}]", flush=True)
+    async with AsyncPostgresStore.from_conn_string(pg_dsn) as store:
+        await store.setup()
+
+        async with AsyncPostgresSaver.from_conn_string(pg_dsn) as checkpointer:
+            # 首次运行需要建表（幂等，可重复执行）
+            await checkpointer.setup()
+
+            agent = await create_my_agent(
+                user_id or "default-user",
+                session_id or "default-session",
+                thread_id,
+                store=store,
+                sandbox=sandbox,
+                checkpointer=checkpointer,
+            )
+
+            async for mode, data in agent.astream(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "根据PLC代码审查skill在当前workspace输出分析报告",
+                        }
+                    ]
+                },
+                config={"configurable": {"thread_id": thread_id}},
+                stream_mode=["updates", "messages", "custom"],
+            ):
+                if mode == "messages":
+                    token, _ = data
+                    if hasattr(token, "content"):
+                        print(token.content, end="", flush=True)
+                elif mode == "updates":
+                    for node_name, node_output in data.items():
+                        print(f"\n[节点完成:{node_name}]", flush=True)
+                elif mode == "custom":
+                    print(f"\n[自定义：{data}]", flush=True)
 
 
 if __name__ == "__main__":
