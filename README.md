@@ -28,6 +28,7 @@ uv add langchain-mcp-adapters
 ## long-term memory
 uv add langgraph-checkpoint-sqlite aiosqlite
 uv add langgraph-checkpoint-postgres
+uv add "psycopg[binary]" 
 
 uv sync
 ```
