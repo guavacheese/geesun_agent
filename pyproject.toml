@@ -10,6 +10,7 @@ dependencies = [
     "langchain>=1.2.15",
     "langchain-mcp-adapters>=0.2.2",
     "langchain-openai>=1.2.1",
+    "langgraph-checkpoint-postgres>=3.1.0",
     "langgraph-checkpoint-sqlite>=3.0.3",
     "openai>=2.32.0",
     "openpyxl>=3.1.5",
