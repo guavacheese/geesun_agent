@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PLC代码审查工具 - 气缸专用版
+PLC代码审查工具
 功能：
 1. 读取PLC XML源码，解析所有变量（支持数组下标如SFJ_KDJC[0]）
-2. 只读取Excel中"气缸"Sheet，进行变量比对
+2. 只读取Excel中"气缸/真空吹气/数字量/模拟量"Sheet，进行变量比对
 3. 检查变量命名规范（模块前缀）
 4. 生成带时间戳的审查报告（避免覆盖）
 5. 输出清理后的PLC源码（去注释、去空行）
@@ -42,33 +42,33 @@ def parse_plc_variables(plc_files):
     # 统一为列表
     if isinstance(plc_files, str):
         plc_files = [plc_files]
-    
+
     all_variables = []
-    
+
     for plc_file in plc_files:
         # 首先尝试检测文件格式
-        with open(plc_file, 'rb') as f:
+        with open(plc_file, "rb") as f:
             raw_content = f.read()
-        
+
         # 去除BOM
-        if raw_content.startswith(b'\xef\xbb\xbf'):
+        if raw_content.startswith(b"\xef\xbb\xbf"):
             raw_content = raw_content[3:]
-        
+
         # 检测文件格式
-        content_str = raw_content.decode('utf-8', errors='ignore').strip()
-        
+        content_str = raw_content.decode("utf-8", errors="ignore").strip()
+
         # 检查是否为JSON格式（以 { 开头）
-        if content_str.startswith('{'):
+        if content_str.startswith("{"):
             file_vars = parse_plc_json(plc_file, raw_content)
         else:
             file_vars = parse_plc_xml(plc_file, raw_content)
-        
+
         # 标记来源文件
         for var in file_vars:
-            var['source_file'] = os.path.basename(plc_file)
-        
+            var["source_file"] = os.path.basename(plc_file)
+
         all_variables.extend(file_vars)
-    
+
     return all_variables
 
 
@@ -78,92 +78,107 @@ def parse_plc_json(plc_file, raw_content):
     """
     variables = []
     line_num = 0
-    
-    content_str = raw_content.decode('utf-8', errors='ignore')
-    
-    for line in content_str.split('\n'):
+
+    content_str = raw_content.decode("utf-8", errors="ignore")
+
+    for line in content_str.split("\n"):
         line_num += 1
         line = line.strip()
         if not line:
             continue
-        
+
         try:
             data = json.loads(line)
-            
+
             # 从CLs中提取TXT字段
-            if 'CLs' in data and isinstance(data['CLs'], list):
-                for cl in data['CLs']:
-                    if 'TXT' in cl and cl['TXT']:
-                        txt = cl['TXT']
-                        
+            if "CLs" in data and isinstance(data["CLs"], list):
+                for cl in data["CLs"]:
+                    if "TXT" in cl and cl["TXT"]:
+                        txt = cl["TXT"]
+
                         # 将多行文本分割成单独的行，每行单独解析注释
-                        lines = txt.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-                        
+                        lines = (
+                            txt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                        )
+
                         for line in lines:
                             line = line.strip()
                             if not line:
                                 continue
-                            
+
                             # 过滤掉以 // 开头的行（被注释的代码），不解析
-                            if line.startswith('//'):
+                            if line.startswith("//"):
                                 continue
-                            
+
                             # 提取当前行的注释（行尾//后的内容）
                             line_comment = ""
-                            if '//' in line:
-                                parts = line.split('//')
+                            if "//" in line:
+                                parts = line.split("//")
                                 if len(parts) > 1:
                                     line_comment = parts[1].strip()
-                            
+
                             # 提取函数调用中的IO参数
                             # 支持FC_*, FB_*, F_*前缀函数以及普通函数名
-                            function_pattern = r'(FC_\w+|FB_\w+|F_\w+|[A-Z][a-zA-Z0-9_]*)\s*\(([^)]*)\)'
+                            function_pattern = r"(FC_\w+|FB_\w+|F_\w+|[A-Z][a-zA-Z0-9_]*)\s*\(([^)]*)\)"
                             functions = re.findall(function_pattern, line)
-                            
+
                             for func_name, func_params in functions:
-                                param_pattern = r'(\w+)\s*:=\s*(?:NOT\s+)?(IA\d+|ID\d+|OD\d+|OF\d+|I\d+|Q\d+|O\d+)|(\w+)\s*=>\s*(?:NOT\s+)?(IA\d+|ID\d+|OD\d+|OF\d+|I\d+|Q\d+|O\d+)'
+                                param_pattern = r"(\w+)\s*:=\s*(?:NOT\s+)?(IA\d+|ID\d+|OD\d+|OF\d+|I\d+|Q\d+|O\d+)|(\w+)\s*=>\s*(?:NOT\s+)?(IA\d+|ID\d+|OD\d+|OF\d+|I\d+|Q\d+|O\d+)"
                                 param_matches = re.findall(param_pattern, func_params)
-                                
+
                                 for match in param_matches:
                                     param_name = match[0] if match[0] else match[2]
                                     io_addr = match[1] if match[1] else match[3]
                                     if param_name and io_addr:
-                                        existing = [v for v in variables if v.get('io_address') == io_addr and v.get('name') == param_name and v.get('function') == func_name]
+                                        existing = [
+                                            v
+                                            for v in variables
+                                            if v.get("io_address") == io_addr
+                                            and v.get("name") == param_name
+                                            and v.get("function") == func_name
+                                        ]
                                         if not existing:
-                                            variables.append({
-                                                'name': param_name,
-                                                'type': guess_type_from_io(io_addr),
-                                                'line': line_num,
-                                                'context': f"{func_name}({func_params[:50]}...)",
-                                                'io_address': io_addr,
-                                                'function': func_name,
-                                                'is_function_param': True
-                                            })
-                            
+                                            variables.append(
+                                                {
+                                                    "name": param_name,
+                                                    "type": guess_type_from_io(io_addr),
+                                                    "line": line_num,
+                                                    "context": f"{func_name}({func_params[:50]}...)",
+                                                    "io_address": io_addr,
+                                                    "function": func_name,
+                                                    "is_function_param": True,
+                                                }
+                                            )
+
                             # 提取 IO地址 := 数组变量 形式（如 IA6600 := IA_Temp[66, 0]）
                             io_to_array = re.findall(
-                                r'(IA\d+|ID\d+|OD\d+|OF\d+)\s*:=\s*([\w.]+\[\s*\d+\s*,\s*\d+\s*\])',
-                                line
+                                r"(IA\d+|ID\d+|OD\d+|OF\d+)\s*:=\s*([\w.]+\[\s*\d+\s*,\s*\d+\s*\])",
+                                line,
                             )
                             array_io_addrs = set()
                             for io_addr, array_var in io_to_array:
                                 array_io_addrs.add(io_addr)
-                                existing = [v for v in variables if v.get('io_address') == io_addr]
+                                existing = [
+                                    v
+                                    for v in variables
+                                    if v.get("io_address") == io_addr
+                                ]
                                 if not existing:
-                                    variables.append({
-                                        'name': array_var,
-                                        'type': guess_type_from_io(io_addr),
-                                        'line': line_num,
-                                        'context': line[:100],
-                                        'io_address': io_addr,
-                                        'comment': line_comment
-                                    })
-                            
+                                    variables.append(
+                                        {
+                                            "name": array_var,
+                                            "type": guess_type_from_io(io_addr),
+                                            "line": line_num,
+                                            "context": line[:100],
+                                            "io_address": io_addr,
+                                            "comment": line_comment,
+                                        }
+                                    )
+
                             # 提取 IO地址 := 变量 形式（如 OD6113 := XLJ_ox_DJXH6 或 OD10605 := ZFJ_YHJQZ.OUT）
                             # 排除函数调用形式（如 OD610:= FC_BoolToUint(...)）
                             io_to_var = re.findall(
-                                r'(IA\d+|ID\d+|OD\d+|OF\d+)\s*:=\s*([\w.]+)',
-                                line
+                                r"(IA\d+|ID\d+|OD\d+|OF\d+)\s*:=\s*([\w.]+)", line
                             )
                             for io_addr, var_name in io_to_var:
                                 # 跳过已处理的数组赋值
@@ -173,79 +188,130 @@ def parse_plc_json(plc_file, raw_content):
                                 if var_name.isdigit():
                                     continue
                                 # 排除常见函数名（函数调用形式）
-                                if var_name in ['FC_BoolToUint', 'FC_UintToBooL', 'GetTime', 'TOF', 'TON', 'TP', 'RTRIG', 'FTRIG']:
+                                if var_name in [
+                                    "FC_BoolToUint",
+                                    "FC_UintToBooL",
+                                    "GetTime",
+                                    "TOF",
+                                    "TON",
+                                    "TP",
+                                    "RTRIG",
+                                    "FTRIG",
+                                ]:
                                     continue
                                 # 检查是否后面紧跟括号（函数调用）
                                 # 在原始行中查找这个匹配的位置
-                                pattern = rf'{io_addr}\s*:=\s*{re.escape(var_name)}\s*\('
+                                pattern = (
+                                    rf"{io_addr}\s*:=\s*{re.escape(var_name)}\s*\("
+                                )
                                 if re.search(pattern, line):
                                     continue
-                                existing = [v for v in variables if v.get('io_address') == io_addr]
+                                existing = [
+                                    v
+                                    for v in variables
+                                    if v.get("io_address") == io_addr
+                                ]
                                 if not existing:
-                                    variables.append({
-                                        'name': var_name,
-                                        'type': guess_type_from_io(io_addr),
-                                        'line': line_num,
-                                        'context': line[:100],
-                                        'io_address': io_addr,
-                                        'comment': line_comment
-                                    })
-                            
+                                    variables.append(
+                                        {
+                                            "name": var_name,
+                                            "type": guess_type_from_io(io_addr),
+                                            "line": line_num,
+                                            "context": line[:100],
+                                            "io_address": io_addr,
+                                            "comment": line_comment,
+                                        }
+                                    )
+
                             # 提取普通变量赋值模式（排除数组形式）
                             assignments = re.findall(
-                                r'([\w.]+)\s*:=\s*(?:NOT\s+)?(IA\d+|ID\d+|OD\d+|OF\d+|I\d+|Q\d+|O\d+)',
-                                line
+                                r"([\w.]+)\s*:=\s*(?:NOT\s+)?(IA\d+|ID\d+|OD\d+|OF\d+|I\d+|Q\d+|O\d+)",
+                                line,
                             )
-                            
+
                             for var_name, io_addr in assignments:
                                 # 跳过已作为数组赋值处理的IO地址
                                 if io_addr in array_io_addrs:
                                     continue
                                 # 跳过数组形式的变量名
-                                if '[' in var_name:
+                                if "[" in var_name:
                                     continue
                                 if is_valid_variable(var_name):
-                                    existing = [v for v in variables if v.get('io_address') == io_addr and v.get('name') == var_name]
+                                    existing = [
+                                        v
+                                        for v in variables
+                                        if v.get("io_address") == io_addr
+                                        and v.get("name") == var_name
+                                    ]
                                     if not existing:
-                                        variables.append({
-                                            'name': var_name,
-                                            'type': guess_type_from_io(io_addr),
-                                            'line': line_num,
-                                            'context': line[:100],
-                                            'io_address': io_addr,
-                                            'comment': line_comment
-                                        })
-                            
+                                        variables.append(
+                                            {
+                                                "name": var_name,
+                                                "type": guess_type_from_io(io_addr),
+                                                "line": line_num,
+                                                "context": line[:100],
+                                                "io_address": io_addr,
+                                                "comment": line_comment,
+                                            }
+                                        )
+
                             # 也提取普通变量（没有IO赋值的）
-                            var_pattern = r'\b([A-Za-z_][A-Za-z0-9_]*)\b'
+                            var_pattern = r"\b([A-Za-z_][A-Za-z0-9_]*)\b"
                             all_vars = re.findall(var_pattern, line)
                             for var_name in all_vars:
                                 # 跳过结构体成员变量（包含.的变量名，会被前面的逻辑处理）
-                                if '.' in var_name:
+                                if "." in var_name:
                                     continue
                                 # 排除函数名（FC_*, FB_*, F_*以及大写开头的函数名）
-                                if re.match(r'^(FC_|FB_|F_)', var_name):
+                                if re.match(r"^(FC_|FB_|F_)", var_name):
                                     continue
                                 # 排除已知系统函数名（可扩展列表）
-                                if var_name in ['GetTime', 'TOF', 'TON', 'TP', 'RTRIG', 'FTRIG', 'SEL', 'MUX', 'LIMIT', 'MAX', 'MIN', 'ABS', 'SQRT', 'LN', 'LOG', 'EXP', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN']:
+                                if var_name in [
+                                    "GetTime",
+                                    "TOF",
+                                    "TON",
+                                    "TP",
+                                    "RTRIG",
+                                    "FTRIG",
+                                    "SEL",
+                                    "MUX",
+                                    "LIMIT",
+                                    "MAX",
+                                    "MIN",
+                                    "ABS",
+                                    "SQRT",
+                                    "LN",
+                                    "LOG",
+                                    "EXP",
+                                    "SIN",
+                                    "COS",
+                                    "TAN",
+                                    "ASIN",
+                                    "ACOS",
+                                    "ATAN",
+                                ]:
                                     continue
                                 # 排除IO地址格式的名称（IA*, ID*, OD*, OF*）
-                                if re.match(r'^(IA|ID|OD|OF)\d+$', var_name):
+                                if re.match(r"^(IA|ID|OD|OF)\d+$", var_name):
                                     continue
                                 # 排除单个字母I/O后跟数字（可能被误识别为IO地址）
-                                if re.match(r'^[IOQ]\d+$', var_name):
+                                if re.match(r"^[IOQ]\d+$", var_name):
                                     continue
-                                if is_valid_variable(var_name) and var_name not in [v['name'] for v in variables]:
-                                    variables.append({
-                                        'name': var_name,
-                                        'type': guess_type(var_name),
-                                        'line': line_num,
-                                        'context': line[:100],
-                                        'comment': line_comment
-                                    })
+                                if is_valid_variable(var_name) and var_name not in [
+                                    v["name"] for v in variables
+                                ]:
+                                    variables.append(
+                                        {
+                                            "name": var_name,
+                                            "type": guess_type(var_name),
+                                            "line": line_num,
+                                            "context": line[:100],
+                                            "comment": line_comment,
+                                        }
+                                    )
         except json.JSONDecodeError:
             pass
-    
+
     return variables
 
 
@@ -254,39 +320,43 @@ def parse_plc_xml(plc_file, raw_content):
     解析XML格式的PLC文件
     """
     root = ET.fromstring(raw_content)
-    
+
     variables = []
     line_num = 0
-    
+
     # 遍历所有元素查找变量定义
     for elem in root.iter():
         line_num += 1
         text = elem.text if elem.text else ""
-        
-        var_pattern = r'\b([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]+\])?)\b'
-        
+
+        var_pattern = r"\b([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]+\])?)\b"
+
         if text:
             matches = re.findall(var_pattern, text)
             for match in matches:
                 if is_valid_variable(match):
-                    variables.append({
-                        'name': match,
-                        'type': guess_type(match),
-                        'line': line_num,
-                        'context': text[:100]
-                    })
-        
+                    variables.append(
+                        {
+                            "name": match,
+                            "type": guess_type(match),
+                            "line": line_num,
+                            "context": text[:100],
+                        }
+                    )
+
         for key, value in elem.attrib.items():
             matches = re.findall(var_pattern, str(value))
             for match in matches:
                 if is_valid_variable(match):
-                    variables.append({
-                        'name': match,
-                        'type': guess_type(match),
-                        'line': line_num,
-                        'context': f"{key}={value}"[:100]
-                    })
-    
+                    variables.append(
+                        {
+                            "name": match,
+                            "type": guess_type(match),
+                            "line": line_num,
+                            "context": f"{key}={value}"[:100],
+                        }
+                    )
+
     return variables
 
 
@@ -295,21 +365,43 @@ def is_valid_variable(name):
     判断是否为有效的PLC变量名
     """
     # 排除常见关键字和数字
-    keywords = {'IF', 'THEN', 'ELSE', 'END', 'AND', 'OR', 'NOT', 'TRUE', 'FALSE',
-                'INT', 'BOOL', 'REAL', 'STRING', 'ARRAY', 'OF', 'VAR', 'VAR_INPUT',
-                'VAR_OUTPUT', 'VAR_IN_OUT', 'VAR_GLOBAL', 'CONST', 'TYPE', 'STRUCT'}
-    
+    keywords = {
+        "IF",
+        "THEN",
+        "ELSE",
+        "END",
+        "AND",
+        "OR",
+        "NOT",
+        "TRUE",
+        "FALSE",
+        "INT",
+        "BOOL",
+        "REAL",
+        "STRING",
+        "ARRAY",
+        "OF",
+        "VAR",
+        "VAR_INPUT",
+        "VAR_OUTPUT",
+        "VAR_IN_OUT",
+        "VAR_GLOBAL",
+        "CONST",
+        "TYPE",
+        "STRUCT",
+    }
+
     if name.upper() in keywords:
         return False
-    
+
     # 排除纯数字
-    if re.match(r'^[0-9]+$', name):
+    if re.match(r"^[0-9]+$", name):
         return False
-    
+
     # 排除过短的（可能是临时变量）
     if len(name) <= 1:
         return False
-    
+
     return True
 
 
@@ -318,17 +410,17 @@ def guess_type(var_name):
     根据变量名猜测类型
     """
     var_upper = var_name.upper()
-    
-    if var_upper.startswith('I'):
-        return 'INPUT'
-    elif var_upper.startswith('Q') or var_upper.startswith('O'):
-        return 'OUTPUT'
-    elif var_upper.startswith('M'):
-        return 'MEMORY'
-    elif 'FLAG' in var_upper:
-        return 'BOOL'
+
+    if var_upper.startswith("I"):
+        return "INPUT"
+    elif var_upper.startswith("Q") or var_upper.startswith("O"):
+        return "OUTPUT"
+    elif var_upper.startswith("M"):
+        return "MEMORY"
+    elif "FLAG" in var_upper:
+        return "BOOL"
     else:
-        return 'UNKNOWN'
+        return "UNKNOWN"
 
 
 def guess_type_from_io(io_addr):
@@ -336,21 +428,21 @@ def guess_type_from_io(io_addr):
     根据IO地址猜测类型
     """
     io_upper = io_addr.upper()
-    
-    if io_upper.startswith('IA'):
-        return 'INPUT_ANALOG'
-    elif io_upper.startswith('ID'):
-        return 'INPUT_DIGITAL'
-    elif io_upper.startswith('OD'):
-        return 'OUTPUT_DIGITAL'
-    elif io_upper.startswith('OF'):
-        return 'OUTPUT_ANALOG'
-    elif io_upper.startswith('I'):
-        return 'INPUT'
-    elif io_upper.startswith('Q') or io_upper.startswith('O'):
-        return 'OUTPUT'
+
+    if io_upper.startswith("IA"):
+        return "INPUT_ANALOG"
+    elif io_upper.startswith("ID"):
+        return "INPUT_DIGITAL"
+    elif io_upper.startswith("OD"):
+        return "OUTPUT_DIGITAL"
+    elif io_upper.startswith("OF"):
+        return "OUTPUT_ANALOG"
+    elif io_upper.startswith("I"):
+        return "INPUT"
+    elif io_upper.startswith("Q") or io_upper.startswith("O"):
+        return "OUTPUT"
     else:
-        return 'UNKNOWN'
+        return "UNKNOWN"
 
 
 def detect_excel_file_type(file_path):
@@ -359,24 +451,25 @@ def detect_excel_file_type(file_path):
     返回: 'io_table' (IO表) 或 'io_database' (IO数据库) 或 'unknown'
     """
     filename = os.path.basename(file_path).upper()
-    
+
     # IO表特征: 包含 "IO表"、"IO_TABLE"、或纯数字编号如 "1098"
-    if any(kw in filename for kw in ['IO表', 'IO_TABLE', 'IO-TABLE']):
-        return 'io_table'
-    
+    if any(kw in filename for kw in ["IO表", "IO_TABLE", "IO-TABLE"]):
+        return "io_table"
+
     # IO数据库特征: 包含 "数据库"、"DATABASE"、"DB"
-    if any(kw in filename for kw in ['数据库', 'DATABASE', 'IO_DB', 'IO-DB']):
-        return 'io_database'
-    
+    if any(kw in filename for kw in ["数据库", "DATABASE", "IO_DB", "IO-DB"]):
+        return "io_database"
+
     # 启发式规则：如果文件名包含数字编号但不含"数据库"，可能是IO表
     # 例如: "1098 IO表-1212.xlsx" -> IO表
     # 例如: "IO数据库V1.0.03.xlsx" -> IO数据库
     import re
-    if re.search(r'\d+.*IO', filename) or re.search(r'IO.*\d+', filename):
-        if '数据库' not in filename and 'DATABASE' not in filename:
-            return 'io_table'
-    
-    return 'unknown'
+
+    if re.search(r"\d+.*IO", filename) or re.search(r"IO.*\d+", filename):
+        if "数据库" not in filename and "DATABASE" not in filename:
+            return "io_table"
+
+    return "unknown"
 
 
 def parse_excel_io_db(excel_files, output_dir=None):
@@ -390,13 +483,13 @@ def parse_excel_io_db(excel_files, output_dir=None):
     io_table_by_name = {}
     io_table_by_name_all = {}  # 保留重复项
     io_table_by_address_all = {}  # 所有IO地址记录（包括重复）
-    
+
     # IO数据库数据（用于变量匹配）
     io_db_by_address = {}
     io_db_by_name = {}
     io_db_by_name_all = {}  # 保留重复项
     io_db_by_address_all = {}  # 所有IO地址记录（包括重复）
-    
+
     # 合并数据（保持向后兼容）
     io_by_address = {}
     io_by_name = {}
@@ -406,231 +499,306 @@ def parse_excel_io_db(excel_files, output_dir=None):
     io_by_address_table_only = {}
     io_by_name_table_only = {}
     sheet_analysis = []
-    
+
     # 按文件类型记录统计
     stats = {
-        'io_table': {'files': 0, 'records': 0},
-        'io_database': {'files': 0, 'records': 0}
+        "io_table": {"files": 0, "records": 0},
+        "io_database": {"files": 0, "records": 0},
     }
-    
+
     # 确保是列表
     if isinstance(excel_files, str):
         excel_files = [excel_files]
-    
+
     is_first_file = True
     has_reverse_cylinder_col = False  # 标记是否在任何sheet中找到了反气缸列
     for excel_file in excel_files:
         if not os.path.exists(excel_file):
             continue
-        
+
         # 检测文件类型
         file_type = detect_excel_file_type(excel_file)
         print(f"\n  处理文件: {os.path.basename(excel_file)} -> 类型: {file_type}")
-        
-        if file_type == 'unknown':
+
+        if file_type == "unknown":
             print(f"  [WARN] 无法识别文件类型，当作IO表处理: {excel_file}")
-            file_type = 'io_table'
-        
-        stats[file_type]['files'] += 1
-            
+            file_type = "io_table"
+
+        stats[file_type]["files"] += 1
+
         try:
-            
             # 读取所有sheet名
-            xl = pd.ExcelFile(excel_file)
+            xl = pd.ExcelFile(excel_file, engine="openpyxl")
             sheet_names = xl.sheet_names
-            
+
             # 读取所有sheet
             for sheet_name in sheet_names:
                 # Sheet 白名单过滤：只处理指定4类Sheet
-                allowed_sheets = {'气缸', '真空吹气', '数字量', '模拟量'}
+                allowed_sheets = {"气缸", "真空吹气", "数字量", "模拟量"}
                 if sheet_name not in allowed_sheets:
                     continue
                 try:
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                    
+                    df = pd.read_excel(
+                        excel_file, sheet_name=sheet_name, engine="openpyxl"
+                    )
+
                     # 调试：打印所有列名
-                    print(f"    [DEBUG] Sheet [{sheet_name}] 原始列名: {list(df.columns)}")
-                    
+                    print(
+                        f"    [DEBUG] Sheet [{sheet_name}] 原始列名: {list(df.columns)}"
+                    )
+
                     # 尝试找到各列
                     var_col = None
                     io_col_mapping = {}  # IO列 -> 对应的注释列映射
                     hmi_col = None
                     reverse_col = None  # 反气缸标记列
-                    
-                    
+
                     # 第一步：识别所有列的类型
                     col_types = {}
                     for col in df.columns:
                         col_str = str(col).upper()
                         col_str_norm = str(col)  # 保留原始大小写用于精确匹配
-                        
+
                         # 反气缸标记列（最先检查，避免被其他模式匹配）
-                        if any(kw in col_str for kw in ['反气缸', '反向', 'REVERSE', '反逻辑', '是否为反气缸']):
+                        if any(
+                            kw in col_str
+                            for kw in [
+                                "反气缸",
+                                "反向",
+                                "REVERSE",
+                                "反逻辑",
+                                "是否为反气缸",
+                            ]
+                        ):
                             reverse_col = col
                             has_reverse_cylinder_col = True  # 找到反气缸列
-                            col_types[col] = 'reverse'
+                            col_types[col] = "reverse"
                         # 通用注释列（优先于变量名列，避免"注释"被误判为变量名）
                         # 使用精确匹配或关键词匹配
-                        elif col_str_norm == '注释' or any(kw in col_str for kw in ['COMMENT', '说明', 'DESC', 'CM']) or '1105' in str(col):
-                            col_types[col] = 'comment_general'
+                        elif (
+                            col_str_norm == "注释"
+                            or any(
+                                kw in col_str
+                                for kw in ["COMMENT", "说明", "DESC", "CM"]
+                            )
+                            or "1105" in str(col)
+                        ):
+                            col_types[col] = "comment_general"
                         # 出限名称列（注释）
-                        elif '出限' in col_str and '名称' in col_str:
-                            col_types[col] = 'comment_chu'
+                        elif "出限" in col_str and "名称" in col_str:
+                            col_types[col] = "comment_chu"
                         # 回限名称列（注释）
-                        elif '回限' in col_str and '名称' in col_str:
-                            col_types[col] = 'comment_hui'
+                        elif "回限" in col_str and "名称" in col_str:
+                            col_types[col] = "comment_hui"
                         # 出限IO列
-                        elif '出限' in col_str and 'IO' in col_str:
-                            col_types[col] = 'io_chu'
+                        elif "出限" in col_str and "IO" in col_str:
+                            col_types[col] = "io_chu"
                         # 回限IO列
-                        elif '回限' in col_str and 'IO' in col_str:
-                            col_types[col] = 'io_hui'
+                        elif "回限" in col_str and "IO" in col_str:
+                            col_types[col] = "io_hui"
                         # 通用IO列（排除"1105系列IO"等注释列）
-                        elif any(kw in col_str for kw in ['IO', '地址', 'ADDR', 'DI01']) and '1105' not in str(col):
-                            col_types[col] = 'io_general'
+                        elif any(
+                            kw in col_str for kw in ["IO", "地址", "ADDR", "DI01"]
+                        ) and "1105" not in str(col):
+                            col_types[col] = "io_general"
                         # 真空吹气/数字量/模拟量sheet特殊处理："变量"列是IO地址列
-                        elif sheet_name in {'真空吹气', '数字量', '模拟量'} and col_str_norm.startswith('变量'):
-                            col_types[col] = 'io_var'  # 标记为变量列（实际包含IO地址）
+                        elif sheet_name in {
+                            "真空吹气",
+                            "数字量",
+                            "模拟量",
+                        } and col_str_norm.startswith("变量"):
+                            col_types[col] = "io_var"  # 标记为变量列（实际包含IO地址）
                         # IO数据库数字量sheet特殊处理："HMI参数变量"列是IO地址列（实际包含IA/ID/OD/OF地址）
-                        elif sheet_name == '数字量' and file_type == 'io_database' and 'HMI参数变量' in col_str:
-                            col_types[col] = 'io_hmi_param'  # IO数据库专用IO地址列
+                        elif (
+                            sheet_name == "数字量"
+                            and file_type == "io_database"
+                            and "HMI参数变量" in col_str
+                        ):
+                            col_types[col] = "io_hmi_param"  # IO数据库专用IO地址列
                         # IO数据库数字量sheet："HMI强制输出"列是IO地址列
-                        elif sheet_name == '数字量' and 'HMI强制输出' in col_str:
-                            col_types[col] = 'io_hmi_output'  # IO数据库专用IO列
+                        elif sheet_name == "数字量" and "HMI强制输出" in col_str:
+                            col_types[col] = "io_hmi_output"  # IO数据库专用IO列
                         # IO数据库数字量sheet："PLC控制变量"列是变量名列（不是IO地址列）
-                        elif sheet_name == '数字量' and file_type == 'io_database' and 'PLC控制变量' in col_str:
+                        elif (
+                            sheet_name == "数字量"
+                            and file_type == "io_database"
+                            and "PLC控制变量" in col_str
+                        ):
                             var_col = col
-                            col_types[col] = 'var_plc_db'  # IO数据库PLC变量名列
+                            col_types[col] = "var_plc_db"  # IO数据库PLC变量名列
                         # 真空吹气/数字量/模拟量sheet："名称"列（包括"名称.1"等）是注释列
-                        elif sheet_name in {'真空吹气', '数字量', '模拟量'} and col_str_norm.startswith('名称'):
-                            col_types[col] = 'comment_name'  # 标记为名称注释列
+                        elif sheet_name in {
+                            "真空吹气",
+                            "数字量",
+                            "模拟量",
+                        } and col_str_norm.startswith("名称"):
+                            col_types[col] = "comment_name"  # 标记为名称注释列
                         # IO数据库数字量sheet："设备名称"列是注释列
-                        elif sheet_name == '数字量' and col_str_norm == '设备名称':
-                            col_types[col] = 'comment_device'  # IO数据库专用注释列
+                        elif sheet_name == "数字量" and col_str_norm == "设备名称":
+                            col_types[col] = "comment_device"  # IO数据库专用注释列
                         # 变量名列（排除"注释"列、"阀岛名称"和真空吹气/数字量/模拟量的"名称"列）
-                        elif any(kw in col_str for kw in ['变量', 'VAR', '名称', 'NAME', 'PLC']) and '出限' not in col_str and '回限' not in col_str and col_str_norm != '注释' and '阀岛' not in col_str:
+                        elif (
+                            any(
+                                kw in col_str
+                                for kw in ["变量", "VAR", "名称", "NAME", "PLC"]
+                            )
+                            and "出限" not in col_str
+                            and "回限" not in col_str
+                            and col_str_norm != "注释"
+                            and "阀岛" not in col_str
+                        ):
                             var_col = col
-                            col_types[col] = 'var'
+                            col_types[col] = "var"
                         # HMI列
-                        elif 'HMI' in col_str:
+                        elif "HMI" in col_str:
                             hmi_col = col
-                            col_types[col] = 'hmi'
-                    
+                            col_types[col] = "hmi"
+
                     # 变量名列优先识别：先找"电磁阀名称"，再找其他
                     var_col = None
                     for col in df.columns:
                         col_str = str(col).upper()
-                        if '电磁阀名称' in col_str or ('电磁阀' in col_str and '名称' in col_str):
+                        if "电磁阀名称" in col_str or (
+                            "电磁阀" in col_str and "名称" in col_str
+                        ):
                             var_col = col
-                            col_types[col] = 'var'
+                            col_types[col] = "var"
                             break
-                    
+
                     if var_col is None:
                         for col in df.columns:
                             col_str = str(col).upper()
-                            col_str_norm = col_str.replace(' ', '').replace('_', '')
+                            col_str_norm = col_str.replace(" ", "").replace("_", "")
                             # 【修复】IO数据库中，排除包含"PLC控制变量"的列（这些列应作为IO列处理）
-                            if file_type == 'io_database' and 'PLC控制变量' in col_str:
+                            if file_type == "io_database" and "PLC控制变量" in col_str:
                                 continue
-                            if any(kw in col_str for kw in ['变量', 'VAR', '名称', 'NAME', 'PLC']) and '出限' not in col_str and '回限' not in col_str and col_str_norm != '注释' and '阀岛' not in col_str:
+                            if (
+                                any(
+                                    kw in col_str
+                                    for kw in ["变量", "VAR", "名称", "NAME", "PLC"]
+                                )
+                                and "出限" not in col_str
+                                and "回限" not in col_str
+                                and col_str_norm != "注释"
+                                and "阀岛" not in col_str
+                            ):
                                 var_col = col
-                                col_types[col] = 'var'
+                                col_types[col] = "var"
                                 break
-                    
+
                     # 气缸Sheet特殊处理：识别"电磁阀名称"列
                     device_name_col = None
-                    if '气缸' in sheet_name:
+                    if "气缸" in sheet_name:
                         for col in df.columns:
                             col_str = str(col).upper()
-                            if '电磁阀名称' in col_str or ('电磁阀' in col_str and '名称' in col_str):
+                            if "电磁阀名称" in col_str or (
+                                "电磁阀" in col_str and "名称" in col_str
+                            ):
                                 device_name_col = col
                                 break
-                    
+
                     # 第二步：建立IO列到注释列的映射
                     io_cols = []
-                    
+
                     # 处理成对的出限列
                     for col, ctype in col_types.items():
-                        if ctype == 'io_chu':
+                        if ctype == "io_chu":
                             # 找对应的出限名称列
                             comment_col = None
                             for c, t in col_types.items():
-                                if t == 'comment_chu':
+                                if t == "comment_chu":
                                     comment_col = c
                                     break
-                            io_cols.append((col, comment_col, '出限'))
-                        elif ctype == 'io_hui':
+                            io_cols.append((col, comment_col, "出限"))
+                        elif ctype == "io_hui":
                             # 找对应的回限名称列
                             comment_col = None
                             for c, t in col_types.items():
-                                if t == 'comment_hui':
+                                if t == "comment_hui":
                                     comment_col = c
                                     break
-                            io_cols.append((col, comment_col, '回限'))
-                        elif ctype == 'io_general' or ctype == 'io_var' or ctype == 'io_hmi_output' or ctype == 'io_hmi_param':
+                            io_cols.append((col, comment_col, "回限"))
+                        elif (
+                            ctype == "io_general"
+                            or ctype == "io_var"
+                            or ctype == "io_hmi_output"
+                            or ctype == "io_hmi_param"
+                        ):
                             # 通用IO列或变量列（真空吹气/数字量/模拟量sheet中"变量"列包含IO地址）
                             # IO数据库数字量sheet："HMI参数变量"列包含IO地址
                             general_comment = None
-                            
+
                             # IO数据库数字量sheet特殊处理
-                            if sheet_name == '数字量' and file_type == 'io_database':
+                            if sheet_name == "数字量" and file_type == "io_database":
                                 # 找"设备名称"列作为注释
                                 for c, t in col_types.items():
-                                    if t == 'comment_device':
+                                    if t == "comment_device":
                                         general_comment = c
                                         break
                                 # 如果没有设备名称，找"CM"列
                                 if not general_comment:
                                     for c, t in col_types.items():
-                                        if t == 'comment_general' or str(c) == 'CM':
+                                        if t == "comment_general" or str(c) == "CM":
                                             general_comment = c
                                             break
                             else:
                                 # IO表原始逻辑：查找对应的注释列（名称列）
                                 # 策略：如果IO列有后缀（如"变量.1"），找对应的"名称.1"
                                 col_str = str(col)
-                                if '.' in col_str:
+                                if "." in col_str:
                                     # IO列有后缀，找相同后缀的注释列
                                     # 例如 "变量.1" 对应 "名称.1"
-                                    suffix = col_str.split('.')[1]
-                                    expected_comment = f'名称.{suffix}'
-                                    print(f"    [DEBUG] 多列配对检查: IO列={col_str}, 期望注释列={expected_comment}")
+                                    suffix = col_str.split(".")[1]
+                                    expected_comment = f"名称.{suffix}"
+                                    print(
+                                        f"    [DEBUG] 多列配对检查: IO列={col_str}, 期望注释列={expected_comment}"
+                                    )
                                     for c, t in col_types.items():
-                                        if t == 'comment_name':
+                                        if t == "comment_name":
                                             c_str = str(c)
                                             if c_str == expected_comment:
                                                 general_comment = c
-                                                print(f"    [DEBUG] 成功配对: {col_str} -> {c_str}")
+                                                print(
+                                                    f"    [DEBUG] 成功配对: {col_str} -> {c_str}"
+                                                )
                                                 break
                                 else:
                                     # IO列没有后缀，找没有后缀的"名称"列
                                     for c, t in col_types.items():
-                                        if t == 'comment_name':
+                                        if t == "comment_name":
                                             c_str = str(c)
-                                            if c_str == '名称':
+                                            if c_str == "名称":
                                                 general_comment = c
-                                                print(f"    [DEBUG] 成功配对: {col_str} -> {c_str}")
+                                                print(
+                                                    f"    [DEBUG] 成功配对: {col_str} -> {c_str}"
+                                                )
                                                 break
-                            
+
                             if general_comment:
-                                print(f"    [DEBUG] IO列={col_str if 'col_str' in locals() else str(col)} 配对到 注释列={general_comment}")
+                                print(
+                                    f"    [DEBUG] IO列={col_str if 'col_str' in locals() else str(col)} 配对到 注释列={general_comment}"
+                                )
                             else:
                                 print(f"    [WARN] IO列={str(col)} 未找到配对的注释列")
                             io_cols.append((col, general_comment, None))
-                    
+
                     # 如果没找到反气缸列，尝试通过内容推断
                     if reverse_col is None:
                         for col in df.columns:
                             # 检查该列是否包含"是"或"否"值
                             sample = df[col].astype(str).head(20).tolist()
-                            has_shi = any('是' in str(v) for v in sample if pd.notna(v))
-                            has_fou = any(v in ['否', ''] for v in sample if pd.notna(v))
+                            has_shi = any("是" in str(v) for v in sample if pd.notna(v))
+                            has_fou = any(
+                                v in ["否", ""] for v in sample if pd.notna(v)
+                            )
                             if has_shi:
                                 print(f"    [DEBUG] 找到可能的反气缸列: {repr(col)}")
                                 reverse_col = col
-                                has_reverse_cylinder_col = True  # 通过内容推断找到反气缸列
+                                has_reverse_cylinder_col = (
+                                    True  # 通过内容推断找到反气缸列
+                                )
                                 break
-                    
+
                     # 如果没找到IO列，尝试通过内容推断（扫描前100行，支持更多IO格式）
                     if not io_cols:
                         for col in df.columns:
@@ -640,59 +808,78 @@ def parse_excel_io_db(excel_files, output_dir=None):
                             for s in sample:
                                 s_str = str(s).strip()
                                 # 支持 IA/ID/OD/OF 和 I/Q 格式
-                                if re.match(r'^(IA|ID|OD|OF|I|Q)\d+$', s_str):
+                                if re.match(r"^(IA|ID|OD|OF|I|Q)\d+$", s_str):
                                     io_count += 1
                                     # 找到至少3个IO地址才认为是IO列（避免误判）
                                     if io_count >= 3:
                                         io_cols.append((col, None, None))
-                                        print(f"    [DEBUG] Sheet [{sheet_name}] 通过内容找到IO列: {repr(col)} ({io_count}个IO地址)")
+                                        print(
+                                            f"    [DEBUG] Sheet [{sheet_name}] 通过内容找到IO列: {repr(col)} ({io_count}个IO地址)"
+                                        )
                                         break  # 跳出内层循环，继续检查下一列
-                    
+
                     # 对于通过内容找到的IO列，尝试找到对应的注释列
                     # 策略1：通过列标题关键词匹配
                     # 策略2：通过列位置（IO列的下一列通常是对应的注释列）
                     new_io_cols = []
                     cols_list = list(df.columns)
-                    
+
                     # 【关键修复】提前定义 plc_control_var_col，确保在行解析时可访问
                     plc_control_var_col = None
                     for c in df.columns:
                         c_str = str(c).strip().upper()
-                        if 'PLC' in c_str and '控制' in c_str and '变量' in c_str:
+                        if "PLC" in c_str and "控制" in c_str and "变量" in c_str:
                             plc_control_var_col = c
-                            print(f"    [DEBUG] Sheet [{sheet_name}] 识别到'plc控制变量'列: {repr(c)}")
+                            print(
+                                f"    [DEBUG] Sheet [{sheet_name}] 识别到'plc控制变量'列: {repr(c)}"
+                            )
                             break
-                    
+
                     for io_col, existing_comment_col, _ in io_cols:
                         comment_col = existing_comment_col  # 保留已有的配对（如果有）
                         limit_type = None
-                        
+
                         # 真空吹气/数字量/模拟量sheet：如果已有正确配对，直接使用
-                        print(f"    [DEBUG] 处理IO列: {repr(io_col)}, 已有注释列: {repr(existing_comment_col)}, sheet_name={sheet_name}")
-                        if sheet_name in {'真空吹气', '数字量', '模拟量'} and comment_col:
-                            print(f"    [DEBUG] 真空吹气/数字量/模拟量sheet，使用已有配对: {repr(io_col)} -> {repr(comment_col)}")
+                        print(
+                            f"    [DEBUG] 处理IO列: {repr(io_col)}, 已有注释列: {repr(existing_comment_col)}, sheet_name={sheet_name}"
+                        )
+                        if (
+                            sheet_name in {"真空吹气", "数字量", "模拟量"}
+                            and comment_col
+                        ):
+                            print(
+                                f"    [DEBUG] 真空吹气/数字量/模拟量sheet，使用已有配对: {repr(io_col)} -> {repr(comment_col)}"
+                            )
                             new_io_cols.append((io_col, comment_col, limit_type))
                             continue
-                        
+
                         # 检查列标题是否包含出限/回限关键词
                         col_str = str(io_col).upper()
-                        if '出限' in col_str or 'CHU' in col_str:
-                            limit_type = '出限'
+                        if "出限" in col_str or "CHU" in col_str:
+                            limit_type = "出限"
                             # 找对应的出限名称列
                             for c in df.columns:
                                 c_str = str(c).upper()
-                                if ('出限' in c_str or 'CHU' in c_str) and ('名称' in c_str or '注释' in c_str or 'NAME' in c_str):
+                                if ("出限" in c_str or "CHU" in c_str) and (
+                                    "名称" in c_str
+                                    or "注释" in c_str
+                                    or "NAME" in c_str
+                                ):
                                     comment_col = c
                                     break
-                        elif '回限' in col_str or 'HUI' in col_str:
-                            limit_type = '回限'
+                        elif "回限" in col_str or "HUI" in col_str:
+                            limit_type = "回限"
                             # 找对应的回限名称列
                             for c in df.columns:
                                 c_str = str(c).upper()
-                                if ('回限' in c_str or 'HUI' in c_str) and ('名称' in c_str or '注释' in c_str or 'NAME' in c_str):
+                                if ("回限" in c_str or "HUI" in c_str) and (
+                                    "名称" in c_str
+                                    or "注释" in c_str
+                                    or "NAME" in c_str
+                                ):
                                     comment_col = c
                                     break
-                        
+
                         # 策略2：如果没找到专用注释列，尝试IO列的下一列
                         if comment_col is None:
                             io_idx = cols_list.index(io_col)
@@ -700,25 +887,32 @@ def parse_excel_io_db(excel_files, output_dir=None):
                                 next_col = cols_list[io_idx + 1]
                                 # 检查下一列是否包含文本内容（不是IO地址）
                                 sample = df[next_col].astype(str).head(10).tolist()
-                                has_text = any(len(str(s)) > 5 and not re.match(r'^(IA|ID|OD|OF|I|Q)\d+$', str(s).strip()) for s in sample if pd.notna(s))
+                                has_text = any(
+                                    len(str(s)) > 5
+                                    and not re.match(
+                                        r"^(IA|ID|OD|OF|I|Q)\d+$", str(s).strip()
+                                    )
+                                    for s in sample
+                                    if pd.notna(s)
+                                )
                                 # 额外检查：排除Unnamed列（除非找不到其他注释列）
-                                is_unnamed = 'UNNAMED' in str(next_col).upper()
+                                is_unnamed = "UNNAMED" in str(next_col).upper()
                                 # 气缸Sheet特殊处理：如果使用策略2，优先使用"电磁阀名称"列
-                                if '气缸' in sheet_name and device_name_col:
+                                if "气缸" in sheet_name and device_name_col:
                                     comment_col = device_name_col
                                 elif has_text and not is_unnamed:
                                     comment_col = next_col
-                        
+
                         # 策略3：尝试通用注释列（包括comment_general和comment_name）
                         # 但如果有多个同名"注释"列，需要根据IO列位置找对应的
                         if comment_col is None:
                             # 检查是否有多个"注释"列
-                            comment_cols = [c for c in cols_list if c == '注释']
+                            comment_cols = [c for c in cols_list if c == "注释"]
                             if len(comment_cols) > 1:
                                 # 有多个"注释"列，根据IO列位置找最近的
                                 io_idx = cols_list.index(io_col)
                                 for i in range(io_idx - 1, -1, -1):
-                                    if cols_list[i] == '注释':
+                                    if cols_list[i] == "注释":
                                         comment_col = cols_list[i]
                                         break
                             else:
@@ -727,416 +921,564 @@ def parse_excel_io_db(excel_files, output_dir=None):
                                 for c in df.columns:
                                     c_str = str(c)
                                     # 排除Unnamed列（这些是被重命名的重复"注释"列）
-                                    if 'UNNAMED' in c_str.upper():
+                                    if "UNNAMED" in c_str.upper():
                                         continue
                                     # 检查是否是comment_general或comment_name类型
-                                    if col_types.get(c) in ['comment_general', 'comment_name']:
+                                    if col_types.get(c) in [
+                                        "comment_general",
+                                        "comment_name",
+                                    ]:
                                         comment_col = c
                                         break
-                                    if any(kw in c_str.upper() for kw in ['注释', 'COMMENT', '说明', 'DESC', 'NAME', '名称']):
+                                    if any(
+                                        kw in c_str.upper()
+                                        for kw in [
+                                            "注释",
+                                            "COMMENT",
+                                            "说明",
+                                            "DESC",
+                                            "NAME",
+                                            "名称",
+                                        ]
+                                    ):
                                         comment_col = c
                                         break
-                        
+
                         # 策略3.5：特殊处理有多个同名"注释"列的Sheet（如"气缸1"）- 保留兼容
                         # 根据IO列位置找对应的注释列：
                         # - 列8(IO地址) 对应 列3(注释)
                         # - 列10(IO地址.1) 对应 列9(注释)
-                        if comment_col is None and '注释' in cols_list:
+                        if comment_col is None and "注释" in cols_list:
                             io_idx = cols_list.index(io_col)
                             # 找IO列前面最近的"注释"列
                             for i in range(io_idx - 1, -1, -1):
-                                if cols_list[i] == '注释':
+                                if cols_list[i] == "注释":
                                     comment_col = cols_list[i]
                                     break
-                        
+
                         # 策略4：特殊处理数字量v2 Sheet，使用"1105系列IO"作为注释列
-                        if comment_col is None and '数字量' in sheet_name:
+                        if comment_col is None and "数字量" in sheet_name:
                             for c in df.columns:
                                 c_str = str(c)
-                                if '1105' in c_str or '系列IO' in c_str:
+                                if "1105" in c_str or "系列IO" in c_str:
                                     comment_col = c
                                     break
-                        
+
                         # 策略5：IO数据库特殊处理 - 优先使用"CM"列作为注释列
                         # IO数据库中，CM列包含中文IO名称，PLC控制变量列包含变量名
                         if comment_col is None:
                             for c in df.columns:
-                                if str(c).strip().upper() == 'CM':
+                                if str(c).strip().upper() == "CM":
                                     comment_col = c
-                                    print(f"    [DEBUG] Sheet [{sheet_name}] 使用'CM'列作为注释列")
+                                    print(
+                                        f"    [DEBUG] Sheet [{sheet_name}] 使用'CM'列作为注释列"
+                                    )
                                     break
-                        
+
                         # 【已移至循环外】策略5.5：识别"plc控制变量"列（用于获取实际PLC变量名）
                         # plc_control_var_col 已在循环外定义
-                        
+
                         new_io_cols.append((io_col, comment_col, limit_type))
-                    
+
                     io_cols = new_io_cols
-                    
+
                     # 【关键修复】确保 plc_control_var_col 在列配对循环结束后仍然可访问
                     # 在整个sheet级别识别PLC控制变量列
                     sheet_plc_control_var_col = None
                     for c in df.columns:
                         c_str = str(c).strip().upper()
-                        if 'PLC' in c_str and '控制' in c_str and '变量' in c_str:
+                        if "PLC" in c_str and "控制" in c_str and "变量" in c_str:
                             sheet_plc_control_var_col = c
-                            print(f"    [DEBUG] Sheet [{sheet_name}] 识别到PLC控制变量列: {repr(c)}")
+                            print(
+                                f"    [DEBUG] Sheet [{sheet_name}] 识别到PLC控制变量列: {repr(c)}"
+                            )
                             break
-                    
+
                     count = 0
                     skipped = 0  # 记录跳过的行数
                     sheet_io_records = []  # 收集该Sheet的IO记录，用于复盘分析
-                    
+
                     # 显示列识别结果
                     if io_cols:
-                        print(f"    [DEBUG] Sheet [{sheet_name}] 列识别: IO列={len(io_cols)}个, 变量={repr(var_col)}, 反气缸={repr(reverse_col)}")
+                        print(
+                            f"    [DEBUG] Sheet [{sheet_name}] 列识别: IO列={len(io_cols)}个, 变量={repr(var_col)}, 反气缸={repr(reverse_col)}"
+                        )
                         for io_col, comment_col, limit_type in io_cols:
-                            print(f"      - IO列: {repr(io_col)}, 注释列: {repr(comment_col)}, 限位类型: {limit_type}")
+                            print(
+                                f"      - IO列: {repr(io_col)}, 注释列: {repr(comment_col)}, 限位类型: {limit_type}"
+                            )
                     else:
                         # 【关键修复】IO数据库特殊处理：没有IO地址列，使用PLC控制变量列和CM列
-                        if file_type == 'io_database' and plc_control_var_col:
+                        if file_type == "io_database" and plc_control_var_col:
                             cm_col = None
                             for c in df.columns:
-                                if str(c).strip().upper() == 'CM':
+                                if str(c).strip().upper() == "CM":
                                     cm_col = c
                                     break
                             io_cols = [(plc_control_var_col, cm_col, None)]
-                            print(f"    [DEBUG] IO数据库Sheet [{sheet_name}] 使用PLC控制变量列作为IO列: {repr(plc_control_var_col)}, 注释列: {repr(cm_col)}")
+                            print(
+                                f"    [DEBUG] IO数据库Sheet [{sheet_name}] 使用PLC控制变量列作为IO列: {repr(plc_control_var_col)}, 注释列: {repr(cm_col)}"
+                            )
                         else:
                             print(f"    [WARN] Sheet [{sheet_name}] 未识别到IO列，跳过")
                             continue  # 跳过没有IO列的Sheet
-                    
+
                     # 解析每一行 - 遍历所有IO列
                     for idx, row in df.iterrows():
                         # 先获取该行的通用信息（变量名等）
                         var_names = []
                         is_reverse = False
-                        
+
                         # 获取变量名（多个可能的列）
                         if var_col and pd.notna(row[var_col]):
                             var_val = str(row[var_col]).strip()
-                            if var_val and var_val != 'nan':
+                            if var_val and var_val != "nan":
                                 var_names.append(var_val)
-                        
+
                         # HMI列也可能有变量名
                         if hmi_col and pd.notna(row[hmi_col]):
                             hmi_val = str(row[hmi_col]).strip()
-                            if hmi_val and hmi_val != 'nan' and hmi_val not in var_names:
+                            if (
+                                hmi_val
+                                and hmi_val != "nan"
+                                and hmi_val not in var_names
+                            ):
                                 var_names.append(hmi_val)
-                        
+
                         # 【修复】确保 plc_control_var_col 已定义
                         # 优先使用sheet级别的PLC控制变量列识别
-                        plc_control_var_col = sheet_plc_control_var_col if 'sheet_plc_control_var_col' in locals() else None
-                        
+                        plc_control_var_col = (
+                            sheet_plc_control_var_col
+                            if "sheet_plc_control_var_col" in locals()
+                            else None
+                        )
+
                         # 获取plc控制变量列的值（如果存在）
                         plc_control_var = None
                         if plc_control_var_col and pd.notna(row[plc_control_var_col]):
                             plc_control_var = str(row[plc_control_var_col]).strip()
-                            if plc_control_var and plc_control_var != 'nan' and plc_control_var not in var_names:
+                            if (
+                                plc_control_var
+                                and plc_control_var != "nan"
+                                and plc_control_var not in var_names
+                            ):
                                 var_names.append(plc_control_var)
-                                print(f"    [DEBUG] 从'plc控制变量'列添加变量名: {plc_control_var}")
-                        
+                                print(
+                                    f"    [DEBUG] 从'plc控制变量'列添加变量名: {plc_control_var}"
+                                )
+
                         # 获取反气缸标记
                         if reverse_col and pd.notna(row[reverse_col]):
                             reverse_val = str(row[reverse_col]).strip().upper()
-                            if reverse_val in ['是', 'Y', 'YES', '1', 'TRUE', '√']:
+                            if reverse_val in ["是", "Y", "YES", "1", "TRUE", "√"]:
                                 is_reverse = True
-                        
+
                         # 遍历所有IO列，提取所有IO地址
                         for io_col, comment_col, limit_type in io_cols:
                             if pd.notna(row[io_col]):
                                 io_val = str(row[io_col]).strip()
                                 # 支持多行单元格（以换行符分隔的多个IO地址）
-                                for line in io_val.split('\n'):
+                                for line in io_val.split("\n"):
                                     line = line.strip()
                                     # 排除表头或非IO地址（如 DI01, DO08, DO10）
-                                    if line in ['DI01', 'DI02', 'DO08', 'DO10']:
+                                    if line in ["DI01", "DI02", "DO08", "DO10"]:
                                         continue
-                                    if re.match(r'^(IA|ID|OD|OF|I|Q)\d+$', line) or (file_type == 'io_database' and line):
+                                    if re.match(r"^(IA|ID|OD|OF|I|Q)\d+$", line) or (
+                                        file_type == "io_database" and line
+                                    ):
                                         io_addr = line
-                                        
+
                                         # 获取该IO列对应的注释
                                         comment = ""
                                         if comment_col and pd.notna(row[comment_col]):
                                             comment = str(row[comment_col]).strip()
                                         # 气缸Sheet中，"电磁阀名称"列作为注释
-                                        elif '气缸' in sheet_name and device_name_col and pd.notna(row[device_name_col]):
+                                        elif (
+                                            "气缸" in sheet_name
+                                            and device_name_col
+                                            and pd.notna(row[device_name_col])
+                                        ):
                                             comment = str(row[device_name_col]).strip()
                                             if limit_type:
                                                 comment = f"{comment}{limit_type}"
                                         # 真空吹气/数字量/模拟量sheet中，查找comment_name类型的列作为注释
-                                        elif sheet_name in {'真空吹气', '数字量', '模拟量'}:
+                                        elif sheet_name in {
+                                            "真空吹气",
+                                            "数字量",
+                                            "模拟量",
+                                        }:
                                             # 查找comment_name类型的列
                                             name_comment_col = None
                                             for c, t in col_types.items():
-                                                if t == 'comment_name':
+                                                if t == "comment_name":
                                                     name_comment_col = c
                                                     break
-                                            if name_comment_col and pd.notna(row[name_comment_col]):
-                                                comment = str(row[name_comment_col]).strip()
+                                            if name_comment_col and pd.notna(
+                                                row[name_comment_col]
+                                            ):
+                                                comment = str(
+                                                    row[name_comment_col]
+                                                ).strip()
                                             elif var_col and pd.notna(row[var_col]):
                                                 # 后备：使用var_col（兼容性）
                                                 comment = str(row[var_col]).strip()
                                         # 如果没有专用注释列但有limt_type，使用默认格式
                                         elif limit_type and var_names:
                                             comment = f"{var_names[0]}{limit_type}"
-                                        
+
                                         # 规则：数字量 Sheet 中，根据真空检测/破真空推断出限/回限
-                                        if '数字量' in sheet_name and comment:
-                                            has_limit_keyword = '出限' in comment or '回限' in comment
+                                        if "数字量" in sheet_name and comment:
+                                            has_limit_keyword = (
+                                                "出限" in comment or "回限" in comment
+                                            )
                                             if not has_limit_keyword:
                                                 # 先检查破真空（回限），再检查真空检测（出限）
-                                                if '破真空' in comment:
-                                                    comment = comment + '回限'
-                                                elif '真空检测' in comment or '张紧' in comment or '到位' in comment:
-                                                    comment = comment + '出限'
-                                        
+                                                if "破真空" in comment:
+                                                    comment = comment + "回限"
+                                                elif (
+                                                    "真空检测" in comment
+                                                    or "张紧" in comment
+                                                    or "到位" in comment
+                                                ):
+                                                    comment = comment + "出限"
+
                                         # 过滤"备用"和"预留"的IO（检查注释和变量名）
-                                        if comment and ('备用' in comment or '预留' in comment):
+                                        if comment and (
+                                            "备用" in comment or "预留" in comment
+                                        ):
                                             continue
-                                        if any('备用' in v or '预留' in v for v in var_names):
+                                        if any(
+                                            "备用" in v or "预留" in v
+                                            for v in var_names
+                                        ):
                                             continue
-                                        
+
                                         # 调试输出：显示找到的反气缸标记
                                         if is_reverse:
-                                            print(f"    [DEBUG] 找到反气缸: {io_addr} - {reverse_val}")
-                                        
+                                            print(
+                                                f"    [DEBUG] 找到反气缸: {io_addr} - {reverse_val}"
+                                            )
+
                                         # 检查是否已存在该地址
                                         existing = io_by_address.get(io_addr)
-                                        new_has_limit = comment and ('出限' in comment or '回限' in comment)
-                                        
+                                        new_has_limit = comment and (
+                                            "出限" in comment or "回限" in comment
+                                        )
+
                                         # 辅助函数：判断是否为变量名格式（非IO名称）
                                         def is_var_name_format(s):
                                             if not s:
                                                 return False
                                             # 变量名特征：包含点号，且不含中文字符
-                                            if '.' in s and '_' in s:
+                                            if "." in s and "_" in s:
                                                 for char in s:
-                                                    if '\u4e00' <= char <= '\u9fff':
+                                                    if "\u4e00" <= char <= "\u9fff":
                                                         return False
                                                 return True
                                             return False
-                                        
+
                                         # 构建记录（不再覆盖，全部保留用于数据质量检测）
                                         # 创建记录时添加 source_type 标记
                                         record = {
-                                            'var_names': var_names,
-                                            'comment': comment,
-                                            'sheet': sheet_name,
-                                            'row': idx + 2,
-                                            'file': os.path.basename(excel_file),
-                                            'is_reverse': is_reverse,
-                                            'plc_control_var': plc_control_var,  # 存储plc控制变量名
-                                            'source_type': file_type,  # 标记数据来源: 'io_table' 或 'io_database'
-                                            'is_duplicate': existing is not None  # 标记是否为重复IO地址
+                                            "var_names": var_names,
+                                            "comment": comment,
+                                            "sheet": sheet_name,
+                                            "row": idx + 2,
+                                            "file": os.path.basename(excel_file),
+                                            "is_reverse": is_reverse,
+                                            "plc_control_var": plc_control_var,  # 存储plc控制变量名
+                                            "source_type": file_type,  # 标记数据来源: 'io_table' 或 'io_database'
+                                            "is_duplicate": existing
+                                            is not None,  # 标记是否为重复IO地址
                                         }
-                                        
+
                                         # 保留"最佳"记录在io_by_address（用于快速参考）
                                         # 但所有记录都存入io_by_address_all
                                         if not existing:
                                             io_by_address[io_addr] = record.copy()
-                                        elif new_has_limit and not (existing.get('comment') and ('出限' in existing['comment'] or '回限' in existing['comment'])):
+                                        elif new_has_limit and not (
+                                            existing.get("comment")
+                                            and (
+                                                "出限" in existing["comment"]
+                                                or "回限" in existing["comment"]
+                                            )
+                                        ):
                                             # 新记录有限位信息，旧记录没有，更新"最佳"记录
                                             io_by_address[io_addr] = record.copy()
-                                        elif is_var_name_format(existing.get('comment', '')) and not is_var_name_format(comment):
+                                        elif is_var_name_format(
+                                            existing.get("comment", "")
+                                        ) and not is_var_name_format(comment):
                                             # 旧记录是变量名格式，新记录是IO名称，更新"最佳"记录
                                             io_by_address[io_addr] = record.copy()
-                                        
+
                                         # 保存到 io_by_address_all（保留所有重复项）
                                         if io_addr:
                                             if io_addr in io_by_address_all:
-                                                io_by_address_all[io_addr].append(record.copy())
+                                                io_by_address_all[io_addr].append(
+                                                    record.copy()
+                                                )
                                             else:
-                                                io_by_address_all[io_addr] = [record.copy()]
-                                        
+                                                io_by_address_all[io_addr] = [
+                                                    record.copy()
+                                                ]
+
                                         for var_name in var_names:
                                             if var_name:
                                                 # 检查是否有重复变量名（去除右括号后相同）
-                                                cleaned = var_name.rstrip(')')
-                                                
+                                                cleaned = var_name.rstrip(")")
+
                                                 # 创建记录时添加 source_type 标记
                                                 record = {
-                                                    'io_address': io_addr,
-                                                    'comment': comment,
-                                                    'sheet': sheet_name,
-                                                    'row': idx + 2,
-                                                    'file': os.path.basename(excel_file),
-                                                    'is_reverse': is_reverse,
-                                                    'original_var_name': var_name,
-                                                    'plc_control_var': plc_control_var,  # 添加plc控制变量字段
-                                                    'source_type': file_type  # 标记数据来源: 'io_table' 或 'io_database'
+                                                    "io_address": io_addr,
+                                                    "comment": comment,
+                                                    "sheet": sheet_name,
+                                                    "row": idx + 2,
+                                                    "file": os.path.basename(
+                                                        excel_file
+                                                    ),
+                                                    "is_reverse": is_reverse,
+                                                    "original_var_name": var_name,
+                                                    "plc_control_var": plc_control_var,  # 添加plc控制变量字段
+                                                    "source_type": file_type,  # 标记数据来源: 'io_table' 或 'io_database'
                                                 }
-                                                
+
                                                 # 保存到 io_by_name_all（保留所有重复项）- 合并数据
                                                 if cleaned in io_by_name_all:
-                                                    existing_records = io_by_name_all[cleaned]
+                                                    existing_records = io_by_name_all[
+                                                        cleaned
+                                                    ]
                                                     is_duplicate = False
                                                     for existing in existing_records:
-                                                        if (existing.get('sheet') == sheet_name and 
-                                                            existing.get('row') == idx + 2 and
-                                                            existing.get('file') == os.path.basename(excel_file)):
+                                                        if (
+                                                            existing.get("sheet")
+                                                            == sheet_name
+                                                            and existing.get("row")
+                                                            == idx + 2
+                                                            and existing.get("file")
+                                                            == os.path.basename(
+                                                                excel_file
+                                                            )
+                                                        ):
                                                             is_duplicate = True
                                                             break
                                                     if not is_duplicate:
-                                                        io_by_name_all[cleaned].append(record)
-                                                        var_name_duplicates[cleaned].append(var_name)
+                                                        io_by_name_all[cleaned].append(
+                                                            record
+                                                        )
+                                                        var_name_duplicates[
+                                                            cleaned
+                                                        ].append(var_name)
                                                 else:
                                                     io_by_name_all[cleaned] = [record]
-                                                    var_name_duplicates[cleaned] = [var_name]
-                                                
+                                                    var_name_duplicates[cleaned] = [
+                                                        var_name
+                                                    ]
+
                                                 # 【关键修复】根据 file_type 分离保存到 IO 表或 IO 数据库
-                                                if file_type == 'io_database':
+                                                if file_type == "io_database":
                                                     # 保存到 IO 数据库专用变量
                                                     if cleaned in io_db_by_name_all:
-                                                        io_db_by_name_all[cleaned].append(record)
+                                                        io_db_by_name_all[
+                                                            cleaned
+                                                        ].append(record)
                                                     else:
-                                                        io_db_by_name_all[cleaned] = [record]
-                                                    
+                                                        io_db_by_name_all[cleaned] = [
+                                                            record
+                                                        ]
+
                                                     # 同时保存到 io_db_by_address_all
                                                     if io_addr in io_db_by_address_all:
-                                                        io_db_by_address_all[io_addr].append(record)
+                                                        io_db_by_address_all[
+                                                            io_addr
+                                                        ].append(record)
                                                     else:
-                                                        io_db_by_address_all[io_addr] = [record]
-                                                    
+                                                        io_db_by_address_all[
+                                                            io_addr
+                                                        ] = [record]
+
                                                     # io_db_by_name 只保留最后一个
                                                     io_db_by_name[var_name] = record
                                                     io_db_by_address[io_addr] = record
                                                 else:
                                                     # IO 表数据 - 保存到 io_table_by_name_all
                                                     if cleaned in io_table_by_name_all:
-                                                        io_table_by_name_all[cleaned].append(record)
+                                                        io_table_by_name_all[
+                                                            cleaned
+                                                        ].append(record)
                                                     else:
-                                                        io_table_by_name_all[cleaned] = [record]
-                                                    
+                                                        io_table_by_name_all[
+                                                            cleaned
+                                                        ] = [record]
+
                                                     # 同时保存到 io_table_by_address_all
-                                                    if io_addr in io_table_by_address_all:
-                                                        io_table_by_address_all[io_addr].append(record)
+                                                    if (
+                                                        io_addr
+                                                        in io_table_by_address_all
+                                                    ):
+                                                        io_table_by_address_all[
+                                                            io_addr
+                                                        ].append(record)
                                                     else:
-                                                        io_table_by_address_all[io_addr] = [record]
-                                                    
+                                                        io_table_by_address_all[
+                                                            io_addr
+                                                        ] = [record]
+
                                                     # io_table_by_name 只保留最后一个
                                                     io_table_by_name[var_name] = record
-                                                
+
                                                 # io_by_name 只保留最后一个（向后兼容）
                                                 io_by_name[var_name] = record
-                                        
+
                                         # 仅第一个文件（IO表）的数据
                                         if is_first_file:
-                                            existing_table = io_by_address_table_only.get(io_addr)
+                                            existing_table = (
+                                                io_by_address_table_only.get(io_addr)
+                                            )
                                             # 判断新数据是否有更详细的comment
-                                            new_is_generic = comment in ['电磁阀', '气缸', '阀岛']
-                                            old_is_generic = existing_table.get('comment', '') in ['电磁阀', '气缸', '阀岛'] if existing_table else True
-                                            
+                                            new_is_generic = comment in [
+                                                "电磁阀",
+                                                "气缸",
+                                                "阀岛",
+                                            ]
+                                            old_is_generic = (
+                                                existing_table.get("comment", "")
+                                                in ["电磁阀", "气缸", "阀岛"]
+                                                if existing_table
+                                                else True
+                                            )
+
                                             if not existing_table:
                                                 # 首次添加
                                                 io_by_address_table_only[io_addr] = {
-                                                    'var_names': var_names,
-                                                    'comment': comment,
-                                                    'sheet': sheet_name,
-                                                    'row': idx + 2,
-                                                    'file': os.path.basename(excel_file),
-                                                    'is_reverse': is_reverse,
-                                                    'source_type': file_type
+                                                    "var_names": var_names,
+                                                    "comment": comment,
+                                                    "sheet": sheet_name,
+                                                    "row": idx + 2,
+                                                    "file": os.path.basename(
+                                                        excel_file
+                                                    ),
+                                                    "is_reverse": is_reverse,
+                                                    "source_type": file_type,
                                                 }
-                                            elif len(comment) > len(existing_table.get('comment', '')):
+                                            elif len(comment) > len(
+                                                existing_table.get("comment", "")
+                                            ):
                                                 # 新数据comment更详细，覆盖旧数据（优先）
                                                 io_by_address_table_only[io_addr] = {
-                                                    'var_names': var_names,
-                                                    'comment': comment,
-                                                    'sheet': sheet_name,
-                                                    'row': idx + 2,
-                                                    'file': os.path.basename(excel_file),
-                                                    'is_reverse': is_reverse,
-                                                    'source_type': file_type
+                                                    "var_names": var_names,
+                                                    "comment": comment,
+                                                    "sheet": sheet_name,
+                                                    "row": idx + 2,
+                                                    "file": os.path.basename(
+                                                        excel_file
+                                                    ),
+                                                    "is_reverse": is_reverse,
+                                                    "source_type": file_type,
                                                 }
                                             elif existing_table and not new_has_limit:
                                                 # 新数据有限位信息，但comment不比旧数据详细，保留旧数据
                                                 pass
                                                 io_by_address_table_only[io_addr] = {
-                                                    'var_names': var_names,
-                                                    'comment': comment,
-                                                    'sheet': sheet_name,
-                                                    'row': idx + 2,
-                                                    'file': os.path.basename(excel_file),
-                                                    'is_reverse': is_reverse
+                                                    "var_names": var_names,
+                                                    "comment": comment,
+                                                    "sheet": sheet_name,
+                                                    "row": idx + 2,
+                                                    "file": os.path.basename(
+                                                        excel_file
+                                                    ),
+                                                    "is_reverse": is_reverse,
                                                 }
                                             for var_name in var_names:
                                                 if var_name:
                                                     io_by_name_table_only[var_name] = {
-                                                        'io_address': io_addr,
-                                                        'comment': comment,
-                                                        'sheet': sheet_name,
-                                                        'file': os.path.basename(excel_file),
-                                                        'is_reverse': is_reverse
+                                                        "io_address": io_addr,
+                                                        "comment": comment,
+                                                        "sheet": sheet_name,
+                                                        "file": os.path.basename(
+                                                            excel_file
+                                                        ),
+                                                        "is_reverse": is_reverse,
                                                     }
                                         count += 1
-                                        
+
                                         # 收集该记录用于复盘分析
-                                        sheet_io_records.append({
-                                            'io_address': io_addr,
-                                            'var_names': var_names,
-                                            'comment': comment,
-                                            'row': idx + 2,
-                                            'is_reverse': is_reverse
-                                        })
-                    
+                                        sheet_io_records.append(
+                                            {
+                                                "io_address": io_addr,
+                                                "var_names": var_names,
+                                                "comment": comment,
+                                                "row": idx + 2,
+                                                "is_reverse": is_reverse,
+                                            }
+                                        )
+
                     if count > 0:
                         print(f"  Sheet [{sheet_name}]: {count} 条记录")
-                        
+
                     # 记录Sheet分析详情，用于复盘
                     sheet_info = {
-                        'file': os.path.basename(excel_file),
-                        'file_type': file_type,  # 添加文件类型标记
-                        'sheet': sheet_name,
-                        'columns': {
-                            'io_cols': [str(c) for c in io_cols] if io_cols else [],
-                            'var_col': str(var_col) if var_col else None,
-                            'comment_col': str(comment_col) if comment_col else None,
-                            'hmi_col': str(hmi_col) if hmi_col else None,
-                            'reverse_col': str(reverse_col) if reverse_col else None
+                        "file": os.path.basename(excel_file),
+                        "file_type": file_type,  # 添加文件类型标记
+                        "sheet": sheet_name,
+                        "columns": {
+                            "io_cols": [str(c) for c in io_cols] if io_cols else [],
+                            "var_col": str(var_col) if var_col else None,
+                            "comment_col": str(comment_col) if comment_col else None,
+                            "hmi_col": str(hmi_col) if hmi_col else None,
+                            "reverse_col": str(reverse_col) if reverse_col else None,
                         },
-                        'stats': {
-                            'total_rows': len(df),
-                            'valid_records': count,
-                            'io_addresses_found': len([r for r in sheet_io_records if r.get('io_address')]),
-                            'var_names_found': len([r for r in sheet_io_records if r.get('var_names')]),
-                            'reverse_cylinders': len([r for r in sheet_io_records if r.get('is_reverse')])
+                        "stats": {
+                            "total_rows": len(df),
+                            "valid_records": count,
+                            "io_addresses_found": len(
+                                [r for r in sheet_io_records if r.get("io_address")]
+                            ),
+                            "var_names_found": len(
+                                [r for r in sheet_io_records if r.get("var_names")]
+                            ),
+                            "reverse_cylinders": len(
+                                [r for r in sheet_io_records if r.get("is_reverse")]
+                            ),
                         },
-                        'sample_io': sheet_io_records if sheet_io_records else []  # 所有记录用于复盘核对
+                        "sample_io": sheet_io_records
+                        if sheet_io_records
+                        else [],  # 所有记录用于复盘核对
                     }
                     sheet_analysis.append(sheet_info)
-                        
+
                 except Exception as e:
                     print(f"  读取Sheet {sheet_name} 出错: {e}")
-            
+
             is_first_file = False
 
         except Exception as e:
             print(f"读取Excel文件 {excel_file} 时出错: {e}")
-    
+
     # 保存Sheet分析详情到文件
     if output_dir and sheet_analysis:
         save_sheet_analysis(sheet_analysis, output_dir)
-    
+
     # 返回两个字典，方便不同方式查询
     # 新增：返回分离的数据结构
     return {
-        'by_address': io_by_address,
-        'by_name': io_by_name,
-        'by_name_all': io_by_name_all,
-        'by_address_all': io_by_address_all,  # 所有IO地址记录（包括重复）
-        'by_address_table_only': io_by_address_table_only,
-        'by_name_table_only': io_by_name_table_only,
+        "by_address": io_by_address,
+        "by_name": io_by_name,
+        "by_name_all": io_by_name_all,
+        "by_address_all": io_by_address_all,  # 所有IO地址记录（包括重复）
+        "by_address_table_only": io_by_address_table_only,
+        "by_name_table_only": io_by_name_table_only,
         # 【新增】IO 数据库专用数据（用于变量匹配）
-        'by_name_db_only': io_db_by_name_all,
-        'by_address_db_only': io_db_by_address_all,
-        'sheet_analysis': sheet_analysis,
-        'var_name_duplicates': var_name_duplicates,
-        'stats': stats,  # 新增：文件类型统计
+        "by_name_db_only": io_db_by_name_all,
+        "by_address_db_only": io_db_by_address_all,
+        "sheet_analysis": sheet_analysis,
+        "var_name_duplicates": var_name_duplicates,
+        "stats": stats,  # 新增：文件类型统计
         # 【新增】气缸sheet是否包含"反气缸"列
-        'has_reverse_cylinder_col': has_reverse_cylinder_col,
+        "has_reverse_cylinder_col": has_reverse_cylinder_col,
         # 辅助函数：按source_type筛选
-        'filter_by_source': lambda records, source: [r for r in records if r.get('source_type') == source]
+        "filter_by_source": lambda records, source: [
+            r for r in records if r.get("source_type") == source
+        ],
     }
 
 
@@ -1146,35 +1488,38 @@ def check_naming_conventions(var_name):
     跳过数组变量（如 IA_Temp[0,0]）- IO地址与数组赋值场景
     """
     issues = []
-    
+
     # 跳过数组变量 - IO地址与数组之间的赋值不算命名规范问题
-    if '[' in var_name and ']' in var_name:
+    if "[" in var_name and "]" in var_name:
         return issues
-    
+
     # 检查模块前缀
-    prefixes = ['JR_', 'XX_', 'QJ_', 'QD_', 'TJ_', 'MQ_', 'CJ_', 'ZJ_']
-    
+    prefixes = ["JR_", "XX_", "QJ_", "QD_", "TJ_", "MQ_", "CJ_", "ZJ_"]
+
     # 提取基础变量名（去掉数组下标）
-    base_name = re.sub(r'\[.*\]', '', var_name)
-    
+    base_name = re.sub(r"\[.*\]", "", var_name)
+
     has_prefix = any(base_name.startswith(prefix) for prefix in prefixes)
-    
+
     if not has_prefix:
         # 尝试推断应该有什么前缀
         suggested_prefix = infer_prefix(var_name)
         if suggested_prefix:
-            issues.append({
-                'problem': '缺少模块前缀',
-                'suggestion': f'建议改为 {suggested_prefix}{base_name}'
-            })
+            issues.append(
+                {
+                    "problem": "缺少模块前缀",
+                    "suggestion": f"建议改为 {suggested_prefix}{base_name}",
+                }
+            )
         else:
-            issues.append({
-                'problem': '缺少模块前缀',
-                'suggestion': f'建议添加模块前缀，如 JR_{base_name}'
-            })
-    
-    return issues
+            issues.append(
+                {
+                    "problem": "缺少模块前缀",
+                    "suggestion": f"建议添加模块前缀，如 JR_{base_name}",
+                }
+            )
 
+    return issues
 
 
 def normalize_comment(comment):
@@ -1184,13 +1529,13 @@ def normalize_comment(comment):
     - 统一常见后缀变体（检测/反馈/状态等）
     """
     if not comment:
-        return ''
+        return ""
     comment = comment.strip()
     # 移除常见技术后缀用于模糊匹配
-    suffixes = ['检测', '反馈', '状态', '信号', '报警', '故障']
+    suffixes = ["检测", "反馈", "状态", "信号", "报警", "故障"]
     for suffix in suffixes:
         if comment.endswith(suffix):
-            return comment[:-len(suffix)]
+            return comment[: -len(suffix)]
     return comment
 
 
@@ -1211,7 +1556,7 @@ def comments_match(comment1, comment2, exact=True):
 def prioritize_records(records, target_comment=None, target_io_addr=None):
     """
     对重复记录进行优先级排序
-    
+
     优先级规则（从高到低）：
     1. IO地址完全匹配（如果提供了目标IO地址）
     2. 注释完全匹配（如果提供了目标注释）
@@ -1219,59 +1564,58 @@ def prioritize_records(records, target_comment=None, target_io_addr=None):
     4. 注释详细程度（长度较长，非通用词如"电磁阀"）
     5. 特定sheet优先级（数字量 > 真空吹气 > 模拟量 > 其他）
     6. 行号较小（文件靠前位置）
-    
+
     返回: 排序后的记录列表
     """
     if not records:
         return []
-    
+
     # Sheet优先级映射
-    sheet_priority = {
-        '数字量': 1,
-        '真空吹气': 2,
-        '模拟量': 3,
-        '气缸': 4
-    }
-    
+    sheet_priority = {"数字量": 1, "真空吹气": 2, "模拟量": 3, "气缸": 4}
+
     def get_priority_score(record):
         score = 0
-        
+
         # 1. IO地址匹配 (+1000)
-        if target_io_addr and record.get('io_address') == target_io_addr:
+        if target_io_addr and record.get("io_address") == target_io_addr:
             score += 1000
-        
+
         # 2. 注释完全匹配 (+500)
-        if target_comment and record.get('comment') == target_comment:
+        if target_comment and record.get("comment") == target_comment:
             score += 500
-        elif target_comment and comments_match(record.get('comment', ''), target_comment, exact=True):
+        elif target_comment and comments_match(
+            record.get("comment", ""), target_comment, exact=True
+        ):
             score += 400
-        elif target_comment and comments_match(record.get('comment', ''), target_comment, exact=False):
+        elif target_comment and comments_match(
+            record.get("comment", ""), target_comment, exact=False
+        ):
             score += 300
-        
+
         # 3. 有PLC控制变量 (+200)
-        if record.get('plc_control_var'):
+        if record.get("plc_control_var"):
             score += 200
-        
+
         # 4. 注释详细程度 (+1~100)
-        comment = record.get('comment', '')
+        comment = record.get("comment", "")
         if comment:
             # 避免通用词
-            generic_words = ['电磁阀', '气缸', '阀岛', '备用', '预留']
+            generic_words = ["电磁阀", "气缸", "阀岛", "备用", "预留"]
             if not any(gw in comment for gw in generic_words):
                 # 长度越长分数越高，最多100分
                 score += min(len(comment), 100)
-        
+
         # 5. Sheet优先级 (+10~40)
-        sheet = record.get('sheet', '')
+        sheet = record.get("sheet", "")
         priority = sheet_priority.get(sheet, 5)
         score += (6 - priority) * 10  # 数字量=50, 真空吹气=40, ...
-        
+
         # 6. 行号较小 (+0~9，行号1-10得9分，11-20得8分...)
-        row = record.get('row', 999)
+        row = record.get("row", 999)
         score += max(0, 9 - (row - 1) // 10)
-        
+
         return score
-    
+
     # 按分数降序排序
     sorted_records = sorted(records, key=get_priority_score, reverse=True)
     return sorted_records
@@ -1280,42 +1624,45 @@ def prioritize_records(records, target_comment=None, target_io_addr=None):
 def find_best_matches_by_comment(records_dict, comment, io_addr=None, source_type=None):
     """
     根据注释查找最佳匹配记录（处理重复情况）
-    
+
     参数:
         records_dict: {key: [record1, record2, ...]} 格式的字典
         comment: 要匹配的注释
         io_addr: 可选，目标IO地址用于进一步筛选
         source_type: 可选，筛选特定来源类型
-    
+
     返回: (最佳匹配记录, 所有匹配记录列表)
     """
     all_matches = []
-    
+
     for key, records in records_dict.items():
         for record in records:
             # 筛选source_type
-            if source_type and record.get('source_type') != source_type:
+            if source_type and record.get("source_type") != source_type:
                 continue
-            
+
             # 检查注释是否匹配
-            rec_comment = record.get('comment', '')
-            if comments_match(rec_comment, comment, exact=True) or \
-               comments_match(rec_comment, comment, exact=False):
+            rec_comment = record.get("comment", "")
+            if comments_match(rec_comment, comment, exact=True) or comments_match(
+                rec_comment, comment, exact=False
+            ):
                 all_matches.append(record)
-    
+
     if not all_matches:
         return None, []
-    
+
     # 对匹配结果进行优先级排序
-    sorted_matches = prioritize_records(all_matches, target_comment=comment, target_io_addr=io_addr)
-    
+    sorted_matches = prioritize_records(
+        all_matches, target_comment=comment, target_io_addr=io_addr
+    )
+
     return sorted_matches[0], sorted_matches
 
 
 def detect_duplicates(io_by_address_all, io_by_name_all):
     """
     检测Excel数据中的重复项
-    
+
     返回: {
         'io_address_duplicates': {io_addr: [records]},  # IO地址重复
         'io_name_duplicates': {io_name: [records]},    # IO名称重复
@@ -1323,75 +1670,84 @@ def detect_duplicates(io_by_address_all, io_by_name_all):
     }
     """
     result = {
-        'io_address_duplicates': {},
-        'io_name_duplicates': {},
-        'plc_var_duplicates': {}
+        "io_address_duplicates": {},
+        "io_name_duplicates": {},
+        "plc_var_duplicates": {},
     }
-    
+
     # 1. 检测IO地址重复（在同一source_type内）
     for io_addr, records in io_by_address_all.items():
         if len(records) > 1:
             # 按source_type分组
             by_source = {}
             for r in records:
-                src = r.get('source_type', 'unknown')
+                src = r.get("source_type", "unknown")
                 if src not in by_source:
                     by_source[src] = []
                 by_source[src].append(r)
-            
+
             # 如果任一source_type内有多个记录，标记为重复
             for src, src_records in by_source.items():
                 if len(src_records) > 1:
-                    if io_addr not in result['io_address_duplicates']:
-                        result['io_address_duplicates'][io_addr] = []
-                    result['io_address_duplicates'][io_addr].extend(src_records)
-    
+                    if io_addr not in result["io_address_duplicates"]:
+                        result["io_address_duplicates"][io_addr] = []
+                    result["io_address_duplicates"][io_addr].extend(src_records)
+
     # 2. 检测IO名称（注释）重复
     comment_records = {}
     for name, records in io_by_name_all.items():
         for r in records:
-            comment = r.get('comment', '')
+            comment = r.get("comment", "")
             if comment:
-                key = (comment, r.get('source_type', 'unknown'))
+                key = (comment, r.get("source_type", "unknown"))
                 if key not in comment_records:
                     comment_records[key] = []
                 comment_records[key].append(r)
-    
+
     for (comment, src), records in comment_records.items():
         if len(records) > 1:
-            result['io_name_duplicates'][comment] = records
-    
+            result["io_name_duplicates"][comment] = records
+
     # 3. 检测PLC控制变量重复（仅在io_database中）
     plc_var_records = {}
     for name, records in io_by_name_all.items():
         for r in records:
-            if r.get('source_type') == 'io_database':
-                plc_var = r.get('plc_control_var', '')
+            if r.get("source_type") == "io_database":
+                plc_var = r.get("plc_control_var", "")
                 if plc_var:
                     if plc_var not in plc_var_records:
                         plc_var_records[plc_var] = []
                     plc_var_records[plc_var].append(r)
-    
+
     for plc_var, records in plc_var_records.items():
         if len(records) > 1:
-            result['plc_var_duplicates'][plc_var] = records
-    
+            result["plc_var_duplicates"][plc_var] = records
+
     return result
 
 
-def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=None, var_name_duplicates=None, io_by_name_all=None, io_by_address_all=None, io_db_by_name_all=None):
+def check_source_io_match(
+    plc_vars,
+    io_by_address,
+    io_by_name,
+    sheet_analysis=None,
+    var_name_duplicates=None,
+    io_by_name_all=None,
+    io_by_address_all=None,
+    io_db_by_name_all=None,
+):
     """
     核对源码IO及PLC控制变量
     根据源码注释去IO表和IO数据库查找核对
-    
+
     参数:
         io_by_name_all: 合并的所有记录（向后兼容）
         io_db_by_name_all: IO数据库的记录（用于变量匹配）
-    
+
     返回: list of dict {源码变量, IO名称, IO地址, IO地址是否匹配, IO名称是否匹配, 变量是否匹配, 备注}
     """
     mismatches = []
-    
+
     # 优先使用IO数据库数据进行变量匹配（如果提供）
     # 否则从io_by_name_all中筛选source_type='io_database'的记录
     db_records = io_db_by_name_all if io_db_by_name_all else {}
@@ -1399,101 +1755,108 @@ def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=No
         # 从合并数据中筛选IO数据库的记录
         db_records = {}
         for name, records in io_by_name_all.items():
-            db_records[name] = [r for r in records if r.get('source_type') == 'io_database']
-    
+            db_records[name] = [
+                r for r in records if r.get("source_type") == "io_database"
+            ]
+
     # 清理后的io_by_name（去除右括号）和 io_by_address
     cleaned_io_by_name = {}
     cleaned_io_by_address = {}  # 通过IO地址索引
     for var_name, info in io_by_name.items():
-        cleaned_name = var_name.rstrip(')')
+        cleaned_name = var_name.rstrip(")")
         cleaned_io_by_name[cleaned_name] = info
         # 同时构建IO地址索引（可能有多个变量对应同一IO地址）
-        io_addr = info.get('io_address', '')
+        io_addr = info.get("io_address", "")
         if io_addr:
             if io_addr not in cleaned_io_by_address:
                 cleaned_io_by_address[io_addr] = []
-            cleaned_io_by_address[io_addr].append({
-                'var_name': var_name,
-                'cleaned_name': cleaned_name,
-                'info': info
-            })
-    
+            cleaned_io_by_address[io_addr].append(
+                {"var_name": var_name, "cleaned_name": cleaned_name, "info": info}
+            )
+
     # 从sheet_analysis构建完整的IO地址映射（包含所有Sheet的记录）
     full_io_records = []
     if sheet_analysis:
         for sheet in sheet_analysis:
-            for record in sheet.get('sample_io', []):
-                if record.get('io_address') and record.get('comment'):
-                    full_io_records.append({
-                        'addr': record['io_address'],
-                        'comment': record['comment'].strip(),
-                        'sheet': sheet['sheet'],
-                        'row': record['row'],
-                        'file': sheet['file']
-                    })
-    
+            for record in sheet.get("sample_io", []):
+                if record.get("io_address") and record.get("comment"):
+                    full_io_records.append(
+                        {
+                            "addr": record["io_address"],
+                            "comment": record["comment"].strip(),
+                            "sheet": sheet["sheet"],
+                            "row": record["row"],
+                            "file": sheet["file"],
+                        }
+                    )
+
     for var in plc_vars:
-        var_name = var.get('name', '')
-        io_addr = var.get('io_address', '')
-        comment = var.get('comment', '').strip()
-        
+        var_name = var.get("name", "")
+        io_addr = var.get("io_address", "")
+        comment = var.get("comment", "").strip()
+
         # 只处理完整的结构体变量名（包含.），跳过基础名和单独的成员名
-        if '.' not in var_name:
+        if "." not in var_name:
             continue
-        
+
         # 跳过已知的结构体成员后缀（不应作为独立变量出现）
-        if var_name in ['.Sr_I', '.Sr_O', '.Bn_On', '.Out', '.In']:
+        if var_name in [".Sr_I", ".Sr_O", ".Bn_On", ".Out", ".In"]:
             continue
-        
+
         if not comment:
             continue
-        
+
         # 1. 在所有IO记录中查找匹配（使用sheet_analysis数据）
         # 改用新的重复处理逻辑：收集所有匹配，然后优先级排序
         table_matches = []
         if sheet_analysis:
             for sheet in sheet_analysis:
                 # 只使用IO表的数据进行IO地址匹配
-                if sheet.get('file_type') != 'io_table':
+                if sheet.get("file_type") != "io_table":
                     continue
-                for record in sheet.get('sample_io', []):
-                    rec_comment = record.get('comment', '')
-                    if comments_match(rec_comment, comment, exact=True) or \
-                       comments_match(rec_comment, comment, exact=False):
-                        table_matches.append({
-                            'addr': record['io_address'],
-                            'sheet': sheet['sheet'],
-                            'row': record['row'],
-                            'comment': rec_comment,
-                            'source_type': sheet.get('file_type', 'unknown')
-                        })
-        
+                for record in sheet.get("sample_io", []):
+                    rec_comment = record.get("comment", "")
+                    if comments_match(
+                        rec_comment, comment, exact=True
+                    ) or comments_match(rec_comment, comment, exact=False):
+                        table_matches.append(
+                            {
+                                "addr": record["io_address"],
+                                "sheet": sheet["sheet"],
+                                "row": record["row"],
+                                "comment": rec_comment,
+                                "source_type": sheet.get("file_type", "unknown"),
+                            }
+                        )
+
         # 对匹配结果进行优先级排序
         if table_matches:
-            table_matches = prioritize_records(table_matches, target_comment=comment, target_io_addr=io_addr)
-        
+            table_matches = prioritize_records(
+                table_matches, target_comment=comment, target_io_addr=io_addr
+            )
+
         found_in_table = len(table_matches) > 0
         match_count = len(table_matches)
-        
+
         # 2. 检查IO地址是否匹配
         # 逻辑：检查所有匹配行的IO地址是否与源码一致
-        io_match = '否'
+        io_match = "否"
         if found_in_table and io_addr:
             # 统计匹配的IO地址数量
-            matching_addrs = [m for m in table_matches if m['addr'] == io_addr]
+            matching_addrs = [m for m in table_matches if m["addr"] == io_addr]
             if len(matching_addrs) == match_count and match_count > 0:
                 # 所有匹配行的IO地址都与源码一致
-                io_match = '是'
+                io_match = "是"
             elif len(matching_addrs) > 0:
                 # 部分匹配
-                io_match = f'部分匹配({len(matching_addrs)}/{match_count})'
+                io_match = f"部分匹配({len(matching_addrs)}/{match_count})"
             # 否则保持'否'
-        
+
         # 3. 在IO数据库中查找（根据IO名称/注释查找，而非变量名）
-        clean_var_name = var_name.rstrip(')')
-        var_match = '未核对'
-        multi_var_hint = ''  # 多变量匹配提示
-        
+        clean_var_name = var_name.rstrip(")")
+        var_match = "未核对"
+        multi_var_hint = ""  # 多变量匹配提示
+
         # 3.1 根据IO名称（源码注释）去IO数据库查找
         comment_matches = []  # 存储所有IO名称匹配的记录
         if comment:
@@ -1502,46 +1865,60 @@ def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=No
             for cleaned_name, records in db_records.items():
                 for record in records:
                     # 使用模糊匹配：优先精确匹配，其次模糊匹配
-                    rec_comment = record.get('comment', '')
-                    if comments_match(rec_comment, comment, exact=True) or \
-                       comments_match(rec_comment, comment, exact=False):
+                    rec_comment = record.get("comment", "")
+                    if comments_match(
+                        rec_comment, comment, exact=True
+                    ) or comments_match(rec_comment, comment, exact=False):
                         # 使用数据库中的变量名（用于显示数据库中的PLC控制变量）
-                        display_var_name = record.get('plc_control_var') or record.get('original_var_name', cleaned_name)
-                        comment_matches.append({
-                            'var_name': display_var_name,
-                            'cleaned_name': cleaned_name,
-                            'io_address': record.get('io_address', ''),
-                            'sheet': record.get('sheet', ''),
-                            'row': record.get('row', ''),
-                            'comment': record.get('comment', ''),
-                            'plc_control_var': record.get('plc_control_var'),  # 保留原始plc_control_var
-                            'source_type': record.get('source_type', 'unknown')
-                        })
-            
+                        display_var_name = record.get("plc_control_var") or record.get(
+                            "original_var_name", cleaned_name
+                        )
+                        comment_matches.append(
+                            {
+                                "var_name": display_var_name,
+                                "cleaned_name": cleaned_name,
+                                "io_address": record.get("io_address", ""),
+                                "sheet": record.get("sheet", ""),
+                                "row": record.get("row", ""),
+                                "comment": record.get("comment", ""),
+                                "plc_control_var": record.get(
+                                    "plc_control_var"
+                                ),  # 保留原始plc_control_var
+                                "source_type": record.get("source_type", "unknown"),
+                            }
+                        )
+
             # 如果没找到，尝试用基础名查找（如 YTJ_QJ_SJ1）
-            if not comment_matches and '.' in clean_var_name:
-                base_name = clean_var_name.split('.')[0]
+            if not comment_matches and "." in clean_var_name:
+                base_name = clean_var_name.split(".")[0]
                 if base_name in db_records:
                     for record in db_records[base_name]:
-                        rec_comment = record.get('comment', '')
-                        if comments_match(rec_comment, comment, exact=True) or \
-                           comments_match(rec_comment, comment, exact=False):
-                            display_var_name = record.get('plc_control_var') or record.get('original_var_name', base_name)
-                            comment_matches.append({
-                                'var_name': display_var_name,
-                                'cleaned_name': base_name,
-                                'io_address': record.get('io_address', ''),
-                                'sheet': record.get('sheet', ''),
-                                'row': record.get('row', ''),
-                                'comment': record.get('comment', ''),
-                                'plc_control_var': record.get('plc_control_var'),
-                                'source_type': record.get('source_type', 'unknown')
-                            })
-        
+                        rec_comment = record.get("comment", "")
+                        if comments_match(
+                            rec_comment, comment, exact=True
+                        ) or comments_match(rec_comment, comment, exact=False):
+                            display_var_name = record.get(
+                                "plc_control_var"
+                            ) or record.get("original_var_name", base_name)
+                            comment_matches.append(
+                                {
+                                    "var_name": display_var_name,
+                                    "cleaned_name": base_name,
+                                    "io_address": record.get("io_address", ""),
+                                    "sheet": record.get("sheet", ""),
+                                    "row": record.get("row", ""),
+                                    "comment": record.get("comment", ""),
+                                    "plc_control_var": record.get("plc_control_var"),
+                                    "source_type": record.get("source_type", "unknown"),
+                                }
+                            )
+
         # 对匹配结果进行优先级排序（处理重复情况）
         if comment_matches:
-            comment_matches = prioritize_records(comment_matches, target_comment=comment, target_io_addr=io_addr)
-        
+            comment_matches = prioritize_records(
+                comment_matches, target_comment=comment, target_io_addr=io_addr
+            )
+
         # 3.2 根据查找结果判断变量是否匹配
         if comment_matches:
             # 找到IO名称匹配的记录，现在比较变量名
@@ -1550,98 +1927,114 @@ def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=No
             var_matches = []
             for m in comment_matches:
                 # 方式1：检查基础名是否匹配
-                if m['cleaned_name'] == clean_var_name:
+                if m["cleaned_name"] == clean_var_name:
                     var_matches.append(m)
                 # 方式2：检查 plc_control_var 是否与源码变量名匹配
-                elif m.get('plc_control_var') and str(m['plc_control_var']).strip() == clean_var_name:
+                elif (
+                    m.get("plc_control_var")
+                    and str(m["plc_control_var"]).strip() == clean_var_name
+                ):
                     var_matches.append(m)
-            
+
             if var_matches:
                 # 变量名也匹配
                 match = var_matches[0]
-                var_match = f'匹配({match["sheet"]}:{str(match["row"])}行)'
-                
+                var_match = f"匹配({match['sheet']}:{str(match['row'])}行)"
+
                 # 检查是否有多个相同变量名
                 if len(comment_matches) > 1:
-                    multi_var_hint = f'匹配到{len(comment_matches)}个变量:{match["sheet"]}第{match["row"]}行等'
+                    multi_var_hint = f"匹配到{len(comment_matches)}个变量:{match['sheet']}第{match['row']}行等"
                 else:
-                    multi_var_hint = f'匹配到1个变量:{match["sheet"]}第{match["row"]}行'
+                    multi_var_hint = f"匹配到1个变量:{match['sheet']}第{match['row']}行"
             else:
                 # IO名称匹配，但变量名不匹配
                 # 检查数据库中plc_control_var是否为空
                 records_with_plc_var = []
                 records_without_plc_var = []
-                
+
                 for m in comment_matches:
-                    m_plc_var = m.get('plc_control_var', '')
+                    m_plc_var = m.get("plc_control_var", "")
                     # 检查plc_control_var是否存在且非空
                     if m_plc_var and str(m_plc_var).strip():
                         records_with_plc_var.append(m)
                     else:
                         records_without_plc_var.append(m)
-                
+
                 # 如果所有匹配记录都没有plc_control_var，显示"变量为空"
                 if not records_with_plc_var:
                     first_match = comment_matches[0]
-                    var_match = f'变量不匹配(数据库:变量为空)'
-                    multi_var_hint = f'IO名称匹配：{first_match["sheet"]}第{first_match["row"]}行，但变量名不匹配'
+                    var_match = f"变量不匹配(数据库:变量为空)"
+                    multi_var_hint = f"IO名称匹配：{first_match['sheet']}第{first_match['row']}行，但变量名不匹配"
                 else:
                     # 有plc_control_var的记录，显示实际的变量名
                     # 按行号排序
-                    prioritized_matches = sorted(records_with_plc_var, key=lambda m: m.get('row', 0))
-                    
+                    prioritized_matches = sorted(
+                        records_with_plc_var, key=lambda m: m.get("row", 0)
+                    )
+
                     # 提取变量名（使用数据库中的plc_control_var用于显示）
                     db_vars = []
                     for m in prioritized_matches:
-                        plc_var = m.get('plc_control_var', '')
+                        plc_var = m.get("plc_control_var", "")
                         if plc_var and str(plc_var).strip():
                             db_vars.append(str(plc_var).strip())
-                    
+
                     first_match = prioritized_matches[0]
-                    
+
                     # 精确显示：1个直接显示，2-3个用"/"分隔列出，超过3个才用"等N个"
                     if len(db_vars) == 1:
-                        var_match = f'变量不匹配(数据库:{db_vars[0]})'
+                        var_match = f"变量不匹配(数据库:{db_vars[0]})"
                     elif len(db_vars) <= 3:
-                        var_match = f'变量不匹配(数据库:{"/".join(db_vars)})'
+                        var_match = f"变量不匹配(数据库:{'/'.join(db_vars)})"
                     else:
-                        var_match = f'变量不匹配(数据库:{db_vars[0]}等{len(db_vars)}个)'
-                    multi_var_hint = f'IO名称匹配：{first_match["sheet"]}第{first_match["row"]}行，但变量名不匹配'
+                        var_match = f"变量不匹配(数据库:{db_vars[0]}等{len(db_vars)}个)"
+                    multi_var_hint = f"IO名称匹配：{first_match['sheet']}第{first_match['row']}行，但变量名不匹配"
         else:
             # IO名称没找到，说明这个设备在数据库中不存在
-            var_match = 'IO名称未找到'
-        
+            var_match = "IO名称未找到"
+
         # 4. 构建备注（拆分为IO地址备注和IO名称备注）
-        io_addr_remark = ''  # IO地址备注：IO地址匹配但变量名不匹配的记录
-        io_name_remark = ''  # IO名称备注：变量名匹配的记录
-        
+        io_addr_remark = ""  # IO地址备注：IO地址匹配但变量名不匹配的记录
+        io_name_remark = ""  # IO名称备注：变量名匹配的记录
+
         # 先计算变量名匹配的记录（用于IO名称备注）
         var_match_locations = set()  # 记录变量名匹配的位置，用于排除
         if comment_matches:
-            var_matches = [m for m in comment_matches if m.get('cleaned_name', '').rstrip(')') == clean_var_name.rstrip(')')]
-            
+            var_matches = [
+                m
+                for m in comment_matches
+                if m.get("cleaned_name", "").rstrip(")") == clean_var_name.rstrip(")")
+            ]
+
             # 也检查 plc_control_var 是否匹配源码变量名
             for m in comment_matches:
                 if m not in var_matches:
-                    if m.get('plc_control_var') and str(m['plc_control_var']).strip() == clean_var_name:
+                    if (
+                        m.get("plc_control_var")
+                        and str(m["plc_control_var"]).strip() == clean_var_name
+                    ):
                         var_matches.append(m)
-            
+
             if var_matches:
                 # 优先使用 IO 数据库的记录
-                db_var_matches = [m for m in var_matches if m.get('source_type') == 'io_database']
-                table_var_matches = [m for m in var_matches if m.get('source_type') != 'io_database']
+                db_var_matches = [
+                    m for m in var_matches if m.get("source_type") == "io_database"
+                ]
+                table_var_matches = [
+                    m for m in var_matches if m.get("source_type") != "io_database"
+                ]
                 prioritized_var_matches = db_var_matches + table_var_matches
-                
+
                 # 获取变量匹配的位置信息
                 locations = []
                 for m in prioritized_var_matches:
-                    sheet = m.get('sheet', '')
-                    row = m.get('row', '')
+                    sheet = m.get("sheet", "")
+                    row = m.get("row", "")
                     if sheet and row:
                         loc = f"{sheet}第{row}行"
                         locations.append(loc)
                         var_match_locations.add(loc)  # 记录这些位置
-                
+
                 # 去重
                 seen = set()
                 unique_locations = []
@@ -1649,53 +2042,63 @@ def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=No
                     if loc not in seen:
                         seen.add(loc)
                         unique_locations.append(loc)
-                
+
                 var_count = len(prioritized_var_matches)
                 if var_count == 1:
                     io_name_remark = f"数据库位置:匹配到1个变量:{unique_locations[0] if unique_locations else '未知'}"
                 else:
-                    loc_str = ', '.join(unique_locations[:3])
+                    loc_str = ", ".join(unique_locations[:3])
                     if len(unique_locations) > 3:
-                        loc_str += f'等{len(unique_locations)}处'
+                        loc_str += f"等{len(unique_locations)}处"
                     io_name_remark = f"数据库位置:匹配到{var_count}个变量:{loc_str}"
             else:
                 # 没有变量名匹配，但IO名称匹配
                 # 优先使用 IO 数据库的记录显示具体位置
-                db_comment_matches = [m for m in comment_matches if m.get('source_type') == 'io_database']
-                table_comment_matches = [m for m in comment_matches if m.get('source_type') != 'io_database']
+                db_comment_matches = [
+                    m for m in comment_matches if m.get("source_type") == "io_database"
+                ]
+                table_comment_matches = [
+                    m for m in comment_matches if m.get("source_type") != "io_database"
+                ]
                 prioritized_comment_matches = db_comment_matches + table_comment_matches
-                
+
                 if prioritized_comment_matches:
                     first_match = prioritized_comment_matches[0]
-                    sheet = first_match.get('sheet', '')
-                    row = first_match.get('row', '')
-                    io_name_remark = f'IO名称匹配：{sheet}第{row}行，但变量名不匹配'
+                    sheet = first_match.get("sheet", "")
+                    row = first_match.get("row", "")
+                    io_name_remark = f"IO名称匹配：{sheet}第{row}行，但变量名不匹配"
                 else:
-                    io_name_remark = 'IO名称匹配但变量名不匹配'
+                    io_name_remark = "IO名称匹配但变量名不匹配"
         else:
-            io_name_remark = 'IO名称未找到'
-        
+            io_name_remark = "IO名称未找到"
+
         # 4.1 IO地址备注：IO地址匹配且IO名称匹配，但排除变量名匹配的记录
         # 优先使用 IO 数据库的数据（source_type='io_database'）
         if io_addr and io_by_address_all and io_addr in io_by_address_all:
             # 筛选：IO地址匹配且IO名称匹配的记录，但排除变量名匹配的位置
             addr_records = [
-                r for r in io_by_address_all[io_addr] 
-                if r.get('comment', '').strip() == comment 
-                and f"{r.get('sheet', '')}第{r.get('row', '')}行" not in var_match_locations
+                r
+                for r in io_by_address_all[io_addr]
+                if r.get("comment", "").strip() == comment
+                and f"{r.get('sheet', '')}第{r.get('row', '')}行"
+                not in var_match_locations
             ]
-            
+
             # 优先使用 IO 数据库的记录（source_type='io_database'）
-            db_records_first = [r for r in addr_records if r.get('source_type') == 'io_database']
-            table_records = [r for r in addr_records if r.get('source_type') != 'io_database']
-            
+            db_records_first = [
+                r for r in addr_records if r.get("source_type") == "io_database"
+            ]
+            table_records = [
+                r for r in addr_records if r.get("source_type") != "io_database"
+            ]
+
             # 优先显示 IO 数据库的记录
             prioritized_records = db_records_first + table_records
-            
+
             locations = []
             for r in prioritized_records:
-                sheet = r.get('sheet', '')
-                row = r.get('row', '')
+                sheet = r.get("sheet", "")
+                row = r.get("row", "")
                 if sheet and row:
                     locations.append(f"{sheet}第{row}行")
             if locations:
@@ -1711,25 +2114,29 @@ def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=No
                 else:
                     io_addr_remark = f"IO地址匹配到多行:{', '.join(unique_locations)}"
             else:
-                io_addr_remark = 'IO地址无其他匹配'
+                io_addr_remark = "IO地址无其他匹配"
         elif not io_addr:
-            io_addr_remark = '无IO地址'
+            io_addr_remark = "无IO地址"
         else:
-            io_addr_remark = 'IO地址未找到'
-        
+            io_addr_remark = "IO地址未找到"
+
         # 5. IO名称匹配检查（使用io_by_address_all检查所有记录）
-        io_name_match = '未找到IO'
-        excel_io_name = ''
+        io_name_match = "未找到IO"
+        excel_io_name = ""
         all_io_names = []  # 收集所有找到的IO名称
-        
+
         if io_addr:
             # 优先使用io_by_address_all（包含所有Sheet的记录）
             if io_by_address_all and io_addr in io_by_address_all:
                 all_records = io_by_address_all[io_addr]
-                all_io_names = [r.get('comment', '').strip() for r in all_records if r.get('comment')]
+                all_io_names = [
+                    r.get("comment", "").strip()
+                    for r in all_records
+                    if r.get("comment")
+                ]
                 # 去重
                 unique_io_names = list(set(all_io_names))
-                
+
                 # 检查是否有任何记录匹配
                 matched = False
                 for io_name in unique_io_names:
@@ -1737,81 +2144,86 @@ def check_source_io_match(plc_vars, io_by_address, io_by_name, sheet_analysis=No
                         matched = True
                         excel_io_name = io_name
                         break
-                
+
                 if matched:
-                    io_name_match = '是'
+                    io_name_match = "是"
                 elif unique_io_names:
-                    io_name_match = '否'
+                    io_name_match = "否"
                     excel_io_name = unique_io_names[0]  # 显示第一个作为参考
                 else:
-                    io_name_match = '未找到IO'
+                    io_name_match = "未找到IO"
             elif io_addr in io_by_address:
                 # 回退到单个记录
-                excel_io_name = io_by_address[io_addr].get('comment', '').strip()
+                excel_io_name = io_by_address[io_addr].get("comment", "").strip()
                 if comment == excel_io_name:
-                    io_name_match = '是'
+                    io_name_match = "是"
                 else:
-                    io_name_match = '否'
+                    io_name_match = "否"
             else:
                 # 从full_io_records查找
                 for record in full_io_records:
-                    if record['addr'] == io_addr:
-                        excel_io_name = record['comment'].strip()
+                    if record["addr"] == io_addr:
+                        excel_io_name = record["comment"].strip()
                         if comment == excel_io_name:
-                            io_name_match = '是'
+                            io_name_match = "是"
                         else:
-                            io_name_match = '否'
+                            io_name_match = "否"
                         break
-        
+
         # 判断是否是完全匹配（用于第5节显示逻辑）
         # 完全匹配 = IO地址匹配 + IO名称匹配 + 变量匹配 + 只匹配到1个变量
         is_perfect_match = (
-            io_match == '是' and 
-            io_name_match == '是' and 
-            '匹配(' in var_match and 
-            '匹配到1个变量' in io_name_remark
+            io_match == "是"
+            and io_name_match == "是"
+            and "匹配(" in var_match
+            and "匹配到1个变量" in io_name_remark
         )
-        
+
         # 【关键修复】第5节记录逻辑：捕获"问题数据"供人工核对
         # 根据用户定义，第5节应显示以下类型的数据：
         # 1. IO表问题：IO名称匹配到多个 / IO名称未找到 / IO地址不一致
         # 2. IO数据库问题：变量名不匹配 / IO名称匹配到多个 / IO名称未找到
         # 3. 即使完全匹配，但如果IO表有多个匹配，也显示出来（让用户知道数据来源）
-        
+
         should_show_in_section5 = False
-        
+
         if not is_perfect_match:
             # 情况1：IO地址不匹配
-            if io_match != '是':
+            if io_match != "是":
                 should_show_in_section5 = True
             # 情况2：IO名称不匹配
-            if io_name_match != '是':
+            if io_name_match != "是":
                 should_show_in_section5 = True
             # 情况3：变量不匹配
-            if '不匹配' in var_match or '未找到' in var_match:
+            if "不匹配" in var_match or "未找到" in var_match:
                 should_show_in_section5 = True
             # 情况4：IO数据库中匹配到多个变量
-            if '匹配到' in io_name_remark and '个变量' in io_name_remark:
-                if '等' in io_name_remark or ('匹配到' in io_name_remark and int(io_name_remark.split('匹配到')[1].split('个')[0]) > 1):
+            if "匹配到" in io_name_remark and "个变量" in io_name_remark:
+                if "等" in io_name_remark or (
+                    "匹配到" in io_name_remark
+                    and int(io_name_remark.split("匹配到")[1].split("个")[0]) > 1
+                ):
                     should_show_in_section5 = True
         else:
             # 【新增】即使完全匹配，但如果IO表匹配到多行（用户需要知道数据来源）
-            if 'IO地址匹配到多行' in io_addr_remark:
+            if "IO地址匹配到多行" in io_addr_remark:
                 should_show_in_section5 = True
-        
+
         # 记录到第5节
         if should_show_in_section5:
-            mismatches.append({
-                '源码变量': var_name,
-                'IO名称': comment,
-                'IO地址': io_addr,
-                'IO地址是否匹配': io_match,
-                'IO名称是否匹配': io_name_match,
-                '变量是否匹配': var_match,
-                'IO地址备注': io_addr_remark,
-                'IO名称备注': io_name_remark
-            })
-    
+            mismatches.append(
+                {
+                    "源码变量": var_name,
+                    "IO名称": comment,
+                    "IO地址": io_addr,
+                    "IO地址是否匹配": io_match,
+                    "IO名称是否匹配": io_name_match,
+                    "变量是否匹配": var_match,
+                    "IO地址备注": io_addr_remark,
+                    "IO名称备注": io_name_remark,
+                }
+            )
+
     return mismatches
 
 
@@ -1821,75 +2233,96 @@ def check_sr_io_mismatch(plc_vars, io_by_address):
     返回: list of dict {气缸名称, io地址, 说明, 源码}
     """
     issues = []
-    
+
     # 已知问题地址硬编码（临时解决方案，直到Excel解析修复）
     known_issues = {
-        'IA0214': {'expected': 'Sr_O', 'actual': 'Sr_I', 'desc': '正极送料_正极送片过程驱动压辊气缸', 'limit': '出限'},
-        'IA0300': {'expected': 'Sr_I', 'actual': 'Sr_O', 'desc': '正极送料_正极送片过程驱动压辊气缸', 'limit': '回限'},
-        'IA2408': {'expected': 'Sr_O', 'actual': 'Sr_I', 'desc': '收尾贴胶_尾胶压胶气缸2', 'limit': '出限'},
+        "IA0214": {
+            "expected": "Sr_O",
+            "actual": "Sr_I",
+            "desc": "正极送料_正极送片过程驱动压辊气缸",
+            "limit": "出限",
+        },
+        "IA0300": {
+            "expected": "Sr_I",
+            "actual": "Sr_O",
+            "desc": "正极送料_正极送片过程驱动压辊气缸",
+            "limit": "回限",
+        },
+        "IA2408": {
+            "expected": "Sr_O",
+            "actual": "Sr_I",
+            "desc": "收尾贴胶_尾胶压胶气缸2",
+            "limit": "出限",
+        },
     }
-    
+
     for var in plc_vars:
-        var_name = var.get('name', '')
-        io_addr = var.get('io_address', '')
-        
+        var_name = var.get("name", "")
+        io_addr = var.get("io_address", "")
+
         # 只检查结构体变量包含.Sr_I或.Sr_O的
-        if '.Sr_I' not in var_name and '.Sr_O' not in var_name:
+        if ".Sr_I" not in var_name and ".Sr_O" not in var_name:
             continue
-        
+
         if not io_addr:
             continue
-        
+
         # 获取源码中的结构体后缀
-        if '.Sr_I' in var_name:
-            plc_suffix = 'Sr_I'
-        elif '.Sr_O' in var_name:
-            plc_suffix = 'Sr_O'
+        if ".Sr_I" in var_name:
+            plc_suffix = "Sr_I"
+        elif ".Sr_O" in var_name:
+            plc_suffix = "Sr_O"
         else:
             continue
-        
+
         # 方法1: 检查Excel注释中的"出限"或"回限"
         detected = False
         if io_addr in io_by_address:
             excel_info = io_by_address[io_addr]
-            comment = excel_info.get('comment', '')
-            
-            has_chu = '出限' in comment
-            has_hui = '回限' in comment
-            
-            if has_chu and plc_suffix == 'Sr_I':
-                issues.append({
-                    '气缸名称': comment.replace('出限', '').strip(),
-                    'io地址': io_addr,
-                    'sheet': excel_info.get('sheet', ''),
-                    '说明': f'Excel=出限，期望.Sr_O，源码实为.Sr_I',
-                    '源码': f'{var_name} := {io_addr};',
-                    'comment': var.get('comment', '')
-                })
+            comment = excel_info.get("comment", "")
+
+            has_chu = "出限" in comment
+            has_hui = "回限" in comment
+
+            if has_chu and plc_suffix == "Sr_I":
+                issues.append(
+                    {
+                        "气缸名称": comment.replace("出限", "").strip(),
+                        "io地址": io_addr,
+                        "sheet": excel_info.get("sheet", ""),
+                        "说明": f"Excel=出限，期望.Sr_O，源码实为.Sr_I",
+                        "源码": f"{var_name} := {io_addr};",
+                        "comment": var.get("comment", ""),
+                    }
+                )
                 detected = True
-            elif has_hui and plc_suffix == 'Sr_O':
-                issues.append({
-                    '气缸名称': comment.replace('回限', '').strip(),
-                    'io地址': io_addr,
-                    'sheet': excel_info.get('sheet', ''),
-                    '说明': f'Excel=回限，期望.Sr_I，源码实为.Sr_O',
-                    '源码': f'{var_name} := {io_addr};',
-                    'comment': var.get('comment', '')
-                })
+            elif has_hui and plc_suffix == "Sr_O":
+                issues.append(
+                    {
+                        "气缸名称": comment.replace("回限", "").strip(),
+                        "io地址": io_addr,
+                        "sheet": excel_info.get("sheet", ""),
+                        "说明": f"Excel=回限，期望.Sr_I，源码实为.Sr_O",
+                        "源码": f"{var_name} := {io_addr};",
+                        "comment": var.get("comment", ""),
+                    }
+                )
                 detected = True
-        
+
         # 方法2: 检查已知问题地址（硬编码备用）
         if not detected and io_addr in known_issues:
             ki = known_issues[io_addr]
-            if plc_suffix == ki['actual']:
-                issues.append({
-                    '气缸名称': ki['desc'],
-                    'io地址': io_addr,
-                    '说明': f"Excel={ki['limit']}，期望.{ki['expected']}，源码实为.{ki['actual']}",
-                    '源码': f'{var_name} := {io_addr};',
-                    'comment': '(从已知问题库匹配)'
-                })
-    
+            if plc_suffix == ki["actual"]:
+                issues.append(
+                    {
+                        "气缸名称": ki["desc"],
+                        "io地址": io_addr,
+                        "说明": f"Excel={ki['limit']}，期望.{ki['expected']}，源码实为.{ki['actual']}",
+                        "源码": f"{var_name} := {io_addr};",
+                        "comment": "(从已知问题库匹配)",
+                    }
+                )
+
     return issues
 
 
@@ -1902,46 +2335,54 @@ def check_reverse_cylinder_not(plc_vars, io_by_address, has_reverse_cylinder_col
     if not has_reverse_cylinder_col:
         return []
     issues = []
-    
+
     for var in plc_vars:
-        var_name = var.get('name', '')
-        io_addr = var.get('io_address', '')
-        context = var.get('context', '')
-        
+        var_name = var.get("name", "")
+        io_addr = var.get("io_address", "")
+        context = var.get("context", "")
+
         # 只检查结构体变量
-        if '.Sr_I' not in var_name and '.Sr_O' not in var_name:
+        if ".Sr_I" not in var_name and ".Sr_O" not in var_name:
             continue
-        
+
         if not io_addr or io_addr not in io_by_address:
             continue
-        
+
         excel_info = io_by_address[io_addr]
-        is_reverse = excel_info.get('is_reverse', False)
-        comment = excel_info.get('comment', '')
-        sheet = excel_info.get('sheet', '')
-        
+        is_reverse = excel_info.get("is_reverse", False)
+        comment = excel_info.get("comment", "")
+        sheet = excel_info.get("sheet", "")
+
         # 只有气缸sheet才检测是否反气缸
-        if sheet != '气缸':
+        if sheet != "气缸":
             continue
-        
+
         # 只检查标记为反气缸的
         if not is_reverse:
             continue
-        
+
         # 检查源码中是否有NOT前缀（反气缸不应该有NOT）
-        has_not = f'NOT {io_addr}' in context or f'not {io_addr}' in context.upper()
-        
+        has_not = f"NOT {io_addr}" in context or f"not {io_addr}" in context.upper()
+
         # 反气缸**不应该**有NOT，如果有则报告问题
         if has_not:
-            limit_type = '出限' if '出限' in comment else '回限' if '回限' in comment else ''
-            issues.append({
-                '气缸名称': comment.replace(limit_type, '').strip() if limit_type else comment,
-                'io地址': io_addr,
-                '说明': f'{sheet}标记为反气缸，{limit_type}={io_addr}，源码**不应**加NOT但加了' if limit_type else f'{sheet}标记为反气缸，源码不应加NOT但加了',
-                '源码': f'{var_name} := NOT {io_addr};',
-                'comment': var.get('comment', '')
-            })
-    
+            limit_type = (
+                "出限" if "出限" in comment else "回限" if "回限" in comment else ""
+            )
+            issues.append(
+                {
+                    "气缸名称": comment.replace(limit_type, "").strip()
+                    if limit_type
+                    else comment,
+                    "io地址": io_addr,
+                    "说明": f"{sheet}标记为反气缸，{limit_type}={io_addr}，源码**不应**加NOT但加了"
+                    if limit_type
+                    else f"{sheet}标记为反气缸，源码不应加NOT但加了",
+                    "源码": f"{var_name} := NOT {io_addr};",
+                    "comment": var.get("comment", ""),
+                }
+            )
+
     return issues
 
 
@@ -1954,47 +2395,55 @@ def check_normal_cylinder_not(plc_vars, io_by_address, has_reverse_cylinder_col=
     if not has_reverse_cylinder_col:
         return []
     issues = []
-    
+
     for var in plc_vars:
-        var_name = var.get('name', '')
-        io_addr = var.get('io_address', '')
-        context = var.get('context', '')
-        
+        var_name = var.get("name", "")
+        io_addr = var.get("io_address", "")
+        context = var.get("context", "")
+
         # 只检查结构体变量
-        if '.Sr_I' not in var_name and '.Sr_O' not in var_name:
+        if ".Sr_I" not in var_name and ".Sr_O" not in var_name:
             continue
-        
+
         if not io_addr or io_addr not in io_by_address:
             continue
-        
+
         excel_info = io_by_address[io_addr]
-        is_reverse = excel_info.get('is_reverse', False)
-        comment = excel_info.get('comment', '')
-        sheet = excel_info.get('sheet', '')
-        
+        is_reverse = excel_info.get("is_reverse", False)
+        comment = excel_info.get("comment", "")
+        sheet = excel_info.get("sheet", "")
+
         # 只有气缸sheet才检测是否反气缸
-        if sheet != '气缸':
+        if sheet != "气缸":
             continue
-        
+
         # 只检查**未**标记为反气缸的（即正常气缸）
         if is_reverse:
             continue
-        
+
         # 检查源码中是否有NOT前缀（正常气缸应该有NOT）
-        has_not = f'NOT {io_addr}' in context or f'not {io_addr}' in context.upper()
-        
+        has_not = f"NOT {io_addr}" in context or f"not {io_addr}" in context.upper()
+
         # 正常气缸**应该**有NOT，如果没有则报告问题
         if not has_not:
-            limit_type = '出限' if '出限' in comment else '回限' if '回限' in comment else ''
-            issues.append({
-                '气缸名称': comment.replace(limit_type, '').strip() if limit_type else comment,
-                'io地址': io_addr,
-                'sheet': sheet,
-                '说明': f'正常气缸（非反气缸），{limit_type}={io_addr}，源码**应该**加NOT但未加' if limit_type else f'正常气缸（非反气缸），源码应该加NOT但未加',
-                '源码': f'{var_name} := {io_addr};',
-                'comment': var.get('comment', '')
-            })
-    
+            limit_type = (
+                "出限" if "出限" in comment else "回限" if "回限" in comment else ""
+            )
+            issues.append(
+                {
+                    "气缸名称": comment.replace(limit_type, "").strip()
+                    if limit_type
+                    else comment,
+                    "io地址": io_addr,
+                    "sheet": sheet,
+                    "说明": f"正常气缸（非反气缸），{limit_type}={io_addr}，源码**应该**加NOT但未加"
+                    if limit_type
+                    else f"正常气缸（非反气缸），源码应该加NOT但未加",
+                    "源码": f"{var_name} := {io_addr};",
+                    "comment": var.get("comment", ""),
+                }
+            )
+
     return issues
 
 
@@ -2005,33 +2454,43 @@ def infer_prefix(var_name):
     """
     var_upper = var_name.upper()
     # 以下划线分割变量名，检查各部分是否匹配关键字
-    parts = var_upper.split('_')
-    
+    parts = var_upper.split("_")
+
     # 入卷相关
-    if any(kw in var_upper for kw in ['DUST', 'ROLL', 'JOIN']) or any(p.startswith('JR') for p in parts):
-        return 'JR_'
+    if any(kw in var_upper for kw in ["DUST", "ROLL", "JOIN"]) or any(
+        p.startswith("JR") for p in parts
+    ):
+        return "JR_"
     # 下料相关
-    elif any(kw in var_upper for kw in ['DISCHARGE']) or any(p.startswith('XX') for p in parts):
-        return 'XX_'
+    elif any(kw in var_upper for kw in ["DISCHARGE"]) or any(
+        p.startswith("XX") for p in parts
+    ):
+        return "XX_"
     # 气检相关
-    elif any(kw in var_upper for kw in ['AIR', 'PRESSURE']) or any(p.startswith('QJ') for p in parts):
-        return 'QJ_'
+    elif any(kw in var_upper for kw in ["AIR", "PRESSURE"]) or any(
+        p.startswith("QJ") for p in parts
+    ):
+        return "QJ_"
     # 切断相关
-    elif any(kw in var_upper for kw in ['SEVER']) or any(p.startswith('QD') for p in parts):
-        return 'QD_'
+    elif any(kw in var_upper for kw in ["SEVER"]) or any(
+        p.startswith("QD") for p in parts
+    ):
+        return "QD_"
     # 贴胶相关 - 使用前缀匹配避免ZLTJC误判
-    elif any(kw in var_upper for kw in ['TAPE', 'GLUE']) or any(p.startswith('TJ') for p in parts):
-        return 'TJ_'
+    elif any(kw in var_upper for kw in ["TAPE", "GLUE"]) or any(
+        p.startswith("TJ") for p in parts
+    ):
+        return "TJ_"
     # 模切相关
-    elif any(p.startswith('MQ') for p in parts):
-        return 'MQ_'
+    elif any(p.startswith("MQ") for p in parts):
+        return "MQ_"
     # 出极相关
-    elif any(p.startswith('CJ') for p in parts):
-        return 'CJ_'
+    elif any(p.startswith("CJ") for p in parts):
+        return "CJ_"
     # 正极/负极相关
-    elif any(p.startswith('ZJ') or p.startswith('FJ') for p in parts):
-        return 'ZJ_'
-    
+    elif any(p.startswith("ZJ") or p.startswith("FJ") for p in parts):
+        return "ZJ_"
+
     return None
 
 
@@ -2051,85 +2510,85 @@ def explain_variable_name(var_name):
     """
     var_upper = var_name.upper()
     explanations = []
-    
+
     # 常见缩写映射
     abbreviations = {
-        'ZLTJC': '张力检测',
-        'YLTJC': '压力检测', 
-        'WJ': '无间/无胶',
-        'YJ': '有胶',
-        'DJ': '断胶',
-        'JQ': '胶区',
-        'WJQ': '无胶区',
-        'JQZ': '胶区中',
-        'QLZ': '切胶中',
-        'FW': '复位',
-        'FWZ': '复位中',
-        'QD': '启动',
-        'TZ': '停止',
-        'TZD': '停止端',
-        'JR': '入卷',
-        'CR': '出卷',
-        'ZJ': '正极',
-        'FJ': '负极',
-        'TJ': '贴胶',
-        'QJ': '气检',
-        'QD': '切断',
-        'MQ': '模切',
-        'CJ': '出极',
-        'XX': '下料',
-        'ZL': '张力',
-        'YL': '压力',
-        'WD': '温度',
-        'SD': '速度',
-        'BW': '摆杆',
-        'QY': '气压',
-        'YX': '运行',
-        'GZ': '故障',
-        'BJ': '报警',
-        'DQ': '到位',
-        'YXW': '原位',
-        'SR': '输入',
-        'SC': '输出',
-        'ZJ': '正转',
-        'FJ': '反转',
-        'SD': '手动',
-        'ZD': '自动',
-        'MS': '模式',
-        'ZT': '状态',
-        'SJ': '升降',
-        'QG': '气缸',
-        'FDJ': '放卷',
-        'SJ': '升降',
-        'SJQ': '升降器',
-        'JGH': '过辊',
-        'JQZ': '胶区中',
-        'YJQ': '有胶区',
-        'YTJ': '预贴胶',
-        'ZFJ': '正极',
-        'YFJ': '放卷',
-        'ZFJ': '正极放卷',
-        'JR': '入卷',
-        'CR': '出卷',
-        'YJ': '有胶',
-        'WJ': '无胶',
-        'DJ': '断胶',
-        'JQ': '胶区',
-        'WJQ': '无胶区',
-        'JQZ': '胶区中',
-        'QLZ': '切胶中',
+        "ZLTJC": "张力检测",
+        "YLTJC": "压力检测",
+        "WJ": "无间/无胶",
+        "YJ": "有胶",
+        "DJ": "断胶",
+        "JQ": "胶区",
+        "WJQ": "无胶区",
+        "JQZ": "胶区中",
+        "QLZ": "切胶中",
+        "FW": "复位",
+        "FWZ": "复位中",
+        "QD": "启动",
+        "TZ": "停止",
+        "TZD": "停止端",
+        "JR": "入卷",
+        "CR": "出卷",
+        "ZJ": "正极",
+        "FJ": "负极",
+        "TJ": "贴胶",
+        "QJ": "气检",
+        "QD": "切断",
+        "MQ": "模切",
+        "CJ": "出极",
+        "XX": "下料",
+        "ZL": "张力",
+        "YL": "压力",
+        "WD": "温度",
+        "SD": "速度",
+        "BW": "摆杆",
+        "QY": "气压",
+        "YX": "运行",
+        "GZ": "故障",
+        "BJ": "报警",
+        "DQ": "到位",
+        "YXW": "原位",
+        "SR": "输入",
+        "SC": "输出",
+        "ZJ": "正转",
+        "FJ": "反转",
+        "SD": "手动",
+        "ZD": "自动",
+        "MS": "模式",
+        "ZT": "状态",
+        "SJ": "升降",
+        "QG": "气缸",
+        "FDJ": "放卷",
+        "SJ": "升降",
+        "SJQ": "升降器",
+        "JGH": "过辊",
+        "JQZ": "胶区中",
+        "YJQ": "有胶区",
+        "YTJ": "预贴胶",
+        "ZFJ": "正极",
+        "YFJ": "放卷",
+        "ZFJ": "正极放卷",
+        "JR": "入卷",
+        "CR": "出卷",
+        "YJ": "有胶",
+        "WJ": "无胶",
+        "DJ": "断胶",
+        "JQ": "胶区",
+        "WJQ": "无胶区",
+        "JQZ": "胶区中",
+        "QLZ": "切胶中",
     }
-    
+
     # 按_分割变量名，解释各部分
-    parts = var_name.split('_')
+    parts = var_name.split("_")
     for part in parts:
         part_upper = part.upper()
         if part_upper in abbreviations:
             explanations.append(abbreviations[part_upper])
-    
+
     if explanations:
-        return ' | '.join(explanations[:3])  # 最多显示3个解释
-    return '-'
+        return " | ".join(explanations[:3])  # 最多显示3个解释
+    return "-"
 
 
 def get_prefix_explanation(prefix):
@@ -2137,30 +2596,50 @@ def get_prefix_explanation(prefix):
     获取模块前缀的中文解释
     """
     prefix_map = {
-        'JR_': '入卷（极片入卷模块）',
-        'XX_': '下料（极片下料模块）',
-        'QJ_': '气检（气密性检测模块）',
-        'QD_': '切断（极片切断模块）',
-        'TJ_': '贴胶（极片贴胶模块）',
-        'MQ_': '模切（模切模块）',
-        'CJ_': '出极（极片出极模块）',
-        'ZJ_': '正极（正极相关）',
-        'FJ_': '放卷（放卷模块）',
+        "JR_": "入卷（极片入卷模块）",
+        "XX_": "下料（极片下料模块）",
+        "QJ_": "气检（气密性检测模块）",
+        "QD_": "切断（极片切断模块）",
+        "TJ_": "贴胶（极片贴胶模块）",
+        "MQ_": "模切（模切模块）",
+        "CJ_": "出极（极片出极模块）",
+        "ZJ_": "正极（正极相关）",
+        "FJ_": "放卷（放卷模块）",
     }
-    return prefix_map.get(prefix, '未知模块')
+    return prefix_map.get(prefix, "未知模块")
 
+    # 需要移除的后缀列表
+    suffixes = [
+        "回限",
+        "出限",
+        "报警",
+        "上限",
+        "下限",
+        "前限",
+        "后限",
+        "左限",
+        "右限",
+        "上升限",
+        "下降限",
+        "伸出限",
+        "缩回限",
+        "原位",
+        "到位",
+        "原点",
+        "前进",
+        "后退",
+        "左旋",
+        "右旋",
+        "正转",
+        "反转",
+    ]
 
-# 需要移除的后缀列表
-    suffixes = ['回限', '出限', '报警', '上限', '下限', '前限', '后限', '左限', '右限', 
-                '上升限', '下降限', '伸出限', '缩回限', '原位', '到位', '原点',
-                '前进', '后退', '左旋', '右旋', '正转', '反转']
-    
     base_name = comment.strip()
     for suffix in suffixes:
         if base_name.endswith(suffix):
-            base_name = base_name[:-len(suffix)]
+            base_name = base_name[: -len(suffix)]
             break
-    
+
     return base_name if base_name != comment else None
 
 
@@ -2170,8 +2649,8 @@ def extract_var_prefix_suffix(var_name):
     例如：'YTJ_QJ_SJ1.Sr_I' -> ('YTJ_QJ_SJ1', 'Sr_I')
           'YTJ_QJ_SJ1' -> ('YTJ_QJ_SJ1', None)
     """
-    if '.' in var_name:
-        parts = var_name.split('.')
+    if "." in var_name:
+        parts = var_name.split(".")
         return parts[0], parts[1]
     return var_name, None
 
@@ -2180,7 +2659,7 @@ def check_variable_device_match(var_name, excel_comment, io_address):
     """
     检查PLC变量名是否与Excel设备描述匹配
     返回: None表示匹配，或返回不匹配原因字符串
-    
+
     匹配逻辑：
     1. 从Excel注释提取设备基础名（去掉回限/出限等后缀）
     2. 从PLC变量名提取前缀（去除.Sr_I/.Sr_O等后缀）
@@ -2190,17 +2669,17 @@ def check_variable_device_match(var_name, excel_comment, io_address):
     device_base = extract_device_base_name(excel_comment)
     if not device_base:
         return None  # 无法提取基础名，跳过检查
-    
+
     # 提取变量前缀和后缀
     var_prefix, var_suffix = extract_var_prefix_suffix(var_name)
-    
+
     # TODO: 这里需要建立设备基础名到变量前缀的映射表
     # 目前简化处理：只检查命名规范中的一致性
     # 如果变量名有结构体后缀(.Sr_I/.Sr_O/.Bn_On)，认为是有效的气缸变量
-    valid_suffixes = ['Sr_I', 'Sr_O', 'Bn_On', 'Out', 'In']
+    valid_suffixes = ["Sr_I", "Sr_O", "Bn_On", "Out", "In"]
     if var_suffix and var_suffix in valid_suffixes:
         return None  # 有有效的结构体后缀，认为匹配
-    
+
     # 如果没有结构体后缀，检查是否在Excel中通过变量名匹配
     # 这种情况已经在前面处理过了
     return None
@@ -2209,21 +2688,21 @@ def check_variable_device_match(var_name, excel_comment, io_address):
 def generate_report(plc_vars, io_db, output_dir, duplicates=None):
     """
     生成Markdown格式的审查报告
-    
+
     参数:
         duplicates: 重复项检测结果（可选）
     """
     """
     生成带时间戳的审查报告
     """
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    report_file = os.path.join(output_dir, f'plc_audit_report_{timestamp}.md')
-    
-    io_by_name = io_db.get('by_name', {})
-    io_by_address = io_db.get('by_address', {})
-    io_by_address_all = io_db.get('by_address_all', {})  # 所有IO地址记录（包括重复）
-    has_rev_col = io_db.get('has_reverse_cylinder_col', False)  # 是否有反气缸列
-    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = os.path.join(output_dir, f"plc_audit_report_{timestamp}.md")
+
+    io_by_name = io_db.get("by_name", {})
+    io_by_address = io_db.get("by_address", {})
+    io_by_address_all = io_db.get("by_address_all", {})  # 所有IO地址记录（包括重复）
+    has_rev_col = io_db.get("has_reverse_cylinder_col", False)  # 是否有反气缸列
+
     # 统计
     total_vars = len(plc_vars)
     matched_by_name = 0
@@ -2231,619 +2710,778 @@ def generate_report(plc_vars, io_db, output_dir, duplicates=None):
     unmatched_vars = []
     naming_issues = []
     variable_mismatch_issues = []  # 重命名：变量名与设备描述不匹配
-    
+
     for var in plc_vars:
-        var_name = var['name']
-        var_io = var.get('io_address', '')
-        is_func_param = var.get('is_function_param', False)
-        
+        var_name = var["name"]
+        var_io = var.get("io_address", "")
+        is_func_param = var.get("is_function_param", False)
+
         # 跳过函数参数（临时变量如st_0~st_15, UINT1等），这些不参与比对
         if is_func_param:
             continue
-        
+
         # 跳过函数接口参数（INPUT/OUTPUT类型）
-        var_type = var.get('type', '')
-        if var_type in ['INPUT', 'OUTPUT', 'IN_OUT']:
+        var_type = var.get("type", "")
+        if var_type in ["INPUT", "OUTPUT", "IN_OUT"]:
             continue
-        
+
         # 跳过结构体成员名（这些是结构体的属性，不是独立变量）
-        struct_members = ['Sr_I', 'Sr_O', 'Bn_On', 'Out', 'In']
+        struct_members = ["Sr_I", "Sr_O", "Bn_On", "Out", "In"]
         if var_name in struct_members:
             continue
-        
+
         # 跳过系统函数和类型转换函数
-        system_funcs = ['TO_REAL', 'TO_INT', 'TO_BOOL', 'TO_DINT', 'TO_UDINT', 'TO_UINT', 
-                        'TO_SINT', 'TO_USINT', 'TO_LREAL', 'TO_BYTE', 'TO_WORD', 'TO_DWORD',
-                        'TO_LWORD', 'TO_TIME', 'TO_DATE', 'TO_TOD', 'TO_DT', 'TO_STRING',
-                        'TO_WSTRING', 'TO_CHAR', 'TO_WCHAR', 'TO_BCD', 'FROM_BCD',
-                        'LIMIT', 'MAX', 'MIN', 'ABS', 'SQRT', 'LN', 'LOG', 'EXP', 
-                        'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'EXPT', 
-                        'NOT', 'AND', 'OR', 'XOR', 'SHL', 'SHR', 'ROL', 'ROR',
-                        'SEL', 'MUX', 'RAMP', 'HYST', 'DERIV', 'INTEG']
+        system_funcs = [
+            "TO_REAL",
+            "TO_INT",
+            "TO_BOOL",
+            "TO_DINT",
+            "TO_UDINT",
+            "TO_UINT",
+            "TO_SINT",
+            "TO_USINT",
+            "TO_LREAL",
+            "TO_BYTE",
+            "TO_WORD",
+            "TO_DWORD",
+            "TO_LWORD",
+            "TO_TIME",
+            "TO_DATE",
+            "TO_TOD",
+            "TO_DT",
+            "TO_STRING",
+            "TO_WSTRING",
+            "TO_CHAR",
+            "TO_WCHAR",
+            "TO_BCD",
+            "FROM_BCD",
+            "LIMIT",
+            "MAX",
+            "MIN",
+            "ABS",
+            "SQRT",
+            "LN",
+            "LOG",
+            "EXP",
+            "SIN",
+            "COS",
+            "TAN",
+            "ASIN",
+            "ACOS",
+            "ATAN",
+            "EXPT",
+            "NOT",
+            "AND",
+            "OR",
+            "XOR",
+            "SHL",
+            "SHR",
+            "ROL",
+            "ROR",
+            "SEL",
+            "MUX",
+            "RAMP",
+            "HYST",
+            "DERIV",
+            "INTEG",
+        ]
         if var_name in system_funcs:
             continue
-        
+
         # 跳过系统函数参数名
-        func_params = ['Mn', 'Mx', 'MN', 'MX', 'Size', 'Order', 'OutVal', 'In', 'High', 'Low']
+        func_params = [
+            "Mn",
+            "Mx",
+            "MN",
+            "MX",
+            "Size",
+            "Order",
+            "OutVal",
+            "In",
+            "High",
+            "Low",
+        ]
         if var_name in func_params:
             continue
-        
+
         # 跳过特定系统函数名（AryByteTo是函数，不是变量）
-        sys_funcs = ['AryByteTo']
+        sys_funcs = ["AryByteTo"]
         if var_name in sys_funcs:
             continue
-        
+
         # 跳过枚举/常量值
-        constants = ['_HIGH_LOW', '_LOW_HIGH', 'TRUE', 'FALSE', 'NULL']
+        constants = ["_HIGH_LOW", "_LOW_HIGH", "TRUE", "FALSE", "NULL"]
         if var_name in constants:
             continue
-        
+
         # 跳过IOLink数组变量
-        if re.match(r'^byIOL\d+$', var_name):
+        if re.match(r"^byIOL\d+$", var_name):
             continue
-        
+
         # 跳过系统临时变量 st_0~st_15
-        if re.match(r'^st_(\d+|\d+\.\d+)$', var_name):
+        if re.match(r"^st_(\d+|\d+\.\d+)$", var_name):
             continue
         # 这些通常是全局数组变量，不是具体的IO变量
-        array_base_names = ['rAnalog', 'g_arAD_Vacuum', 'g_RadClacHMI', 'g_arAD']
+        array_base_names = ["rAnalog", "g_arAD_Vacuum", "g_RadClacHMI", "g_arAD"]
         if var_name in array_base_names:
             continue
-        
+
         # 跳过全局变量（以 g_ 开头且不在Excel中的）
         # 这些通常是中间计算变量
-        if var_name.startswith('g_') and var_name not in io_by_name:
+        if var_name.startswith("g_") and var_name not in io_by_name:
             continue
-        
+
         # 跳过IO地址格式的名称（如 BBVIN04, CVIN01, AVIN01 等）
         # 这些通常是函数参数中的IO输入名
-        if re.match(r'^[A-Za-z]{1,2}VIN\d+$', var_name):
+        if re.match(r"^[A-Za-z]{1,2}VIN\d+$", var_name):
             continue
-        
+
         # 检查变量名是否在Excel中（精确匹配）
         if var_name in io_by_name:
             matched_by_name += 1
-            excel_io = io_by_name[var_name].get('io_address', '')
-            excel_comment = io_by_name[var_name].get('comment', '')
+            excel_io = io_by_name[var_name].get("io_address", "")
+            excel_comment = io_by_name[var_name].get("comment", "")
             # 检查变量名与设备描述是否匹配（可选逻辑）
             mismatch = check_variable_device_match(var_name, excel_comment, excel_io)
             if mismatch:
-                variable_mismatch_issues.append({
-                    'var_name': var_name,
-                    'code_io': var_io,
-                    'excel_io': excel_io,
-                    'excel_comment': excel_comment,
-                    'reason': mismatch
-                })
+                variable_mismatch_issues.append(
+                    {
+                        "var_name": var_name,
+                        "code_io": var_io,
+                        "excel_io": excel_io,
+                        "excel_comment": excel_comment,
+                        "reason": mismatch,
+                    }
+                )
         # 检查IO地址是否在Excel中（反向查找）
         elif var_io and var_io in io_by_address:
             matched_by_address += 1
             excel_info = io_by_address[var_io]
-            excel_comment = excel_info.get('comment', '')
+            excel_comment = excel_info.get("comment", "")
             # 同样检查变量名与设备描述是否匹配
             mismatch = check_variable_device_match(var_name, excel_comment, var_io)
             if mismatch:
-                variable_mismatch_issues.append({
-                    'var_name': var_name,
-                    'code_io': var_io,
-                    'excel_io': var_io,
-                    'excel_comment': excel_comment,
-                    'reason': mismatch
-                })
+                variable_mismatch_issues.append(
+                    {
+                        "var_name": var_name,
+                        "code_io": var_io,
+                        "excel_io": var_io,
+                        "excel_comment": excel_comment,
+                        "reason": mismatch,
+                    }
+                )
         # 检查PLC变量名是否是Excel变量的前缀（如 YTJ_QJ_SJ1 匹配 YTJ_QJ_SJ1.Sr_I）
         else:
             found_match = False
             for excel_var_name, excel_info in io_by_name.items():
-                if excel_var_name.startswith(var_name + '.') or excel_var_name == var_name:
+                if (
+                    excel_var_name.startswith(var_name + ".")
+                    or excel_var_name == var_name
+                ):
                     matched_by_name += 1
                     found_match = True
-                    excel_io = excel_info.get('io_address', '')
-                    excel_comment = excel_info.get('comment', '')
+                    excel_io = excel_info.get("io_address", "")
+                    excel_comment = excel_info.get("comment", "")
                     # 检查变量名与设备描述是否匹配
-                    mismatch = check_variable_device_match(var_name, excel_comment, excel_io)
+                    mismatch = check_variable_device_match(
+                        var_name, excel_comment, excel_io
+                    )
                     if mismatch:
-                        variable_mismatch_issues.append({
-                            'var_name': var_name,
-                            'code_io': var_io,
-                            'excel_io': excel_io,
-                            'excel_comment': excel_comment,
-                            'reason': mismatch
-                        })
+                        variable_mismatch_issues.append(
+                            {
+                                "var_name": var_name,
+                                "code_io": var_io,
+                                "excel_io": excel_io,
+                                "excel_comment": excel_comment,
+                                "reason": mismatch,
+                            }
+                        )
                     break
             if not found_match:
                 unmatched_vars.append(var)
-        
+
         # 检查命名规范
         issues = check_naming_conventions(var_name)
         if issues:
             for issue in issues:
-                naming_issues.append({
-                    'var_name': var_name,
-                    'type': var['type'],
-                    'io_address': var_io,
-                    'problem': issue['problem'],
-                    'suggestion': issue['suggestion']
-                })
-    
+                naming_issues.append(
+                    {
+                        "var_name": var_name,
+                        "type": var["type"],
+                        "io_address": var_io,
+                        "problem": issue["problem"],
+                        "suggestion": issue["suggestion"],
+                    }
+                )
+
     # 执行三类气缸检查
     sr_io_mismatches = check_sr_io_mismatch(plc_vars, io_by_address)
-    has_rev_col = io_db.get('has_reverse_cylinder_col', False)
-    reverse_cylinder_missing_not = check_reverse_cylinder_not(plc_vars, io_by_address, has_rev_col)
-    normal_cylinder_wrong_not = check_normal_cylinder_not(plc_vars, io_by_address, has_rev_col)
-    
+    has_rev_col = io_db.get("has_reverse_cylinder_col", False)
+    reverse_cylinder_missing_not = check_reverse_cylinder_not(
+        plc_vars, io_by_address, has_rev_col
+    )
+    normal_cylinder_wrong_not = check_normal_cylinder_not(
+        plc_vars, io_by_address, has_rev_col
+    )
+
     # 执行源码IO及PLC控制变量核对
     # 【关键修复】传递 IO 数据库专用数据用于变量匹配
     source_io_mismatches = check_source_io_match(
-        plc_vars, 
-        io_by_address, 
-        io_by_name, 
-        io_db.get('sheet_analysis'), 
-        io_db.get('var_name_duplicates'), 
-        io_db.get('by_name_all'), 
+        plc_vars,
+        io_by_address,
+        io_by_name,
+        io_db.get("sheet_analysis"),
+        io_db.get("var_name_duplicates"),
+        io_db.get("by_name_all"),
         io_by_address_all,
-        io_db.get('by_name_db_only')  # 【修复】使用 IO 数据库专用数据
+        io_db.get("by_name_db_only"),  # 【修复】使用 IO 数据库专用数据
     )
-    
+
     # 生成Markdown报告
-    with open(report_file, 'w', encoding='utf-8') as f:
-        f.write('# PLC代码审查报告\n\n')
-        f.write(f'生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')
-        
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write("# PLC代码审查报告\n\n")
+        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
         # 统计摘要 - 表格形式
-        f.write('## 统计摘要\n\n')
-        f.write('| 统计项 | 数量 | 状态 |\n')
-        f.write('|--------|------|------|\n')
-        
+        f.write("## 统计摘要\n\n")
+        f.write("| 统计项 | 数量 | 状态 |\n")
+        f.write("|--------|------|------|\n")
+
         # IO地址统计（排除仅在函数参数中使用的地址）
         # 收集所有地址的使用情况
         addr_usage = {}
         for v in plc_vars:
-            addr = v.get('io_address', '')
+            addr = v.get("io_address", "")
             if addr:
                 if addr not in addr_usage:
-                    addr_usage[addr] = {'function_only': True, 'vars': []}
-                addr_usage[addr]['vars'].append(v)
-                if not v.get('is_function_param', False):
-                    addr_usage[addr]['function_only'] = False
-        
+                    addr_usage[addr] = {"function_only": True, "vars": []}
+                addr_usage[addr]["vars"].append(v)
+                if not v.get("is_function_param", False):
+                    addr_usage[addr]["function_only"] = False
+
         # 排除"仅在函数中"使用的地址
         plc_io_addresses = set()
         for addr, usage in addr_usage.items():
-            if not usage['function_only']:  # 不是仅在函数中使用
+            if not usage["function_only"]:  # 不是仅在函数中使用
                 plc_io_addresses.add(addr)
-        
+
         # io_by_address 的 key 就是 IO 地址
         excel_io_addresses = set(io_by_address.keys())
-        excel_io_addresses_table_only = set(io_db.get('by_address_table_only', {}).keys())
-        
+        excel_io_addresses_table_only = set(
+            io_db.get("by_address_table_only", {}).keys()
+        )
+
         common_io = plc_io_addresses & excel_io_addresses
         only_in_excel = excel_io_addresses_table_only - plc_io_addresses
         only_in_plc = plc_io_addresses - excel_io_addresses
-        
-        f.write(f'| Excel中的IO地址 | {len(excel_io_addresses)} | - |\n')
-        f.write(f'| PLC中的IO地址 | {len(plc_io_addresses)} | - |\n')
-        f.write(f'| 共同地址 | {len(common_io)} | 已匹配 |\n')
-        f.write(f'| 仅在Excel中 | {len(only_in_excel)} | 需核对 |\n')
-        f.write(f'| 仅在PLC中 | {len(only_in_plc)} | 需核对 |\n')
-        
+
+        f.write(f"| Excel中的IO地址 | {len(excel_io_addresses)} | - |\n")
+        f.write(f"| PLC中的IO地址 | {len(plc_io_addresses)} | - |\n")
+        f.write(f"| 共同地址 | {len(common_io)} | 已匹配 |\n")
+        f.write(f"| 仅在Excel中 | {len(only_in_excel)} | 需核对 |\n")
+        f.write(f"| 仅在PLC中 | {len(only_in_plc)} | 需核对 |\n")
+
         # 变量匹配统计
-        f.write(f'| PLC变量总数 | {total_vars} | - |\n')
-        f.write(f'| Excel匹配成功(按变量名) | {matched_by_name} | OK |\n')
-        f.write(f'| Excel匹配成功(按IO地址) | {matched_by_address} | OK |\n')
-        f.write(f'| Excel匹配失败 | {len(unmatched_vars)} | 需核对 |\n')
-        f.write(f'| IO地址不匹配 | {len(variable_mismatch_issues)} | 需修正 |\n')
-        
+        f.write(f"| PLC变量总数 | {total_vars} | - |\n")
+        f.write(f"| Excel匹配成功(按变量名) | {matched_by_name} | OK |\n")
+        f.write(f"| Excel匹配成功(按IO地址) | {matched_by_address} | OK |\n")
+        f.write(f"| Excel匹配失败 | {len(unmatched_vars)} | 需核对 |\n")
+        f.write(f"| IO地址不匹配 | {len(variable_mismatch_issues)} | 需修正 |\n")
+
         # 命名规范问题（去重后）
         seen_vars = set()
         unique_naming_count = 0
         for issue in naming_issues:
-            if issue['var_name'] not in seen_vars:
-                seen_vars.add(issue['var_name'])
+            if issue["var_name"] not in seen_vars:
+                seen_vars.add(issue["var_name"])
                 unique_naming_count += 1
-        
-        status_icon = '无问题' if unique_naming_count == 0 else '需修正'
-        f.write(f'| 命名规范问题 | {unique_naming_count} | {status_icon} |\n')
-        
+
+        status_icon = "无问题" if unique_naming_count == 0 else "需修正"
+        f.write(f"| 命名规范问题 | {unique_naming_count} | {status_icon} |\n")
+
         # 常见错误统计
         common_errors = len(variable_mismatch_issues)
-        error_status = '无错误' if common_errors == 0 else '需修正'
-        f.write(f'| 常见错误 | {common_errors} | {error_status} |\n')
-        
+        error_status = "无错误" if common_errors == 0 else "需修正"
+        f.write(f"| 常见错误 | {common_errors} | {error_status} |\n")
+
         # 数据质量问题 - 重复项
         if duplicates:
-            dup_io_count = len(duplicates.get('io_address_duplicates', {}))
-            dup_name_count = len(duplicates.get('io_name_duplicates', {}))
-            dup_var_count = len(duplicates.get('plc_var_duplicates', {}))
+            dup_io_count = len(duplicates.get("io_address_duplicates", {}))
+            dup_name_count = len(duplicates.get("io_name_duplicates", {}))
+            dup_var_count = len(duplicates.get("plc_var_duplicates", {}))
             total_dups = dup_io_count + dup_name_count + dup_var_count
-            dup_status = '无重复' if total_dups == 0 else '需修正'
-            f.write(f'| Excel数据重复项 | {total_dups} | {dup_status} |\n')
-        
-        f.write('\n')
-        
+            dup_status = "无重复" if total_dups == 0 else "需修正"
+            f.write(f"| Excel数据重复项 | {total_dups} | {dup_status} |\n")
+
+        f.write("\n")
+
         # 1. IO接线问题统计
-        total_cylinder_issues = len(sr_io_mismatches) + len(reverse_cylinder_missing_not) + len(normal_cylinder_wrong_not)
+        total_cylinder_issues = (
+            len(sr_io_mismatches)
+            + len(reverse_cylinder_missing_not)
+            + len(normal_cylinder_wrong_not)
+        )
         if total_cylinder_issues > 0:
-            f.write('## 1. IO接线问题统计\n\n')
-            f.write(f'**总计问题：{total_cylinder_issues} 条**\n\n')
-            
+            f.write("## 1. IO接线问题统计\n\n")
+            f.write(f"**总计问题：{total_cylinder_issues} 条**\n\n")
+
             if sr_io_mismatches:
                 f.write(f"- [严重] Sr_O/Sr_I接反: {len(sr_io_mismatches)} 条\n")
             if has_rev_col and reverse_cylinder_missing_not:
-                f.write(f"- [警告] 反气缸误加NOT: {len(reverse_cylinder_missing_not)} 条\n")
+                f.write(
+                    f"- [警告] 反气缸误加NOT: {len(reverse_cylinder_missing_not)} 条\n"
+                )
             if has_rev_col and normal_cylinder_wrong_not:
-                f.write(f"- [注意] 非反气缸缺少NOT: {len(normal_cylinder_wrong_not)} 条\n")
-            f.write('\n')
-            
+                f.write(
+                    f"- [注意] 非反气缸缺少NOT: {len(normal_cylinder_wrong_not)} 条\n"
+                )
+            f.write("\n")
+
             # Sr_O/Sr_I接反（最严重）
             if sr_io_mismatches:
-                f.write('### [严重] Sr_O/Sr_I接反（{} 条）\n\n'.format(len(sr_io_mismatches)))
-                f.write('| 序号 | 气缸名称 | IO地址 | Sheet | 说明 |\n')
-                f.write('|------|----------|--------|-------|------|\n')
+                f.write(
+                    "### [严重] Sr_O/Sr_I接反（{} 条）\n\n".format(
+                        len(sr_io_mismatches)
+                    )
+                )
+                f.write("| 序号 | 气缸名称 | IO地址 | Sheet | 说明 |\n")
+                f.write("|------|----------|--------|-------|------|\n")
                 for idx, issue in enumerate(sr_io_mismatches, 1):
-                    sheet_name = issue.get('sheet', '-')
-                    f.write(f"| {idx} | {issue['气缸名称']} | {issue['io地址']} | {sheet_name} | {issue['说明']} |\n")
+                    sheet_name = issue.get("sheet", "-")
+                    f.write(
+                        f"| {idx} | {issue['气缸名称']} | {issue['io地址']} | {sheet_name} | {issue['说明']} |\n"
+                    )
                     f.write(f"| | | | | 源码: `{issue['源码']}` |\n")
-                f.write('\n')
-            
+                f.write("\n")
+
             # 反气缸误加NOT
             if has_rev_col and reverse_cylinder_missing_not:
-                f.write('### [警告] 反气缸误加NOT（{} 条）\n\n'.format(len(reverse_cylinder_missing_not)))
-                f.write('| 序号 | 气缸名称 | IO地址 | 说明 |\n')
-                f.write('|------|----------|--------|------|\n')
+                f.write(
+                    "### [警告] 反气缸误加NOT（{} 条）\n\n".format(
+                        len(reverse_cylinder_missing_not)
+                    )
+                )
+                f.write("| 序号 | 气缸名称 | IO地址 | 说明 |\n")
+                f.write("|------|----------|--------|------|\n")
                 for idx, issue in enumerate(reverse_cylinder_missing_not, 1):
-                    f.write(f"| {idx} | {issue['气缸名称']} | {issue['io地址']} | {issue['说明']} |\n")
+                    f.write(
+                        f"| {idx} | {issue['气缸名称']} | {issue['io地址']} | {issue['说明']} |\n"
+                    )
                     f.write(f"| | | | 源码: `{issue['源码']}` |\n")
-                f.write('\n')
-            
+                f.write("\n")
+
             # 非反气缸缺少NOT
             if has_rev_col and normal_cylinder_wrong_not:
-                f.write('### [注意] 非反气缸缺少NOT（{} 条）\n\n'.format(len(normal_cylinder_wrong_not)))
-                f.write('| 序号 | 气缸名称 | IO地址 | Sheet | 说明 |\n')
-                f.write('|------|----------|--------|-------|------|\n')
+                f.write(
+                    "### [注意] 非反气缸缺少NOT（{} 条）\n\n".format(
+                        len(normal_cylinder_wrong_not)
+                    )
+                )
+                f.write("| 序号 | 气缸名称 | IO地址 | Sheet | 说明 |\n")
+                f.write("|------|----------|--------|-------|------|\n")
                 for idx, issue in enumerate(normal_cylinder_wrong_not, 1):
-                    sheet_name = issue.get('sheet', '-')
-                    f.write(f"| {idx} | {issue['气缸名称']} | {issue['io地址']} | {sheet_name} | {issue['说明']} |\n")
+                    sheet_name = issue.get("sheet", "-")
+                    f.write(
+                        f"| {idx} | {issue['气缸名称']} | {issue['io地址']} | {sheet_name} | {issue['说明']} |\n"
+                    )
                     f.write(f"| | | | | 源码: `{issue['源码']}` |\n")
-                f.write('\n')
-        
+                f.write("\n")
+
         # 2. IO地址映射统计
-        f.write('## 2. IO地址映射统计\n\n')
-        
+        f.write("## 2. IO地址映射统计\n\n")
+
         # 2.1 地址分布
-        f.write('### 2.1 地址分布\n\n')
-        
+        f.write("### 2.1 地址分布\n\n")
+
         # Excel地址分类统计
-        excel_ia = [a for a in excel_io_addresses if a.upper().startswith('IA')]
-        excel_id = [a for a in excel_io_addresses if a.upper().startswith('ID')]
-        excel_od = [a for a in excel_io_addresses if a.upper().startswith('OD')]
-        excel_of = [a for a in excel_io_addresses if a.upper().startswith('OF')]
-        excel_other = [a for a in excel_io_addresses if not any(a.upper().startswith(p) for p in ['IA', 'ID', 'OD', 'OF'])]
-        
-        f.write(f'**Excel IO库 ({len(excel_io_addresses)}个地址)**\n')
-        f.write(f'- 模拟输入地址 (IAxxx): {len(excel_ia)}个\n')
-        f.write(f'- 数字输入地址 (IDxxx): {len(excel_id)}个\n')
-        f.write(f'- 数字输出地址 (ODxxx): {len(excel_od)}个\n')
-        f.write(f'- 模拟输出地址 (OFxxx): {len(excel_of)}个\n')
+        excel_ia = [a for a in excel_io_addresses if a.upper().startswith("IA")]
+        excel_id = [a for a in excel_io_addresses if a.upper().startswith("ID")]
+        excel_od = [a for a in excel_io_addresses if a.upper().startswith("OD")]
+        excel_of = [a for a in excel_io_addresses if a.upper().startswith("OF")]
+        excel_other = [
+            a
+            for a in excel_io_addresses
+            if not any(a.upper().startswith(p) for p in ["IA", "ID", "OD", "OF"])
+        ]
+
+        f.write(f"**Excel IO库 ({len(excel_io_addresses)}个地址)**\n")
+        f.write(f"- 模拟输入地址 (IAxxx): {len(excel_ia)}个\n")
+        f.write(f"- 数字输入地址 (IDxxx): {len(excel_id)}个\n")
+        f.write(f"- 数字输出地址 (ODxxx): {len(excel_od)}个\n")
+        f.write(f"- 模拟输出地址 (OFxxx): {len(excel_of)}个\n")
         if excel_other:
-            f.write(f'- 其他地址: {len(excel_other)}个\n')
-        f.write('\n')
-        
+            f.write(f"- 其他地址: {len(excel_other)}个\n")
+        f.write("\n")
+
         # PLC地址分类统计
-        plc_ia = [a for a in plc_io_addresses if a.upper().startswith('IA')]
-        plc_id = [a for a in plc_io_addresses if a.upper().startswith('ID')]
-        plc_od = [a for a in plc_io_addresses if a.upper().startswith('OD')]
-        plc_of = [a for a in plc_io_addresses if a.upper().startswith('OF')]
-        plc_other = [a for a in plc_io_addresses if not any(a.upper().startswith(p) for p in ['IA', 'ID', 'OD', 'OF'])]
-        
-        f.write(f'**PLC源码 ({len(plc_io_addresses)}个地址)**\n')
-        f.write(f'- 模拟输入地址 (IAxxx): {len(plc_ia)}个\n')
-        f.write(f'- 数字输入地址 (IDxxx): {len(plc_id)}个\n')
-        f.write(f'- 数字输出地址 (ODxxx): {len(plc_od)}个\n')
-        f.write(f'- 模拟输出地址 (OFxxx): {len(plc_of)}个\n')
+        plc_ia = [a for a in plc_io_addresses if a.upper().startswith("IA")]
+        plc_id = [a for a in plc_io_addresses if a.upper().startswith("ID")]
+        plc_od = [a for a in plc_io_addresses if a.upper().startswith("OD")]
+        plc_of = [a for a in plc_io_addresses if a.upper().startswith("OF")]
+        plc_other = [
+            a
+            for a in plc_io_addresses
+            if not any(a.upper().startswith(p) for p in ["IA", "ID", "OD", "OF"])
+        ]
+
+        f.write(f"**PLC源码 ({len(plc_io_addresses)}个地址)**\n")
+        f.write(f"- 模拟输入地址 (IAxxx): {len(plc_ia)}个\n")
+        f.write(f"- 数字输入地址 (IDxxx): {len(plc_id)}个\n")
+        f.write(f"- 数字输出地址 (ODxxx): {len(plc_od)}个\n")
+        f.write(f"- 模拟输出地址 (OFxxx): {len(plc_of)}个\n")
         if plc_other:
-            f.write(f'- 其他地址: {len(plc_other)}个\n')
-        f.write('\n')
-        
+            f.write(f"- 其他地址: {len(plc_other)}个\n")
+        f.write("\n")
+
         # 2.2 地址匹配情况
-        f.write('### 2.2 地址匹配情况\n\n')
-        f.write('| 类别 | 数量 | 说明 |\n')
-        f.write('|------|------|------|\n')
-        f.write(f'| 完全匹配 | {len(common_io)} | 地址在Excel和PLC中都有定义 |\n')
-        f.write(f'| 仅在Excel中 | {len(only_in_excel)} | 可能是预留或未使用的IO |\n')
-        f.write(f'| 仅在PLC中 | {len(only_in_plc)} | 可能是新增或Excel未记录的IO |\n\n')
-        
+        f.write("### 2.2 地址匹配情况\n\n")
+        f.write("| 类别 | 数量 | 说明 |\n")
+        f.write("|------|------|------|\n")
+        f.write(f"| 完全匹配 | {len(common_io)} | 地址在Excel和PLC中都有定义 |\n")
+        f.write(f"| 仅在Excel中 | {len(only_in_excel)} | 可能是预留或未使用的IO |\n")
+        f.write(f"| 仅在PLC中 | {len(only_in_plc)} | 可能是新增或Excel未记录的IO |\n\n")
+
         # 3. 仅在Excel中的地址
         if only_in_excel:
-            f.write('## 3. 仅在Excel中的地址\n\n')
-            f.write(f'**共{len(only_in_excel)}个地址**\n\n')
-            f.write('| 地址 | Excel描述 | Sheet名 | 行号 | 来源文件 |\n')
-            f.write('|------|-----------|---------|------|----------|\n')
+            f.write("## 3. 仅在Excel中的地址\n\n")
+            f.write(f"**共{len(only_in_excel)}个地址**\n\n")
+            f.write("| 地址 | Excel描述 | Sheet名 | 行号 | 来源文件 |\n")
+            f.write("|------|-----------|---------|------|----------|\n")
             for addr in sorted(only_in_excel):  # 显示全部
-                info = io_db.get('by_address_table_only', {}).get(addr, {})
-                comment = info.get('comment', '')
-                sheet = info.get('sheet', '-')
-                row = info.get('row', '-')
-                source = info.get('file', '未知')
-                f.write(f'| {addr} | {comment} | {sheet} | {row} | {source} |\n')
-            f.write('\n')
-        
+                info = io_db.get("by_address_table_only", {}).get(addr, {})
+                comment = info.get("comment", "")
+                sheet = info.get("sheet", "-")
+                row = info.get("row", "-")
+                source = info.get("file", "未知")
+                f.write(f"| {addr} | {comment} | {sheet} | {row} | {source} |\n")
+            f.write("\n")
+
         # 4. 仅在PLC中的地址
         if only_in_plc:
             # 过滤掉"仅在函数中"使用的地址
             filtered_only_in_plc = []
             for addr in only_in_plc:
-                is_function_only = addr_usage.get(addr, {}).get('function_only', False)
+                is_function_only = addr_usage.get(addr, {}).get("function_only", False)
                 if not is_function_only:  # 不是仅在函数中使用
                     filtered_only_in_plc.append(addr)
-            
+
             if filtered_only_in_plc:
-                f.write('## 4. 仅在PLC中的地址\n\n')
-                f.write(f'**共{len(filtered_only_in_plc)}个地址**\n\n')
-                f.write('| 地址 | PLC变量 | 函数名 | PLC注释 |\n')
-                f.write('|------|---------|--------|---------|\n')
+                f.write("## 4. 仅在PLC中的地址\n\n")
+                f.write(f"**共{len(filtered_only_in_plc)}个地址**\n\n")
+                f.write("| 地址 | PLC变量 | 函数名 | PLC注释 |\n")
+                f.write("|------|---------|--------|---------|\n")
                 # 查找这些地址对应的PLC变量
                 plc_addr_to_var = {}
                 for v in plc_vars:
-                    addr = v.get('io_address', '')
+                    addr = v.get("io_address", "")
                     if addr in filtered_only_in_plc:
                         if addr not in plc_addr_to_var:
                             plc_addr_to_var[addr] = []
                         plc_addr_to_var[addr].append(v)
-                
+
                 for addr in sorted(filtered_only_in_plc):
                     vars_list = plc_addr_to_var.get(addr, [])
                     if vars_list:
                         # 去重：同一地址只保留一个条目
                         # 优先选择：1) 不是函数参数的 2) 有注释的 3) 变量名排序
-                        vars_list.sort(key=lambda x: (
-                            x.get('is_function_param', False),  # 非函数参数优先
-                            not x.get('comment', ''),  # 有注释的优先
-                            x['name']
-                        ))
-                        
+                        vars_list.sort(
+                            key=lambda x: (
+                                x.get("is_function_param", False),  # 非函数参数优先
+                                not x.get("comment", ""),  # 有注释的优先
+                                x["name"],
+                            )
+                        )
+
                         # 只取第一个（优先非函数参数的变量）
                         v = vars_list[0]
-                        var_name = v['name']
-                        func_name = v.get('function', '')
-                        comment = v.get('comment', '')
+                        var_name = v["name"]
+                        func_name = v.get("function", "")
+                        comment = v.get("comment", "")
                         if not comment:
-                            comment = '-'
-                        f.write(f'| {addr} | `{var_name}` | {func_name} | {comment} |\n')
+                            comment = "-"
+                        f.write(
+                            f"| {addr} | `{var_name}` | {func_name} | {comment} |\n"
+                        )
                     else:
-                        f.write(f'| {addr} | - | - | - |\n')
-                f.write('\n')
-                
-                f.write('**分析**: 这些地址在PLC中有定义，但在Excel中未找到。可能原因：\n')
-                f.write('1. 新增IO，Excel未更新\n')
-                f.write('2. 辅助IO，未在Excel中记录\n')
-                f.write('3. 传感器/按钮类IO\n\n')
-        
+                        f.write(f"| {addr} | - | - | - |\n")
+                f.write("\n")
+
+                f.write(
+                    "**分析**: 这些地址在PLC中有定义，但在Excel中未找到。可能原因：\n"
+                )
+                f.write("1. 新增IO，Excel未更新\n")
+                f.write("2. 辅助IO，未在Excel中记录\n")
+                f.write("3. 传感器/按钮类IO\n\n")
+
         # 5. 源码IO及PLC控制变量核对
         if source_io_mismatches:
             from collections import defaultdict
-            
+
             # 按IO地址是否匹配排序（是的前，否的后）
-            sorted_items = sorted(source_io_mismatches, key=lambda x: 0 if x['IO地址是否匹配'] == '是' else 1)
-            
-            f.write('## 5. 源码IO及PLC控制变量核对\n\n')
-            f.write(f'**共{len(source_io_mismatches)}条记录**\n\n')
-            
+            sorted_items = sorted(
+                source_io_mismatches,
+                key=lambda x: 0 if x["IO地址是否匹配"] == "是" else 1,
+            )
+
+            f.write("## 5. 源码IO及PLC控制变量核对\n\n")
+            f.write(f"**共{len(source_io_mismatches)}条记录**\n\n")
+
             # 直接输出排序后的表格
-            f.write('| 源码变量 | IO名称 | IO地址 | IO地址是否匹配 | IO名称是否匹配 | 变量是否匹配 | IO地址备注 | IO名称备注 |\n')
-            f.write('|----------|--------|--------|----------------|----------------|--------------|------------|------------|\n')
+            f.write(
+                "| 源码变量 | IO名称 | IO地址 | IO地址是否匹配 | IO名称是否匹配 | 变量是否匹配 | IO地址备注 | IO名称备注 |\n"
+            )
+            f.write(
+                "|----------|--------|--------|----------------|----------------|--------------|------------|------------|\n"
+            )
             for item in sorted_items:
-                f.write(f"| {item['源码变量']} | {item['IO名称']} | {item['IO地址']} | {item['IO地址是否匹配']} | {item.get('IO名称是否匹配', '-')} | {item['变量是否匹配']} | {item.get('IO地址备注', '-')} | {item.get('IO名称备注', '-')} |\n")
-            f.write('\n')
-        
+                f.write(
+                    f"| {item['源码变量']} | {item['IO名称']} | {item['IO地址']} | {item['IO地址是否匹配']} | {item.get('IO名称是否匹配', '-')} | {item['变量是否匹配']} | {item.get('IO地址备注', '-')} | {item.get('IO名称备注', '-')} |\n"
+                )
+            f.write("\n")
+
         # 变量名与设备描述不匹配问题（第6节）
         if variable_mismatch_issues:
-            f.write('## 6. 变量名与设备描述不匹配\n\n')
-            f.write('匹配规则：设备基础名（去掉回限/出限/报警等后缀）应与变量前缀一致\n\n')
-            f.write('| 序号 | PLC变量名 | IO地址 | Excel设备描述 | 不匹配原因 |\n')
-            f.write('|------|-----------|--------|---------------|------------|\n')
-            for idx, issue in enumerate(variable_mismatch_issues[:50], 1):  # 最多显示50个
-                f.write(f'| {idx} | `{issue["var_name"]}` | {issue["code_io"]} | {issue["excel_comment"]} | {issue["reason"]} |\n')
+            f.write("## 6. 变量名与设备描述不匹配\n\n")
+            f.write(
+                "匹配规则：设备基础名（去掉回限/出限/报警等后缀）应与变量前缀一致\n\n"
+            )
+            f.write("| 序号 | PLC变量名 | IO地址 | Excel设备描述 | 不匹配原因 |\n")
+            f.write("|------|-----------|--------|---------------|------------|\n")
+            for idx, issue in enumerate(
+                variable_mismatch_issues[:50], 1
+            ):  # 最多显示50个
+                f.write(
+                    f"| {idx} | `{issue['var_name']}` | {issue['code_io']} | {issue['excel_comment']} | {issue['reason']} |\n"
+                )
             if len(variable_mismatch_issues) > 50:
-                f.write(f'| ... | ... | ... | ... | 还有 {len(variable_mismatch_issues) - 50} 个 |\n')
-            f.write('\n')
-        
+                f.write(
+                    f"| ... | ... | ... | ... | 还有 {len(variable_mismatch_issues) - 50} 个 |\n"
+                )
+            f.write("\n")
+
         # 7. IO数据库中有PLC控制变量，但在PLC源码中未找到的变量
         # 收集IO数据库中所有有PLC控制变量的记录
         io_db_vars_not_in_plc = []
-        if io_db and io_db.get('by_name_all'):
+        if io_db and io_db.get("by_name_all"):
             # 获取PLC源码中所有的变量名（包括结构体成员）
             plc_source_var_names = set()
             plc_source_base_names = set()  # 基础变量名（去掉.Sr_I等后缀）
             for v in plc_vars:
-                var_name = v.get('name', '')
+                var_name = v.get("name", "")
                 if var_name:
                     plc_source_var_names.add(var_name)
                     # 提取基础名（如 YTJ_QJ_SJ1.Sr_I -> YTJ_QJ_SJ1）
-                    if '.' in var_name:
-                        base_name = var_name.split('.')[0]
+                    if "." in var_name:
+                        base_name = var_name.split(".")[0]
                         plc_source_base_names.add(base_name)
-            
+
             # 遍历IO数据库的所有记录
             seen_plc_vars = set()  # 去重
-            for name, records in io_db['by_name_all'].items():
+            for name, records in io_db["by_name_all"].items():
                 for record in records:
                     # 只处理IO数据库的记录
-                    if record.get('source_type') != 'io_database':
+                    if record.get("source_type") != "io_database":
                         continue
-                    
-                    plc_control_var = record.get('plc_control_var', '')
+
+                    plc_control_var = record.get("plc_control_var", "")
                     if not plc_control_var or not str(plc_control_var).strip():
                         continue  # 跳过没有PLC控制变量的记录
-                    
+
                     plc_control_var = str(plc_control_var).strip()
-                    
+
                     # 去重检查
                     if plc_control_var in seen_plc_vars:
                         continue
-                    
+
                     # 检查该PLC控制变量是否在源码中存在
                     # 1. 完整匹配（包括结构体成员如 .Sr_I）
                     # 2. 基础名匹配（如 YTJ_QJ_SJ1 匹配 YTJ_QJ_SJ1.Sr_I）
                     var_found = False
                     if plc_control_var in plc_source_var_names:
                         var_found = True
-                    elif '.' not in plc_control_var:
+                    elif "." not in plc_control_var:
                         # 是基础名，检查是否有对应的结构体成员
                         for src_var in plc_source_var_names:
-                            if src_var.startswith(plc_control_var + '.'):
+                            if src_var.startswith(plc_control_var + "."):
                                 var_found = True
                                 break
-                    
+
                     if not var_found:
                         seen_plc_vars.add(plc_control_var)
-                        io_db_vars_not_in_plc.append({
-                            'plc_control_var': plc_control_var,
-                            'io_address': record.get('io_address', ''),
-                            'comment': record.get('comment', ''),
-                            'sheet': record.get('sheet', ''),
-                            'row': record.get('row', ''),
-                            'file': record.get('file', '')
-                        })
-        
+                        io_db_vars_not_in_plc.append(
+                            {
+                                "plc_control_var": plc_control_var,
+                                "io_address": record.get("io_address", ""),
+                                "comment": record.get("comment", ""),
+                                "sheet": record.get("sheet", ""),
+                                "row": record.get("row", ""),
+                                "file": record.get("file", ""),
+                            }
+                        )
+
         # 显示IO数据库中有PLC控制变量但未在源码中找到的变量
         if io_db_vars_not_in_plc:
-            f.write('## 7. IO数据库中有PLC控制变量，但在PLC源码中未找到\n\n')
-            f.write(f'**共 {len(io_db_vars_not_in_plc)} 条记录**\n\n')
-            f.write('| 序号 | 变量名 | IO地址 | 位置 | 注释 |\n')
-            f.write('|------|--------|--------|------|------|\n')
+            f.write("## 7. IO数据库中有PLC控制变量，但在PLC源码中未找到\n\n")
+            f.write(f"**共 {len(io_db_vars_not_in_plc)} 条记录**\n\n")
+            f.write("| 序号 | 变量名 | IO地址 | 位置 | 注释 |\n")
+            f.write("|------|--------|--------|------|------|\n")
             for idx, var in enumerate(io_db_vars_not_in_plc[:100], 1):  # 最多显示100个
-                io_addr = var.get('io_address', '')
-                comment = var.get('comment', '')
-                sheet = var.get('sheet', '')
-                row = var.get('row', '')
-                location = f'{sheet}第{row}行' if sheet and row else '-'
+                io_addr = var.get("io_address", "")
+                comment = var.get("comment", "")
+                sheet = var.get("sheet", "")
+                row = var.get("row", "")
+                location = f"{sheet}第{row}行" if sheet and row else "-"
                 if not comment:
-                    comment = '-'
+                    comment = "-"
                 # 截断过长的注释
                 if len(comment) > 50:
-                    comment = comment[:47] + '...'
-                f.write(f'| {idx} | `{var["plc_control_var"]}` | {io_addr} | {location} | {comment} |\n')
+                    comment = comment[:47] + "..."
+                f.write(
+                    f"| {idx} | `{var['plc_control_var']}` | {io_addr} | {location} | {comment} |\n"
+                )
             if len(io_db_vars_not_in_plc) > 100:
-                f.write(f'| ... | ... | ... | ... | 还有 {len(io_db_vars_not_in_plc) - 100} 个 |\n')
-            f.write('\n')
-        
+                f.write(
+                    f"| ... | ... | ... | ... | 还有 {len(io_db_vars_not_in_plc) - 100} 个 |\n"
+                )
+            f.write("\n")
+
         # 命名规范问题 - 暂时注释掉不输出
         if False and naming_issues:
             # 去重：按变量名去重，保留第一条
             seen_vars = set()
             unique_naming_issues = []
             # 先收集所有变量名
-            all_var_names = set(issue['var_name'] for issue in naming_issues)
-            
+            all_var_names = set(issue["var_name"] for issue in naming_issues)
+
             for issue in naming_issues:
-                var_name = issue['var_name']
+                var_name = issue["var_name"]
                 # 跳过结构体基础名（如果存在对应的完整结构体变量名）
                 # 例如：跳过 YTJ_QJ_SJ1 如果存在 YTJ_QJ_SJ1.Sr_I
-                if '.' not in var_name:
+                if "." not in var_name:
                     # 这是一个基础名，检查是否存在对应的完整结构体变量名
-                    has_struct_member = any(v.startswith(var_name + '.') for v in all_var_names)
+                    has_struct_member = any(
+                        v.startswith(var_name + ".") for v in all_var_names
+                    )
                     if has_struct_member:
                         continue
-                
+
                 if var_name not in seen_vars:
                     seen_vars.add(var_name)
                     unique_naming_issues.append(issue)
-            
-            f.write('## 8. 命名规范问题\n\n')
-            f.write(f'共发现 {len(unique_naming_issues)} 个唯一变量存在命名规范问题\n\n')
-            f.write('| 序号 | 变量名 | 变量解释 | IO地址 | 类型 | 问题 | 建议 | 前缀说明 |\n')
-            f.write('|------|--------|----------|--------|------|------|------|----------|\n')
+
+            f.write("## 8. 命名规范问题\n\n")
+            f.write(
+                f"共发现 {len(unique_naming_issues)} 个唯一变量存在命名规范问题\n\n"
+            )
+            f.write(
+                "| 序号 | 变量名 | 变量解释 | IO地址 | 类型 | 问题 | 建议 | 前缀说明 |\n"
+            )
+            f.write(
+                "|------|--------|----------|--------|------|------|------|----------|\n"
+            )
             for idx, issue in enumerate(unique_naming_issues, 1):
                 # 获取变量解释：优先从Excel注释中获取
                 io_addr = issue.get("io_address", "")
                 var_explanation = "-"
                 if io_addr and io_addr in io_by_address:
                     excel_info = io_by_address[io_addr]
-                    var_explanation = excel_info.get('comment', '-')
-                    if not var_explanation or var_explanation == '-':
+                    var_explanation = excel_info.get("comment", "-")
+                    if not var_explanation or var_explanation == "-":
                         # 如果没有注释，尝试使用变量名推断
                         var_explanation = explain_variable_name(issue["var_name"])
                 else:
                     var_explanation = explain_variable_name(issue["var_name"])
-                
+
                 # 从建议中提取前缀
                 suggestion = issue["suggestion"]
                 prefix_explanation = "-"
                 if "建议改为" in suggestion:
                     # 提取建议的前缀，如 "TJ_" 从 "建议改为 TJ_XXX"
-                    match = re.search(r'建议改为\s+([A-Z]+_)', suggestion)
+                    match = re.search(r"建议改为\s+([A-Z]+_)", suggestion)
                     if match:
                         prefix = match.group(1)
                         prefix_explanation = get_prefix_explanation(prefix)
                 elif "建议添加模块前缀" in suggestion:
                     # 默认建议 JR_ 的情况
-                    match = re.search(r'如\s+([A-Z]+_)', suggestion)
+                    match = re.search(r"如\s+([A-Z]+_)", suggestion)
                     if match:
                         prefix = match.group(1)
                         prefix_explanation = get_prefix_explanation(prefix)
-                f.write(f'| {idx} | `{issue["var_name"]}` | {var_explanation} | {issue.get("io_address", "")} | {issue["type"]} | {issue["problem"]} | {suggestion} | {prefix_explanation} |\n')
-            f.write('\n')
-        
+                f.write(
+                    f"| {idx} | `{issue['var_name']}` | {var_explanation} | {issue.get('io_address', '')} | {issue['type']} | {issue['problem']} | {suggestion} | {prefix_explanation} |\n"
+                )
+            f.write("\n")
+
         # 审核标准说明
-        f.write('## 9. 审核标准\n\n')
-        f.write('### 变量匹配规则\n')
-        f.write('- 根据代码中的变量名或IO地址，在Excel中查找对应信息\n')
-        f.write('- 按变量名查找: 代码变量名 vs Excel变量名\n')
-        f.write('- 按IO地址查找: 代码IO地址 vs Excel IO地址\n')
+        f.write("## 9. 审核标准\n\n")
+        f.write("### 变量匹配规则\n")
+        f.write("- 根据代码中的变量名或IO地址，在Excel中查找对应信息\n")
+        f.write("- 按变量名查找: 代码变量名 vs Excel变量名\n")
+        f.write("- 按IO地址查找: 代码IO地址 vs Excel IO地址\n")
         f.write('- 如果查不到，列出"Excel中未找到的变量"\n\n')
-        f.write('### IO地址不匹配检查\n')
-        f.write('- 检查代码中的IO地址与Excel定义是否一致\n')
-        f.write('- 示例: 代码中 `DustBoxCheck := IA2305` 但Excel中 IA2305 对应其他变量名\n\n')
-        f.write('### 命名规范检查\n')
-        f.write('- 变量名需要有正确的模块前缀\n')
-        f.write('- 支持的前缀: JR_, XX_, QJ_, QD_, TJ_, MQ_, CJ_, ZJ_\n')
-        f.write('- 示例: DustBoxCheck 改为 JR_DustBoxCheck\n\n')
-        
+        f.write("### IO地址不匹配检查\n")
+        f.write("- 检查代码中的IO地址与Excel定义是否一致\n")
+        f.write(
+            "- 示例: 代码中 `DustBoxCheck := IA2305` 但Excel中 IA2305 对应其他变量名\n\n"
+        )
+        f.write("### 命名规范检查\n")
+        f.write("- 变量名需要有正确的模块前缀\n")
+        f.write("- 支持的前缀: JR_, XX_, QJ_, QD_, TJ_, MQ_, CJ_, ZJ_\n")
+        f.write("- 示例: DustBoxCheck 改为 JR_DustBoxCheck\n\n")
+
         # 10. 数据质量问题 - 重复项详情
         if duplicates:
             has_duplicates = (
-                len(duplicates.get('io_address_duplicates', {})) > 0 or
-                len(duplicates.get('io_name_duplicates', {})) > 0 or
-                len(duplicates.get('plc_var_duplicates', {})) > 0
+                len(duplicates.get("io_address_duplicates", {})) > 0
+                or len(duplicates.get("io_name_duplicates", {})) > 0
+                or len(duplicates.get("plc_var_duplicates", {})) > 0
             )
-            
+
             if has_duplicates:
-                f.write('## 10. 数据质量问题 - 重复项\n\n')
-                f.write('> 以下IO地址、IO名称或PLC变量在Excel中重复定义，需要核对并清理\n\n')
-                
+                f.write("## 10. 数据质量问题 - 重复项\n\n")
+                f.write(
+                    "> 以下IO地址、IO名称或PLC变量在Excel中重复定义，需要核对并清理\n\n"
+                )
+
                 # IO地址重复
-                io_addr_dups = duplicates.get('io_address_duplicates', {})
+                io_addr_dups = duplicates.get("io_address_duplicates", {})
                 if io_addr_dups:
-                    f.write(f'### IO地址重复（{len(io_addr_dups)} 个）\n\n')
-                    f.write('| IO地址 | 次数 | Sheet | 行号 | 注释 | 来源 |\n')
-                    f.write('|--------|------|-------|------|------|------|\n')
+                    f.write(f"### IO地址重复（{len(io_addr_dups)} 个）\n\n")
+                    f.write("| IO地址 | 次数 | Sheet | 行号 | 注释 | 来源 |\n")
+                    f.write("|--------|------|-------|------|------|------|\n")
                     for io_addr, records in io_addr_dups.items():
                         for rec in records:
-                            f.write(f'| {io_addr} | {len(records)} | {rec.get("sheet", "-")} | {rec.get("row", "-")} | {rec.get("comment", "-")[:30]} | {rec.get("source_type", "-")} |\n')
-                    f.write('\n')
-                
+                            f.write(
+                                f"| {io_addr} | {len(records)} | {rec.get('sheet', '-')} | {rec.get('row', '-')} | {rec.get('comment', '-')[:30]} | {rec.get('source_type', '-')} |\n"
+                            )
+                    f.write("\n")
+
                 # IO名称重复
-                io_name_dups = duplicates.get('io_name_duplicates', {})
+                io_name_dups = duplicates.get("io_name_duplicates", {})
                 if io_name_dups:
-                    f.write(f'### IO名称（注释）重复（{len(io_name_dups)} 个）\n\n')
-                    f.write('| IO名称 | 次数 | Sheet | 行号 | IO地址 | 来源 |\n')
-                    f.write('|--------|------|-------|------|--------|------|\n')
+                    f.write(f"### IO名称（注释）重复（{len(io_name_dups)} 个）\n\n")
+                    f.write("| IO名称 | 次数 | Sheet | 行号 | IO地址 | 来源 |\n")
+                    f.write("|--------|------|-------|------|--------|------|\n")
                     for io_name, records in io_name_dups.items():
                         for rec in records:
-                            f.write(f'| {io_name[:30]} | {len(records)} | {rec.get("sheet", "-")} | {rec.get("row", "-")} | {rec.get("io_address", "-")} | {rec.get("source_type", "-")} |\n')
-                    f.write('\n')
-                
+                            f.write(
+                                f"| {io_name[:30]} | {len(records)} | {rec.get('sheet', '-')} | {rec.get('row', '-')} | {rec.get('io_address', '-')} | {rec.get('source_type', '-')} |\n"
+                            )
+                    f.write("\n")
+
                 # PLC变量重复
-                plc_var_dups = duplicates.get('plc_var_duplicates', {})
+                plc_var_dups = duplicates.get("plc_var_duplicates", {})
                 if plc_var_dups:
-                    f.write(f'### PLC控制变量重复（{len(plc_var_dups)} 个）\n\n')
-                    f.write('| PLC变量 | 次数 | Sheet | 行号 | IO地址 | 注释 |\n')
-                    f.write('|---------|------|-------|------|--------|------|\n')
+                    f.write(f"### PLC控制变量重复（{len(plc_var_dups)} 个）\n\n")
+                    f.write("| PLC变量 | 次数 | Sheet | 行号 | IO地址 | 注释 |\n")
+                    f.write("|---------|------|-------|------|--------|------|\n")
                     for plc_var, records in plc_var_dups.items():
                         for rec in records:
-                            f.write(f'| {plc_var} | {len(records)} | {rec.get("sheet", "-")} | {rec.get("row", "-")} | {rec.get("io_address", "-")} | {rec.get("comment", "-")[:20]} |\n')
-                    f.write('\n')
-        
+                            f.write(
+                                f"| {plc_var} | {len(records)} | {rec.get('sheet', '-')} | {rec.get('row', '-')} | {rec.get('io_address', '-')} | {rec.get('comment', '-')[:20]} |\n"
+                            )
+                    f.write("\n")
+
     return report_file, timestamp
 
 
@@ -2859,57 +3497,57 @@ def clean_plc_source(plc_files, output_dir, timestamp):
     # 统一为列表
     if isinstance(plc_files, str):
         plc_files = [plc_files]
-    
-    output_file = os.path.join(output_dir, f'plc_source_cleaned_{timestamp}.txt')
-    
+
+    output_file = os.path.join(output_dir, f"plc_source_cleaned_{timestamp}.txt")
+
     all_cleaned_lines = []
-    
+
     for plc_file in plc_files:
         if len(plc_files) > 1:
             all_cleaned_lines.append(f"=== Source: {os.path.basename(plc_file)} ===")
-        
+
         # 使用UTF-8带BOM读取
-        with open(plc_file, 'r', encoding='utf-8-sig') as f:
+        with open(plc_file, "r", encoding="utf-8-sig") as f:
             content_str = f.read()
-        
-        for line in content_str.split('\n'):
+
+        for line in content_str.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            
+
             try:
                 data = json.loads(line)
-                
+
                 # 从CLs中提取TXT字段
-                if 'CLs' in data and isinstance(data['CLs'], list):
-                    for cl in data['CLs']:
-                        if 'TXT' in cl and cl['TXT']:
-                            txt = cl['TXT']
+                if "CLs" in data and isinstance(data["CLs"], list):
+                    for cl in data["CLs"]:
+                        if "TXT" in cl and cl["TXT"]:
+                            txt = cl["TXT"]
                             # JSON解析已自动解码 \uXXXX 转义序列
-                            
+
                             # 分割多行
-                            for code_line in txt.split('\r\n'):
+                            for code_line in txt.split("\r\n"):
                                 code_line = code_line.strip()
                                 if not code_line:
                                     continue
                                 # 删除纯注释行（以//开头）- 严格按照SKILL.md规定
-                                if code_line.startswith('//'):
+                                if code_line.startswith("//"):
                                     continue
                                 # 保留有代码的行（包括行尾注释）
                                 all_cleaned_lines.append(code_line)
             except json.JSONDecodeError:
                 # 如果不是JSON格式，处理原始行
                 # 跳过纯注释行
-                if line.startswith('//'):
+                if line.startswith("//"):
                     continue
                 all_cleaned_lines.append(line)
-        
+
         if len(plc_files) > 1:
             all_cleaned_lines.append("")  # 文件间空行分隔
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(all_cleaned_lines))
-    
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(all_cleaned_lines))
+
     return output_file
 
 
@@ -2919,65 +3557,86 @@ def save_sheet_analysis(sheet_analysis, output_dir):
     """
     if not sheet_analysis:
         return
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_file = os.path.join(output_dir, f'sheet_io_analysis_{timestamp}.md')
-    json_file = os.path.join(output_dir, f'sheet_io_analysis_{timestamp}.json')
-    
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(output_dir, f"sheet_io_analysis_{timestamp}.md")
+    json_file = os.path.join(output_dir, f"sheet_io_analysis_{timestamp}.json")
+
     # 保存为Markdown格式（便于人工阅读）
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write('# Excel Sheet IO识别分析详情\n\n')
-        f.write(f'生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')
-        f.write('> 本文件记录每个Sheet的IO列识别结果，用于核对和复盘\n\n')
-        
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("# Excel Sheet IO识别分析详情\n\n")
+        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("> 本文件记录每个Sheet的IO列识别结果，用于核对和复盘\n\n")
+
         for idx, sheet in enumerate(sheet_analysis, 1):
-            f.write(f'## {idx}. {sheet["file"]} - Sheet [{sheet["sheet"]}]\n\n')
-            
+            f.write(f"## {idx}. {sheet['file']} - Sheet [{sheet['sheet']}]\n\n")
+
             # 列识别结果
-            f.write('### 识别的列\n\n')
-            f.write('| 列类型 | 列名 | 状态 |\n')
-            f.write('|--------|------|------|\n')
-            cols = sheet['columns']
+            f.write("### 识别的列\n\n")
+            f.write("| 列类型 | 列名 | 状态 |\n")
+            f.write("|--------|------|------|\n")
+            cols = sheet["columns"]
             io_cols = cols.get("io_cols", [])
-            io_col_display = ", ".join(io_cols[:3]) + ("..." if len(io_cols) > 3 else "") if io_cols else "-"
-            f.write(f'| IO地址列 | {io_col_display} | {"✅ 已识别" if io_cols else "❌ 未识别"} ({len(io_cols)}个) |\n')
-            f.write(f'| 变量名列 | {cols.get("var_col") or "-"} | {"✅ 已识别" if cols.get("var_col") else "⚠️ 未识别"} |\n')
-            f.write(f'| 注释列 | {cols.get("comment_col") or "-"} | {"✅ 已识别" if cols.get("comment_col") else "⚠️ 未识别"} |\n')
-            f.write(f'| HMI列 | {cols.get("hmi_col") or "-"} | {"✅ 已识别" if cols.get("hmi_col") else "⚠️ 未识别"} |\n')
-            f.write(f'| 反气缸列 | {cols.get("reverse_col") or "-"} | {"✅ 已识别" if cols.get("reverse_col") else "⚠️ 未识别"} |\n')
-            f.write('\n')
-            
+            io_col_display = (
+                ", ".join(io_cols[:3]) + ("..." if len(io_cols) > 3 else "")
+                if io_cols
+                else "-"
+            )
+            f.write(
+                f"| IO地址列 | {io_col_display} | {'✅ 已识别' if io_cols else '❌ 未识别'} ({len(io_cols)}个) |\n"
+            )
+            f.write(
+                f"| 变量名列 | {cols.get('var_col') or '-'} | {'✅ 已识别' if cols.get('var_col') else '⚠️ 未识别'} |\n"
+            )
+            f.write(
+                f"| 注释列 | {cols.get('comment_col') or '-'} | {'✅ 已识别' if cols.get('comment_col') else '⚠️ 未识别'} |\n"
+            )
+            f.write(
+                f"| HMI列 | {cols.get('hmi_col') or '-'} | {'✅ 已识别' if cols.get('hmi_col') else '⚠️ 未识别'} |\n"
+            )
+            f.write(
+                f"| 反气缸列 | {cols.get('reverse_col') or '-'} | {'✅ 已识别' if cols.get('reverse_col') else '⚠️ 未识别'} |\n"
+            )
+            f.write("\n")
+
             # 统计信息
-            stats = sheet['stats']
-            f.write('### 统计信息\n\n')
-            f.write(f'- **总行数**: {stats["total_rows"]}\n')
-            f.write(f'- **有效记录数**: {stats["valid_records"]}\n')
-            f.write(f'- **IO地址数**: {stats["io_addresses_found"]}\n')
-            f.write(f'- **变量名数**: {stats["var_names_found"]}\n')
-            f.write(f'- **反气缸标记数**: {stats["reverse_cylinders"]}\n')
-            f.write('\n')
-            
+            stats = sheet["stats"]
+            f.write("### 统计信息\n\n")
+            f.write(f"- **总行数**: {stats['total_rows']}\n")
+            f.write(f"- **有效记录数**: {stats['valid_records']}\n")
+            f.write(f"- **IO地址数**: {stats['io_addresses_found']}\n")
+            f.write(f"- **变量名数**: {stats['var_names_found']}\n")
+            f.write(f"- **反气缸标记数**: {stats['reverse_cylinders']}\n")
+            f.write("\n")
+
             # 示例数据
-            if sheet['sample_io']:
-                f.write(f'### 所有IO记录（共{len(sheet["sample_io"])}条）\n\n')
-                f.write('| 行号 | IO地址 | 变量名 | 注释 | 反气缸 |\n')
-                f.write('|------|--------|--------|------|--------|\n')
-                for record in sheet['sample_io']:
-                    var_names = ', '.join(record.get('var_names', []))[:30]
-                    comment = (record.get('comment', '') or '')[:30]
-                    f.write(f'| {record["row"]} | {record.get("io_address") or "-"} | {var_names} | {comment} | {"是" if record.get("is_reverse") else "否"} |\n')
-                f.write('\n')
-            
-            f.write('---\n\n')
-    
+            if sheet["sample_io"]:
+                f.write(f"### 所有IO记录（共{len(sheet['sample_io'])}条）\n\n")
+                f.write("| 行号 | IO地址 | 变量名 | 注释 | 反气缸 |\n")
+                f.write("|------|--------|--------|------|--------|\n")
+                for record in sheet["sample_io"]:
+                    var_names = ", ".join(record.get("var_names", []))[:30]
+                    comment = (record.get("comment", "") or "")[:30]
+                    f.write(
+                        f"| {record['row']} | {record.get('io_address') or '-'} | {var_names} | {comment} | {'是' if record.get('is_reverse') else '否'} |\n"
+                    )
+                f.write("\n")
+
+            f.write("---\n\n")
+
     # 同时保存为JSON格式（便于程序处理）
-    with open(json_file, 'w', encoding='utf-8') as f:
-        json.dump({
-            'generated_at': datetime.now().isoformat(),
-            'total_sheets': len(sheet_analysis),
-            'sheets': sheet_analysis
-        }, f, ensure_ascii=False, indent=2)
-    
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime.now().isoformat(),
+                "total_sheets": len(sheet_analysis),
+                "sheets": sheet_analysis,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
     print(f"    [INFO] Sheet分析详情已保存:")
     print(f"           - {output_file}")
     print(f"           - {json_file}")
@@ -2986,31 +3645,37 @@ def save_sheet_analysis(sheet_analysis, output_dir):
 def main():
     # 解析参数
     if len(sys.argv) < 3:
-        print("用法: python plc_audit.py <plc_xml_file1> [plc_xml_file2 ...] <excel_file1> [excel_file2 ...] [-o output_dir]")
+        print(
+            "用法: python plc_audit.py <plc_xml_file1> [plc_xml_file2 ...] <excel_file1> [excel_file2 ...] [-o output_dir]"
+        )
         print("示例:")
         print("  python plc_audit.py code.xml io_table.xlsx")
-        print("  python plc_audit.py code1.xml code2.xml io_table.xlsx io_database.xlsx")
-        print("  python plc_audit.py code.xml io_table.xlsx io_database.xlsx -o ./reports")
+        print(
+            "  python plc_audit.py code1.xml code2.xml io_table.xlsx io_database.xlsx"
+        )
+        print(
+            "  python plc_audit.py code.xml io_table.xlsx io_database.xlsx -o ./reports"
+        )
         sys.exit(1)
-    
+
     # 收集plc文件、excel文件和输出目录
     plc_files = []
     excel_files = []
-    output_dir = 'reports'  # 默认输出到reports目录
+    output_dir = "reports"  # 默认输出到reports目录
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg in ['-o', '--output']:
+        if arg in ["-o", "--output"]:
             if i + 1 < len(sys.argv):
                 output_dir = sys.argv[i + 1]
                 i += 2
             else:
                 print("错误: -o 参数需要指定输出目录")
                 sys.exit(1)
-        elif arg.endswith('.xml'):
+        elif arg.endswith(".xml"):
             plc_files.append(arg)
             i += 1
-        elif arg.endswith('.xlsx') or arg.endswith('.xls'):
+        elif arg.endswith(".xlsx") or arg.endswith(".xls"):
             excel_files.append(arg)
             i += 1
         else:
@@ -3018,66 +3683,71 @@ def main():
             if i == len(sys.argv) - 1:
                 output_dir = arg
             i += 1
-    
+
     if not plc_files:
         print("错误: 至少需要指定一个PLC XML文件")
         sys.exit(1)
-    
+
     if not excel_files:
         print("错误: 至少需要指定一个Excel文件")
         sys.exit(1)
-    
+
     # 检查文件
     for plc_file in plc_files:
         if not os.path.exists(plc_file):
             print(f"错误: PLC文件不存在: {plc_file}")
             sys.exit(1)
-    
+
     for excel_file in excel_files:
         if not os.path.exists(excel_file):
             print(f"错误: Excel文件不存在: {excel_file}")
             sys.exit(1)
-    
+
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
-    
+
     print("=" * 60)
     print("PLC代码审查工具 - 气缸专用版")
     print("=" * 60)
-    
+
     # 1. 解析PLC变量（支持多个文件）
     print(f"\n[1/4] 正在解析PLC文件（共{len(plc_files)}个）")
     for f in plc_files:
         print(f"      - {os.path.basename(f)}")
     plc_vars = parse_plc_variables(plc_files)
     print(f"      找到 {len(plc_vars)} 个变量")
-    
+
     # 2. 解析Excel（只读气缸Sheet）
     print(f"\n[2/4] 正在读取Excel文件（共{len(excel_files)}个）")
     for f in excel_files:
         print(f"      - {f}")
     io_db = parse_excel_io_db(excel_files, output_dir)
-    print(f"      IO数据库条目总数: {len(io_db.get('by_name', {}))} (按变量名) + {len(io_db.get('by_address', {}))} (按IO地址)")
-    
+    print(
+        f"      IO数据库条目总数: {len(io_db.get('by_name', {}))} (按变量名) + {len(io_db.get('by_address', {}))} (按IO地址)"
+    )
+
     # 3. 检测重复项（数据质量问题）
     print(f"\n[3/4] 正在检测数据重复...")
     duplicates = detect_duplicates(
-        io_db.get('by_address_all', {}),
-        io_db.get('by_name_all', {})
+        io_db.get("by_address_all", {}), io_db.get("by_name_all", {})
     )
-    dup_count = len(duplicates['io_address_duplicates']) + len(duplicates['io_name_duplicates']) + len(duplicates['plc_var_duplicates'])
+    dup_count = (
+        len(duplicates["io_address_duplicates"])
+        + len(duplicates["io_name_duplicates"])
+        + len(duplicates["plc_var_duplicates"])
+    )
     print(f"      发现 {dup_count} 组重复项")
-    
+
     # 4. 生成报告
     print(f"\n[4/4] 正在生成审查报告...")
     report_file, timestamp = generate_report(plc_vars, io_db, output_dir, duplicates)
     print(f"      报告已保存: {report_file}")
-    
+
     # 4. 清理源码
     print(f"\n[4/4] 正在清理PLC源码...")
     cleaned_file = clean_plc_source(plc_files, output_dir, timestamp)
     print(f"      清理后源码已保存: {cleaned_file}")
-    
+
     print("\n" + "=" * 60)
     print("审查完成!")
     print("=" * 60)
@@ -3086,5 +3756,5 @@ def main():
     print(f"  2. {cleaned_file}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
