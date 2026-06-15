@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import time
+from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import (
@@ -13,54 +16,33 @@ from deepagents.backends import (
 from dotenv import load_dotenv
 from langchain.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-
-# from langchain.chat_models import init_chat_model
 from langchain_openai import ChatOpenAI
-
-# from langgraph.store.memory import InMemoryStore
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from deepagents.middleware.summarization import create_summarization_tool_middleware
-
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langchain_cubesandbox import CubeSandbox
 
 load_dotenv()
+
+# ─── Environment ──────────────────────────────────────────────────────────────
 
 BASE_URL = os.getenv("BASE_URL")
 API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
 WORKSPACE = os.getenv("AGENT_WORKSPACE")
-UPLOAD_ROOT = "/data/myapp/uploads"  # 用户上传文件的物理路径
-REPORT_ROOT = "/data/myapp/reports"  # 生成报告的物理路径
+UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/data/myapp/uploads")
+REPORT_ROOT = os.getenv("REPORT_ROOT", "/data/myapp/reports")
+MCP_TOKEN = os.getenv("MCP_TOKEN", "YOUR_TOKEN")
 
-# sandbox
-from langchain_cubesandbox import CubeSandbox
+# Validate required env vars
+for _name, _val in [
+    ("BASE_URL", BASE_URL),
+    ("API_KEY", API_KEY),
+    ("MODEL_NAME", MODEL_NAME),
+    ("WORKSPACE", WORKSPACE),
+]:
+    if not _val:
+        raise ValueError(f"Missing required env var: {_name}")
 
-
-# 用户发消息时 — 有就复用，没有就新建
-sandbox = CubeSandbox.get_or_create(
-    template=os.environ["CUBE_TEMPLATE_ID"],
-    thread_id="conv-12345",
-    api_url=os.environ["CUBE_API_URL"],
-    api_key="dummy",
-)
-
-user_id = ""
-session_id = ""
-
-
-plc_audit_instructions = """
-    You are an elite PLC Code Review Engineer specializing in 
-    Omron NX/NJ series industrial automation systems.
-
-    ## 核心原则
-    - 基于证据，不捏造数据；解析失败时报告部分结果
-    - 保留所有原始标识符（中文/日文/英文）原样输出
-    - 数据有歧义时，先明确说明假设再下结论
-
-    ## 重要
-    所有审查流程、输出格式、报告模板，严格遵循你的 plc-code-auditor Skills 中的规范，
-    不得自行发明格式。
-    """
-
+# ─── Model ────────────────────────────────────────────────────────────────────
 
 model = ChatOpenAI(
     base_url=BASE_URL,
@@ -68,13 +50,33 @@ model = ChatOpenAI(
     api_key=API_KEY,
     temperature=0,
     max_retries=5,
-    # 如需关闭 thinking：
-    # model_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-    timeout=300,  # ← 5 分钟，给长文本生成留足时间
+    timeout=300,
 )
+
+# ─── System Prompt ────────────────────────────────────────────────────────────
+
+system_prompt = """\
+You are an elite PLC Code Review Engineer specializing in
+Omron NX/NJ series industrial automation systems.
+
+## 核心原则
+- 基于证据，不捏造数据；解析失败时报告部分结果
+- 保留所有原始标识符（中文/日文/英文）原样输出
+- 数据有歧义时，先明确说明假设再下结论
+
+## 重要
+所有审查流程、输出格式、报告模板，严格遵循你的 plc-code-auditor Skills 中的规范，
+不得自行发明格式。"""
+
+# ─── MCP Client Cache ─────────────────────────────────────────────────────────
+
+_cached_tools: list[BaseTool] | None = None
 
 
 async def mcp_tools() -> list[BaseTool]:
+    global _cached_tools
+    if _cached_tools is not None:
+        return _cached_tools
 
     client = MultiServerMCPClient(
         {
@@ -82,79 +84,95 @@ async def mcp_tools() -> list[BaseTool]:
                 "transport": "streamable-http",
                 "url": "http://localhost:8000/mcp",
                 "headers": {
-                    "Authorization": "Bearer YOUR_TOKEN",
+                    "Authorization": f"Bearer {MCP_TOKEN}",
                     "X-customer-header": "custom-value",
                 },
             }
         }
     )
 
-    mcp_tools = await client.get_tools()
+    _cached_tools = await client.get_tools()
+    return _cached_tools
 
-    return mcp_tools
+
+# ─── Sandbox Factory ──────────────────────────────────────────────────────────
 
 
-def build_backend(user_id: str, session_id: str) -> CompositeBackend:
-    return CompositeBackend(
-        default=StateBackend,
-        routes={
-            f"/uploads/{user_id}/{session_id}": FilesystemBackend(
-                root_dir=f"{UPLOAD_ROOT}/{user_id}/{session_id}",
-                virtual_mode=True,
-            ),
-            f"/reports/{user_id}/{session_id}": FilesystemBackend(
-                root_dir=f"{REPORT_ROOT}/{user_id}/{session_id}",
-                virtual_mode=True,
-            ),
-            "/memories/": StoreBackend(
-                namespace=lambda rt: (
-                    "memories",
-                    user_id,
-                )
-            ),
-            "/code/": sandbox,
-        },
+def _make_sandbox(thread_id: str) -> Any:
+
+    return CubeSandbox.get_or_create(
+        template=os.environ["CUBE_TEMPLATE_ID"],
+        thread_id=thread_id,
+        api_url=os.environ.get("CUBE_API_URL"),
+        api_key=os.environ.get("CUBE_API_KEY", "dummy"),
     )
 
 
-async def create_my_agent(user_id: str, session_id: str, checkpointer):
+# ─── Backend ──────────────────────────────────────────────────────────────────
 
-    backend = build_backend(user_id, session_id)
+
+def build_backend(user_id: str, session_id: str, thread_id: str) -> CompositeBackend:
+    routes: dict[str, Any] = {
+        f"/uploads/{user_id}/{session_id}": FilesystemBackend(
+            root_dir=f"{UPLOAD_ROOT}/{user_id}/{session_id}/",
+            virtual_mode=True,
+        ),
+        f"/reports/{user_id}/{session_id}": FilesystemBackend(
+            root_dir=f"{REPORT_ROOT}/{user_id}/{session_id}/",
+            virtual_mode=True,
+        ),
+        "/memories/": StoreBackend(namespace=lambda rt: ("memories", user_id)),
+    }
+    sandbox = _make_sandbox(thread_id)
+    routes["/code/"] = sandbox
+    return CompositeBackend(default=StateBackend(), routes=routes)
+
+
+# ─── Agent Creation ───────────────────────────────────────────────────────────
+
+
+async def create_my_agent(user_id: str, session_id: str, thread_id: str, checkpointer):
+    backend = build_backend(user_id, session_id, thread_id)
     tools = await mcp_tools()
 
     agent = create_deep_agent(
         model=model,
         tools=tools,
         backend=backend,
-        skills=[f"{WORKSPACE}/skills/plc-code-auditor"],  # 具体 skill 路径
+        system_prompt=system_prompt,
+        skills=[f"{WORKSPACE}/skills/plc-code-auditor"],
         interrupt_on={
-            "write_file": False,  # Default: approve, edit, reject
-            "read_file": False,  # No interrupts needed
-            "edit_file": False,  # Default: approve, edit, reject
+            "write_file": False,
+            "read_file": False,
+            "edit_file": False,
         },
-        checkpointer=checkpointer,  # Required!
-        # system_prompt=plc_audit_instructions,
+        checkpointer=checkpointer,
         debug=True,
-        system_prompt=f"""你是一个全能助手，当前服务的用户ID是 {user_id}。
-
-        文件系统说明：
-        - /uploads/ 目录存放用户上传的文件
-        - /reports/ 目录存放你生成的报告，完成后告诉用户下载
-        - /memories/ 目录是你的长期记忆，可以写入跨会话记住的关键信息
-        - 比如用户的偏好、已完成的任务等，每次会话开始先读取这里
-                
-        请根据用户指令完成对应的任务。""",
     )
 
     return agent
 
 
-async def main():
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 
-    db_path = f"{WORKSPACE}/checkpoints.db"
-    os.makedirs(WORKSPACE, exist_ok=True)
-    async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
-        agent = await create_my_agent(user_id, session_id, checkpointer=checkpointer)
+
+async def main(user_id: str = "", session_id: str = ""):
+    thread_id = f"conv-{int(time.time())}"
+
+    pg_dsn = (
+        f"postgresql://{os.getenv('POSTGRES_USER')}:"
+        f"{os.getenv('POSTGRES_PASSWORD')}@"
+        f"{os.getenv('POSTGRES_HOST')}:"
+        f"{os.getenv('POSTGRES_PORT')}/"
+        f"{os.getenv('POSTGRES_DB')}"
+    )
+    async with AsyncPostgresSaver.from_conn_string(pg_dsn) as checkpointer:
+        # 首次运行需要建表（幂等，可重复执行）
+        await checkpointer.setup()
+
+        agent = await create_my_agent(
+            user_id, session_id, thread_id, checkpointer=checkpointer
+        )
 
         async for mode, data in agent.astream(
             {
@@ -165,7 +183,7 @@ async def main():
                     }
                 ]
             },
-            config={"configurable": {"thread_id": f"audit_{int(time.time())}"}},
+            config={"configurable": {"thread_id": thread_id}},
             stream_mode=["updates", "messages", "custom"],
         ):
             if mode == "messages":
@@ -173,7 +191,6 @@ async def main():
                 if hasattr(token, "content"):
                     print(token.content, end="", flush=True)
             elif mode == "updates":
-                # 仅打印节点名
                 for node_name, node_output in data.items():
                     print(f"\n[节点完成:{node_name}]", flush=True)
             elif mode == "custom":
