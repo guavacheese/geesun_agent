@@ -9,7 +9,6 @@ from deepagents import create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
-    LocalShellBackend,
     StateBackend,
     StoreBackend,
 )
@@ -125,7 +124,7 @@ def build_backend(user_id: str, session_id: str, thread_id: str) -> CompositeBac
     }
     sandbox = _make_sandbox(thread_id)
     routes["/code/"] = sandbox
-    return CompositeBackend(default=StateBackend(), routes=routes)
+    return CompositeBackend(default=StateBackend, routes=routes)
 
 
 # ─── Agent Creation ───────────────────────────────────────────────────────────
