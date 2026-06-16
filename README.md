@@ -29,6 +29,7 @@ uv add langchain-mcp-adapters
 uv add langgraph-checkpoint-sqlite aiosqlite
 uv add langgraph-checkpoint-postgres
 uv add "psycopg[binary]" 
+uv add grandalf
 
 uv sync
 ```
