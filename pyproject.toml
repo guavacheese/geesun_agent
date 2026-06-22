@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
     "deepagents>=0.5.3",
+    "fastapi>=0.137.1",
     "grandalf>=0.8",
     "langchain>=1.2.15",
     "langchain-mcp-adapters>=0.2.2",
@@ -17,5 +18,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "pandas>=3.0.2",
     "psycopg[binary]>=3.3.4",
+    "pydantic-settings>=2.14.0",
     "python-dotenv>=1.2.2",
+    "uvicorn[standard]>=0.46.0",
 ]

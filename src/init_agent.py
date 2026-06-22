@@ -194,6 +194,7 @@ def _make_sandbox(thread_id: str) -> Any:
             thread_id=thread_id,
             api_url=os.environ.get("CUBE_API_URL"),
             api_key=os.environ.get("CUBE_API_KEY", "dummy"),
+            # ssl_cert=
         )
     except Exception as e:
         print(f"[WARN] sandbox unavailable: {e}")
