@@ -1,5 +1,5 @@
 import json
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from src.infra.sandbox import create_sandbox
@@ -19,6 +19,7 @@ router = APIRouter()
 
 @router.post("/chat")
 async def chat(
+    request: Request,
     body: ChatRequest,  # ← FastAPI 自动解析 JSON
     store=Depends(get_store),
     checkpointer=Depends(get_checkpointer),
@@ -27,6 +28,8 @@ async def chat(
 
     tools = await get_mcp_tools()
     sandbox = create_sandbox(thread_id)
+    # 从 lifespan 预加载的 skills 缓存获取
+    skills = getattr(request.app, "state", {}).get("skills", [])
     agent = await create_agent(
         user_id=body.user_id,
         session_id=body.session_id,
@@ -35,6 +38,7 @@ async def chat(
         sandbox=sandbox,
         checkpointer=checkpointer,
         tools=tools,
+        skills=skills,
     )
 
     async def event_stream():

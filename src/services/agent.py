@@ -1,4 +1,5 @@
 import os
+
 from deepagents import create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
@@ -10,10 +11,6 @@ from deepagents.backends import (
 from src.core.config import settings
 from src.core.model import create_model
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
-
-
-# 默认技能根目录
-SKILLS_ROOT = f"{settings.agent_workspace}/skills"
 
 
 def build_backend(user_id: str, session_id: str, store, sandbox):
@@ -70,32 +67,17 @@ async def create_agent(
     sandbox,
     checkpointer,
     tools,
-    skills=None,
+    skills: list[str],
 ):
     backend = build_backend(user_id, session_id, store, sandbox)
     model = create_model()
-
-    print("==========Tools:", [t.name for t in tools])
-    print("==========Sandbox type:", type(sandbox))
-    print("==========Sandbox has execute:", hasattr(sandbox, "execute"))
-
-    # 用户没指定技能 → 加载全部（或按需选择）
-    if skills is None:
-        import os
-
-        if os.path.isdir(SKILLS_ROOT):
-            skills = [
-                f"{SKILLS_ROOT}/{d}"
-                for d in os.listdir(SKILLS_ROOT)
-                if os.path.isdir(f"{SKILLS_ROOT}/{d}")
-            ]
 
     return create_deep_agent(
         model=model,
         tools=tools,
         backend=backend,
         system_prompt=PLC_AUDITOR_SYSTEM_PROMPT,
-        skills=skills or [],
+        skills=skills,
         interrupt_on={
             "write_file": False,
             "read_file": False,
