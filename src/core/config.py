@@ -1,0 +1,34 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    base_url: str
+    openai_api_key: str
+    model_name: str
+    agent_workspace: str
+
+    upload_root: str = "/data/myapp/uploads"
+    report_root: str = "/data/myapp/reports"
+    mcp_token: str = "YOUR_TOKEN"
+
+    cube_template_id: str = ""
+    cube_api_url: str = ""
+    cube_api_key: str = "dummy"
+
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_db: str = "agent_mem"
+    postgres_user: str = "postgres"
+    postgres_password: str = ""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+print(type(Settings.model_config))
+print(Settings.model_config.get("env_file"))  # 应该输出 .env
+
+settings = Settings()

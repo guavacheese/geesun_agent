@@ -1,0 +1,65 @@
+@host = http://localhost:8009
+
+
+### 第一轮：打招呼
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "message": "你好，列出workspace里的文件"
+}
+
+### 第二轮：追问（多轮对话）
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "abc",
+  "message": "刚才列出的文件里，找一个toml文件打开看看"
+}
+
+### 第二轮：追问（多轮对话）
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "123",
+  "message": "根据PLC代码审查skill在当前workspace输出分析报告，并把用户的偏好'使用中文交流'写入 memories 目录"
+}
+
+
+
+### 第二轮：追问（多轮对话）
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "123",
+  "message": "写个python脚本，测试下1+100等于多少"
+}
+
+### 第二轮：追问（多轮对话）
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "123",
+  "message": "你写了一堆test_add5.py这种脚本为啥不运行？还是运行不了？告诉我原因，为啥一直在写这种脚本？"
+}
+
+
+
+### 第二轮：追问（多轮对话）
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "1001",
+  "message": "写个python脚本，测试下100+100等于多少。如果执行不了你写的这个脚本告诉我原因，不要一直写test_add1.py test_add2.py这种脚本"
+}
