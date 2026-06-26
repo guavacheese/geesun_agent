@@ -1,6 +1,9 @@
 from src.core.config import settings
 import os
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "cube-ca.pem"))
@@ -14,13 +17,18 @@ def create_sandbox(thread_id: str):
     try:
         from langchain_cubesandbox import CubeSandbox
 
-        return CubeSandbox.get_or_create(
+        sandbox = CubeSandbox.get_or_create(
             template=settings.cube_template_id,
             thread_id=thread_id,
             api_url=settings.cube_api_url,
             api_key=key,
             ssl_cert=str(ca_path),
         )
+
+        # 快速验证沙箱是否真的可用
+        if hasattr(sandbox, "_sandbox") and sandbox._sandbox is not None:
+            return sandbox
+        return None
     except Exception as e:
-        print(f"[WARN] sandbox unavailable: {e}")
+        logger.warning("sandbox unavailable: %s", e)
         return None

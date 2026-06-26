@@ -8,6 +8,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
+from langchain.messages import trim_messages
 from src.core.config import settings
 from src.core.model import create_model
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
@@ -27,16 +28,16 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
         #     env={**os.environ},
         # ),
         # 兜底：模型不听话发磁盘绝对路径
-        f"{settings.agent_workspace}/": LocalShellBackend(
-            root_dir=settings.agent_workspace,
-            virtual_mode=True,
-            env={**os.environ},
-        ),
-        f"/uploads/{user_id}/{session_id}": FilesystemBackend(
+        # f"{settings.agent_workspace}/": LocalShellBackend(
+        #     root_dir=settings.agent_workspace,
+        #     virtual_mode=True,
+        #     env={**os.environ},
+        # ),
+        f"/uploads/{user_id}/{session_id}/": FilesystemBackend(
             root_dir=f"{settings.upload_root}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
-        f"/reports/{user_id}/{session_id}": FilesystemBackend(
+        f"/reports/{user_id}/{session_id}/": FilesystemBackend(
             root_dir=f"{settings.report_root}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
@@ -44,6 +45,19 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
             namespace=lambda rt: ("memories", user_id or "default-user"),
             store=store,
         ),
+        "/skills/": FilesystemBackend(
+            root_dir=f"{settings.agent_workspace}/skills/",
+            virtual_mode=True,
+        ),
+        # ★ SummarizationMiddleware 需要这个路径来 offload 历史消息
+        # f"/conversation_history/{user_id}:{session_id}": FilesystemBackend(
+        #     root_dir=f"{settings.report_root}/{user_id}/{session_id}/",
+        #     virtual_mode=True,
+        # ),
+        # offload → LangGraph state，不写磁盘，不经过沙箱;offload 归档：SummarizationMiddleware 写 /conversation_history/xxx.md
+        "/conversation_history/": StateBackend(),
+        # 大工具结果驱逐 → LangGraph state
+        "/large_tool_results/": StateBackend(),
     }
     if sandbox:
         # sandbox 作为 default backend —— execute 走这里！
@@ -84,5 +98,11 @@ async def create_agent(
             "edit_file": False,
         },
         checkpointer=checkpointer,
+        # messages_modifier=trim_messages(
+        #     max_tokens=200000,
+        #     strategy="last",
+        #     token_counter=model,
+        #     include_system=True,
+        # ),
         debug=True,
     )

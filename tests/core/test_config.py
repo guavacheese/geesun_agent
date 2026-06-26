@@ -7,4 +7,6 @@ class Test(BaseSettings):
 
 
 t = Test()
-print(t.cube_api_key)  # 应该输出 e2b_dummy，而不是 dummy
+print(
+    t.cube_api_key
+)  # 应该输出 e2b_0000000000000000000000000000000000000000，而不是 dummy

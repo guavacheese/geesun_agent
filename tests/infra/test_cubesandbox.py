@@ -16,7 +16,7 @@ ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "cube-ca.pem"))
 # 用户发消息时 — 有就复用，没有就新建
 sandbox = CubeSandbox.get_or_create(
     template=os.environ["CUBE_TEMPLATE_ID"],
-    thread_id="conv-12345",
+    thread_id="test-user:1001",
     api_url=os.environ["CUBE_API_URL"],
     api_key="e2b_0000000000000000000000000000000000000000",
     ssl_cert=str(ca_path),
@@ -24,7 +24,7 @@ sandbox = CubeSandbox.get_or_create(
 print(f"=============Created sandbox: {sandbox.id}")
 print(f"======================={sandbox._sandbox}")
 
-result = CubeSandbox.list(metadata={"thread_id": "conv-12345"}, state="running")
+result = CubeSandbox.list(metadata={"thread_id": "test-user:1001"}, state="running")
 print(f"=============List result: {result}")
 
 # 执行代码
