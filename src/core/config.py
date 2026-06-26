@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     cube_template_id: str = ""
     cube_api_url: str = ""
-    cube_api_key: str = "dummy"
+    cube_api_key: str = "e2b_0000000000000000000000000000000000000000"
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432

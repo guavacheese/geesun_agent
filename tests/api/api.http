@@ -7,7 +7,8 @@ Content-Type: application/json
 
 {
   "user_id": "test-user",
-  "message": "你好，列出workspace里的文件"
+  "session_id": "1001",
+  "message": "用 ls 列出 /uploads/test-user/1001/ 里的文件"
 }
 
 ### 第二轮：追问（多轮对话）
@@ -20,13 +21,50 @@ Content-Type: application/json
   "message": "刚才列出的文件里，找一个toml文件打开看看"
 }
 
+### 上传多个文件
+POST {{host}}/api/v1/upload
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="78b44bcc.xml"
+Content-Type: application/xml
+
+< /mnt/d/workspace/geesun_agent/78b44bcc-81d9-470c-a2df-b7e479d1351f.xml
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="ac335d65.xml"
+Content-Type: application/xml
+
+< /mnt/d/workspace/geesun_agent/ac335d65-5243-4fe7-a2d3-c38faa56045d.xml
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="IO数据库.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+< /mnt/d/workspace/geesun_agent/IO数据库V1.0.03.xlsx
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="1111-IO表-012.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+< /mnt/d/workspace/geesun_agent/1111-IO表-012.xlsx
+------WebKitFormBoundary
+Content-Disposition: form-data; name="user_id"
+
+test-user
+------WebKitFormBoundary
+Content-Disposition: form-data; name="session_id"
+
+1001
+------WebKitFormBoundary--
+
+
+
+
 ### 第二轮：追问（多轮对话）
 POST {{host}}/api/v1/chat
 Content-Type: application/json
 
 {
   "user_id": "test-user",
-  "session_id": "123",
+  "session_id": "1001",
   "message": "根据PLC代码审查skill在当前workspace输出分析报告，并把用户的偏好'使用中文交流'写入 memories 目录"
 }
 
@@ -61,5 +99,5 @@ Content-Type: application/json
 {
   "user_id": "test-user",
   "session_id": "1001",
-  "message": "写个python脚本，测试下100+100等于多少。如果执行不了你写的这个脚本告诉我原因，不要一直写test_add1.py test_add2.py这种脚本"
+  "message": "我之前要求过你做什么？"
 }

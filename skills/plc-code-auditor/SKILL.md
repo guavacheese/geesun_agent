@@ -1,6 +1,12 @@
 ---
 name: plc-code-auditor
-description: PLC代码审查工具，用于自动化检查PLC XML源码与Excel IO表和IO数据库的匹配性。Use when: (1) 比对PLC中IO名称和IO表中的IO地址、IO名称映射，(2) 比对PLC变量与IO数据库映射，(3) 检查模块前缀缺失问题如DustBoxCheck应改为JR_DustBoxCheck，(4) 生成PLC代码审查报告，(5) 提取PLC变量列表。支持数组变量解析如SFJ_KDJC[0]、多Sheet比对、带时间戳报告输出避免覆盖。
+description:  > 
+    PLC代码审查工具，用于自动化检查PLC XML源码与Excel IO表和IO数据库的匹配性。
+    Use when: (1) 比对PLC中IO名称和IO表中的IO地址、IO名称映射，
+    (2) 比对PLC变量与IO数据库映射，
+    (3) 检查模块前缀缺失问题如DustBoxCheck应改为JR_DustBoxCheck，
+    (4) 生成PLC代码审查报告，
+    (5) 提取PLC变量列表。支持数组变量解析如SFJ_KDJC[0]、多Sheet比对、带时间戳报告输出避免覆盖。
 ---
 
 # PLC代码审查工具

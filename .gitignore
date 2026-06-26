@@ -14,3 +14,8 @@ plc*.md
 plc*.txt
 sheet_io*
 *.iml
+*.log
+*.claude
+checkpoints.db
+*.json
+*.md
