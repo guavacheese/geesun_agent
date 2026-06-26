@@ -1,4 +1,5 @@
 import os
+import logging
 
 from deepagents import create_deep_agent
 from deepagents.backends import (
@@ -8,10 +9,39 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
+from deepagents.backends.protocol import FileDownloadResponse
+from deepagents.backends.utils import file_data_to_string
+import base64
 from langchain.messages import trim_messages
 from src.core.config import settings
 from src.core.model import create_model
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
+
+# ─── Monkey-patch: 给 StoreBackend 补上 adownload_files ─────────────────
+# deepagents StoreBackend 缺少异步下载文件的实现，默认降级为 asyncio.to_thread
+# 但 AsyncPostgresStore 的同步 get() 在跨线程调用时连不上连接池。
+# 等官方修好后可删除此补丁。
+async def _store_adownload_files(self, paths):
+    store = self._get_store()
+    namespace = self._get_namespace()
+    responses = []
+    for path in paths:
+        item = await store.aget(namespace, path)
+        if item is None:
+            responses.append(FileDownloadResponse(path=path, content=None, error="file_not_found"))
+            continue
+        file_data = self._convert_store_item_to_file_data(item)
+        content_str = file_data_to_string(file_data)
+        encoding = file_data["encoding"]
+        content_bytes = base64.standard_b64decode(content_str) if encoding == "base64" else content_str.encode("utf-8")
+        responses.append(FileDownloadResponse(path=path, content=content_bytes, error=None))
+    return responses
+
+StoreBackend.adownload_files = _store_adownload_files
+
+# AGENTS.md 虚拟路径，由 memory= 参数始终注入系统提示词（平台通用规则）
+# 注意：使用独立的 agent-memory 路由，所有用户共享同一份 AGENTS.md
+AGENTS_MD_PATH = "/workspace/agent-memory/AGENTS.md"
 
 
 def build_backend(user_id: str, session_id: str, store, sandbox):
@@ -43,6 +73,11 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
         ),
         "/workspace/memories/": StoreBackend(
             namespace=lambda rt: ("memories", user_id or "default-user"),
+            store=store,
+        ),
+        # 独立路由：所有用户共享的 AGENTS.md（平台通用规则，不由用户修改）
+        "/workspace/agent-memory/": StoreBackend(
+            namespace=lambda rt: ("__agent__",),
             store=store,
         ),
         "/skills/": FilesystemBackend(
@@ -92,6 +127,7 @@ async def create_agent(
         backend=backend,
         system_prompt=PLC_AUDITOR_SYSTEM_PROMPT,
         skills=skills,
+        memory=[AGENTS_MD_PATH],
         interrupt_on={
             "write_file": False,
             "read_file": False,

@@ -43,6 +43,20 @@ async def lifespan(app: FastAPI):
 
     async with AsyncPostgresStore.from_conn_string(dsn) as store:
         await store.setup()
+
+        # 种子 AGENTS.md 到 store（供 memory= 参数通过 StoreBackend 读取）
+        # 注意：CompositeBackend 剥离路由前缀后保留前导斜杠，所以 key 是 "/AGENTS.md" 而非 "AGENTS.md"
+        agents_md_key = "/AGENTS.md"
+        if await store.aget(("__agent__",), agents_md_key) is None:
+            with open("AGENTS.md", "r", encoding="utf-8") as f:
+                content = f.read()
+            await store.aput(
+                ("__agent__",),
+                agents_md_key,
+                {"content": content, "encoding": "utf-8"},
+            )
+            logging.warning("[DIAG] AGENTS.md seeded to store")
+
         app.state.store = store
 
         async with AsyncPostgresSaver.from_conn_string(dsn) as checkpointer:
