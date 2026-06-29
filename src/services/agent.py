@@ -80,8 +80,17 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
             namespace=lambda rt: ("__agent__",),
             store=store,
         ),
-        "/skills/": FilesystemBackend(
-            root_dir=f"{settings.agent_workspace}/skills/",
+        # Skills 三层路由：系统 → Agent自创 → 用户共享
+        "/skills/__system__/": FilesystemBackend(
+            root_dir=f"{settings.agent_workspace}/skills/__system__/",
+            virtual_mode=True,
+        ),
+        "/skills/__agent__/": FilesystemBackend(
+            root_dir=f"{settings.agent_workspace}/skills/__agent__/",
+            virtual_mode=True,
+        ),
+        f"/skills/__user_{user_id}__/": FilesystemBackend(
+            root_dir=f"{settings.agent_workspace}/skills/__user_{user_id}__/",
             virtual_mode=True,
         ),
         # ★ SummarizationMiddleware 需要这个路径来 offload 历史消息

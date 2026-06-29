@@ -11,6 +11,10 @@ async def upload_file(
     user_id: str = Form(...),
     session_id: str = Form(...),
 ):
+    """
+    用户上传自己需要处理的文件，用于输入文件（PLC 源码、Excel 表等）
+    """
+
     dir_path = f"{settings.upload_root}/{user_id}/{session_id}"
     os.makedirs(dir_path, exist_ok=True)
 

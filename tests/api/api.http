@@ -21,7 +21,7 @@ Content-Type: application/json
   "message": "刚才列出的文件里，找一个toml文件打开看看"
 }
 
-### 上传多个文件
+### 上传多个文件-xml和xlsx
 POST {{host}}/api/v1/upload
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
 
@@ -56,7 +56,27 @@ Content-Disposition: form-data; name="session_id"
 ------WebKitFormBoundary--
 
 
+### 上传skill zip包
+POST {{host}}/api/v1/skill/upload
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
 
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="plc-code-auditor.zip"
+Content-Type: application/zip
+
+< /mnt/d/workspace/geesun_agent/plc-code-auditor.zip
+------WebKitFormBoundary
+Content-Disposition: form-data; name="skill_name"
+
+plc-code-auditor
+------WebKitFormBoundary
+Content-Disposition: form-data; name="user_id"
+
+test-user
+------WebKitFormBoundary--
+
+### 删除skill 
+DELETE {{host}}/api/v1/skill/plc-code-auditor?user_id=test-user
 
 ### 第二轮：追问（多轮对话）
 POST {{host}}/api/v1/chat
@@ -66,6 +86,28 @@ Content-Type: application/json
   "user_id": "test-user",
   "session_id": "1001",
   "message": "根据PLC代码审查skill在当前workspace输出分析报告，并把用户的偏好'使用中文交流'写入 memories 目录"
+}
+
+
+
+### 让Agent下一个查下当天某个城市的天气预报的skill
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "create-weather-skill",
+  "message": "编写一个查下某个城市当天天气的skill，方便后续复用"
+}
+
+### 让Agent下一个查下当天某个城市的天气预报的skill
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "user_id": "test-user",
+  "session_id": "create-weather-skill",
+  "message": "查下下深圳今天的天气"
 }
 
 

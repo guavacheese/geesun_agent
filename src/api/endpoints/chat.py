@@ -31,8 +31,10 @@ async def chat(
 
     tools = await get_mcp_tools()
     sandbox = create_sandbox(thread_id)
-    # 从 lifespan 预加载的 skills 缓存获取
-    skills = getattr(request.app.state, "skills", [])
+    # 构建 skill sources：系统 + Agent 自创（启动时加载）+ 当前用户的共享 skill
+    base_skills = getattr(request.app.state, "skills", [])
+    user_skill_path = f"/skills/__user_{user_id}__/"
+    skills = list(base_skills) + [user_skill_path]
     agent = await create_agent(
         user_id=body.user_id,
         session_id=body.session_id,

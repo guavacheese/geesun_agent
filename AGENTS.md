@@ -60,10 +60,12 @@ copy_script_to_sandbox(
     sandbox_path="/home/user/脚本名.py",
     sandbox_id="<沙箱ID>",
     skill_name="<技能名>"
+)   # 自动搜索 __system__ → __agent__ → __user_*__，无需指定来源
 )
 
 # 然后安装依赖并执行
-execute pip install <所需依赖>
+# 安装依赖（沙箱下载包速度一般，设置 timeout=600 最多等10分钟）
+execute pip install <所需依赖> timeout=600
 execute python /home/user/脚本名.py <参数> -o /home/user/
 
 # 脚本输出的报告在沙箱内，用 download_from_sandbox 拉回宿主机
@@ -89,4 +91,4 @@ download_from_sandbox(
 - execute 在沙箱里运行，看不到 /uploads/ 和 /reports/ 下的文件
 - glob 说文件在，文件就在。重复用 execute 验证一次，就浪费一次 LLM 调用
 - **禁止使用 glob 的 ** 通配符** —— `**/*.py`、`**/脚本名*` 这种模式会扫描整个虚拟文件系统，超时 20 秒
-- 正确做法：`ls /skills/技能名/scripts/`
+- 正确做法：`ls /skills/__system__/技能名/scripts/`
