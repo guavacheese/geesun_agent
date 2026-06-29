@@ -13,6 +13,7 @@ class ChatRequest(BaseModel):
     user_id: str = "default-user"
     session_id: str = "default-session"
     message: str
+    model_override: dict | None = None  # 可选，动态切换模型：{"model_name": "...", "base_url": "...", "api_key": "..."}
 
 
 router = APIRouter()
@@ -62,15 +63,19 @@ async def chat(
     )
 
     async def event_stream():
+        # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
+        invoke_kwargs = {}
+        if body.model_override:
+            invoke_kwargs["context"] = {"model_config": body.model_override}
+
         async for mode, data in agent.astream(
             {"messages": [{"role": "user", "content": f"{path_hint}\n{body.message}"}]},
             config={
                 "configurable": {"thread_id": thread_id},
                 "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
             },
-            # stream_mode=["updates", "messages", "custom"],
             stream_mode=["messages", "updates"],
-            # stream_mode=["messages"],
+            **invoke_kwargs,
         ):
             if (
                 mode == "messages"

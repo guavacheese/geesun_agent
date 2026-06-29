@@ -1,23 +1,16 @@
-feat: Skills 目录结构重组 + 用户上传 Skill API + copy_script_to_sandbox 自动搜索来源
+feat: 支持运行时动态切换模型（通过 model_override 字段）
 
-- Skills 目录结构重组：
-  - skills/ → skills/__system__/ + skills/__agent__/ + skills/__user_{user_id}__/
-  - plc-code-auditor 搬入 skills/__system__/plc-code-auditor
-  - agent.py 新增三层 FilesystemBackend 路由
+- 新增 src/core/model.py:
+  - ModelConfig dataclass（model_name/base_url/api_key）
+  - switch_model middleware（@wrap_model_call async）
+  - 从 runtime context 读取模型配置，动态切换 ChatOpenAI 实例
 
-- 新增 src/api/endpoints/skills.py（Skill 管理 API）：
-  - POST /api/v1/skill/upload → 上传 skill（zip 解压/多文件）
-    校验 SKILL.md YAML frontmatter（name/description 必填）
-    自动剥离 zip 根目录防双重嵌套，Zip Slip 安全检查
-  - GET /api/v1/skills → 列出所有可用 skill（system/agent/user 三层）
-  - DELETE /api/v1/skill/{skill_name} → 删除用户上传的 skill
+- 修改 src/api/endpoints/chat.py:
+  - ChatRequest 新增可选 model_override 字段
+  - astream() 传 context 给 switch_model middleware
 
-- MCP copy_script_to_sandbox 改进：
-  - 移除 skill_source 参数，改为自动搜索 __system__ → __agent__ → __user_*__
-  - AGENTS.md 和 plc_auditor.py 同步更新
+- 修改 src/services/agent.py:
+  - 导入 switch_model，挂载到 create_deep_agent middleware
 
-- Sandbox 改进：
-  - 创建沙箱时自动配置 pip 清华镜像源（优先）+ PyPI 官方（兜底）
-  - AGENTS.md 中 pip install 增加 timeout=600 提示
-
-- 注册 skills 路由到 api_router
+client 不传 model_override 走默认模型（内网 vLLM），
+传了则动态切换（支持 Kimi/GLM/vLLM 等 OpenAI 兼容 API）

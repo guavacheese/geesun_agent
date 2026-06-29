@@ -8,7 +8,7 @@ Content-Type: application/json
 {
   "user_id": "test-user",
   "session_id": "1001",
-  "message": "用 ls 列出 /uploads/test-user/1001/ 里的文件"
+  "message": "用 ls 列出 /data/uploads/test-user/1001/ 里的文件"
 }
 
 ### 第二轮：追问（多轮对话）
@@ -17,8 +17,13 @@ Content-Type: application/json
 
 {
   "user_id": "test-user",
-  "session_id": "abc",
-  "message": "刚才列出的文件里，找一个toml文件打开看看"
+  "session_id": "1001",
+  "message": "刚才列出的文件里，找一个toml文件打开看看",
+  "model_override": {
+    "model_name": "Qwen3.6-35B-A3B",
+    "base_url": "http://172.16.66.13:8003/v1",
+    "api_key": "75ddc7233ab54209b6b850e02bd5925e"
+  }
 }
 
 ### 上传多个文件-xml和xlsx
