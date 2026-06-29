@@ -48,7 +48,8 @@ async def switch_model(
     不传 context 或传 None 时走默认模型（内网 vLLM），
     传了 ModelConfig 则用指定模型。
     """
-    raw = request.runtime.context.get("model_config")
+    ctx = request.runtime.context
+    raw = ctx.get("model_config") if ctx else None
     if raw is None:
         return await handler(request)
 
