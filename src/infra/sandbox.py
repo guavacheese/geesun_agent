@@ -25,8 +25,15 @@ def create_sandbox(thread_id: str):
             ssl_cert=str(ca_path),
         )
 
-        # 快速验证沙箱是否真的可用
+        # 沙箱内配置 pip 国内镜像源（清华优先 + PyPI 官方兜底）
         if hasattr(sandbox, "_sandbox") and sandbox._sandbox is not None:
+            try:
+                sandbox.execute(
+                    "pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple "
+                    "&& pip config set global.extra-index-url https://pypi.org/simple"
+                )
+            except Exception:
+                pass  # pip 配置非关键，失败不影响沙箱使用
             return sandbox
         return None
     except Exception as e:

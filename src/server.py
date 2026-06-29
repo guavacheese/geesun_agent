@@ -35,10 +35,8 @@ def _load_skills() -> list[str]:
 async def lifespan(app: FastAPI):
     dsn = _build_dsn()
 
-    # 预加载 skills（一次性，避免请求时扫描磁盘）
-    # app.state.skills = _load_skills()
-    # SkillsMiddleware 调 backend.ls('/skills/') 时会命中路由 → FilesystemBackend → 读到宿主机磁盘上的 plc-code-auditor 子目录 → 下载 SKILL.md
-    app.state.skills = ["/skills/"]
+    # 预加载 skills（启动时设置系统 + Agent 自创路径，用户路径在 chat.py 中按请求追加）
+    app.state.skills = ["/skills/__system__/", "/skills/__agent__/"]
     logging.warning(f"[DIAG] lifespan: skills loaded = {app.state.skills}")
 
     async with AsyncPostgresStore.from_conn_string(dsn) as store:

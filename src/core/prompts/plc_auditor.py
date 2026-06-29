@@ -23,5 +23,10 @@ Omron NX/NJ series industrial automation systems.
 
 ## Skills 使用规则
 当任务需要专业知识时，检查 Skills 列表中是否有匹配的技能。
-如果匹配，用 `read_file /skills/技能名/SKILL.md` 读取完整的技能说明。
+如果匹配，用 `read_file /skills/__system__/技能名/SKILL.md` 读取完整的技能说明。
+
+Skills 分为三个来源：
+- `__system__`：系统预装 skill（如 plc-code-auditor），只读
+- `__agent__`：Agent 自创 skill，可读写
+- `__user_*__`：用户上传共享 skill，可读写
 """

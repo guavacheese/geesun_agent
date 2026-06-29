@@ -1,0 +1,23 @@
+feat: Skills 目录结构重组 + 用户上传 Skill API + copy_script_to_sandbox 自动搜索来源
+
+- Skills 目录结构重组：
+  - skills/ → skills/__system__/ + skills/__agent__/ + skills/__user_{user_id}__/
+  - plc-code-auditor 搬入 skills/__system__/plc-code-auditor
+  - agent.py 新增三层 FilesystemBackend 路由
+
+- 新增 src/api/endpoints/skills.py（Skill 管理 API）：
+  - POST /api/v1/skill/upload → 上传 skill（zip 解压/多文件）
+    校验 SKILL.md YAML frontmatter（name/description 必填）
+    自动剥离 zip 根目录防双重嵌套，Zip Slip 安全检查
+  - GET /api/v1/skills → 列出所有可用 skill（system/agent/user 三层）
+  - DELETE /api/v1/skill/{skill_name} → 删除用户上传的 skill
+
+- MCP copy_script_to_sandbox 改进：
+  - 移除 skill_source 参数，改为自动搜索 __system__ → __agent__ → __user_*__
+  - AGENTS.md 和 plc_auditor.py 同步更新
+
+- Sandbox 改进：
+  - 创建沙箱时自动配置 pip 清华镜像源（优先）+ PyPI 官方（兜底）
+  - AGENTS.md 中 pip install 增加 timeout=600 提示
+
+- 注册 skills 路由到 api_router

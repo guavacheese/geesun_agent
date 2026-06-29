@@ -19,3 +19,4 @@ sheet_io*
 checkpoints.db
 *.json
 *.md
+*.zip
