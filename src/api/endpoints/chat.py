@@ -214,9 +214,14 @@ async def chat(
                     role = getattr(msg, "type", "unknown")
                     if role == "human":
                         role = "user"
+                    content = str(msg.content)[:2000] if msg.content else ""
+                    # 去掉 user 消息中的 path_hint 前缀
+                    if role == "user" and "\n\n" in content:
+                        parts = content.rsplit("\n\n", 1)
+                        content = parts[-1].strip() if len(parts) > 1 else parts[0].strip()
                     entry = {
                         "role": role,
-                        "content": str(msg.content)[:2000] if msg.content else "",
+                        "content": content,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }
                     # AI 消息附带 tool_calls 信息
