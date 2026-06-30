@@ -14,11 +14,13 @@ dependencies = [
     "langchain-openai>=1.2.1",
     "langgraph-checkpoint-postgres>=3.1.0",
     "langgraph-checkpoint-sqlite>=3.0.3",
+    "ldap3>=2.9.1",
     "openai>=2.32.0",
     "openpyxl>=3.1.5",
     "pandas>=3.0.2",
     "psycopg[binary]>=3.3.4",
     "pydantic-settings>=2.14.0",
+    "pyjwt>=2.12.1",
     "python-dotenv>=1.2.2",
     "uvicorn[standard]>=0.46.0",
 ]

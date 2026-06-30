@@ -32,6 +32,9 @@ uv add "psycopg[binary]"
 uv add grandalf
 uv add fastapi "uvicorn[standard]" pydantic-settings
 
+# LDAP
+uv add ldap3 pyjwt
+
 uv sync
 ```
 

@@ -5,15 +5,16 @@ from pydantic import BaseModel
 from src.infra.sandbox import create_sandbox
 from src.services.agent import create_agent
 from src.core.mcp import get_mcp_tools
-from src.api.deps import get_store, get_checkpointer
+from src.api.deps import get_store, get_checkpointer, get_current_user
 from src.core.config import settings
 
 
 class ChatRequest(BaseModel):
-    user_id: str = "default-user"
     session_id: str = "default-session"
     message: str
-    model_override: dict | None = None  # 可选，动态切换模型：{"model_name": "...", "base_url": "...", "api_key": "..."}
+    model_override: dict | None = (
+        None  # 可选，动态切换模型：{"model_name": "...", "base_url": "...", "api_key": "..."}
+    )
 
 
 router = APIRouter()
@@ -25,8 +26,9 @@ async def chat(
     body: ChatRequest,  # ← FastAPI 自动解析 JSON
     store=Depends(get_store),
     checkpointer=Depends(get_checkpointer),
+    current_user: dict = Depends(get_current_user),  # 从 JWT 取当前用户
 ):
-    user_id = body.user_id
+    user_id = current_user["user_id"]
     session_id = body.session_id
     thread_id = f"{user_id}:{session_id}"
 
@@ -37,7 +39,7 @@ async def chat(
     user_skill_path = f"/skills/__user_{user_id}__/"
     skills = list(base_skills) + [user_skill_path]
     agent = await create_agent(
-        user_id=body.user_id,
+        user_id=user_id,
         session_id=body.session_id,
         thread_id=thread_id,
         store=store,
@@ -56,6 +58,7 @@ async def chat(
 
     path_hint = (
         f"沙箱 ID：{sandbox_id}\n"
+        f"当前用户：{current_user.get('display_name', user_id)}（{current_user.get('role', 'user')}）\n"
         f"\n"
         f"【当前会话路径】\n"
         f"输入文件：/uploads/{user_id}/{session_id}/\n"
@@ -63,8 +66,8 @@ async def chat(
     )
 
     async def event_stream():
-        # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
         invoke_kwargs = {}
+        # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
         if body.model_override:
             invoke_kwargs["context"] = {"model_config": body.model_override}
 
