@@ -61,7 +61,6 @@ copy_script_to_sandbox(
     sandbox_id="<沙箱ID>",
     skill_name="<技能名>"
 )   # 自动搜索 __system__ → __agent__ → __user_*__，无需指定来源
-)
 
 # 然后安装依赖并执行
 # 安装依赖（沙箱下载包速度一般，设置 timeout=600 最多等10分钟）

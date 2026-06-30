@@ -1,22 +1,44 @@
 @host = http://localhost:8009
+@username = GY24428
+@password = ddd2025
 
+
+### ─── 登录获取 Token ───
+# @name login
+POST {{host}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "username": "{{username}}",
+  "password": "{{password}}"
+}
+
+
+### 列出用户（管理员）
+# @name admin_users
+GET {{host}}/api/v1/admin/users?search=
+Authorization: Bearer {{login.response.body.access_token}}
+
+
+### ─── 聊天 ───
 
 ### 第一轮：打招呼
 POST {{host}}/api/v1/chat
 Content-Type: application/json
+Authorization: Bearer {{login.response.body.access_token}}
 
 {
-  "user_id": "test-user",
   "session_id": "1001",
-  "message": "用 ls 列出 /data/uploads/test-user/1001/ 里的文件"
+  "message": "用 ls 列出 /uploads/{{username}}/1001/ 里的文件"
 }
 
-### 第二轮：追问（多轮对话）
+
+### 第二轮：追问（多轮对话，同一个 session_id）
 POST {{host}}/api/v1/chat
 Content-Type: application/json
+Authorization: Bearer {{login.response.body.access_token}}
 
 {
-  "user_id": "test-user",
   "session_id": "1001",
   "message": "刚才列出的文件里，找一个toml文件打开看看",
   "model_override": {
@@ -26,9 +48,57 @@ Content-Type: application/json
   }
 }
 
-### 上传多个文件-xml和xlsx
+
+### PLC 代码审查
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+Authorization: Bearer {{login.response.body.access_token}}
+
+{
+  "session_id": "1001",
+  "message": "根据PLC代码审查skill在当前workspace输出分析报告，并把用户的偏好'使用中文交流'写入 memories 目录"
+}
+
+
+### 创建天气 Skill
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+Authorization: Bearer {{login.response.body.access_token}}
+
+{
+  "session_id": "create-weather-skill",
+  "message": "编写一个查下某个城市当天天气的skill，方便后续复用"
+}
+
+
+### 查询天气
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+Authorization: Bearer {{login.response.body.access_token}}
+
+{
+  "session_id": "create-weather-skill",
+  "message": "查下下深圳今天的天气"
+}
+
+
+### 测试 Python 脚本
+POST {{host}}/api/v1/chat
+Content-Type: application/json
+Authorization: Bearer {{login.response.body.access_token}}
+
+{
+  "session_id": "123",
+  "message": "写个python脚本，测试下1+100等于多少"
+}
+
+
+### ─── 文件上传 ───
+
+### 上传输入文件（xml 和 xlsx）
 POST {{host}}/api/v1/upload
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+Authorization: Bearer {{login.response.body.access_token}}
 
 ------WebKitFormBoundary
 Content-Disposition: form-data; name="files"; filename="78b44bcc.xml"
@@ -53,7 +123,7 @@ Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 ------WebKitFormBoundary
 Content-Disposition: form-data; name="user_id"
 
-test-user
+{{username}}
 ------WebKitFormBoundary
 Content-Disposition: form-data; name="session_id"
 
@@ -61,7 +131,9 @@ Content-Disposition: form-data; name="session_id"
 ------WebKitFormBoundary--
 
 
-### 上传skill zip包
+### ─── Skill 管理 ───
+
+### 上传 skill zip 包
 POST {{host}}/api/v1/skill/upload
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
 
@@ -77,74 +149,13 @@ plc-code-auditor
 ------WebKitFormBoundary
 Content-Disposition: form-data; name="user_id"
 
-test-user
+{{username}}
 ------WebKitFormBoundary--
 
-### 删除skill 
-DELETE {{host}}/api/v1/skill/plc-code-auditor?user_id=test-user
 
-### 第二轮：追问（多轮对话）
-POST {{host}}/api/v1/chat
-Content-Type: application/json
-
-{
-  "user_id": "test-user",
-  "session_id": "1001",
-  "message": "根据PLC代码审查skill在当前workspace输出分析报告，并把用户的偏好'使用中文交流'写入 memories 目录"
-}
+### 删除 skill
+DELETE {{host}}/api/v1/skill/{{username}}/plc-code-auditor
 
 
-
-### 让Agent下一个查下当天某个城市的天气预报的skill
-POST {{host}}/api/v1/chat
-Content-Type: application/json
-
-{
-  "user_id": "test-user",
-  "session_id": "create-weather-skill",
-  "message": "编写一个查下某个城市当天天气的skill，方便后续复用"
-}
-
-### 让Agent下一个查下当天某个城市的天气预报的skill
-POST {{host}}/api/v1/chat
-Content-Type: application/json
-
-{
-  "user_id": "test-user",
-  "session_id": "create-weather-skill",
-  "message": "查下下深圳今天的天气"
-}
-
-
-
-### 第二轮：追问（多轮对话）
-POST {{host}}/api/v1/chat
-Content-Type: application/json
-
-{
-  "user_id": "test-user",
-  "session_id": "123",
-  "message": "写个python脚本，测试下1+100等于多少"
-}
-
-### 第二轮：追问（多轮对话）
-POST {{host}}/api/v1/chat
-Content-Type: application/json
-
-{
-  "user_id": "test-user",
-  "session_id": "123",
-  "message": "你写了一堆test_add5.py这种脚本为啥不运行？还是运行不了？告诉我原因，为啥一直在写这种脚本？"
-}
-
-
-
-### 第二轮：追问（多轮对话）
-POST {{host}}/api/v1/chat
-Content-Type: application/json
-
-{
-  "user_id": "test-user",
-  "session_id": "1001",
-  "message": "我之前要求过你做什么？"
-}
+### 列出所有 skill
+GET {{host}}/api/v1/skills?user_id={{username}}

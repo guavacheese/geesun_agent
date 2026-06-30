@@ -21,6 +21,19 @@ class Settings(BaseSettings):
     postgres_user: str = "postgres"
     postgres_password: str = ""
 
+    # LDAP / AD 配置
+    ldap_server: str = "ldap://192.168.1.241:389"
+    ldap_base_dn: str = "DC=geesun,DC=li"
+    ldap_bind_user: str = "geesunai"
+    ldap_bind_password: str = ""
+    ldap_domain_format: str = "%s@geesun.li"  # 用于构造 UPN：username@geesun.li
+    ldap_admin_group_dn: str = "CN=geesun-admins,CN=Users,DC=geesun,DC=li"
+
+    # JWT 配置
+    jwt_secret: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_expire_hours: int = 24 * 7
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
