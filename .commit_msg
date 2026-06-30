@@ -1,16 +1,17 @@
-feat: 支持运行时动态切换模型（通过 model_override 字段）
+feat: AD/LDAP 用户认证 + JWT 登录 + 动态模型切换
 
-- 新增 src/core/model.py:
-  - ModelConfig dataclass（model_name/base_url/api_key）
-  - switch_model middleware（@wrap_model_call async）
-  - 从 runtime context 读取模型配置，动态切换 ChatOpenAI 实例
+- 新增 LDAP/AD 域用户认证：
+  src/core/auth.py（LDAP 用户验证/列表搜索/JWT 签发验证）
+  src/api/endpoints/auth.py（POST /auth/login + GET /admin/users）
+  src/api/deps.py（get_current_user JWT 校验依赖）
+  chat.py 移除请求体 user_id，从 JWT 提取
 
-- 修改 src/api/endpoints/chat.py:
-  - ChatRequest 新增可选 model_override 字段
-  - astream() 传 context 给 switch_model middleware
+- 配置更新：
+  .env/pyproject.toml/uv.lock：新增 ldap3/pyjwt 依赖及配置项
+  config.py：新增 LDAP/JWT 配置
 
-- 修改 src/services/agent.py:
-  - 导入 switch_model，挂载到 create_deep_agent middleware
+- 动态模型切换完善：
+  switch_model 支持 context=None 默认走内网模型
+  expires_in 与配置同步
 
-client 不传 model_override 走默认模型（内网 vLLM），
-传了则动态切换（支持 Kimi/GLM/vLLM 等 OpenAI 兼容 API）
+- api.http 重写：新增登录用例，统一 Bearer Token
