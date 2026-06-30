@@ -76,10 +76,10 @@ async def chat(
         if body.model_override:
             invoke_kwargs["context"] = {"model_config": body.model_override}
 
-        # 追踪当前模型调用 ID，用于识别新一次 LLM 调用
-        current_run_id = None
         # 标记当前是否刚发出过 thinking 事件
         thinking_emitted = False
+        # [DEBUG] 记录上一个 langgraph_step，避免逐 token 重复打印
+        _last_debug_step = None
 
         async for mode, data in agent.astream(
             {"messages": [{"role": "user", "content": f"{path_hint}\n{body.message}"}]},
@@ -94,12 +94,18 @@ async def chat(
                 mode == "messages"
             ):  # mode == "messages" 时，data 是 (AIMessageChunk, metadata) 的元组
                 token, metadata = data
-                run_id = metadata.get("run_id") if metadata else None
-
-                # 检测到新一次 LLM 调用 → 发出 thinking 状态
-                if run_id and run_id != current_run_id:
-                    current_run_id = run_id
-                    thinking_emitted = False
+                # 用 langgraph_step 变化检测"新一次 LLM 调用"，替代不存在的 run_id
+                if metadata:
+                    step = metadata.get("langgraph_step")
+                    if step is not None and step != _last_debug_step:
+                        _last_debug_step = step
+                        thinking_emitted = False  # 新 step → 重置 thinking 标记
+                        logger.warning(
+                            "[DIAG] new messages stream: step=%s, node=%s, metadata keys=%s",
+                            step,
+                            metadata.get("langgraph_node"),
+                            list(metadata.keys()),
+                        )
 
                 # 第一条 token 时发出 thinking（避免空 thinking 事件）
                 content = token.content if hasattr(token, "content") else ""
