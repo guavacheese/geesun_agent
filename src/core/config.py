@@ -1,3 +1,6 @@
+# 日志配置必须在任何其他导入之前就绪，否则 logger.warning 会丢失时间戳
+from src.core.logging import *  # noqa: F401,F403
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -41,7 +44,11 @@ class Settings(BaseSettings):
     )
 
 
-print(type(Settings.model_config))
-print(Settings.model_config.get("env_file"))  # 应该输出 .env
+import logging
+
+logger = logging.getLogger(__name__)
+
+logger.warning("[DIAG] Settings.model_config type: %s", type(Settings.model_config))
+logger.warning("[DIAG] env_file: %s", Settings.model_config.get("env_file"))
 
 settings = Settings()

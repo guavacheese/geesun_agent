@@ -1,3 +1,7 @@
+"""FastAPI 应用入口 — 日志配置由 src/core/logging.py 统一管理。"""
+
+from src.core.logging import *  # noqa: F401,F403 — 日志最早就绪
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -9,12 +13,6 @@ from .infra.database import _build_dsn
 from src.core.config import settings
 import os
 import logging
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
 
 
 def _load_skills() -> list[str]:
@@ -43,7 +41,6 @@ async def lifespan(app: FastAPI):
         await store.setup()
 
         # 种子 AGENTS.md 到 store（供 memory= 参数通过 StoreBackend 读取）
-        # 注意：CompositeBackend 剥离路由前缀后保留前导斜杠，所以 key 是 "/AGENTS.md" 而非 "AGENTS.md"
         agents_md_key = "/AGENTS.md"
         if await store.aget(("__agent__",), agents_md_key) is None:
             with open("AGENTS.md", "r", encoding="utf-8") as f:
