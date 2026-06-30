@@ -1,6 +1,6 @@
 @host = http://localhost:8009
 @username = GY24428
-@password = ddd2025
+@password = Php_2025
 
 
 ### ─── 登录获取 Token ───
@@ -159,3 +159,12 @@ DELETE {{host}}/api/v1/skill/{{username}}/plc-code-auditor
 
 ### 列出所有 skill
 GET {{host}}/api/v1/skills?user_id={{username}}
+
+
+### 列会话
+GET {{host}}/api/v1/sessions
+Authorization: Bearer {{login.response.body.access_token}}
+
+### 获取某会话消息
+GET {{host}}/api/v1/sessions/1001/messages
+Authorization: Bearer {{login.response.body.access_token}}
