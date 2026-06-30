@@ -60,8 +60,12 @@ async def list_sessions(
         # 每个 session 存为 key = session_id
         # 通过维护一个 index key 来记录所有 session_id
         index_key = "__index__"
-        index_item = await store.aget(namespace, index_key)
-        session_ids = index_item.value if index_item else []
+        try:
+            index_item = await store.aget(namespace, index_key)
+            idx_data = index_item.value if index_item else {}
+            session_ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
+        except Exception:
+            session_ids = []
     except Exception:
         session_ids = []
 
@@ -195,7 +199,8 @@ async def get_session_messages(
 
     try:
         item = await store.aget(msg_namespace, "messages")
-        messages = item.value if item else []
+        msg_data = item.value if item else {}
+        messages = msg_data.get("items", []) if isinstance(msg_data, dict) else []
     except Exception:
         messages = []
 
@@ -208,11 +213,17 @@ async def get_session_messages(
 async def _update_session_index(
     store, namespace: tuple, session_id: str, add: bool
 ):
-    """维护 session_id 索引列表。"""
+    """维护 session_id 索引列表。
+    
+    注意：__index__ 必须以 dict 存储（{"items": [...]}），
+    因为 LangGraph PostgresStore 的 _row_to_item 对非 dict 值
+    会调用 json.loads()，导致列表类型报错。
+    """
     index_key = "__index__"
     try:
         item = await store.aget(namespace, index_key)
-        ids = list(item.value) if item else []
+        idx_data = item.value if item else {}
+        ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
     except Exception:
         ids = []
 
@@ -221,4 +232,4 @@ async def _update_session_index(
     elif not add and session_id in ids:
         ids.remove(session_id)
 
-    await store.aput(namespace, index_key, ids)
+    await store.aput(namespace, index_key, {"items": ids})

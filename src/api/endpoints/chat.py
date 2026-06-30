@@ -201,12 +201,12 @@ async def chat(
                     "configurable": {"thread_id": thread_id},
                 }
             )
-            logger.info("[DIAG] SSE 结束, state=%s, has_values=%s",
+            logging.warning("[DIAG] SSE 结束, state=%s, has_values=%s",
                         type(state).__name__ if state else None,
                         hasattr(state, "values") if state else False)
             if state and hasattr(state, "values"):
                 all_msgs = state.values.get("messages", [])
-                logger.info("[DIAG] 消息数=%d, 用户=%s, 会话=%s", len(all_msgs), user_id, session_id)
+                logger.warning("[DIAG] 消息数=%d, 用户=%s, 会话=%s", len(all_msgs), user_id, session_id)
                 all_msgs = state.values.get("messages", [])
                 # 提取人类可读的消息（只保留 user / assistant / tool 角色的核心信息）
                 history = []
@@ -227,29 +227,25 @@ async def chat(
                         ]
                     history.append(entry)
 
-                # 存入 store
+                # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
                 msg_namespace = ("messages", user_id, session_id)
-                await store.aput(msg_namespace, "messages", history)
+                await store.aput(msg_namespace, "messages", {"items": history})
 
                 # 更新会话元数据（标题、消息数、时间）
                 session_ns = ("sessions", user_id)
                 item = await store.aget(session_ns, session_id)
                 now_ts = datetime.now(timezone.utc).isoformat()
 
-                # 用第一条用户消息作为默认标题
-                first_user_msg = next(
-                    (m["content"][:50] for m in history if m["role"] == "user"),
-                    None,
-                )
-                title = (
-                    first_user_msg + ("..." if first_user_msg and len(first_user_msg) >= 50 else "")
-                ) if first_user_msg else "新会话"
+                # 用用户实际输入作为默认标题
+                title = body.message[:50] + ("..." if len(body.message) >= 50 else "") if body.message else "新会话"
 
                 if item is not None:
                     data = item.value
                     data["message_count"] = len(history)
                     data["updated_at"] = now_ts
-                    if data.get("title", "新会话") == "新会话" and title:
+                    old_title = data.get("title", "")
+                    # 覆盖旧的 path_hint 标题，或首次设置标题
+                    if old_title.startswith("沙箱 ID") or old_title == "新会话" or not old_title:
                         data["title"] = title
                 else:
                     # 会话不存在则创建（兼容直接调 /chat 而非 POST /sessions 的场景）
@@ -259,19 +255,27 @@ async def chat(
                         "updated_at": now_ts,
                         "message_count": len(history),
                     }
-                    # 添加到 session 索引
-                    try:
-                        idx_item = await store.aget(session_ns, "__index__")
-                        ids = list(idx_item.value) if idx_item else []
-                        logger.info("[DIAG] 索引当前=%s", ids)
-                        if session_id not in ids:
-                            ids.append(session_id)
-                        await store.aput(session_ns, "__index__", ids)
-                        logger.info("[DIAG] 索引更新后=%s, 存入key=%s", ids, session_id)
-                    except Exception as e:
-                        logger.warning("[DIAG] 索引更新失败: %s", e)
+
+                # 确保会话在索引中（新增或已有都要维护）
+                # 注意：__index__ 必须以 dict 存储（{"items": [...]}），
+                # 因为 LangGraph PostgresStore 的 _row_to_item 对非 dict 值
+                # 会调用 json.loads()，导致列表类型报错
+                try:
+                    idx_item = await store.aget(session_ns, "__index__")
+                    idx_data = idx_item.value if idx_item else {}
+                    ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
+                except Exception as e:
+                    logger.warning("[DIAG] 索引读取失败，重新初始化: %s", e)
+                    ids = []
+                try:
+                    if session_id not in ids:
+                        ids.append(session_id)
+                    await store.aput(session_ns, "__index__", {"items": ids})
+                except Exception as e:
+                    logger.warning("[DIAG] 索引更新失败: %s", e)
 
                 await store.aput(session_ns, session_id, data)
+                logger.warning("[DIAG] 会话保存完成: user=%s, session=%s, msgs=%d", user_id, session_id, len(history))
         except Exception as e:
             logger.warning("保存会话消息失败（非关键错误）: %s", e)
 
