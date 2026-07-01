@@ -81,8 +81,8 @@ async def list_sessions(
         except Exception:
             continue
 
-    # 按 updated_at 倒序
-    sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+    # pinned 优先，再按 updated_at 倒序
+    sessions.sort(key=lambda s: (not s.get("pinned", False), s.get("updated_at", "")), reverse=False)
     return {"sessions": sessions}
 
 
@@ -148,6 +148,56 @@ async def update_session(
 
     await store.aput(namespace, session_id, data)
 
+    return {"session_id": session_id, **data}
+
+
+# ─── Pin / Unpin ───
+
+
+class PinRequest(BaseModel):
+    pinned: bool
+
+
+@router.patch("/sessions/{session_id}/pin")
+async def pin_session(
+    session_id: str,
+    store=Depends(get_store),
+    current_user: dict = Depends(get_current_user),
+):
+    """Pin 会话。"""
+    user_id = current_user["user_id"]
+    namespace = _session_namespace(user_id)
+
+    item = await store.aget(namespace, session_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    data = item.value
+    data["pinned"] = True
+    data["pinned_at"] = _now()
+
+    await store.aput(namespace, session_id, data)
+    return {"session_id": session_id, **data}
+
+
+@router.patch("/sessions/{session_id}/unpin")
+async def unpin_session(
+    session_id: str,
+    store=Depends(get_store),
+    current_user: dict = Depends(get_current_user),
+):
+    """Unpin 会话。"""
+    user_id = current_user["user_id"]
+    namespace = _session_namespace(user_id)
+
+    item = await store.aget(namespace, session_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    data = item.value
+    data["pinned"] = False
+
+    await store.aput(namespace, session_id, data)
     return {"session_id": session_id, **data}
 
 
