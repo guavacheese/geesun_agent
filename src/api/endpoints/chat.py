@@ -166,6 +166,7 @@ async def chat(
                     elif node_name == "tools" and hasattr(last_msg, "name"):
                         # 工具执行结果
                         tool_name = last_msg.name
+                        tool_call_id = getattr(last_msg, "tool_call_id", None)
                         content_str = str(last_msg.content) if last_msg.content else ""
                         is_error = (
                             any(
@@ -190,6 +191,7 @@ async def chat(
                                 {
                                     'type': 'tool_result',
                                     'tool': tool_name,
+                                    'id': tool_call_id,
                                     'success': not is_error,
                                     'error': content_str[:500] if is_error else None,
                                 },
@@ -226,6 +228,7 @@ async def chat(
                         parts = content.rsplit("\n\n", 1)
                         content = parts[-1].strip() if len(parts) > 1 else parts[0].strip()
                     entry = {
+                        "id": getattr(msg, "id", None),
                         "role": role,
                         "content": content,
                         "created_at": datetime.now(timezone.utc).isoformat(),
