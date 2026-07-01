@@ -4,6 +4,7 @@ from src.core.logging import *  # noqa: F401,F403 — 日志最早就绪
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from .api.router import api_router
@@ -67,4 +68,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Geesun Agent", lifespan=lifespan)
+
+# CORS：开发阶段允许前端 localhost:3000 跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(api_router)
