@@ -259,7 +259,7 @@ async def chat(
                     data["updated_at"] = now_ts
                     old_title = data.get("title", "")
                     # 覆盖旧的 path_hint 标题，或首次设置标题
-                    if old_title.startswith("沙箱 ID") or old_title == "新会话" or not old_title:
+                    if old_title.startswith("沙箱 ID") or old_title in ("新会话", "新对话") or not old_title:
                         data["title"] = title
                 else:
                     # 会话不存在则创建（兼容直接调 /chat 而非 POST /sessions 的场景）
