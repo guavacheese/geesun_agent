@@ -1,17 +1,5 @@
-feat: AD/LDAP 用户认证 + JWT 登录 + 动态模型切换
+fix: CORS & PostgreSQL keepalive for frontend dev and long-running stability
 
-- 新增 LDAP/AD 域用户认证：
-  src/core/auth.py（LDAP 用户验证/列表搜索/JWT 签发验证）
-  src/api/endpoints/auth.py（POST /auth/login + GET /admin/users）
-  src/api/deps.py（get_current_user JWT 校验依赖）
-  chat.py 移除请求体 user_id，从 JWT 提取
-
-- 配置更新：
-  .env/pyproject.toml/uv.lock：新增 ldap3/pyjwt 依赖及配置项
-  config.py：新增 LDAP/JWT 配置
-
-- 动态模型切换完善：
-  switch_model 支持 context=None 默认走内网模型
-  expires_in 与配置同步
-
-- api.http 重写：新增登录用例，统一 Bearer Token
+- src/server.py: add CORSMiddleware, allow localhost:3000 cross-origin requests
+- src/infra/database.py: add TCP keepalive params to DSN (keepalives_idle=60s)
+  to prevent PostgreSQL dropping idle connections after extended inactivity
