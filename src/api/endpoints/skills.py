@@ -106,6 +106,33 @@ async def upload_skill(
         content = await files[0].read()
         if _is_zip(content):
             return await _handle_zip_upload(content, target_dir, skill_name, user_id)
+        # 非 zip：直接写单文件，避免二次 read + seek 失效
+        os.makedirs(target_dir, exist_ok=True)
+        filename = files[0].filename or "unnamed"
+        if ".." in filename or filename.startswith("/"):
+            raise HTTPException(status_code=400, detail=f"非法路径: {filename}")
+        # 如果是 SKILL.md，先校验
+        if filename.lower() == "skill.md":
+            validation = _validate_skill_md(content.decode("utf-8"))
+            if not validation["valid"]:
+                raise HTTPException(status_code=400, detail=f"SKILL.md 校验失败: {validation['error']}")
+            if validation["name"] != skill_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"skill_name 参数与 SKILL.md 中的 name 不一致",
+                )
+        file_path = os.path.normpath(f"{target_dir}/{filename}")
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "wb") as fh:
+            fh.write(content)
+        return {
+            "success": True,
+            "skill_name": skill_name,
+            "description": validation.get("description", "") if filename.lower() == "skill.md" else "",
+            "virtual_path": f"/skills/__user_{user_id}__/{skill_name}/",
+            "files": [filename],
+            "files_count": 1,
+        }
 
     # 多个文件或单个非 zip → 逐个写入
     return await _handle_multi_file_upload(files, target_dir, skill_name, user_id)
@@ -307,3 +334,105 @@ async def delete_skill(
         return {"success": True, "skill_name": skill_name, "deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
+
+
+# ─── 浏览 skill 内的文件列表 ───
+
+@router.get("/skill/{skill_name}/files")
+async def list_skill_files(
+    skill_name: str,
+    user_id: str = Query(..., description="当前用户 ID"),
+    source: str = Query("user", description="skill 来源: system / agent / user"),
+):
+    """
+    列出指定 skill 目录下的所有文件（含子目录结构，相对路径）。
+    """
+    source_map = {
+        "system": f"{settings.agent_workspace}/skills/__system__",
+        "agent": f"{settings.agent_workspace}/skills/__agent__",
+        "user": _user_skill_root(user_id),
+    }
+    root_dir = source_map.get(source)
+    if not root_dir:
+        raise HTTPException(status_code=400, detail=f"无效的 source: {source}")
+
+    skill_dir = os.path.join(root_dir, skill_name)
+    if not os.path.isdir(skill_dir):
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' 不存在")
+
+    files = []
+    for dirpath, _, filenames in os.walk(skill_dir):
+        for f in filenames:
+            abs_path = os.path.join(dirpath, f)
+            rel_path = os.path.relpath(abs_path, skill_dir).replace("\\", "/")
+            file_size = os.path.getsize(abs_path)
+            files.append({
+                "path": rel_path,
+                "size": file_size,
+            })
+
+    files.sort(key=lambda x: x["path"])
+    return {
+        "skill_name": skill_name,
+        "source": source,
+        "files": files,
+        "count": len(files),
+    }
+
+
+# ─── 读取 skill 内单个文件内容 ───
+
+@router.get("/skill/{skill_name}/file")
+async def read_skill_file(
+    skill_name: str,
+    user_id: str = Query(..., description="当前用户 ID"),
+    source: str = Query("user", description="skill 来源: system / agent / user"),
+    path: str = Query(..., description="文件相对路径，如 SKILL.md 或 scripts/tool.py"),
+):
+    """
+    读取 skill 内单个文本文件的内容。
+    只返回文本文件（.md / .py / .txt / .json / .yaml / .yml / .sh），禁止读取二进制。
+    """
+    source_map = {
+        "system": f"{settings.agent_workspace}/skills/__system__",
+        "agent": f"{settings.agent_workspace}/skills/__agent__",
+        "user": _user_skill_root(user_id),
+    }
+    root_dir = source_map.get(source)
+    if not root_dir:
+        raise HTTPException(status_code=400, detail=f"无效的 source: {source}")
+
+    # 安全检查
+    if ".." in path or path.startswith("/"):
+        raise HTTPException(status_code=400, detail=f"非法路径: {path}")
+
+    file_path = os.path.normpath(os.path.join(root_dir, skill_name, path))
+    if not file_path.startswith(os.path.normpath(root_dir)):
+        raise HTTPException(status_code=400, detail=f"非法路径: {path}")
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+
+    # 只允许文本文件
+    ext = os.path.splitext(path)[1].lower()
+    allowed_exts = {".md", ".py", ".txt", ".json", ".yaml", ".yml", ".sh", ".js", ".ts", ".css", ".html"}
+    if ext not in allowed_exts:
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+
+    # 限制 200KB
+    if os.path.getsize(file_path) > 200 * 1024:
+        raise HTTPException(status_code=400, detail="文件过大（超过 200KB）")
+
+    try:
+        file_size = os.path.getsize(file_path)
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        logger.info("读取 skill 文件: %s (%d bytes, %d chars)", file_path, file_size, len(content))
+        return {
+            "skill_name": skill_name,
+            "path": path,
+            "content": content,
+            "size": file_size,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取文件失败: {str(e)}")
