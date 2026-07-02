@@ -16,11 +16,12 @@ logger = logging.getLogger(__name__)
 
 class ChatRequest(BaseModel):
     session_id: str = "default-session"
-    message: str
+    message: str = ""
     model_override: dict | None = (
         None  # 可选，动态切换模型：{"model_name": "...", "base_url": "...", "api_key": "..."}
     )
     files: list[str] | None = None  # 可选，本轮上传的文件虚拟路径列表
+    continue_from_state: bool = False  # 为 true 时不新增用户消息，直接从当前 checkpoint 继续生成
 
 
 router = APIRouter()
@@ -79,6 +80,9 @@ async def chat(
 
     user_message = f"{path_hint}\n{body.message}{file_hint}"
 
+    # 构造 graph 输入：正常发送新增用户消息；编辑后重发则从当前 checkpoint 继续
+    graph_input = None if body.continue_from_state else {"messages": [{"role": "user", "content": user_message}]}
+
     async def event_stream():
         invoke_kwargs = {}
         # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
@@ -91,7 +95,7 @@ async def chat(
         _last_debug_step = None
 
         async for mode, data in agent.astream(
-            {"messages": [{"role": "user", "content": user_message}]},
+            graph_input,
             config={
                 "configurable": {"thread_id": thread_id},
                 "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
