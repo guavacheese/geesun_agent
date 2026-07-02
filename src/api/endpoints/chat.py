@@ -80,11 +80,31 @@ async def chat(
 
     user_message = f"{path_hint}\n{body.message}{file_hint}"
 
-    # 构造 graph 输入：正常发送新增用户消息；编辑后重发则读当前 state 作为输入触发续写
+    # 构造 graph 输入：
     graph_config = {"configurable": {"thread_id": thread_id}}
+
+    # - 正常发送：新增用户消息
+    # - 编辑后重发：从 PostgresStore 读取截断后的消息列表重建 graph 状态
+    from langchain_core.messages import HumanMessage, AIMessage
+
     if body.continue_from_state:
-        latest = await agent.aget_state(graph_config)
-        graph_input = latest.values if latest else None
+        try:
+            msg_namespace = ("messages", user_id, session_id)
+            item = await store.aget(msg_namespace, "messages")
+            stored = item.value if item else {"items": []}
+            stored_items = stored.get("items", []) if isinstance(stored, dict) else []
+            lc_msgs = []
+            for m in stored_items:
+                if m.get("role") == "user":
+                    lc_msgs.append(HumanMessage(content=m.get("content", "")))
+                elif m.get("role") == "ai":
+                    lc_msgs.append(AIMessage(content=m.get("content", "")))
+            graph_input = {"messages": lc_msgs}
+            logger.info("continue_from_state: 从 store 重建 %d 条消息", len(lc_msgs))
+        except Exception as e:
+            logger.warning("continue_from_state: 读取 store 失败, fallback 到 checkpoint: %s", e)
+            latest = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+            graph_input = {"messages": latest.values.get("messages", [])} if latest else None
     else:
         graph_input = {"messages": [{"role": "user", "content": user_message}]}
 
