@@ -81,8 +81,9 @@ async def list_sessions(
         except Exception:
             continue
 
-    # pinned 优先，再按 updated_at 倒序
-    sessions.sort(key=lambda s: (not s.get("pinned", False), s.get("updated_at", "")), reverse=False)
+    # 先按更新时间倒序，再稳定排序让 pinned 置顶（同一组内保持倒序）
+    sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+    sessions.sort(key=lambda s: not s.get("pinned", False))
     return {"sessions": sessions}
 
 
