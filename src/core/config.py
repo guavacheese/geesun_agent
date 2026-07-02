@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     base_url: str
     openai_api_key: str
     model_name: str
+    extra_models: str = "[]"  # 额外模型，JSON 数组：[{"model_name":"...","base_url":"...","api_key":"..."}]
     agent_workspace: str
 
     upload_root: str = "/data/myapp/uploads"
