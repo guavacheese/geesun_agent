@@ -20,6 +20,7 @@ class ChatRequest(BaseModel):
     model_override: dict | None = (
         None  # 可选，动态切换模型：{"model_name": "...", "base_url": "...", "api_key": "..."}
     )
+    files: list[str] | None = None  # 可选，本轮上传的文件虚拟路径列表
 
 
 router = APIRouter()
@@ -70,6 +71,14 @@ async def chat(
         f"报告输出：/reports/{user_id}/{session_id}/\n"
     )
 
+    # 本轮文件提示（多轮对话时 Agent 只处理本轮上传的文件）
+    file_hint = ""
+    if body.files:
+        file_list = "\n".join(f"- {f}" for f in body.files)
+        file_hint = f"\n用户为本轮对话上传了以下文件（路径已映射到虚拟文件系统，请精确处理这些文件）：\n{file_list}"
+
+    user_message = f"{path_hint}\n{body.message}{file_hint}"
+
     async def event_stream():
         invoke_kwargs = {}
         # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
@@ -82,7 +91,7 @@ async def chat(
         _last_debug_step = None
 
         async for mode, data in agent.astream(
-            {"messages": [{"role": "user", "content": f"{path_hint}\n{body.message}"}]},
+            {"messages": [{"role": "user", "content": user_message}]},
             config={
                 "configurable": {"thread_id": thread_id},
                 "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
