@@ -80,8 +80,13 @@ async def chat(
 
     user_message = f"{path_hint}\n{body.message}{file_hint}"
 
-    # 构造 graph 输入：正常发送新增用户消息；编辑后重发则从当前 checkpoint 继续
-    graph_input = None if body.continue_from_state else {"messages": [{"role": "user", "content": user_message}]}
+    # 构造 graph 输入：正常发送新增用户消息；编辑后重发则读当前 state 作为输入触发续写
+    graph_config = {"configurable": {"thread_id": thread_id}}
+    if body.continue_from_state:
+        latest = await agent.aget_state(graph_config)
+        graph_input = latest.values if latest else None
+    else:
+        graph_input = {"messages": [{"role": "user", "content": user_message}]}
 
     async def event_stream():
         invoke_kwargs = {}
@@ -97,7 +102,7 @@ async def chat(
         async for mode, data in agent.astream(
             graph_input,
             config={
-                "configurable": {"thread_id": thread_id},
+                **graph_config,
                 "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
             },
             stream_mode=["messages", "updates"],
