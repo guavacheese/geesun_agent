@@ -5,9 +5,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from src.api.deps import get_store, get_current_user
-from src.services.agent import create_agent
-from src.infra.sandbox import create_sandbox
-from src.core.mcp import get_mcp_tools
 
 logger = logging.getLogger(__name__)
 
@@ -308,87 +305,36 @@ async def edit_session_message(
     """
     编辑会话中的某条用户消息，并删除其后的所有消息。
 
-    - from_index: 要编辑的用户消息在 messages 中的索引
-    - new_message: 编辑后的新内容
-
-    后端通过 LangGraph checkpoint 修改 state.messages：
-    1. 保留 from_index 之前的消息
-    2. 将索引 from_index 处的消息替换为新的 HumanMessage
-    3. 保存回 checkpoint，后续 /chat 即可从该状态继续流式生成
+    只更新 PostgresStore 中的消息列表（get_session_messages 从此读取）。
+    后续 /chat 的 continue_from_state 模式从存储消息重建 graph 输入，
+    避免 LangGraph add_messages reducer 将截断视为追加导致旧消息残留。
     """
     user_id = current_user["user_id"]
-    thread_id = f"{user_id}:{session_id}"
 
-    # 读取 LangGraph state
-    checkpointer = request.app.state.checkpointer
-    base_skills = getattr(request.app.state, "skills", [])
-    user_skill_path = f"/skills/__user_{user_id}__/"
-    skills = list(base_skills) + [user_skill_path]
-    tools = await get_mcp_tools()
-    sandbox = create_sandbox(thread_id)
-
-    agent = await create_agent(
-        user_id=user_id,
-        session_id=session_id,
-        thread_id=thread_id,
-        store=store,
-        sandbox=sandbox,
-        checkpointer=checkpointer,
-        tools=tools,
-        skills=skills,
-    )
-
-    config = {"configurable": {"thread_id": thread_id}}
-
-    try:
-        state = await agent.aget_state(config)
-    except Exception as e:
-        logger.error("读取 session state 失败: %s", e)
-        raise HTTPException(status_code=500, detail=f"读取会话状态失败: {str(e)}")
-
-    messages = state.values.get("messages", [])
-    if not messages:
-        raise HTTPException(status_code=404, detail="会话没有消息")
-
-    if body.from_index >= len(messages):
-        raise HTTPException(status_code=400, detail="from_index 超出消息范围")
-
-    # 截断并替换用户消息
-    new_messages = messages[: body.from_index + 1]
-    target_message = new_messages[body.from_index]
-
-    # 判断消息类型：HumanMessage 直接替换 content
-    from langchain_core.messages import HumanMessage
-
-    is_human = isinstance(target_message, HumanMessage) or getattr(target_message, "type", None) == "human"
-    if not is_human:
-        raise HTTPException(status_code=400, detail="from_index 指向的不是用户消息")
-
-    new_messages[body.from_index] = HumanMessage(content=body.new_message)
-
-    try:
-        await agent.aupdate_state(config, {"messages": new_messages})
-    except Exception as e:
-        logger.error("更新 session state 失败: %s", e)
-        raise HTTPException(status_code=500, detail=f"更新会话状态失败: {str(e)}")
-
-    # 同步更新 PostgresStore 中的消息列表（get_session_messages 从此读取）
+    # 更新 PostgresStore 中的消息列表
     msg_namespace = _messages_namespace(user_id, session_id)
     try:
         item = await store.aget(msg_namespace, "messages")
         stored = item.value if item else {"items": []}
         stored_items = stored.get("items", []) if isinstance(stored, dict) else []
-        if body.from_index < len(stored_items):
-            stored_items = stored_items[: body.from_index + 1]
-            stored_items[body.from_index] = {
-                **stored_items[body.from_index],
-                "content": body.new_message,
-                "edited": True,
-            }
-            await store.aput(msg_namespace, "messages", {"items": stored_items})
+
+        if body.from_index < 0 or body.from_index >= len(stored_items):
+            raise HTTPException(status_code=400, detail=f"from_index {body.from_index} 越界，消息总数 {len(stored_items)}")
+
+        # 截断并替换
+        stored_items = stored_items[: body.from_index + 1]
+        stored_items[body.from_index] = {
+            **stored_items[body.from_index],
+            "content": body.new_message,
+            "edited": True,
+        }
+        await store.aput(msg_namespace, "messages", {"items": stored_items})
+        logger.info("edit: truncate to index %d done, new count=%d", body.from_index, len(stored_items))
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning("同步 messages store 失败: %s", e)
-        # 不影响主流程
+        logger.warning("edit: store update failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"更新消息列表失败: {str(e)}")
 
     return {"success": True, "session_id": session_id, "from_index": body.from_index}
 
