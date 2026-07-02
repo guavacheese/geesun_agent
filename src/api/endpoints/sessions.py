@@ -317,7 +317,7 @@ async def edit_session_message(
     3. 保存回 checkpoint，后续 /chat 即可从该状态继续流式生成
     """
     user_id = current_user["user_id"]
-    thread_id = session_id
+    thread_id = f"{user_id}:{session_id}"
 
     # 读取 LangGraph state
     checkpointer = request.app.state.checkpointer
