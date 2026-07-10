@@ -121,157 +121,164 @@ async def chat(
         # [DEBUG] 记录上一个 langgraph_step，避免逐 token 重复打印
         _last_debug_step = None
 
-        async for mode, data in agent.astream(
-            graph_input,
-            config={
-                **graph_config,
-                "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
-            },
-            stream_mode=["messages", "updates"],
-            **invoke_kwargs,
-        ):
-            if (
-                mode == "messages"
-            ):  # mode == "messages" 时，data 是 (AIMessageChunk, metadata) 的元组
-                token, metadata = data
-                # 用 langgraph_step 变化检测"新一次 LLM 调用"，替代不存在的 run_id
-                if metadata:
-                    step = metadata.get("langgraph_step")
-                    if step is not None and step != _last_debug_step:
-                        _last_debug_step = step
-                        thinking_emitted = False  # 新 step → 重置 thinking 标记
-                        logger.warning(
-                            "[DIAG] new messages stream: step=%s, node=%s, metadata keys=%s",
-                            step,
-                            metadata.get("langgraph_node"),
-                            list(metadata.keys()),
+        # ─── 流式生成循环 ───
+        # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
+        try:
+            async for mode, data in agent.astream(
+                graph_input,
+                config={
+                    **graph_config,
+                    "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
+                },
+                stream_mode=["messages", "updates"],
+                **invoke_kwargs,
+            ):
+                if (
+                    mode == "messages"
+                ):  # mode == "messages" 时，data 是 (AIMessageChunk, metadata) 的元组
+                    token, metadata = data
+                    # 用 langgraph_step 变化检测"新一次 LLM 调用"，替代不存在的 run_id
+                    if metadata:
+                        step = metadata.get("langgraph_step")
+                        if step is not None and step != _last_debug_step:
+                            _last_debug_step = step
+                            thinking_emitted = False  # 新 step → 重置 thinking 标记
+                            logger.warning(
+                                "[DIAG] new messages stream: step=%s, node=%s, metadata keys=%s",
+                                step,
+                                metadata.get("langgraph_node"),
+                                list(metadata.keys()),
+                            )
+
+                    # 第一条 token 时发出 thinking（避免空 thinking 事件）
+                    content = token.content if hasattr(token, "content") else ""
+                    if content and not thinking_emitted:
+                        thinking_emitted = True
+                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+                    elif content:
+                        yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+
+                elif mode == "updates":
+                    # 根据 node 名称和输出内容解析 Agent 行为
+                    for node_name, node_output in data.items():
+                        # 跳过 middleware 节点（非 agent 关键节点）
+                        if node_name in (
+                            "SkillsMiddleware.before_agent",
+                            "PatchToolCallsMiddleware.before_agent",
+                            "MemoryMiddleware.before_agent",
+                            "HumanInTheLoopMiddleware.after_model",
+                            "TodoListMiddleware.after_model",
+                        ):
+                            continue
+
+                        messages = (
+                            node_output.get("messages")
+                            if isinstance(node_output, dict)
+                            else None
                         )
+                        if (
+                            not messages
+                            or not isinstance(messages, list)
+                            or len(messages) == 0
+                        ):
+                            continue
 
-                # 第一条 token 时发出 thinking（避免空 thinking 事件）
-                content = token.content if hasattr(token, "content") else ""
-                if content and not thinking_emitted:
-                    thinking_emitted = True
-                    yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
-                elif content:
-                    yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+                        last_msg = messages[-1]
 
-            elif mode == "updates":
-                # 根据 node 名称和输出内容解析 Agent 行为
-                for node_name, node_output in data.items():
-                    # 跳过 middleware 节点（非 agent 关键节点）
-                    if node_name in (
-                        "SkillsMiddleware.before_agent",
-                        "PatchToolCallsMiddleware.before_agent",
-                        "MemoryMiddleware.before_agent",
-                        "HumanInTheLoopMiddleware.after_model",
-                        "TodoListMiddleware.after_model",
-                    ):
-                        continue
+                        if (
+                            node_name == "model"
+                            and hasattr(last_msg, "tool_calls")
+                            and last_msg.tool_calls
+                        ):
+                            # LLM 调用了工具
+                            for tc in last_msg.tool_calls:
+                                yield f"data: {
+                                    json.dumps(
+                                        {
+                                            'type': 'tool_call',
+                                            'tool': tc['name'],
+                                            'args': tc['args'],
+                                            'id': tc['id'],
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                }\n\n"
+                            yield f"data: {json.dumps({'type': 'agent_status', 'status': 'running_tool', 'tool': last_msg.tool_calls[0]['name']}, ensure_ascii=False)}\n\n"
 
-                    messages = (
-                        node_output.get("messages")
-                        if isinstance(node_output, dict)
-                        else None
-                    )
-                    if (
-                        not messages
-                        or not isinstance(messages, list)
-                        or len(messages) == 0
-                    ):
-                        continue
+                        elif node_name == "tools" and hasattr(last_msg, "name"):
+                            # 工具执行结果
+                            tool_name = last_msg.name
+                            tool_call_id = getattr(last_msg, "tool_call_id", None)
+                            content_str = str(last_msg.content) if last_msg.content else ""
+                            is_error = (
+                                any(
+                                    kw in content_str.lower()
+                                    for kw in [
+                                        "error",
+                                        "exception",
+                                        "traceback",
+                                        "not found",
+                                        "failed",
+                                        "failure",
+                                        "timeout",
+                                        "permission denied",
+                                    ]
+                                )
+                                if content_str
+                                else False
+                            )
 
-                    last_msg = messages[-1]
-
-                    if (
-                        node_name == "model"
-                        and hasattr(last_msg, "tool_calls")
-                        and last_msg.tool_calls
-                    ):
-                        # LLM 调用了工具
-                        for tc in last_msg.tool_calls:
                             yield f"data: {
                                 json.dumps(
                                     {
-                                        'type': 'tool_call',
-                                        'tool': tc['name'],
-                                        'args': tc['args'],
-                                        'id': tc['id'],
+                                        'type': 'tool_result',
+                                        'tool': tool_name,
+                                        'id': tool_call_id,
+                                        'success': not is_error,
+                                        'error': content_str[:500] if is_error else None,
                                     },
                                     ensure_ascii=False,
                                 )
                             }\n\n"
-                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'running_tool', 'tool': last_msg.tool_calls[0]['name']}, ensure_ascii=False)}\n\n"
 
-                    elif node_name == "tools" and hasattr(last_msg, "name"):
-                        # 工具执行结果
-                        tool_name = last_msg.name
-                        tool_call_id = getattr(last_msg, "tool_call_id", None)
-                        content_str = str(last_msg.content) if last_msg.content else ""
-                        is_error = (
-                            any(
-                                kw in content_str.lower()
-                                for kw in [
-                                    "error",
-                                    "exception",
-                                    "traceback",
-                                    "not found",
-                                    "failed",
-                                    "failure",
-                                    "timeout",
-                                    "permission denied",
-                                ]
-                            )
-                            if content_str
-                            else False
-                        )
+                            # ─── 检测 write_file 类工具的结果，提取生成的文件信息 ───
+                            if not is_error and tool_name in (
+                                "write_file", "write", "create_file",
+                            ):
+                                m = re.search(r"Updated file\s+(/\S+)", content_str)
+                                if m:
+                                    file_path_virtual = m.group(1)
+                                    # 只处理 reports 路径下的 Agent 生成文件
+                                    if file_path_virtual.startswith("/reports/"):
+                                        prefix = f"/reports/{user_id}/{session_id}/"
+                                        if file_path_virtual.startswith(prefix):
+                                            filename = file_path_virtual[len(prefix):]
+                                            file_size = 0
+                                            try:
+                                                disk_path = os.path.join(
+                                                    settings.report_root, user_id, session_id, filename
+                                                )
+                                                if os.path.isfile(disk_path):
+                                                    file_size = os.path.getsize(disk_path)
+                                            except Exception:
+                                                pass
 
-                        yield f"data: {
-                            json.dumps(
-                                {
-                                    'type': 'tool_result',
-                                    'tool': tool_name,
-                                    'id': tool_call_id,
-                                    'success': not is_error,
-                                    'error': content_str[:500] if is_error else None,
-                                },
-                                ensure_ascii=False,
-                            )
-                        }\n\n"
-
-                        # ─── 检测 write_file 类工具的结果，提取生成的文件信息 ───
-                        if not is_error and tool_name in (
-                            "write_file", "write", "create_file",
-                        ):
-                            m = re.search(r"Updated file\s+(/\S+)", content_str)
-                            if m:
-                                file_path_virtual = m.group(1)
-                                # 只处理 reports 路径下的 Agent 生成文件
-                                if file_path_virtual.startswith("/reports/"):
-                                    prefix = f"/reports/{user_id}/{session_id}/"
-                                    if file_path_virtual.startswith(prefix):
-                                        filename = file_path_virtual[len(prefix):]
-                                        file_size = 0
-                                        try:
-                                            disk_path = os.path.join(
-                                                settings.report_root, user_id, session_id, filename
-                                            )
-                                            if os.path.isfile(disk_path):
-                                                file_size = os.path.getsize(disk_path)
-                                        except Exception:
-                                            pass
-
-                                        yield f"data: {
-                                            json.dumps(
-                                                {
-                                                    'type': 'file_generated',
-                                                    'file_name': file_path_virtual.split('/')[-1],
-                                                    'file_path': file_path_virtual,
-                                                    'file_size': file_size,
-                                                },
-                                                ensure_ascii=False,
-                                            )
-                                        }\n\n"
+                                            yield f"data: {
+                                                json.dumps(
+                                                    {
+                                                        'type': 'file_generated',
+                                                        'file_name': file_path_virtual.split('/')[-1],
+                                                        'file_path': file_path_virtual,
+                                                        'file_size': file_size,
+                                                    },
+                                                    ensure_ascii=False,
+                                                )
+                                            }\n\n"
+        except Exception as e:
+            # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
+            logger.exception("Agent 流式处理异常: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
 
         yield "data: [DONE]\n\n"
 
