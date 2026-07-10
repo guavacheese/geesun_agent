@@ -166,5 +166,5 @@ GET {{host}}/api/v1/sessions
 Authorization: Bearer {{login.response.body.access_token}}
 
 ### 获取某会话消息
-GET {{host}}/api/v1/sessions/1001/messages
+GET {{host}}/api/v1/sessions/123/messages
 Authorization: Bearer {{login.response.body.access_token}}
