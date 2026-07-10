@@ -5,6 +5,7 @@ from src.api.endpoints.skills import router as skills_router
 from src.api.endpoints.auth import router as auth_router
 from src.api.endpoints.sessions import router as sessions_router
 from src.api.endpoints.models import router as models_router
+from src.api.endpoints.files import router as files_router
 
 
 api_router = APIRouter()
@@ -14,3 +15,4 @@ api_router.include_router(skills_router, prefix="/api/v1")
 api_router.include_router(auth_router, prefix="/api/v1")
 api_router.include_router(sessions_router, prefix="/api/v1")
 api_router.include_router(models_router, prefix="/api/v1")
+api_router.include_router(files_router, prefix="/api/v1")

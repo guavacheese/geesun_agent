@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import logging
 from datetime import datetime, timezone
 
@@ -236,6 +238,40 @@ async def chat(
                                 ensure_ascii=False,
                             )
                         }\n\n"
+
+                        # ─── 检测 write_file 类工具的结果，提取生成的文件信息 ───
+                        if not is_error and tool_name in (
+                            "write_file", "write", "create_file",
+                        ):
+                            m = re.search(r"Updated file\s+(/\S+)", content_str)
+                            if m:
+                                file_path_virtual = m.group(1)
+                                # 只处理 reports 路径下的 Agent 生成文件
+                                if file_path_virtual.startswith("/reports/"):
+                                    prefix = f"/reports/{user_id}/{session_id}/"
+                                    if file_path_virtual.startswith(prefix):
+                                        filename = file_path_virtual[len(prefix):]
+                                        file_size = 0
+                                        try:
+                                            disk_path = os.path.join(
+                                                settings.report_root, user_id, session_id, filename
+                                            )
+                                            if os.path.isfile(disk_path):
+                                                file_size = os.path.getsize(disk_path)
+                                        except Exception:
+                                            pass
+
+                                        yield f"data: {
+                                            json.dumps(
+                                                {
+                                                    'type': 'file_generated',
+                                                    'file_name': file_path_virtual.split('/')[-1],
+                                                    'file_path': file_path_virtual,
+                                                    'file_size': file_size,
+                                                },
+                                                ensure_ascii=False,
+                                            )
+                                        }\n\n"
 
         yield "data: [DONE]\n\n"
 
