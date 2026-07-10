@@ -247,6 +247,7 @@ async def chat(
                                         'id': tool_call_id,
                                         'success': not is_error,
                                         'error': content_str[:500] if is_error else None,
+                                        'result': content_str[:2000] if content_str else None,
                                     },
                                     ensure_ascii=False,
                                 )
