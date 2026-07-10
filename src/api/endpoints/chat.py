@@ -65,26 +65,14 @@ async def chat(
         except Exception:
             pass
 
-    path_hint_lines = [
-        f"沙箱 ID：{sandbox_id if sandbox_id else '（无）'}",
-        f"当前用户：{current_user.get('display_name', user_id)}（{current_user.get('role', 'user')}）",
-        "",
-        "【当前会话路径】",
-        f"输入文件：/uploads/{user_id}/{session_id}/",
-        f"报告输出：/reports/{user_id}/{session_id}/",
-    ]
-    if sandbox_id:
-        path_hint_lines += [
-            f"沙箱路径：/home/user/",
-        ]
-    else:
-        path_hint_lines += [
-            "",
-            "⚠️ 沙箱不可用，无法上传文件到沙箱或从沙箱下载文件。",
-            "   请使用 read_file 等本地工具读取上传目录中的文件。",
-            "   禁止使用 execute 命令在宿主文件系统中探索路径！",
-        ]
-    path_hint = "\n".join(path_hint_lines)
+    path_hint = (
+        f"沙箱 ID：{sandbox_id}\n"
+        f"当前用户：{current_user.get('display_name', user_id)}（{current_user.get('role', 'user')}）\n"
+        f"\n"
+        f"【当前会话路径】\n"
+        f"输入文件：/uploads/{user_id}/{session_id}/\n"
+        f"报告输出：/reports/{user_id}/{session_id}/\n"
+    )
 
     # 本轮文件提示（多轮对话时 Agent 只处理本轮上传的文件）
     file_hint = ""
