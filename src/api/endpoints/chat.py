@@ -228,28 +228,34 @@ async def chat(
                             )
                             is_error = False
                             if content_str:
-                                if tool_name == "execute":
-                                    # execute 工具以命令退出码判断成败，不检查输出内容关键词
-                                    # 例如 sed 读取文件内容中含 "xml_not_found" 不应被误判为失败
-                                    is_error = (
-                                        "command failed with exit code"
-                                        in content_str.lower()
-                                        or content_str.startswith("Execution error:")
-                                    )
-                                else:
-                                    is_error = any(
-                                        kw in content_str.lower()
-                                        for kw in [
-                                            "error",
-                                            "exception",
-                                            "traceback",
-                                            "not found",
-                                            "failed",
-                                            "failure",
-                                            "timeout",
-                                            "permission denied",
-                                        ]
-                                    )
+                                # 优先尝试 JSON 解析：MCP 工具返回结构化 JSON 带 success 字段
+                                try:
+                                    parsed = json.loads(content_str)
+                                    if isinstance(parsed, dict) and "success" in parsed:
+                                        is_error = not parsed["success"]
+                                    # 结构化 JSON 不走关键词匹配
+                                except (json.JSONDecodeError, TypeError):
+                                    # 非 JSON 内容，退回到关键词匹配
+                                    if tool_name == "execute":
+                                        is_error = (
+                                            "command failed with exit code"
+                                            in content_str.lower()
+                                            or content_str.startswith("Execution error:")
+                                        )
+                                    else:
+                                        is_error = any(
+                                            kw in content_str.lower()
+                                            for kw in [
+                                                "error",
+                                                "exception",
+                                                "traceback",
+                                                "not found",
+                                                "failed",
+                                                "failure",
+                                                "timeout",
+                                                "permission denied",
+                                            ]
+                                        )
 
                             yield f"data: {
                                 json.dumps(
