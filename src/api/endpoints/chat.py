@@ -66,12 +66,16 @@ async def chat(
             pass
 
     path_hint = (
-        f"沙箱 ID：{sandbox_id}\n"
-        f"当前用户：{current_user.get('display_name', user_id)}（{current_user.get('role', 'user')}）\n"
-        f"\n"
-        f"【当前会话路径】\n"
-        f"输入文件：/uploads/{user_id}/{session_id}/\n"
-        f"报告输出：/reports/{user_id}/{session_id}/\n"
+        "=== 当前会话信息 ===\n"
+        f"sandbox_id={sandbox_id}\n"
+        f"sandbox_path=/home/user/\n"
+        f"user_id={user_id}\n"
+        f"session_id={session_id}\n"
+        f"upload_dir=/uploads/{user_id}/{session_id}/\n"
+        f"report_dir=/reports/{user_id}/{session_id}/\n"
+        f"display_name={current_user.get('display_name', user_id)}\n"
+        f"role={current_user.get('role', 'user')}\n"
+        "=====================\n"
     )
 
     # 本轮文件提示（多轮对话时 Agent 只处理本轮上传的文件）
