@@ -11,6 +11,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# 与 chat.py 的 _infer_file_type 保持一致，用于兼容老消息
+_FILE_TYPE_BY_EXT = {
+    "md": "text", "txt": "text", "log": "text",
+    "py": "code", "js": "code", "ts": "code", "tsx": "code",
+    "css": "code", "html": "code", "json": "code",
+    "yaml": "code", "yml": "code", "sh": "code",
+    "java": "code", "go": "code", "rs": "code",
+    "c": "code", "cpp": "code", "h": "code",
+    "png": "image", "jpg": "image", "jpeg": "image",
+    "gif": "image", "svg": "image", "webp": "image",
+    "bmp": "image", "ico": "image",
+    "pdf": "pdf",
+    "xlsx": "spreadsheet", "xls": "spreadsheet", "csv": "spreadsheet",
+    "zip": "archive", "tar": "archive", "gz": "archive",
+    "7z": "archive", "rar": "archive",
+}
+
+
+def _infer_file_type(file_name: str) -> str:
+    ext = file_name.split(".")[-1].lower() if "." in file_name else ""
+    return _FILE_TYPE_BY_EXT.get(ext, "other")
+
+
 # ─── 会话 CRUD ───
 # 存储结构：
 #   namespace ("sessions", user_id) → key: session_id → value: {title, created_at, updated_at, message_count}
@@ -244,7 +267,13 @@ async def get_session_messages(
     store=Depends(get_store),
     current_user: dict = Depends(get_current_user),
 ):
-    """获取某会话的所有消息。"""
+    """获取某会话的所有消息。
+
+    兼容老数据：AI 消息没有 generated_files 时，扫描 content 自动
+    补 /uploads/.../file.ext 或 /reports/.../file.ext 路径的文件信息，
+    保证历史消息刷新后仍能看到文件卡片。
+    """
+    import re
     user_id = current_user["user_id"]
     msg_namespace = _messages_namespace(user_id, session_id)
 
@@ -254,6 +283,31 @@ async def get_session_messages(
         messages = msg_data.get("items", []) if isinstance(msg_data, dict) else []
     except Exception:
         messages = []
+
+    # 兼容老数据：AI 消息没有 generated_files 时从 content 补
+    file_path_re = re.compile(r"(/uploads/|/reports/)[^\s)\]\"',]+")
+    for msg in messages:
+        if msg.get("role") == "ai" and not msg.get("generated_files"):
+            content = msg.get("content", "")
+            files = []
+            seen = set()
+            for m in file_path_re.finditer(content):
+                path = m.group(0)
+                if not path.startswith(f"/uploads/{user_id}/{session_id}/") and \
+                   not path.startswith(f"/reports/{user_id}/{session_id}/"):
+                    continue
+                if path in seen:
+                    continue
+                seen.add(path)
+                filename = path.split("/")[-1]
+                files.append({
+                    "file_name": filename,
+                    "file_path": path,
+                    "file_size": 0,
+                    "file_type": _infer_file_type(filename),
+                })
+            if files:
+                msg["generated_files"] = files
 
     return {"session_id": session_id, "messages": messages}
 
