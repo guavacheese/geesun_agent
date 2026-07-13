@@ -141,7 +141,7 @@ async def chat(
                 graph_input,
                 config={
                     **graph_config,
-                    "recursion_limit": 60,  # ← 最多 60 步，超了直接报错而不是卡死
+                    "recursion_limit": 100,  # ← 最多 100 步，正常流程 25-35 步，留 2-3 倍余量
                 },
                 stream_mode=["messages", "updates"],
                 **invoke_kwargs,
@@ -275,36 +275,54 @@ async def chat(
                                 )
                             }\n\n"
 
-                            # ─── 检测 write_file 类工具的结果，提取生成的文件信息 ───
-                            if not is_error and tool_name in (
-                                "write_file",
-                                "write",
-                                "create_file",
-                            ):
-                                m = re.search(r"Updated file\s+(/\S+)", content_str)
-                                if m:
-                                    file_path_virtual = m.group(1)
-                                    # 只处理 reports 路径下的 Agent 生成文件
-                                    if file_path_virtual.startswith("/reports/"):
-                                        prefix = f"/reports/{user_id}/{session_id}/"
-                                        if file_path_virtual.startswith(prefix):
-                                            filename = file_path_virtual[len(prefix) :]
-                                            file_size = 0
-                                            try:
-                                                disk_path = os.path.join(
-                                                    settings.report_root,
-                                                    user_id,
-                                                    session_id,
-                                                    filename,
-                                                )
-                                                if os.path.isfile(disk_path):
-                                                    file_size = os.path.getsize(
-                                                        disk_path
-                                                    )
-                                            except Exception:
-                                                pass
+                            # ─── 检测工具返回的文件信息，提取生成/下载的文件 ───
+                            # 不限定工具名，任何返回 /reports/ 路径的工具都能触发
+                            file_path_virtual = None
+                            if not is_error:
+                                if tool_name in ("write_file", "write", "create_file"):
+                                    m = re.search(
+                                        r"Updated file\s+(/\S+)", content_str
+                                    )
+                                    if m:
+                                        file_path_virtual = m.group(1)
+                                else:
+                                    # 其他工具（如 download_from_sandbox）：
+                                    # 在返回值中搜索 /reports/ 路径
+                                    m = re.search(
+                                        r'/reports/\S+', content_str
+                                    )
+                                    if m:
+                                        file_path_virtual = m.group(0).rstrip(
+                                            '"'
+                                        ).rstrip("}").rstrip(",")
 
-                                            yield f"data: {
+                            if file_path_virtual and file_path_virtual.startswith(
+                                "/reports/"
+                            ):
+                                prefix = f"/reports/{user_id}/{session_id}/"
+                                if file_path_virtual.startswith(prefix):
+                                    filename = file_path_virtual[len(prefix) :]
+                                    file_size = 0
+                                    try:
+                                        disk_path = os.path.join(
+                                            settings.report_root,
+                                            user_id,
+                                            session_id,
+                                            filename,
+                                        )
+                                        if os.path.isfile(disk_path):
+                                            file_size = os.path.getsize(disk_path)
+                                    except Exception:
+                                        pass
+                                    # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
+                                    if file_size == 0:
+                                        size_m = re.search(
+                                            r'"size"\s*:\s*(\d+)', content_str
+                                        )
+                                        if size_m:
+                                            file_size = int(size_m.group(1))
+
+                                    yield f"data: {
                                                 json.dumps(
                                                     {
                                                         'type': 'file_generated',
