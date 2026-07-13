@@ -164,6 +164,10 @@ async def chat(
                     if metadata:
                         step = metadata.get("langgraph_step")
                         if step is not None and step != _last_debug_step:
+                            # 新 step 到来前先通知前端：上一条 AI 消息结束
+                            # 这是关键：让前端能正确分割多条 AIMessage
+                            if _last_debug_step is not None:
+                                yield f"data: {json.dumps({'type': 'ai_message_start'}, ensure_ascii=False)}\n\n"
                             _last_debug_step = step
                             thinking_emitted = False  # 新 step → 重置 thinking 标记
                             # 关键：每条 AIMessage 独立切分 <think> 段
