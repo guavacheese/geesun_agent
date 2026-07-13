@@ -183,19 +183,24 @@ async def chat(
                             yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
                         yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning}, ensure_ascii=False)}\n\n"
                     elif not _think_done and content:
-                        # 2. Qwen 系：推理内容嵌入在 content 的 </think> 前
+                        # 2. Qwen 系：仅以 </think> 作为推理结束标记（无开始标签）
                         _think_buffer += content
                         think_end = _think_buffer.find("</think>")
                         if think_end >= 0:
                             _think_done = True
+                            # thinking_part 取 </think> 之前的内容；
+                            # remaining 是 </think> 之后 8 字符（跳过标签）开始的内容
                             thinking_part = _think_buffer[:think_end]
-                            remaining = _think_buffer[think_end + 8 :]  # 跳过 </think>
+                            remaining = _think_buffer[think_end + 8 :]
+                            # 去掉 remaining 开头的换行
+                            if remaining.startswith("\n"):
+                                remaining = remaining[1:]
                             if thinking_part.strip():
                                 if not thinking_emitted:
                                     thinking_emitted = True
                                     yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
                                 yield f"data: {json.dumps({'type': 'reasoning', 'content': thinking_part}, ensure_ascii=False)}\n\n"
-                            if remaining.strip():
+                            if remaining:
                                 yield f"data: {json.dumps({'type': 'token', 'content': remaining}, ensure_ascii=False)}\n\n"
                     elif content:
                         # 3. 正常 token：已过 </think> 或无推理内容
