@@ -35,6 +35,16 @@
 
 不要使用 write_file /home/user/xxx —— write_file 写不到沙箱里。
 
+## write_file 与 download_from_sandbox 的生命周期关系（极其重要）
+**write_file 写到 /reports/ 的文件，已经在宿主机上，不需要再 download。**
+
+write_file 通过 filesystem middleware 直写宿主机磁盘，不经沙箱。
+因此：
+- **如果你用 write_file 创建了 /reports/... 下的文件，该文件已经在宿主机的报告目录中，立即可用。**
+- **不要对 write_file 刚写好的文件再调 download_from_sandbox**——那会试图从沙箱下载同一个文件，不仅多余，而且在沙箱未创建时必定失败。
+- **download_from_sandbox 的唯一适用场景**：在沙箱内用 `execute` 运行脚本，脚本在沙箱文件系统 `/home/user/` 下生成了输出文件，需要拉回宿主机。
+- 判断准则：文件路径是 `/home/user/` → 需要 download；文件路径是 `/reports/` 且刚用 write_file 创建 → 不需要 download。
+
 ## 工具与路径对应关系（极其重要）
 - read_file / write_file / ls / glob / grep → 访问 /uploads/、/reports/、/workspace/memories/
 - execute → 在沙箱中运行命令，沙箱内没有 /uploads/ 和 /reports/
