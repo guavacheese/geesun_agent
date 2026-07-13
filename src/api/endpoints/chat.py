@@ -131,6 +131,9 @@ async def chat(
 
         # 标记当前是否刚发出过 thinking 事件
         thinking_emitted = False
+        # Qwen 系模型将推理放在 content 的 </think> 前，流式场景下可能跨 chunk 截断
+        _think_buffer = ""
+        _think_done = False
         # [DEBUG] 记录上一个 langgraph_step，避免逐 token 重复打印
         _last_debug_step = None
 
@@ -163,14 +166,45 @@ async def chat(
                                 list(metadata.keys()),
                             )
 
-                    # 第一条 token 时发出 thinking（避免空 thinking 事件）
+                    # ─── 流式 token 处理：分离推理内容与回复内容 ───
                     content = token.content if hasattr(token, "content") else ""
-                    if content and not thinking_emitted:
-                        thinking_emitted = True
-                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
-                        yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+
+                    # 1. 优先从 additional_kwargs 提取推理内容（DeepSeek/Groq/Ollama/XAI 等）
+                    reasoning = ""
+                    if hasattr(token, "additional_kwargs") and token.additional_kwargs:
+                        reasoning = (
+                            token.additional_kwargs.get("reasoning_content") or ""
+                        )
+
+                    if reasoning:
+                        # 模型通过 API 字段返回推理内容（不经过 content）
+                        if not thinking_emitted:
+                            thinking_emitted = True
+                            yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning}, ensure_ascii=False)}\n\n"
+                    elif not _think_done and content:
+                        # 2. Qwen 系：推理内容嵌入在 content 的 </think> 前
+                        _think_buffer += content
+                        think_end = _think_buffer.find("</think>")
+                        if think_end >= 0:
+                            _think_done = True
+                            thinking_part = _think_buffer[:think_end]
+                            remaining = _think_buffer[think_end + 8 :]  # 跳过 </think>
+                            if thinking_part.strip():
+                                if not thinking_emitted:
+                                    thinking_emitted = True
+                                    yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
+                                yield f"data: {json.dumps({'type': 'reasoning', 'content': thinking_part}, ensure_ascii=False)}\n\n"
+                            if remaining.strip():
+                                yield f"data: {json.dumps({'type': 'token', 'content': remaining}, ensure_ascii=False)}\n\n"
                     elif content:
-                        yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+                        # 3. 正常 token：已过 </think> 或无推理内容
+                        if not thinking_emitted:
+                            thinking_emitted = True
+                            yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
 
                 elif mode == "updates":
                     # 根据 node 名称和输出内容解析 Agent 行为
