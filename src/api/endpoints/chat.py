@@ -403,13 +403,6 @@ async def chat(
             )
             if state and hasattr(state, "values"):
                 all_msgs = state.values.get("messages", [])
-                logger.warning(
-                    "[DIAG] 消息数=%d, 用户=%s, 会话=%s",
-                    len(all_msgs),
-                    user_id,
-                    session_id,
-                )
-                all_msgs = state.values.get("messages", [])
                 # 提取人类可读的消息（只保留 user / assistant / tool 角色的核心信息）
                 history = []
                 for msg in all_msgs:
@@ -426,14 +419,20 @@ async def chat(
                             reasoning = kw_reasoning
 
                     # 2. Qwen 系：从 content 中移除 </think> 段
-                    if not reasoning and "</think>" in content:
+                    # 关键：每条 AI 消息独立切分（之前的 `if not reasoning` 会让后一条
+                    # AI 消息的 <think> 段残留到 content 里）
+                    if "</think>" in content:
                         think_end = content.find("</think>")
                         thinking_part = content[:think_end]
                         remaining = content[think_end + 8:]  # skip </think>
                         if remaining.startswith("\n"):
                             remaining = remaining[1:]
                         if thinking_part.strip():
-                            reasoning = thinking_part
+                            # 保留 original reasoning（如有），附加本次 <think> 段
+                            if reasoning:
+                                reasoning = reasoning + "\n\n" + thinking_part
+                            else:
+                                reasoning = thinking_part
                             content = remaining
 
                     # 3. 截断长度
