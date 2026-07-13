@@ -163,7 +163,9 @@ async def chat(
                     # 用 langgraph_step 变化检测"新一次 LLM 调用"，替代不存在的 run_id
                     if metadata:
                         step = metadata.get("langgraph_step")
-                        if step is not None and step != _last_debug_step:
+                        node = metadata.get("langgraph_node")
+                        # 只在 model 节点发送 ai_message_start（避免 tool 节点空触发）
+                        if step is not None and step != _last_debug_step and node == "model":
                             # 新 step 到来前先通知前端：上一条 AI 消息结束
                             # 这是关键：让前端能正确分割多条 AIMessage
                             if _last_debug_step is not None:
