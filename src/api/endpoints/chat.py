@@ -109,7 +109,14 @@ async def chat(
                 if m.get("role") == "user":
                     lc_msgs.append(HumanMessage(content=m.get("content", "")))
                 elif m.get("role") == "ai":
-                    lc_msgs.append(AIMessage(content=m.get("content", "")))
+                    stored_reasoning = m.get("reasoning", "")
+                    ai_kwargs = {}
+                    if stored_reasoning:
+                        ai_kwargs["reasoning_content"] = stored_reasoning
+                    lc_msgs.append(AIMessage(
+                        content=m.get("content", ""),
+                        additional_kwargs=ai_kwargs,
+                    ))
             graph_input = {"messages": lc_msgs}
             logger.info("continue_from_state: 从 store 重建 %d 条消息", len(lc_msgs))
         except Exception as e:
@@ -409,8 +416,31 @@ async def chat(
                     role = getattr(msg, "type", "unknown")
                     if role == "human":
                         role = "user"
-                    content = str(msg.content)[:2000] if msg.content else ""
-                    # 去掉 user 消息中的 path_hint 前缀
+                    content = str(msg.content) if msg.content else ""
+                    reasoning = ""
+
+                    # 1. 从 additional_kwargs 提取推理内容（DeepSeek/Groq/Ollama/XAI 等）
+                    if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
+                        kw_reasoning = msg.additional_kwargs.get("reasoning_content") or ""
+                        if kw_reasoning:
+                            reasoning = kw_reasoning
+
+                    # 2. Qwen 系：从 content 中移除 </think> 段
+                    if not reasoning and "</think>" in content:
+                        think_end = content.find("</think>")
+                        thinking_part = content[:think_end]
+                        remaining = content[think_end + 8:]  # skip </think>
+                        if remaining.startswith("\n"):
+                            remaining = remaining[1:]
+                        if thinking_part.strip():
+                            reasoning = thinking_part
+                            content = remaining
+
+                    # 3. 截断长度
+                    content = content[:2000]
+                    reasoning = reasoning[:2000]
+
+                    # 4. 去掉 user 消息中的 path_hint 前缀
                     if role == "user" and "\n\n" in content:
                         parts = content.rsplit("\n\n", 1)
                         content = (
@@ -422,6 +452,8 @@ async def chat(
                         "content": content,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    if reasoning:
+                        entry["reasoning"] = reasoning
                     # AI 消息附带 tool_calls 信息
                     if role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
                         entry["tool_calls"] = [
