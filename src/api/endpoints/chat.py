@@ -166,6 +166,11 @@ async def chat(
                         if step is not None and step != _last_debug_step:
                             _last_debug_step = step
                             thinking_emitted = False  # 新 step → 重置 thinking 标记
+                            # 关键：每条 AIMessage 独立切分 <think> 段
+                            # 之前 _think_done 跨消息保留导致第二条 AIMessage 的
+                            # <think> 段（被 langchain 拼在 ToolMessage 之后）无法切分
+                            _think_done = False
+                            _think_buffer = ""
                             logger.warning(
                                 "[DIAG] new messages stream: step=%s, node=%s, metadata keys=%s",
                                 step,
