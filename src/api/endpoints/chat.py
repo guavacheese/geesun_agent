@@ -16,6 +16,30 @@ from src.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+# 与前端 lib/types.ts inferFileType 保持一致
+# 用于保存 generated_files 时填充 file_type 字段
+_FILE_TYPE_BY_EXT = {
+    "md": "text", "txt": "text", "log": "text",
+    "py": "code", "js": "code", "ts": "code", "tsx": "code",
+    "css": "code", "html": "code", "json": "code",
+    "yaml": "code", "yml": "code", "sh": "code",
+    "java": "code", "go": "code", "rs": "code",
+    "c": "code", "cpp": "code", "h": "code",
+    "png": "image", "jpg": "image", "jpeg": "image",
+    "gif": "image", "svg": "image", "webp": "image",
+    "bmp": "image", "ico": "image",
+    "pdf": "pdf",
+    "xlsx": "spreadsheet", "xls": "spreadsheet", "csv": "spreadsheet",
+    "zip": "archive", "tar": "archive", "gz": "archive",
+    "7z": "archive", "rar": "archive",
+}
+
+
+def _infer_file_type(file_name: str) -> str:
+    ext = file_name.split(".")[-1].lower() if "." in file_name else ""
+    return _FILE_TYPE_BY_EXT.get(ext, "other")
+
+
 class ChatRequest(BaseModel):
     session_id: str = "default-session"
     message: str = ""
@@ -143,6 +167,9 @@ async def chat(
         _think_done = False
         # [DEBUG] 记录上一个 langgraph_step，避免逐 token 重复打印
         _last_debug_step = None
+        # 记录本次流式生成过程中产生/下载的文件
+        # 后续保存到 store 时关联到对应的 AI 消息 entry，确保刷新页面后还能看到文件卡片
+        _generated_files: list[dict] = []
 
         # ─── 流式生成循环 ───
         # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
@@ -388,10 +415,22 @@ async def chat(
                                                         )[-1],
                                                         'file_path': file_path_virtual,
                                                         'file_size': file_size,
+                                                        'file_type': _infer_file_type(
+                                                            file_path_virtual.split('/')[-1]
+                                                        ),
                                                     },
                                                     ensure_ascii=False,
                                                 )
                                             }\n\n"
+                                    # 同时记录到 _generated_files 列表，保存时关联到对应 AI 消息
+                                    _generated_files.append({
+                                        "file_name": file_path_virtual.split('/')[-1],
+                                        "file_path": file_path_virtual,
+                                        "file_size": file_size,
+                                        "file_type": _infer_file_type(
+                                            file_path_virtual.split('/')[-1]
+                                        ),
+                                    })
         except Exception as e:
             # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
             logger.exception("Agent 流式处理异常: %s", e)
@@ -470,6 +509,12 @@ async def chat(
                             {"name": tc["name"], "args": tc["args"]}
                             for tc in msg.tool_calls
                         ]
+                    # AI 消息附带本次生成的文件（用于刷新页面后仍能看到文件卡片）
+                    if role == "ai":
+                        # 文件优先按消息索引对齐：遍历时遇到 ai 消息就 pop 一个文件
+                        # 因为 _generated_files 按时间顺序收集，对应 LangGraph 工具调用顺序
+                        if _generated_files:
+                            entry["generated_files"] = [_generated_files.pop(0)]
                     history.append(entry)
 
                 # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
