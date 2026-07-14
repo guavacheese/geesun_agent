@@ -1,6 +1,8 @@
 import os
 import logging
 
+logger = logging.getLogger(__name__)
+
 from deepagents import create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
