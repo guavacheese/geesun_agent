@@ -2,6 +2,7 @@ import os
 import logging
 
 from deepagents import create_deep_agent
+from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -138,6 +139,15 @@ async def create_agent(
         skills=skills,
         memory=[AGENTS_MD_PATH],
         middleware=[switch_model],
+        permissions=[
+            # 只允许写入 /reports/（报告输出）和 /workspace/memories/（用户偏好）
+            FilesystemPermission(operations=["write"], paths=["/reports/**"], mode="allow"),
+            FilesystemPermission(operations=["write"], paths=["/workspace/memories/**"], mode="allow"),
+            # 拒绝写入所有其他路径（包括 /uploads/）
+            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+            # 读取不限制
+            FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
+        ],
         interrupt_on={
             "write_file": False,
             "read_file": False,

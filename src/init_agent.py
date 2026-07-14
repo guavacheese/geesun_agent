@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from deepagents import create_deep_agent
+from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -281,6 +282,12 @@ async def create_my_agent(
         backend=backend,
         system_prompt=system_prompt,
         skills=[f"{WORKSPACE}/skills/plc-code-auditor"],
+        permissions=[
+            FilesystemPermission(operations=["write"], paths=["/reports/**"], mode="allow"),
+            FilesystemPermission(operations=["write"], paths=["/workspace/memories/**"], mode="allow"),
+            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+            FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
+        ],
         interrupt_on={
             "write_file": False,
             "read_file": False,
