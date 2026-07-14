@@ -35,6 +35,19 @@
 
 不要使用 write_file /home/user/xxx —— write_file 写不到沙箱里。
 
+## write_file 路径规则（严格）
+
+**⚠️ 严重警告：文件只能写到 `/reports/{user_id}/{session_id}/`，写错位置会导致文件无法预览和下载。**
+
+- `/uploads/` 是**用户上传的输入文件**目录，**只读**，不可写入
+- `/reports/` 是**Agent 生成的输出文件**目录，**可写**，所有给用户下载的文件必须写到这里
+- 写错到 `/uploads/` 的文件虽然会存在宿主机磁盘上，但**不会触发 `file_generated` 事件**，导致前端不显示文件卡片，用户无法预览和下载
+
+**判断准则（每次 write_file 前必须确认）：**
+1. 文件是给用户预览/下载的 → **必须**写 `/reports/{user_id}/{session_id}/`
+2. 文件是用户偏好 → 写 `/workspace/memories/`
+3. 其他路径（`/uploads/`、`/home/user/`、`/tmp/` 等）→ **不允许**
+
 ## write_file 与 download_from_sandbox 的生命周期关系（极其重要）
 **write_file 写到 /reports/ 的文件，已经在宿主机上，不需要再 download。**
 

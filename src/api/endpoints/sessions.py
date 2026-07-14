@@ -285,7 +285,8 @@ async def get_session_messages(
         messages = []
 
     # 兼容老数据：AI 消息没有 generated_files 时从 content 补
-    file_path_re = re.compile(r"(/uploads/|/reports/)[^\s)\]\"',]+")
+    # 注意：反引号`排除——markdown 格式 `path` 的反引号不应被吞入路径
+    file_path_re = re.compile(r"(/uploads/|/reports/)[^\s)\]\"',`]+")
     for msg in messages:
         if msg.get("role") == "ai" and not msg.get("generated_files"):
             content = msg.get("content", "")

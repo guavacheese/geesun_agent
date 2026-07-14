@@ -495,6 +495,14 @@ async def chat(
                         content = (
                             parts[-1].strip() if len(parts) > 1 else parts[0].strip()
                         )
+
+                    # 5. 跳过中间 AI 消息（只有 thinking + tool_call，没有正文内容）
+                    #    这种消息是 LLM 决定调用工具时的中间步骤，存了会让前端显示一个
+                    #    只有 thinking 折叠块、正文为空的奇怪气泡
+                    if role == "ai" and not content and hasattr(msg, "tool_calls") and msg.tool_calls:
+                        logger.debug("跳过中间 AI 消息（空正文 + tool_call）: id=%s", getattr(msg, "id", None))
+                        continue
+
                     entry = {
                         "id": getattr(msg, "id", None),
                         "role": role,
@@ -509,13 +517,14 @@ async def chat(
                             {"name": tc["name"], "args": tc["args"]}
                             for tc in msg.tool_calls
                         ]
-                    # AI 消息附带本次生成的文件（用于刷新页面后仍能看到文件卡片）
-                    if role == "ai":
-                        # 文件优先按消息索引对齐：遍历时遇到 ai 消息就 pop 一个文件
-                        # 因为 _generated_files 按时间顺序收集，对应 LangGraph 工具调用顺序
-                        if _generated_files:
-                            entry["generated_files"] = [_generated_files.pop(0)]
                     history.append(entry)
+
+                # 循环结束后，将 _generated_files 关联到最后一条 AI 消息
+                if _generated_files:
+                    for i in range(len(history) - 1, -1, -1):
+                        if history[i].get("role") == "ai":
+                            history[i]["generated_files"] = list(_generated_files)
+                            break
 
                 # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
                 msg_namespace = ("messages", user_id, session_id)
