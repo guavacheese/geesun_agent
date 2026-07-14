@@ -7,7 +7,6 @@ import time
 from typing import Any
 
 from deepagents import create_deep_agent
-from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -15,6 +14,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
+from deepagents.backends.protocol import WriteResult
 from dotenv import load_dotenv
 from langchain.messages import trim_messages
 from langchain.tools import BaseTool
@@ -205,6 +205,28 @@ def _make_sandbox(thread_id: str) -> Any:
 # ─── Backend ──────────────────────────────────────────────────────────────────
 
 
+class _ValidatedFilesystemBackend(FilesystemBackend):
+    """带路径白名单校验的 FilesystemBackend，拒绝写入 /uploads/ 等非允许路径。"""
+
+    ALLOWED_WRITE_PREFIXES = {"/reports/", "/memories/"}
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+            logging.getLogger(__name__).warning(
+                "[VALIDATED_FS] 拒绝写入: path=%s (允许 %s)",
+                file_path, self.ALLOWED_WRITE_PREFIXES,
+            )
+            return WriteResult(
+                error=(
+                    f"拒绝写入: 文件路径 '{file_path}' 不在允许范围内。"
+                    f" 只能写入到: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
+                ),
+                path=file_path,
+                files_update=None,
+            )
+        return super().write(file_path, content)
+
+
 def build_backend(
     user_id: str,
     session_id: str,
@@ -226,12 +248,12 @@ def build_backend(
             env={**os.environ},
         ),
         # ── 用户上传 ──
-        f"/uploads/{user_id}/{session_id}": FilesystemBackend(
+        f"/uploads/{user_id}/{session_id}": _ValidatedFilesystemBackend(
             root_dir=f"{UPLOAD_ROOT}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
         # ── 报告输出 ──
-        f"/reports/{user_id}/{session_id}": FilesystemBackend(
+        f"/reports/{user_id}/{session_id}": _ValidatedFilesystemBackend(
             root_dir=f"{REPORT_ROOT}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
@@ -282,12 +304,6 @@ async def create_my_agent(
         backend=backend,
         system_prompt=system_prompt,
         skills=[f"{WORKSPACE}/skills/plc-code-auditor"],
-        permissions=[
-            FilesystemPermission(operations=["write"], paths=["/reports/**"], mode="allow"),
-            FilesystemPermission(operations=["write"], paths=["/workspace/memories/**"], mode="allow"),
-            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
-            FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
-        ],
         interrupt_on={
             "write_file": False,
             "read_file": False,

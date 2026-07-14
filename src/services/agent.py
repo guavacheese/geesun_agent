@@ -2,7 +2,6 @@ import os
 import logging
 
 from deepagents import create_deep_agent
-from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -10,7 +9,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
-from deepagents.backends.protocol import FileDownloadResponse
+from deepagents.backends.protocol import FileDownloadResponse, WriteResult
 from deepagents.backends.utils import file_data_to_string
 import base64
 from langchain.messages import trim_messages
@@ -45,6 +44,34 @@ StoreBackend.adownload_files = _store_adownload_files
 AGENTS_MD_PATH = "/workspace/agent-memory/AGENTS.md"
 
 
+class ValidatedFilesystemBackend(FilesystemBackend):
+    """带路径白名单校验的 FilesystemBackend 包装。
+
+    在 write_file 实际写盘前拦截，拒绝写入 /uploads/ 等非允许路径。
+    比依赖 AI 提示词更可靠，属于工具执行层强制校验。
+    """
+
+    ALLOWED_WRITE_PREFIXES = {"/reports/", "/workspace/memories/"}
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        # virtual_mode 下 file_path 是虚拟路径（如 /reports/xxx/file.go）
+        # 还没被 resolve_path 转换，直接做前缀匹配
+        if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+            logger.warning(
+                "[VALIDATED_FS] 拒绝写入: path=%s (只允许 %s)",
+                file_path, self.ALLOWED_WRITE_PREFIXES,
+            )
+            return WriteResult(
+                error=(
+                    f"拒绝写入: 文件路径 '{file_path}' 不在允许范围内。"
+                    f" 只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
+                ),
+                path=file_path,
+                files_update=None,
+            )
+        return super().write(file_path, content)
+
+
 def build_backend(user_id: str, session_id: str, store, sandbox):
     """
     Execute a shell command via the default backend.
@@ -64,11 +91,11 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
         #     virtual_mode=True,
         #     env={**os.environ},
         # ),
-        f"/uploads/{user_id}/{session_id}/": FilesystemBackend(
+        f"/uploads/{user_id}/{session_id}/": ValidatedFilesystemBackend(
             root_dir=f"{settings.upload_root}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
-        f"/reports/{user_id}/{session_id}/": FilesystemBackend(
+        f"/reports/{user_id}/{session_id}/": ValidatedFilesystemBackend(
             root_dir=f"{settings.report_root}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
@@ -139,15 +166,6 @@ async def create_agent(
         skills=skills,
         memory=[AGENTS_MD_PATH],
         middleware=[switch_model],
-        permissions=[
-            # 只允许写入 /reports/（报告输出）和 /workspace/memories/（用户偏好）
-            FilesystemPermission(operations=["write"], paths=["/reports/**"], mode="allow"),
-            FilesystemPermission(operations=["write"], paths=["/workspace/memories/**"], mode="allow"),
-            # 拒绝写入所有其他路径（包括 /uploads/）
-            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
-            # 读取不限制
-            FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
-        ],
         interrupt_on={
             "write_file": False,
             "read_file": False,
