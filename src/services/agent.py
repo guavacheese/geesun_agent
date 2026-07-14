@@ -46,21 +46,20 @@ StoreBackend.adownload_files = _store_adownload_files
 AGENTS_MD_PATH = "/workspace/agent-memory/AGENTS.md"
 
 
-class ValidatedFilesystemBackend(FilesystemBackend):
-    """带路径白名单校验的 FilesystemBackend 包装。
+class ValidatedCompositeBackend(CompositeBackend):
+    """带路径白名单校验的 CompositeBackend 包装。
 
-    在 write_file 实际写盘前拦截，拒绝写入 /uploads/ 等非允许路径。
-    比依赖 AI 提示词更可靠，属于工具执行层强制校验。
+    关键：在 CompositeBackend.write 调用 _get_backend_and_key 之前拦截，
+    此时 file_path 还是完整虚拟路径（/reports/{user}/{sid}/file.go），
+    还没被路由前缀剥掉。
     """
 
     ALLOWED_WRITE_PREFIXES = {"/reports/", "/workspace/memories/"}
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        # virtual_mode 下 file_path 是虚拟路径（如 /reports/xxx/file.go）
-        # 还没被 resolve_path 转换，直接做前缀匹配
         if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
             logger.warning(
-                "[VALIDATED_FS] 拒绝写入: path=%s (只允许 %s)",
+                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s)",
                 file_path, self.ALLOWED_WRITE_PREFIXES,
             )
             return WriteResult(
@@ -72,6 +71,22 @@ class ValidatedFilesystemBackend(FilesystemBackend):
                 files_update=None,
             )
         return super().write(file_path, content)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+            logger.warning(
+                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s)",
+                file_path, self.ALLOWED_WRITE_PREFIXES,
+            )
+            return WriteResult(
+                error=(
+                    f"拒绝写入: 文件路径 '{file_path}' 不在允许范围内。"
+                    f" 只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
+                ),
+                path=file_path,
+                files_update=None,
+            )
+        return await super().awrite(file_path, content)
 
 
 def build_backend(user_id: str, session_id: str, store, sandbox):
@@ -93,11 +108,11 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
         #     virtual_mode=True,
         #     env={**os.environ},
         # ),
-        f"/uploads/{user_id}/{session_id}/": ValidatedFilesystemBackend(
+        f"/uploads/{user_id}/{session_id}/": FilesystemBackend(
             root_dir=f"{settings.upload_root}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
-        f"/reports/{user_id}/{session_id}/": ValidatedFilesystemBackend(
+        f"/reports/{user_id}/{session_id}/": FilesystemBackend(
             root_dir=f"{settings.report_root}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
@@ -135,9 +150,9 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
     }
     if sandbox:
         # sandbox 作为 default backend —— execute 走这里！
-        return CompositeBackend(default=sandbox, routes=routes)
+        return ValidatedCompositeBackend(default=sandbox, routes=routes)
     else:
-        return CompositeBackend(
+        return ValidatedCompositeBackend(
             default=LocalShellBackend(
                 root_dir=settings.agent_workspace,
                 virtual_mode=True,

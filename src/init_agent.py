@@ -205,15 +205,19 @@ def _make_sandbox(thread_id: str) -> Any:
 # ─── Backend ──────────────────────────────────────────────────────────────────
 
 
-class _ValidatedFilesystemBackend(FilesystemBackend):
-    """带路径白名单校验的 FilesystemBackend，拒绝写入 /uploads/ 等非允许路径。"""
+class _ValidatedCompositeBackend(CompositeBackend):
+    """带路径白名单校验的 CompositeBackend。
+
+    关键：在 _get_backend_and_key 之前拦截，file_path 还是完整虚拟路径，
+    还没被路由前缀剥掉。
+    """
 
     ALLOWED_WRITE_PREFIXES = {"/reports/", "/memories/"}
 
     def write(self, file_path: str, content: str) -> WriteResult:
         if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
             logging.getLogger(__name__).warning(
-                "[VALIDATED_FS] 拒绝写入: path=%s (允许 %s)",
+                "[VALIDATED_CB] 拒绝写入: path=%s (允许 %s)",
                 file_path, self.ALLOWED_WRITE_PREFIXES,
             )
             return WriteResult(
@@ -225,6 +229,22 @@ class _ValidatedFilesystemBackend(FilesystemBackend):
                 files_update=None,
             )
         return super().write(file_path, content)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+            logging.getLogger(__name__).warning(
+                "[VALIDATED_CB] 拒绝写入: path=%s (允许 %s)",
+                file_path, self.ALLOWED_WRITE_PREFIXES,
+            )
+            return WriteResult(
+                error=(
+                    f"拒绝写入: 文件路径 '{file_path}' 不在允许范围内。"
+                    f" 只能写入到: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
+                ),
+                path=file_path,
+                files_update=None,
+            )
+        return await super().awrite(file_path, content)
 
 
 def build_backend(
@@ -248,12 +268,12 @@ def build_backend(
             env={**os.environ},
         ),
         # ── 用户上传 ──
-        f"/uploads/{user_id}/{session_id}": _ValidatedFilesystemBackend(
+        f"/uploads/{user_id}/{session_id}": FilesystemBackend(
             root_dir=f"{UPLOAD_ROOT}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
         # ── 报告输出 ──
-        f"/reports/{user_id}/{session_id}": _ValidatedFilesystemBackend(
+        f"/reports/{user_id}/{session_id}": FilesystemBackend(
             root_dir=f"{REPORT_ROOT}/{user_id}/{session_id}/",
             virtual_mode=True,
         ),
@@ -266,13 +286,8 @@ def build_backend(
     if sandbox:
         routes["/code/"] = sandbox
 
-    return CompositeBackend(
+    return _ValidatedCompositeBackend(
         default=StateBackend(),  # ← offload 文件落这里，不污染磁盘
-        # default=LocalShellBackend(
-        #     root_dir=WORKSPACE,
-        #     virtual_mode=False,
-        #     env={**os.environ},
-        # ),
         routes=routes,
     )
 
