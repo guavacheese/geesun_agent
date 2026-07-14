@@ -453,6 +453,15 @@ async def chat(
             )
             if state and hasattr(state, "values"):
                 all_msgs = state.values.get("messages", [])
+                # 第一遍：建立 tool_call_id -> ToolMessage content 的映射
+                # 用于在保存 AIMessage 的 tool_calls 时填入 result 字段
+                tool_results: dict[str, str] = {}
+                for m in all_msgs:
+                    if getattr(m, "type", None) == "tool":
+                        tc_id = getattr(m, "tool_call_id", None)
+                        if tc_id:
+                            tool_results[tc_id] = str(m.content) if m.content else ""
+
                 # 提取人类可读的消息（只保留 user / assistant / tool 角色的核心信息）
                 history = []
                 for msg in all_msgs:
@@ -514,8 +523,14 @@ async def chat(
                     # AI 消息附带 tool_calls 信息
                     if role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
                         entry["tool_calls"] = [
-                            {"name": tc["name"], "args": tc["args"]}
-                            for tc in msg.tool_calls
+                            {
+                                "id": tc.get("id") or f"tc-{i}",
+                                "tool": tc["name"],
+                                "args": tc["args"],
+                                "status": "success",
+                                "result": (tool_results.get(tc.get("id", "")) or "")[:2000],
+                            }
+                            for i, tc in enumerate(msg.tool_calls)
                         ]
                     history.append(entry)
 
