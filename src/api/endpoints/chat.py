@@ -496,12 +496,12 @@ async def chat(
                             parts[-1].strip() if len(parts) > 1 else parts[0].strip()
                         )
 
-                    # 5. 跳过中间 AI 消息（只有 thinking + tool_call，没有正文内容）
-                    #    这种消息是 LLM 决定调用工具时的中间步骤，存了会让前端显示一个
-                    #    只有 thinking 折叠块、正文为空的奇怪气泡
-                    if role == "ai" and not content.strip() and hasattr(msg, "tool_calls") and msg.tool_calls:
-                        logger.debug("跳过中间 AI 消息（空正文 + tool_call）: id=%s", getattr(msg, "id", None))
-                        continue
+                    # 5. 不再跳过中间 AI 消息
+                    #    之前跳过的初衷是避免"只有 thinking 折叠块 + 空正文"的奇怪气泡，
+                    #    但这会丢失 tool_call 渲染（流式阶段用户能看到 write_file 的 tool_call
+                    #    卡片 + 文件卡片，刷新后这部分消失，体验不一致）。
+                    #    现在保留所有 AI 消息：中间 AI 消息显示 thinking + ToolCallCard +
+                    #    GeneratedFileCard，最终 AI 消息显示 thinking + 真正的回复内容。
 
                     entry = {
                         "id": getattr(msg, "id", None),
@@ -519,12 +519,25 @@ async def chat(
                         ]
                     history.append(entry)
 
-                # 循环结束后，将 _generated_files 关联到最后一条 AI 消息
+                # 循环结束后，将 _generated_files 关联到合适的 AI 消息
+                # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
+                #  file_generated 事件在 tool_call 后立即到达，前端把文件卡片加到
+                #  当前最后一条 AI 消息，也就是发起 tool_call 的那条）。如果没有任何
+                #  AI 消息带 tool_call（比如文件由其他方式生成），fallback 到最后一条
+                #  AI 消息。
                 if _generated_files:
-                    for i in range(len(history) - 1, -1, -1):
-                        if history[i].get("role") == "ai":
-                            history[i]["generated_files"] = list(_generated_files)
+                    target_idx = None
+                    for i, e in enumerate(history):
+                        if e.get("role") == "ai" and e.get("tool_calls"):
+                            target_idx = i
                             break
+                    if target_idx is None:
+                        for i in range(len(history) - 1, -1, -1):
+                            if history[i].get("role") == "ai":
+                                target_idx = i
+                                break
+                    if target_idx is not None:
+                        history[target_idx]["generated_files"] = list(_generated_files)
 
                 # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
                 msg_namespace = ("messages", user_id, session_id)
