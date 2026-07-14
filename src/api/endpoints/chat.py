@@ -380,6 +380,17 @@ async def chat(
                                             '"'
                                         ).rstrip("}").rstrip(",")
 
+                            # 规范化文件路径：如果 write_file 返回的路径是 WSL/宿主机完整路径
+                            # （如 /mnt/d/.../data/reports/.../file），从中提取 /reports/... 部分
+                            if file_path_virtual and not file_path_virtual.startswith("/reports/"):
+                                reports_m = re.search(r'/reports/[\w/.-]+', file_path_virtual)
+                                if reports_m:
+                                    file_path_virtual = reports_m.group(0)
+                                    logger.debug(
+                                        "[DIAG] 文件路径已规范化: path=%s",
+                                        file_path_virtual,
+                                    )
+
                             if file_path_virtual and file_path_virtual.startswith(
                                 "/reports/"
                             ):
@@ -396,6 +407,16 @@ async def chat(
                                         )
                                         if os.path.isfile(disk_path):
                                             file_size = os.path.getsize(disk_path)
+                                        else:
+                                            # 如果 report_root 路径不存在，尝试 WSL 路径
+                                            # （write_file 可能写到了 /mnt/d/... 而不是 /data/myapp/...）
+                                            wsl_path = os.path.join(
+                                                os.path.dirname(os.path.dirname(settings.agent_workspace)),
+                                                "data", "reports",
+                                                user_id, session_id, filename,
+                                            )
+                                            if os.path.isfile(wsl_path):
+                                                file_size = os.path.getsize(wsl_path)
                                     except Exception:
                                         pass
                                     # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
