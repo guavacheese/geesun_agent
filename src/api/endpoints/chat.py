@@ -499,7 +499,7 @@ async def chat(
                     # 5. 跳过中间 AI 消息（只有 thinking + tool_call，没有正文内容）
                     #    这种消息是 LLM 决定调用工具时的中间步骤，存了会让前端显示一个
                     #    只有 thinking 折叠块、正文为空的奇怪气泡
-                    if role == "ai" and not content and hasattr(msg, "tool_calls") and msg.tool_calls:
+                    if role == "ai" and not content.strip() and hasattr(msg, "tool_calls") and msg.tool_calls:
                         logger.debug("跳过中间 AI 消息（空正文 + tool_call）: id=%s", getattr(msg, "id", None))
                         continue
 
