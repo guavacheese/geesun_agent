@@ -408,10 +408,10 @@ async def chat(
                                         if os.path.isfile(disk_path):
                                             file_size = os.path.getsize(disk_path)
                                         else:
-                                            # 如果 report_root 路径不存在，尝试 WSL 路径
+                                            # 如果 report_root 路径不存在，尝试 agent_workspace 下的 data 目录
                                             # （write_file 可能写到了 /mnt/d/... 而不是 /data/myapp/...）
                                             wsl_path = os.path.join(
-                                                os.path.dirname(os.path.dirname(settings.agent_workspace)),
+                                                settings.agent_workspace,
                                                 "data", "reports",
                                                 user_id, session_id, filename,
                                             )

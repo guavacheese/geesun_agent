@@ -68,14 +68,11 @@ async def download_file(
         ("reports", settings.report_root),
         ("uploads", settings.upload_root),
     ]
-    # 回退：如果 report_root 是 /data/myapp/ 但文件实际在 WSL 路径
-    # /mnt/d/workspace/.../data/ 下，追加 WSL 路径
+    # 回退：如果 report_root 是 /data/myapp/ 但文件实际在
+    # agent_workspace/data/reports/ 下，追加该路径
     try:
-        workspace_root = os.path.normpath(
-            os.path.join(os.path.dirname(settings.agent_workspace), "..")
-        )
-        wsl_report_root = os.path.join(workspace_root, "data", "reports")
-        wsl_upload_root = os.path.join(workspace_root, "data", "uploads")
+        wsl_report_root = os.path.join(settings.agent_workspace, "data", "reports")
+        wsl_upload_root = os.path.join(settings.agent_workspace, "data", "uploads")
         if os.path.normpath(wsl_report_root) != os.path.normpath(settings.report_root):
             search_dirs.append(("reports", wsl_report_root))
         if os.path.normpath(wsl_upload_root) != os.path.normpath(settings.upload_root):
