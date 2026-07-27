@@ -43,10 +43,9 @@ class ReconnectingAsyncPostgresStore:
     # ── 内部生命周期 ──
 
     async def _create_fresh(self) -> AsyncPostgresStore:
-        """创建全新的 store 实例（含连接池初始化 + schema）。"""
+        """创建全新的 store 实例（连接池初始化，schema 由公开的 setup() 统一处理）。"""
         cm = AsyncPostgresStore.from_conn_string(self._dsn)
         store = await cm.__aenter__()
-        await store.setup()
         return store
 
     async def _ensure(self) -> AsyncPostgresStore:
@@ -135,7 +134,6 @@ class ReconnectingAsyncPostgresSaver:
     async def _create_fresh(self) -> AsyncPostgresSaver:
         cm = AsyncPostgresSaver.from_conn_string(self._dsn)
         cp = await cm.__aenter__()
-        await cp.setup()
         return cp
 
     async def _ensure(self) -> AsyncPostgresSaver:
