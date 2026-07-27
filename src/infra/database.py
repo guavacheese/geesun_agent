@@ -4,6 +4,7 @@ from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import psycopg
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
@@ -119,8 +120,11 @@ class ReconnectingAsyncPostgresStore:
                 logger.warning("PostgresStore 连接已主动关闭")
 
 
-class ReconnectingAsyncPostgresSaver:
+class ReconnectingAsyncPostgresSaver(BaseCheckpointSaver):
     """AsyncPostgresSaver 自动重连包装器。
+
+    同时继承 BaseCheckpointSaver 以满足 langgraph.compile() 的
+    isinstance(checkpointer, BaseCheckpointSaver) 类型检查。
 
     与 ReconnectingAsyncPostgresStore 相同模式，包装 checkpointer。
     当 aget/aput/alist/aget_tuple 抛出 psycopg.OperationalError 时，
@@ -128,6 +132,7 @@ class ReconnectingAsyncPostgresSaver:
     """
 
     def __init__(self, dsn: str):
+        super().__init__()
         self._dsn = dsn
         self._cp: Optional[AsyncPostgresSaver] = None
         self._lock = asyncio.Lock()
@@ -184,6 +189,13 @@ class ReconnectingAsyncPostgresSaver:
                 raise
 
     # ── 公开接口 ──
+
+    @property
+    def config_specs(self):
+        """委托给内部 checkpointer 的配置规范。"""
+        if self._cp is not None:
+            return self._cp.config_specs
+        return []
 
     async def aget_tuple(self, config):
         return await self._call("aget_tuple", config)
