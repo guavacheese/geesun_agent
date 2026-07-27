@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -264,7 +265,6 @@ async def delete_session(
         for root in [settings.report_root, settings.upload_root]:
             session_dir = os.path.join(root, user_id, session_id)
             if os.path.isdir(session_dir):
-                import shutil
                 shutil.rmtree(session_dir)
                 logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, session_dir)
     except Exception as e:
