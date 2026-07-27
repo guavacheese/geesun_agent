@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import psycopg
@@ -39,6 +39,7 @@ class ReconnectingAsyncPostgresStore:
         self._store: Optional[AsyncPostgresStore] = None
         self._lock = asyncio.Lock()
         self._closed = False
+        self._cm: Any = None  # 保持 from_conn_string 生成器存活，防 GC 关闭连接池
 
     # ── 内部生命周期 ──
 
@@ -46,6 +47,7 @@ class ReconnectingAsyncPostgresStore:
         """创建全新的 store 实例（连接池初始化，schema 由公开的 setup() 统一处理）。"""
         cm = AsyncPostgresStore.from_conn_string(self._dsn)
         store = await cm.__aenter__()
+        self._cm = cm  # 保持引用，防止生成器被 GC → 连接池被关
         return store
 
     async def _ensure(self) -> AsyncPostgresStore:
@@ -61,6 +63,7 @@ class ReconnectingAsyncPostgresStore:
         old = self._store
         async with self._lock:
             self._store = None
+            self._cm = None  # 释放旧生成器 → 触发 pool.__aexit__ + 连接池清理
             if old is not None:
                 try:
                     await old.__aexit__(None, None, None)
@@ -105,6 +108,7 @@ class ReconnectingAsyncPostgresStore:
     async def aclose(self):
         """关闭连接池，之后所有调用会抛出错误。"""
         self._closed = True
+        self._cm = None  # 释放生成器 → 触发 pool.__aexit__
         async with self._lock:
             if self._store is not None:
                 try:
@@ -128,12 +132,14 @@ class ReconnectingAsyncPostgresSaver:
         self._cp: Optional[AsyncPostgresSaver] = None
         self._lock = asyncio.Lock()
         self._closed = False
+        self._cm: Any = None  # 保持 from_conn_string 生成器存活
 
     # ── 内部生命周期 ──
 
     async def _create_fresh(self) -> AsyncPostgresSaver:
         cm = AsyncPostgresSaver.from_conn_string(self._dsn)
         cp = await cm.__aenter__()
+        self._cm = cm
         return cp
 
     async def _ensure(self) -> AsyncPostgresSaver:
@@ -147,6 +153,7 @@ class ReconnectingAsyncPostgresSaver:
         old = self._cp
         async with self._lock:
             self._cp = None
+            self._cm = None  # 释放旧生成器 → 触发 pool.__aexit__
             if old is not None:
                 try:
                     await old.__aexit__(None, None, None)
@@ -199,6 +206,7 @@ class ReconnectingAsyncPostgresSaver:
 
     async def aclose(self):
         self._closed = True
+        self._cm = None  # 释放生成器 → 触发 pool.__aexit__
         async with self._lock:
             if self._cp is not None:
                 try:
