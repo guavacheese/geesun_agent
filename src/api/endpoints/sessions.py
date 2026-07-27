@@ -87,9 +87,11 @@ async def list_sessions(
             index_item = await store.aget(namespace, index_key)
             idx_data = index_item.value if index_item else {}
             session_ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
-        except Exception:
+        except Exception as e:
+            logger.error("获取会话索引失败: %s", e, exc_info=True)
             session_ids = []
-    except Exception:
+    except Exception as e:
+        logger.error("获取会话索引失败(外层): %s", e, exc_info=True)
         session_ids = []
 
     for sid in session_ids:
@@ -101,7 +103,8 @@ async def list_sessions(
                 "session_id": sid,
                 **item.value,
             })
-        except Exception:
+        except Exception as e:
+            logger.error("获取会话 %s 的元数据失败: %s", sid, e, exc_info=True)
             continue
 
     # 先按更新时间倒序，再稳定排序让 pinned 置顶（同一组内保持倒序）
@@ -252,8 +255,8 @@ async def delete_session(
     try:
         msg_namespace = _messages_namespace(user_id, session_id)
         await store.aput(msg_namespace, "messages", None)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("删除会话 %s 的消息失败: %s", session_id, e, exc_info=True)
 
     return {"deleted": True, "session_id": session_id}
 
@@ -281,7 +284,8 @@ async def get_session_messages(
         item = await store.aget(msg_namespace, "messages")
         msg_data = item.value if item else {}
         messages = msg_data.get("items", []) if isinstance(msg_data, dict) else []
-    except Exception:
+    except Exception as e:
+        logger.error("获取会话消息失败: session_id=%s, error=%s", session_id, e, exc_info=True)
         messages = []
 
     # 兼容老数据：AI 消息没有 generated_files 时从 content 补
@@ -330,7 +334,8 @@ async def _update_session_index(
         item = await store.aget(namespace, index_key)
         idx_data = item.value if item else {}
         ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
-    except Exception:
+    except Exception as e:
+        logger.error("读取会话索引失败: %s", e, exc_info=True)
         ids = []
 
     if add and session_id not in ids:
