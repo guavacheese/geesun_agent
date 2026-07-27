@@ -36,6 +36,37 @@ def _validate_path(path: str) -> bool:
     return True
 
 
+def _search_file(user_id: str, session_id: str, filename: str) -> str | None:
+    """在可能的目录中查找真实文件路径，返回绝对路径或 None。"""
+    search_dirs = [
+        ("reports", settings.report_root),
+        ("uploads", settings.upload_root),
+    ]
+    # 回退：如果 report_root 是 /data/myapp/ 但文件实际在
+    # agent_workspace/data/reports/ 下，追加该路径
+    try:
+        wsl_report_root = os.path.join(settings.agent_workspace, "data", "reports")
+        wsl_upload_root = os.path.join(settings.agent_workspace, "data", "uploads")
+        if os.path.normpath(wsl_report_root) != os.path.normpath(settings.report_root):
+            search_dirs.append(("reports", wsl_report_root))
+        if os.path.normpath(wsl_upload_root) != os.path.normpath(settings.upload_root):
+            search_dirs.append(("uploads", wsl_upload_root))
+    except Exception:
+        pass
+
+    for dir_name, root_dir in search_dirs:
+        candidate = os.path.normpath(os.path.join(root_dir, user_id, session_id, filename))
+        # 确保候选路径仍在允许的根目录下
+        allowed_root = os.path.normpath(os.path.join(root_dir, user_id, session_id))
+        if not candidate.startswith(allowed_root):
+            logger.warning("路径穿越拦截: candidate=%s, allowed=%s", candidate, allowed_root)
+            continue
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+@router.head("/files/{user_id}/{session_id}/{filename:path}")
 @router.get("/files/{user_id}/{session_id}/{filename:path}")
 async def download_file(
     user_id: str,
@@ -64,33 +95,8 @@ async def download_file(
         raise HTTPException(status_code=400, detail="非法的文件路径")
 
     # ─── 在可能的目录中查找文件 ───
-    search_dirs = [
-        ("reports", settings.report_root),
-        ("uploads", settings.upload_root),
-    ]
-    # 回退：如果 report_root 是 /data/myapp/ 但文件实际在
-    # agent_workspace/data/reports/ 下，追加该路径
-    try:
-        wsl_report_root = os.path.join(settings.agent_workspace, "data", "reports")
-        wsl_upload_root = os.path.join(settings.agent_workspace, "data", "uploads")
-        if os.path.normpath(wsl_report_root) != os.path.normpath(settings.report_root):
-            search_dirs.append(("reports", wsl_report_root))
-        if os.path.normpath(wsl_upload_root) != os.path.normpath(settings.upload_root):
-            search_dirs.append(("uploads", wsl_upload_root))
-    except Exception:
-        pass
-
-    file_path = None
-    for dir_name, root_dir in search_dirs:
-        candidate = os.path.normpath(os.path.join(root_dir, user_id, session_id, filename))
-        # 确保候选路径仍在允许的根目录下
-        allowed_root = os.path.normpath(os.path.join(root_dir, user_id, session_id))
-        if not candidate.startswith(allowed_root):
-            logger.warning("路径穿越拦截: candidate=%s, allowed=%s", candidate, allowed_root)
-            continue
-        if os.path.isfile(candidate):
-            file_path = candidate
-            break
+    file_path = _search_file(user_id, session_id, filename)
+    dir_name = "reports"  # 仅用于日志
 
     if file_path is None:
         raise HTTPException(status_code=404, detail="文件不存在")
