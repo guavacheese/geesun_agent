@@ -5,10 +5,8 @@ from src.core.logging import *  # noqa: F401,F403 — 日志最早就绪
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.store.postgres.aio import AsyncPostgresStore
 from .api.router import api_router
-from .infra.database import _build_dsn
+from .infra.database import _build_dsn, ReconnectingAsyncPostgresStore, ReconnectingAsyncPostgresSaver
 
 
 from src.core.config import settings
@@ -38,33 +36,40 @@ async def lifespan(app: FastAPI):
     app.state.skills = ["/skills/__system__/", "/skills/__agent__/"]
     logging.warning(f"[DIAG] lifespan: skills loaded = {app.state.skills}")
 
-    async with AsyncPostgresStore.from_conn_string(dsn) as store:
-        await store.setup()
+    # 使用自动重连的 store 包装器替换原始 AsyncPostgresStore
+    # 普通 async with 生命周期无法在连接断开后重建，包装器在
+    # aget/aput 抛出 psycopg.OperationalError 时自动重连并重试
+    store = ReconnectingAsyncPostgresStore(dsn)
+    await store.setup()
 
-        # 种子 AGENTS.md 到 store（供 memory= 参数通过 StoreBackend 读取）
-        agents_md_key = "/AGENTS.md"
-        if await store.aget(("__agent__",), agents_md_key) is None:
-            with open("AGENTS.md", "r", encoding="utf-8") as f:
-                content = f.read()
-            await store.aput(
-                ("__agent__",),
-                agents_md_key,
-                {"content": content, "encoding": "utf-8"},
-            )
-            logging.warning("[DIAG] AGENTS.md seeded to store")
+    # 种子 AGENTS.md 到 store（供 memory= 参数通过 StoreBackend 读取）
+    agents_md_key = "/AGENTS.md"
+    if await store.aget(("__agent__",), agents_md_key) is None:
+        with open("AGENTS.md", "r", encoding="utf-8") as f:
+            content = f.read()
+        await store.aput(
+            ("__agent__",),
+            agents_md_key,
+            {"content": content, "encoding": "utf-8"},
+        )
+        logging.warning("[DIAG] AGENTS.md seeded to store")
 
-        app.state.store = store
+    app.state.store = store
 
-        async with AsyncPostgresSaver.from_conn_string(dsn) as checkpointer:
-            await checkpointer.setup()
-            app.state.checkpointer = checkpointer
+    checkpointer = ReconnectingAsyncPostgresSaver(dsn)
+    await checkpointer.setup()
+    app.state.checkpointer = checkpointer
 
-            from src.core.mcp import get_mcp_tools
+    from src.core.mcp import get_mcp_tools
 
-            await get_mcp_tools()
+    await get_mcp_tools()
 
-            yield  # ← 服务运行期间停在这里
-            # 关闭时：PostgreSQL 连接池由 gc 自动清理
+    yield  # ← 服务运行期间停在这里
+
+    # 服务退出时手动关闭连接池
+    await store.aclose()
+    await checkpointer.aclose()
+    logging.warning("Store + Checkpointer 连接池已关闭，服务退出完成")
 
 
 app = FastAPI(title="Geesun Agent", lifespan=lifespan)
