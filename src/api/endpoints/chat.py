@@ -457,9 +457,8 @@ async def chat(
             logger.exception("Agent 流式处理异常: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
 
-        yield "data: [DONE]\n\n"
-
-        # ─── SSE 流结束，保存消息到会话历史（P1）───
+        # ─── SSE 流结束，先保存消息到会话历史，再发 [DONE] ───
+        # 防止前端 [DONE] 后立即编辑导致竞态（消息尚未落盘 → from_index 越界）
         try:
             # 读取最终状态中的消息
             state = await agent.aget_state(
@@ -641,5 +640,7 @@ async def chat(
                 )
         except Exception as e:
             logger.warning("保存会话消息失败（非关键错误）: %s", e)
+
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

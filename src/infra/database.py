@@ -212,6 +212,9 @@ class ReconnectingAsyncPostgresSaver(BaseCheckpointSaver):
     async def aget(self, config):
         return await self._call("aget", config)
 
+    async def aput_writes(self, config, writes, task_id, task_path=""):
+        return await self._call("aput_writes", config, writes, task_id, task_path)
+
     async def setup(self):
         cp = await self._ensure()
         await cp.setup()
