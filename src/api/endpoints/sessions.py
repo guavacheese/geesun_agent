@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -257,6 +258,17 @@ async def delete_session(
         await store.aput(msg_namespace, "messages", None)
     except Exception as e:
         logger.error("删除会话 %s 的消息失败: %s", session_id, e, exc_info=True)
+
+    # 清理磁盘文件（非关键，失败不影响会话删除）
+    try:
+        for root in [settings.report_root, settings.upload_root]:
+            session_dir = os.path.join(root, user_id, session_id)
+            if os.path.isdir(session_dir):
+                import shutil
+                shutil.rmtree(session_dir)
+                logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, session_dir)
+    except Exception as e:
+        logger.warning("清理会话文件失败（非关键错误）: %s", e)
 
     return {"deleted": True, "session_id": session_id}
 
