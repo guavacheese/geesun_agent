@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     report_root: str = "/data/myapp/reports"
     mcp_token: str = "YOUR_TOKEN"
 
+    # Arize Phoenix 追踪（从 .env 或环境变量读取）
+    phoenix_collector_endpoint: str = ""
+
     cube_template_id: str = ""
     cube_api_url: str = ""
     cube_api_key: str = "e2b_0000000000000000000000000000000000000000"

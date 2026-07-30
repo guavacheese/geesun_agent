@@ -2,6 +2,17 @@
 
 from src.core.logging import *  # noqa: F401,F403 — 日志最早就绪
 
+# ──────────────────────────────────────────────
+# Arize Phoenix tracing 初始化（必须在任何 LangChain 导入之前）
+# ──────────────────────────────────────────────
+# setup_tracing() 必须在 from .api.router import api_router 之前执行，
+# 因为 router → endpoints → services/agent 会触发 deepagents + langchain 的导入。
+# OpenInference 的 auto_instrument 需要在模块加载时 patch 进去。
+from src.core.tracing import setup_tracing
+
+setup_tracing()
+# ──────────────────────────────────────────────
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
