@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     # Arize Phoenix 追踪（从 .env 或环境变量读取）
     phoenix_collector_endpoint: str = ""
 
+    # Langfuse 追踪（OpenTelemetry HTTP ingest）
+    langfuse_secret_key: str = ""
+    langfuse_public_key: str = ""
+    langfuse_base_url: str = ""
+
     cube_template_id: str = ""
     cube_api_url: str = ""
     cube_api_key: str = "e2b_0000000000000000000000000000000000000000"
