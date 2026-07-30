@@ -41,13 +41,18 @@ def setup_tracing() -> bool:
             OTLPSpanExporter as HttpExporter,
         )
         from opentelemetry.sdk import trace as trace_sdk
+        from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace.export import (
             SimpleSpanProcessor,
             BatchSpanProcessor,
         )
         from openinference.instrumentation.langchain import LangChainInstrumentor
 
-        tracer_provider = trace_sdk.TracerProvider()
+        tracer_provider = trace_sdk.TracerProvider(
+            resource=Resource.create({
+                "openinference.project.name": "Geesun-Agent-dev",
+            })
+        )
 
         # ── 1. Phoenix gRPC exporter ──
         phoenix_endpoint = settings.phoenix_collector_endpoint
