@@ -30,4 +30,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-langchain-cubesandbox = { path = "../langchain-cubesandbox" }
+langchain-cubesandbox = { path = "../langchain-cubesandbox", editable = true }

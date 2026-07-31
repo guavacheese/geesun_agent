@@ -1,9 +1,13 @@
 from langchain_cubesandbox.sandbox import CubeSandbox
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 s = CubeSandbox(
-    template="tpl-feb83bbc69ae4fb897329c54",
-    api_url="http://192.168.10.136:13000",
-    api_key="dummy",
+    template=os.environ["CUBE_TEMPLATE_ID"],
+    api_key=os.environ["CUBE_API_KEY"],
+    api_url=os.environ["CUBE_API_URL"],
 )
 
 print("Sandbox ID:", s.id)
