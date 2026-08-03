@@ -3,6 +3,7 @@
 import os
 import logging
 import mimetypes
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -112,10 +113,17 @@ async def download_file(
 
     # ─── 确定展示方式 ───
     # 图片/PDF/文本 inline 预览，其他 attachment 下载
-    if ext in INLINE_EXTENSIONS:
-        content_disposition = f'inline; filename="{filename}"'
-    else:
-        content_disposition = f'attachment; filename="{filename}"'
+    disposition = "inline" if ext in INLINE_EXTENSIONS else "attachment"
+    # RFC 5987：HTTP header 只允许 Latin-1 字符，中文文件名若直接放进
+    # Content-Disposition，Starlette 编码 header 时会抛 UnicodeEncodeError(500)。
+    # 因此用 ASCII 回退名 + filename*=UTF-8'' 百分号编码的标准写法，
+    # 现代浏览器可正确识别并下载为原始中文文件名。
+    ascii_fallback = filename.encode("ascii", "ignore").decode("ascii") or "download"
+    encoded_name = quote(filename)
+    content_disposition = (
+        f'{disposition}; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{encoded_name}"
+    )
 
     logger.info(
         "文件下载: user=%s, session=%s, virtual=%s/%s/%s/%s, disk=%s, mime=%s",
