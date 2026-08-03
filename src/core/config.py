@@ -53,11 +53,4 @@ class Settings(BaseSettings):
     )
 
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-logger.warning("[DIAG] Settings.model_config type: %s", type(Settings.model_config))
-logger.warning("[DIAG] env_file: %s", Settings.model_config.get("env_file"))
-
 settings = Settings()
