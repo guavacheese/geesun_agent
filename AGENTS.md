@@ -102,6 +102,9 @@ download_from_sandbox(
 ## 解密规则
 - XML 文本文件不需要解密，用 `upload_to_sandbox` 直接上传到沙箱
 - Excel (.xlsx) 和 Word (.docx) 等 Office 文件会被公司加密，用 `decrypt_and_upload_to_sandbox` 解密后上传到沙箱
+- **禁止用 read_excel 直接读取 /uploads/ 下的加密 Office 文件**：`/uploads/` 是虚拟路径，只在虚拟文件系统（read_file/ls/glob/grep）和 MCP 传输工具里有效；read_excel 底层用真实文件系统 open()，宿主机与沙箱均无 `/uploads` 目录，必然报 No such file；且文件为密文，路径通了也读不出内容
+- 加密 Office 文件的正确读取流程：`decrypt_and_upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")` → 沙箱 `/home/user/` 下用 execute / read 处理
+- 同一目录下的文件名可用 `ls /uploads/{user_id}/{session_id}/` 确认（虚拟文件系统可列出），但**不要**用 execute 在沙箱里验证 /uploads（沙箱内不存在）
 
 ## 文件上传到沙箱的流程
 - 所有输入文件（XML / Excel / Word）：用对应的 MCP 工具直传沙箱，不经过 LLM 上下文
