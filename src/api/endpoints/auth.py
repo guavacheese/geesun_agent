@@ -49,6 +49,17 @@ async def login(body: LoginRequest):
     )
 
 
+@router.get("/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """
+    返回当前登录用户信息。
+
+    用于前端初始化时校验本地 Token 是否仍然有效（签名/过期）。
+    Token 无效时由 get_current_user 抛出 401。
+    """
+    return {"user": current_user}
+
+
 # ─── 管理员接口 ───
 
 
