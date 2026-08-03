@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 import logging
 
@@ -8,6 +9,11 @@ logging.basicConfig(level=logging.DEBUG)
 
 from e2b_code_interpreter import Sandbox
 
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "cube-ca.pem"))
+
+# 关键：e2b SDK 没有 ssl_cert 参数，证书信任靠环境变量
+os.environ["SSL_CERT_FILE"] = ca_path  # ← 加这一行，删掉 create 里的 ssl_cert=
 
 sb = None
 
@@ -16,7 +22,7 @@ try:
         template=os.environ["CUBE_TEMPLATE_ID"],
         api_key=os.environ["CUBE_API_KEY"],
         api_url=os.environ["CUBE_API_URL"],
-        secure=False,
+        # ssl_cert=str(ca_path),
     )
     result = sb.run_code("print('============hello')")
     print(result)
