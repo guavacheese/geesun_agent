@@ -50,6 +50,9 @@ class ChatRequest(BaseModel):
     continue_from_state: bool = (
         False  # 为 true 时不新增用户消息，直接从当前 checkpoint 继续生成
     )
+    mcp_servers: list[str] | None = (
+        None  # 可选，本轮临时启用的 MCP 服务名列表（缺省 = 全部 enabled）
+    )
 
 
 router = APIRouter()
@@ -67,7 +70,8 @@ async def chat(
     session_id = body.session_id
     thread_id = f"{user_id}:{session_id}"
 
-    tools = await get_mcp_tools()
+    # 按本轮透传的 mcp_servers 过滤 MCP 工具（缺省 = 全部 enabled）
+    tools = await get_mcp_tools(body.mcp_servers)
     sandbox = create_sandbox(thread_id)
     logger.info("[DIAG] create_sandbox(thread_id=%s) → sandbox=%s", thread_id, type(sandbox).__name__ if sandbox else "None")
     # 构建 skill sources：系统 + Agent 自创（启动时加载）+ 当前用户的共享 skill
