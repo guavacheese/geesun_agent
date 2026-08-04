@@ -192,15 +192,16 @@ def set_disabled(name: str, disabled: bool) -> dict:
 # 客户端+工具缓存：key = frozenset(启用的 server 名集合)
 # value = (MultiServerMCPClient, tools 列表) — 复用 client 避免重复握手/泄漏
 _tools_cache: dict[frozenset, tuple[object, list[BaseTool]]] = {}
-# 按 server 统计的工具数缓存（探测一次后复用，配置变更后失效）
-_tool_count_cache: dict[str, int] | None = None
+# 工具信息缓存：{server_name: {"ts": 探测时间戳, "tools": [{name, description}]}}
+# 30 分钟 TTL，配置变更（invalidate_cache）后立即失效
+_tool_info_cache: dict[str, dict] = {}
+_TOOL_CACHE_TTL = 30 * 60  # 30 分钟
 
 
 def invalidate_cache() -> None:
     """配置变更后清空缓存（热重载）。"""
-    global _tool_count_cache
     _tools_cache.clear()
-    _tool_count_cache = None
+    _tool_info_cache.clear()
 
 
 def _enabled_entries(names: list[str] | None = None) -> dict[str, dict]:
@@ -258,28 +259,45 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
         return []
 
 
-async def get_tool_count_map() -> dict[str, int]:
-    """按 server 返回工具数（带超时保护，失败回退 0）。"""
-    entries = _enabled_entries()
+async def get_tool_info_map(
+    names: list[str] | None = None,
+) -> dict[str, list[dict]]:
+    """按 server 返回工具信息列表 [{name, description}]（30 分钟 TTL 缓存）。
+
+    - 服务不可达/探测失败 → 该 server 返回空列表
+    - names 给定 → 仅探测列表中且启用的 server
+    """
+    entries = _enabled_entries(names)
     if not entries:
         return {}
-    # 已有缓存直接返回
-    global _tool_count_cache
-    if _tool_count_cache is not None:
-        return _tool_count_cache
 
-    result: dict[str, int] = {}
+    now = time.time()
+    result: dict[str, list[dict]] = {}
 
     async def probe(name: str, entry: dict) -> None:
+        cached = _tool_info_cache.get(name)
+        if cached and (now - cached["ts"]) < _TOOL_CACHE_TTL:
+            result[name] = cached["tools"]
+            return
         try:
             client = MultiServerMCPClient({name: _to_client_config(entry)})
             tools = await asyncio.wait_for(client.get_tools(), timeout=5)
-            result[name] = len(tools)
+            infos = [
+                {"name": t.name, "description": (t.description or "")[:300]}
+                for t in tools
+            ]
+            _tool_info_cache[name] = {"ts": now, "tools": infos}
+            result[name] = infos
         except Exception:  # noqa: BLE001
-            result[name] = 0
+            result[name] = []
 
     await asyncio.gather(
         *[probe(name, entry) for name, entry in entries.items()]
     )
-    _tool_count_cache = result
     return result
+
+
+async def get_tool_count_map() -> dict[str, int]:
+    """按 server 返回工具数（兼容旧调用，基于 get_tool_info_map 派生）。"""
+    info = await get_tool_info_map()
+    return {name: len(tools) for name, tools in info.items()}

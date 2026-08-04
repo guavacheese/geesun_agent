@@ -122,16 +122,19 @@ _HUB_ITEMS = [
 async def list_mcp_servers(
     current_user: dict = Depends(get_current_user),
 ):
-    """列出所有 MCP 服务（system / agent / user 三类合并）。"""
+    """列出所有 MCP 服务（system / agent / user 三类合并），含已探测的工具列表。"""
     servers = mcp_service.list_servers()
-    # 附加工具数统计（尽力而为）
+    # 附加工具信息（名称 + 描述，30 分钟 TTL 缓存）
     try:
-        counts = await mcp_service.get_tool_count_map()
+        info = await mcp_service.get_tool_info_map()
         for s in servers:
-            s["tool_count"] = counts.get(s["name"], 0)
+            tools = info.get(s["name"], [])
+            s["tool_count"] = len(tools)
+            s["tools"] = tools
     except Exception:  # noqa: BLE001
         for s in servers:
             s["tool_count"] = 0
+            s["tools"] = []
     return {"servers": servers}
 
 
