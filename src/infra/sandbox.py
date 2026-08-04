@@ -2,11 +2,153 @@ from src.core.config import settings
 import os
 from pathlib import Path
 import logging
+import json
+import time
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "cube-ca.pem"))
+
+
+# ─── 环境快照（设计文档 M1：环境预检注入，消除"模型现场探索环境"）───────────
+
+# 默认探测白名单：只探测这些命令是否存在（不执行任意命令，杜绝注入面）
+DEFAULT_PROBE_COMMANDS = ["rustc", "cargo", "python3", "node", "go", "gcc", "javac"]
+
+
+@dataclass
+class SandboxEnvSnapshot:
+    """一次沙箱环境探测的结构化结果，注入 system 消息供模型直接使用。"""
+
+    ok: bool  # 探测是否成功（失败 = 降级，不阻断任务）
+    commands: dict[str, str | None] = field(default_factory=dict)  # 命令 -> 绝对路径或 None
+    disk_avail_mb: int | None = None  # df -h / 可用空间（MB）
+    toolchains: list[str] = field(default_factory=list)  # rustup toolchain list（如存在）
+    error: str | None = None  # 探测失败原因（降级时非 None）
+
+    def to_hint(self) -> str:
+        """渲染为注入 system 消息的一段文本。"""
+        parts = []
+        if self.ok:
+            cmd_bits = [
+                f"{name}: {path or '未安装'}"
+                for name, path in sorted(self.commands.items())
+            ]
+            parts.append("  " + " | ".join(cmd_bits))
+            if self.disk_avail_mb is not None:
+                warn = ""
+                if self.disk_avail_mb < settings.sandbox_disk_warn_mb:
+                    warn = "（偏低，编译/大文件类任务可能失败）"
+                parts.append(f"  可用磁盘: {self.disk_avail_mb}MB{warn}")
+            if self.toolchains:
+                parts.append(f"  rustup toolchains: {', '.join(self.toolchains)}")
+        else:
+            parts.append(f"  环境探测失败: {self.error or '未知原因'}，请自行确认可用工具与磁盘空间")
+        return "\n".join(parts)
+
+
+# 快照缓存：{thread_id: (ts, snapshot)}，TTL 由 settings.sandbox_probe_ttl_sec 控制
+_env_snapshot_cache: dict[str, tuple[float, SandboxEnvSnapshot]] = {}
+
+
+def _probe_commands() -> list[str]:
+    """读取探测命令白名单（配置可覆盖，JSON 数组）。"""
+    raw = (settings.sandbox_probe_commands or "").strip()
+    if not raw:
+        return list(DEFAULT_PROBE_COMMANDS)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and parsed:
+            return [str(c) for c in parsed]
+    except json.JSONDecodeError:
+        logger.warning("sandbox_probe_commands 解析失败，使用默认白名单: %s", raw)
+    return list(DEFAULT_PROBE_COMMANDS)
+
+
+def probe_sandbox_env(sandbox) -> SandboxEnvSnapshot:
+    """对沙箱执行一次环境探测，合并为单次 execute 降低开销。
+
+    探测内容（全部只读，无副作用）：
+      1. 白名单命令是否存在：for c in ...; do command -v $c
+      2. 根分区可用空间：df -h / | tail -1（parse 第 4 列如 "120M"/"1.2G"）
+      3. rustup 默认 toolchain：rustup toolchain list（存在 rustup 才跑）
+    任一步骤失败不抛异常，置 ok=False 降级（环境探测失败不应阻断任务）。
+    """
+    snapshot = SandboxEnvSnapshot(ok=True, commands={})
+    try:
+        probe_list = _probe_commands()
+        cmd = (
+            "for c in %s; do p=$(command -v $c 2>/dev/null); "
+            "if [ -n \"$p\" ]; then echo \"CMD:$c=$p\"; fi; done; "
+            "echo '---'; df -h / | tail -1; echo '---'; "
+            "if command -v rustup >/dev/null 2>&1; then rustup toolchain list 2>/dev/null; fi"
+            % " ".join(probe_list)
+        )
+        resp = sandbox.execute(cmd, timeout=30)
+        if resp.exit_code != 0:
+            raise RuntimeError(f"probe 命令退出码 {resp.exit_code}: {resp.output[:200]}")
+
+        output = resp.output or ""
+        section = "cmds"
+        for line in output.splitlines():
+            line = line.strip()
+            if line == "---":
+                section = "df" if section == "cmds" else "rustup"
+                continue
+            if section == "cmds":
+                if line.startswith("CMD:"):
+                    name, _, path = line[4:].partition("=")
+                    if name:
+                        snapshot.commands[name] = path or None
+            elif section == "df" and line:
+                # df -h 行格式: Filesystem Size Used Avail Use% Mounted on
+                # tail -1 取数据行，第 4 列是 Avail（如 "120M"、"1.2G"、"0"）
+                fields = line.split()
+                if len(fields) >= 4:
+                    snapshot.disk_avail_mb = _df_avail_to_mb(fields[3])
+            elif section == "rustup" and line:
+                snapshot.toolchains.append(line)
+        return snapshot
+    except Exception as e:  # noqa: BLE001
+        logger.warning("probe_sandbox_env 失败（降级）: %s", e)
+        return SandboxEnvSnapshot(ok=False, error=str(e)[:200])
+
+
+def _df_avail_to_mb(avail: str) -> int | None:
+    """把 df -h 的 Avail 列（如 120M / 1.2G / 512K）解析为 MB。解析失败返回 None。"""
+    avail = avail.strip().upper()
+    try:
+        if avail.endswith("G"):
+            return int(float(avail[:-1]) * 1024)
+        if avail.endswith("M"):
+            return int(float(avail[:-1]))
+        if avail.endswith("K"):
+            return max(1, int(float(avail[:-1]) // 1024))
+        if avail.endswith("T"):
+            return int(float(avail[:-1]) * 1024 * 1024)
+        # 无单位：按字节处理（df 无 -h 时）
+        return int(float(avail)) // (1024 * 1024)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_env_snapshot(sandbox, thread_id: str | None = None) -> SandboxEnvSnapshot | None:
+    """带缓存的快照入口：TTL 内同一 thread_id 复用，避免每轮 chat 重跑探测。
+
+    返回 None 表示无沙箱（本地模式）或 thread_id 缺失，调用方跳过注入。
+    """
+    if sandbox is None:
+        return None
+    cache_key = thread_id or "default"
+    now = time.time()
+    cached = _env_snapshot_cache.get(cache_key)
+    if cached and (now - cached[0]) < settings.sandbox_probe_ttl_sec:
+        return cached[1]
+    snapshot = probe_sandbox_env(sandbox)
+    _env_snapshot_cache[cache_key] = (now, snapshot)
+    return snapshot
 
 
 def create_sandbox(thread_id: str):

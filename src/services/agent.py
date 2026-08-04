@@ -52,21 +52,49 @@ class ValidatedCompositeBackend(CompositeBackend):
     关键：在 CompositeBackend.write 调用 _get_backend_and_key 之前拦截，
     此时 file_path 还是完整虚拟路径（/reports/{user}/{sid}/file.go），
     还没被路由前缀剥掉。
+
+    M2（设计文档）：拒绝 ≠ 沉默。持有 user/session 上下文，拒绝时按路径
+    模式返回可执行修正建议，把模型可能不记得的会话上下文直接算好塞回。
     """
 
     ALLOWED_WRITE_PREFIXES = {"/reports/", "/workspace/memories/"}
 
+    # 沙箱内路径：write_file 本就不该碰，命中即提示走 MCP 传输或直接写 reports
+    SANDBOX_PATH_PREFIXES = ("/tmp/", "/home/", "/root/", "/mnt/", "/code/", "/var/")
+    # 虚拟文件系统内只读路径：命中即提示改 reports
+    VIRTUAL_READONLY_PREFIXES = ("/uploads/", "/skills/", "/workspace/agent-memory/")
+
+    def __init__(self, default, routes, *, user_id: str = "", session_id: str = ""):
+        super().__init__(default=default, routes=routes)
+        self._report_prefix = f"/reports/{user_id}/{session_id}/" if user_id and session_id else "/reports/<user_id>/<session_id>/"
+
+    def _reject_hint(self, file_path: str) -> str:
+        """按路径类型生成修正建议（单条 ≤ 200 字，仅拒绝路径出现）。"""
+        if file_path.startswith(self.SANDBOX_PATH_PREFIXES):
+            return (
+                f"路径 '{file_path}' 是沙箱内路径，write_file 无法写入沙箱文件系统。"
+                f"沙箱内文件请用 upload_to_sandbox / copy_script_to_sandbox 传输；"
+                f"如需生成交付物，请直接写入 '{self._report_prefix}<文件名>'"
+            )
+        if file_path.startswith(self.VIRTUAL_READONLY_PREFIXES):
+            return (
+                f"路径 '{file_path}' 为只读（输入/技能/共享规则）。"
+                f"交付物请写入 '{self._report_prefix}<文件名>'"
+            )
+        return (
+            f"只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}。"
+            f"当前会话交付目录为 '{self._report_prefix}'"
+        )
+
     def write(self, file_path: str, content: str) -> WriteResult:
         if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+            hint = self._reject_hint(file_path)
             logger.warning(
-                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s)",
-                file_path, self.ALLOWED_WRITE_PREFIXES,
+                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s) | hint=%s",
+                file_path, self.ALLOWED_WRITE_PREFIXES, hint,
             )
             return WriteResult(
-                error=(
-                    f"拒绝写入: 文件路径 '{file_path}' 不在允许范围内。"
-                    f" 只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
-                ),
+                error=f"拒绝写入: {hint}",
                 path=file_path,
                 files_update=None,
             )
@@ -74,15 +102,13 @@ class ValidatedCompositeBackend(CompositeBackend):
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+            hint = self._reject_hint(file_path)
             logger.warning(
-                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s)",
-                file_path, self.ALLOWED_WRITE_PREFIXES,
+                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s) | hint=%s",
+                file_path, self.ALLOWED_WRITE_PREFIXES, hint,
             )
             return WriteResult(
-                error=(
-                    f"拒绝写入: 文件路径 '{file_path}' 不在允许范围内。"
-                    f" 只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
-                ),
+                error=f"拒绝写入: {hint}",
                 path=file_path,
                 files_update=None,
             )
@@ -150,7 +176,12 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
     }
     if sandbox:
         # sandbox 作为 default backend —— execute 走这里！
-        return ValidatedCompositeBackend(default=sandbox, routes=routes)
+        return ValidatedCompositeBackend(
+            default=sandbox,
+            routes=routes,
+            user_id=user_id,
+            session_id=session_id,
+        )
     else:
         return ValidatedCompositeBackend(
             default=LocalShellBackend(
@@ -159,6 +190,8 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
                 env={**os.environ},
             ),
             routes=routes,
+            user_id=user_id,
+            session_id=session_id,
         )
 
 

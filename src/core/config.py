@@ -27,6 +27,28 @@ class Settings(BaseSettings):
     cube_api_url: str = ""
     cube_api_key: str = "e2b_0000000000000000000000000000000000000000"
 
+    # ─── 沙箱护栏（设计文档 M1：环境快照注入 + 磁盘前置校验）───
+    # 覆盖默认探测命令白名单（JSON 数组），空 = 用 sandbox.py 内置默认
+    sandbox_probe_commands: str = ""
+    # 磁盘可用空间阈值（MB）：低于 warn 注入警告提示模型避开编译类任务；
+    # 低于 hard 直接在 chat 入口拒绝启动任务（HTTP 503）
+    sandbox_disk_warn_mb: int = 200
+    sandbox_disk_hard_mb: int = 50
+    # 环境快照缓存 TTL（秒）：同一 thread_id 的沙箱在 TTL 内复用快照，避免每轮 chat 重跑探测
+    sandbox_probe_ttl_sec: int = 60
+    # ─── M3 完成门（设计文档）：零产出不放行结束 ───
+    # 总开关（M1/M2/M3 回滚开关，False = 全部关闭护栏）
+    sandbox_guardrails_enabled: bool = True
+    # 完成门检测：False = 不做零产出校验（回到旧行为）
+    sandbox_completion_gate_enabled: bool = True
+    # 自动继续：零产出时注入 SystemMessage 让模型再跑一轮。
+    # ⚠ 依赖 deepagents astream 继续模式（spike_checkpoint_resume.py 验证），
+    #   spike 通过前保持默认 False（此时完成门为纯检测 + blocked 事件，即 v1 行为）；
+    #   验证通过后在 .env 设 SANDOX_COMPLETION_GATE_AUTO_CONTINUE=true 开启 v2。
+    sandbox_completion_gate_auto_continue: bool = False
+    # 最多打回次数，超限标记任务失败终止
+    sandbox_completion_gate_max_retries: int = 2
+
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "agent_mem"
