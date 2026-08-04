@@ -205,6 +205,11 @@ async def chat(
         # M3 完成门：astream 前快照 /reports/ 目录，结束后做差集判定本轮产出
         _before_files = snapshot_report_files(settings.report_root, user_id, session_id)
         _completion_blocked = False
+        # graph_input 是 chat() 外层变量；event_stream 内若要重新赋值（完成门自动
+        # 继续轮注入 SystemMessage），必须用独立局部变量 _graph_input，否则
+        # Python 会把 graph_input 判定为 event_stream 局部变量，首轮读取即
+        # UnboundLocalError（2026-08-04 M3 重构回归，已修复）
+        _graph_input = graph_input
 
         # ─── 流式生成（多轮共用：首轮 + 完成门自动继续轮）───
         async def _drain_astream(_graph_input):
@@ -506,7 +511,7 @@ async def chat(
         # 异常由 _drain_astream 内部吞掉 → 本轮零产出仍会递增重试，超限终止）。
         _completion_retries = 0
         while True:
-            async for _ev in _drain_astream(graph_input):
+            async for _ev in _drain_astream(_graph_input):
                 yield _ev
             _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
             _new_files = _after_files - _before_files
@@ -535,7 +540,7 @@ async def chat(
                 "[M3] 零产出，注入 SystemMessage 自动继续（第 %d/%d 次）: user=%s, session=%s",
                 _completion_retries, settings.sandbox_completion_gate_max_retries, user_id, session_id,
             )
-            graph_input = {"messages": [SystemMessage(
+            _graph_input = {"messages": [SystemMessage(
                 f"系统检测：/reports/{user_id}/{session_id}/ 当前无本轮新文件，本轮任务未产出任何交付物。"
                 "请检查是否遗漏 download_from_sandbox / write_file 步骤，并继续完成。"
             )]}
