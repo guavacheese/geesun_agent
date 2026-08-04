@@ -4,7 +4,7 @@
 - 连接器 = mcp.json 中的 mcpServers 条目
 - 管理连接器 = 本模块的 CRUD + 启停 + JSON 直写
 - MCP Hub = 内置静态列表（预留官方 Hub API 接入）
-配置文件：~/.geesun_agent/mcp.json
+配置文件：{AGENT_WORKSPACE}/mcp.json
 """
 
 import logging

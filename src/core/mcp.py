@@ -1,4 +1,4 @@
-"""MCP 客户端管理 — 从 ~/.geesun_agent/mcp.json 读取多 MCP 配置。
+"""MCP 客户端管理 — 从 {AGENT_WORKSPACE}/mcp.json 读取多 MCP 配置。
 
 mcp.json 结构：
 {
@@ -33,8 +33,8 @@ from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# mcp.json 路径：~/.geesun_agent/mcp.json
-_CONFIG_DIR = Path.home() / ".geesun_agent"
+# mcp.json 路径：跟随工程目录（AGENT_WORKSPACE），便于随项目共享与迁移
+_CONFIG_DIR = Path(settings.agent_workspace)
 CONFIG_PATH = _CONFIG_DIR / "mcp.json"
 
 # 系统预装 MCP 默认配置（首次运行时写入）
@@ -68,7 +68,7 @@ def write_config(config: dict) -> None:
 
 
 def _ensure_default_config() -> None:
-    """首次运行时创建 ~/.geesun_agent/mcp.json 并写入系统预装配置。"""
+    """首次运行时创建 {AGENT_WORKSPACE}/mcp.json 并写入系统预装配置。"""
     if CONFIG_PATH.exists():
         return
     try:
