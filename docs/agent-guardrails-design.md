@@ -28,13 +28,13 @@
 |----|------|------|
 | F1 | 活入口是 `src/services/agent.py`（chat.py:11 引用）；`src/init_agent.py` 的 `_ValidatedCompositeBackend`（允许前缀 `/reports/, /memories/`）**无任何引用** | 两套校验分叉，旧版必须删除或统一，否则行为漂移 |
 | F2 | `mcp.json` 中 `decrypt-file` 的 `Authorization: Bearer YOUR_TOKEN` 是**占位符**；`.env` 未检出 `mcp_token` 配置 | `upload_to_sandbox` / `download_from_sandbox` 可能**根本没被加载**——若 MCP 握手失败，AGENTS.md 写的传输流程对模型是空话，它只能走 heredoc。**这是比 ④ 更前置的问题** |
-| F3 | `langchain-cubesandbox` 是本地 editable 依赖（`../langchain-cubesandbox`，基于 e2b-code-interpreter） | 强版本①（透明重定向到沙箱写入）需读其源码确认文件写入 API，评估可行性与路径语义 |
+| F3 | `langchain-cubesandbox` 是本地 editable 依赖（`../langchain-cubesandbox`，基于 e2b-code-interpreter） | **已探查（T3）**：`CubeSandbox.upload_files(files: list[(path, bytes)])` → `_sandbox.files.write(path, content)`，**要求绝对路径**（`path.startswith("/")`，相对路径直接拒绝）；`download_files(paths)` → `_sandbox.files.read(path, format="bytes")`；均有 async 版本。**强版本①透明重定向可直接调用本服务持有的 sandbox 对象，不依赖 decrypt-file MCP 可用性** —— 依赖从 T1 降级为"仅需 sandbox 非 None" |
 | F4 | deepagents == 0.6.12，langgraph checkpoint 已接入（create_agent 传 checkpointer） | 完成门 v2"自动继续生成"需 spike 验证 `astream(None, config)` 继续模式 |
 
 **待验证项（T 项，实施第一步）**：
-- T1：启动服务后 `GET /api/v1/mcp/json` 或直接调 `get_mcp_tools(["decrypt-file"])`，确认 upload/download 工具是否加载；若失败，修 token/服务可用性。
-- T2：grep 全仓库确认 init_agent.py 无其他引用后删除（或至少统一前缀）。
-- T3：读 `langchain-cubesandbox` 源码，确认 sandbox 是否有 `filesystem.write` / `upload` 等价 API。
+- T1：静态核查完成——`.env` **无 `MCP_TOKEN`**（`settings.mcp_token` 保持默认占位符 `YOUR_TOKEN`），`mcp.json` decrypt-file header 为 `Bearer YOUR_TOKEN`。若解密服务校验 Bearer 则握手失败 → `get_mcp_tools` 跳过该服务（mcp.py:268）→ 模型拿不到 upload/download 工具。**运行时验证命令**：`python -c "import asyncio; from src.core.mcp import get_mcp_tools; print(asyncio.run(get_mcp_tools(['decrypt-file'])))"`（需在服务环境下执行）。修复：在 .env 配置真实 `MCP_TOKEN`。
+- T2：grep 全仓库确认 init_agent.py 无其他引用后删除（或至少统一前缀）。→ **已完成**（commit 073e7f9，init_agent.py 已删除）。
+- T3：读 `langchain-cubesandbox` 源码，确认 sandbox 是否有 `filesystem.write` / `upload` 等价 API。→ **已完成**：有 `upload_files`/`download_files`（绝对路径，拒绝相对路径），见 F3。
 
 ---
 
@@ -294,3 +294,23 @@ while True:
 | 收尾 | AGENTS.md 修订、配置文档、验收回归 | 全部 |
 
 > 每个里程碑独立可交付、可回滚，建议按 M0 → M1 → M2 → M3-v1 → M3-v2 顺序评审与实施。
+
+---
+
+## 9. 实施状态（2026-08-04 更新）
+
+| 项 | 状态 | 说明 |
+|----|------|------|
+| M0-T2 | ✅ 已完成 | commit `073e7f9` 删除 `src/init_agent.py`（406 行旧原型，无引用） |
+| M0-T3 | ✅ 已完成 | CubeSandbox 有 `upload_files`/`download_files`（绝对路径），强版本①可直接用 sandbox 对象，不依赖 MCP（见 F3） |
+| M0-T1 | ⚠ 静态结论 | `.env` 无 `MCP_TOKEN`（settings 保持占位符 `YOUR_TOKEN`），decrypt-file 握手成败需运行时验证；修复 = .env 配真实 token |
+| M1 | ✅ 已实现 | `src/infra/sandbox.py`：`SandboxEnvSnapshot` + `probe_sandbox_env`（单次 execute 合并探测）+ `get_env_snapshot`（thread_id 缓存 60s）；`config.py`：`sandbox_probe_commands` / `sandbox_disk_warn_mb=200` / `sandbox_disk_hard_mb=50` / `sandbox_probe_ttl_sec=60`；`chat.py`：path_hint 注入 `【沙箱环境】` + 硬阈值 503 |
+| M2 | ✅ 已实现 | `ValidatedCompositeBackend` 持有 user/session，`_reject_hint` 按三类路径（沙箱/只读/未知）返回可执行建议；`build_backend` 传参 |
+| M3-v1 | ✅ 已实现 | `src/infra/reports.py`（**从 chat.py 抽出**，可脱离 fastapi 单测）`snapshot_report_files`；event_stream 前后差集判定；零产出发 `completion_blocked` + 会话历史 `blocked_no_output` |
+| M3-v2 | 🟡 已实现但默认关闭 | `chat.py` 流式循环抽为 `_drain_astream` 支持多轮；完成门 while 循环注入 SystemMessage 继续（≤ `sandbox_completion_gate_max_retries=2`）；`config.py` 新增 `sandbox_guardrails_enabled` / `sandbox_completion_gate_enabled` / `sandbox_completion_gate_auto_continue`(**默认 False**) / `sandbox_completion_gate_max_retries`。**启用前置**：WSL 环境跑 `spike_checkpoint_resume.py` 三检查全过后在 .env 设 `SANDOX_COMPLETION_GATE_AUTO_CONTINUE=true` |
+| 单测 | ✅ 28 passed | `tests/infra/test_sandbox_probe.py`（15）/ `tests/services/test_validated_backend.py`（7，打桩 deepagents 本机可跑）/ `tests/infra/test_reports.py`（6） |
+| 验证限制 | ⚠ | WSL 被本机安全策略禁用 + Windows pip 无法安装 deepagents → M3-v2 spike 与集成测试需在 WSL 环境（`.venv/bin/python`）执行 |
+
+**偏差记录**：
+- §4 M3 设计快照函数原定 chat.py 模块级，实现时下沉到 `src/infra/reports.py`：因 chat.py 顶层 import fastapi 等重依赖，模块级函数无法脱离 fastapi 做单测。功能与签名不变。
+- M3-v2 的 `astream` 继续输入采用 `{"messages": [SystemMessage(...)]}`（追加消息模式）而非 `astream(None)`，具体行为以 spike 实测为准；未验证前默认关闭，异常路径由 `_drain_astream` 内部吞掉降级为 v1 行为，不会崩 SSE。
