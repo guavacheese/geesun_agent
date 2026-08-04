@@ -245,6 +245,8 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
 
     - names=None → 使用全部启用中的 MCP
     - names=[...] → 仅使用列表中且启用中的 MCP（chat 透传）
+    - 逐个 server 独立连接：单个服务连接失败只跳过该服务并告警，
+      不影响其他服务（避免 MultiServerMCPClient 批量连接时一个失败拖垮全部）
     结果按 server 集合缓存，配置变更（invalidate_cache）后失效。
     """
     entries = _enabled_entries(names)
@@ -255,18 +257,32 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
     if cache_key in _tools_cache:
         return _tools_cache[cache_key][1]
 
-    try:
-        client_config = {
-            name: _to_client_config(entry)
-            for name, entry in entries.items()
-        }
-        client = MultiServerMCPClient(client_config)
-        tools = await client.get_tools()
-        _tools_cache[cache_key] = (client, tools)
-        return tools
-    except Exception as e:  # noqa: BLE001
-        logger.warning("加载 MCP 工具失败: %s", e)
-        return []
+    results: list[BaseTool] = []
+    failed: list[str] = []
+
+    async def connect_one(name: str, entry: dict) -> None:
+        try:
+            client = MultiServerMCPClient({name: _to_client_config(entry)})
+            tools = await asyncio.wait_for(client.get_tools(), timeout=10)
+            results.extend(tools)
+        except Exception as e:  # noqa: BLE001
+            failed.append(name)
+            logger.warning("MCP server [%s] 加载工具失败: %s", name, e)
+
+    await asyncio.gather(
+        *[connect_one(name, entry) for name, entry in entries.items()]
+    )
+
+    if failed:
+        logger.warning(
+            "MCP 工具加载完成，%d/%d 个服务失败: %s",
+            len(failed),
+            len(entries),
+            ", ".join(failed),
+        )
+
+    _tools_cache[cache_key] = (None, results)
+    return results
 
 
 async def get_tool_info_map(
@@ -298,8 +314,9 @@ async def get_tool_info_map(
             ]
             _tool_info_cache[name] = {"ts": now, "tools": infos}
             result[name] = infos
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             result[name] = []
+            logger.warning("探测 MCP server [%s] 工具失败: %s", name, e)
 
     await asyncio.gather(
         *[probe(name, entry) for name, entry in entries.items()]
