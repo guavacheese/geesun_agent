@@ -218,11 +218,21 @@ def _enabled_entries(names: list[str] | None = None) -> dict[str, dict]:
 
 
 def _to_client_config(entry: dict) -> dict:
-    """把 mcp.json 条目转换为 MultiServerMCPClient 期望的配置格式。"""
+    """把 mcp.json 条目转换为 MultiServerMCPClient 期望的配置格式。
+
+    注意：langchain-mcp-adapters 0.2.2 的 create_session 要求每个 server
+    必须显式包含 transport 键（stdio/sse/websocket/http 之一），缺失即抛错。
+    """
     cfg: dict = {}
-    server_type = entry.get("type") or entry.get("transport") or "streamable-http"
-    if server_type in ("sse", "streamable-http"):
+    server_type = (entry.get("type") or entry.get("transport") or "http").lower()
+    # 归一化到 0.2.2 可接受的 transport 值
+    if server_type in ("streamable_http", "streamable-http", "http"):
+        cfg["transport"] = "http"
+    elif server_type in ("stdio", "sse", "websocket"):
         cfg["transport"] = server_type
+    else:
+        # 未知类型兜底为 http
+        cfg["transport"] = "http"
     for key in ("url", "command", "args", "env", "headers"):
         val = entry.get(key)
         if val not in (None, "", [], {}):
