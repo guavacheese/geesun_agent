@@ -16,3 +16,4 @@ skills/
 
 !docs/*.md
 *.json
+*.venv
