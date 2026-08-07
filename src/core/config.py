@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     sandbox_completion_gate_auto_continue: bool = False
     # 最多打回次数，超限标记任务失败终止
     sandbox_completion_gate_max_retries: int = 2
+    # 工具连续失败阈值：单轮内连续失败（error/超时）达到该次数即提前终止，
+    # 避免模型在错误循环里空转直到烧满 recursion_limit（100 步，约几分钟白等）
+    sandbox_tool_failure_threshold: int = 5
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432

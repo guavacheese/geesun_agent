@@ -17,6 +17,15 @@ from src.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class ToolLoopAbortError(Exception):
+    """工具连续失败超限，提前终止本轮流式生成。
+
+    与 GraphRecursionError 的区别：后者要烧满 recursion_limit（100 步）才抛，
+    期间模型会反复空转；本异常在连续失败达到阈值时立刻抛出，
+    由 _drain_astream 的 except 分支捕获后转为 SSE error 事件，秒级止损。
+    """
+
+
 # 与前端 lib/types.ts inferFileType 保持一致
 # 用于保存 generated_files 时填充 file_type 字段
 _FILE_TYPE_BY_EXT = {
@@ -202,6 +211,8 @@ async def chat(
         # 记录本次流式生成过程中产生/下载的文件
         # 后续保存到 store 时关联到对应的 AI 消息 entry，确保刷新页面后还能看到文件卡片
         _generated_files: list[dict] = []
+        # 工具连续失败计数（跨 astream 轮共享声明，实际每轮在 _drain_astream 内重置）
+        _consecutive_tool_failures = 0
         # M3 完成门：astream 前快照 /reports/ 目录，结束后做差集判定本轮产出
         _before_files = snapshot_report_files(settings.report_root, user_id, session_id)
         _completion_blocked = False
@@ -217,7 +228,8 @@ async def chat(
             M3-v2 继续轮传入 {'messages': [SystemMessage(...)]} 追加系统消息，
             依赖 deepagents astream 继续模式（spike 验证，未通过时自动继续保持关闭）。
             """
-            nonlocal _last_debug_step, thinking_emitted, _think_buffer, _think_done, _generated_files
+            nonlocal _last_debug_step, thinking_emitted, _think_buffer, _think_done, _generated_files, _consecutive_tool_failures
+            _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
             try:
                 async for mode, data in agent.astream(
@@ -405,6 +417,28 @@ async def chat(
                                     )
                                 }\n\n"
 
+                                # ─── 工具连续失败检测：超限提前终止，防止烧满 recursion_limit ───
+                                # 模型在错误循环里空转时（如反复 glob 失败/read 失败），
+                                # 每次 ToolMessage 都进 messages 撑大步数，直到 100 步才抛
+                                # GraphRecursionError（几分钟白等）。这里数连续失败次数，
+                                # 达到阈值立即 raise，由 except 分支转成 SSE error 事件止损。
+                                if is_error:
+                                    _consecutive_tool_failures += 1
+                                    if (
+                                        _consecutive_tool_failures
+                                        >= settings.sandbox_tool_failure_threshold
+                                    ):
+                                        logger.warning(
+                                            "[M3] 工具连续失败 %d 次（最近: %s），提前终止: user=%s, session=%s",
+                                            _consecutive_tool_failures, tool_name, user_id, session_id,
+                                        )
+                                        raise ToolLoopAbortError(
+                                            f"工具连续失败 {_consecutive_tool_failures} 次"
+                                            f"（最近一次：{tool_name}），判定任务已无法继续，已提前终止"
+                                        )
+                                else:
+                                    _consecutive_tool_failures = 0
+
                                 # ─── 检测工具返回的文件信息，提取生成/下载的文件 ───
                                 # 不限定工具名，任何返回 /reports/ 路径的工具都能触发
                                 file_path_virtual = None
@@ -498,6 +532,11 @@ async def chat(
                                                 file_path_virtual.split('/')[-1]
                                             ),
                                         })
+            except ToolLoopAbortError as e:
+                # ─── 工具连续失败超限：预期内主动终止，不打印堆栈（非程序 bug）───
+                # 只向前端发 error 事件（比 GraphRecursionError 快几十步）
+                logger.warning("工具连续失败超限提前终止: %s", e)
+                yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
             except Exception as e:
                 # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
                 logger.exception("Agent 流式处理异常: %s", e)
