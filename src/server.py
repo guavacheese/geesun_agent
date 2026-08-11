@@ -54,16 +54,18 @@ async def lifespan(app: FastAPI):
     await store.setup()
 
     # 种子 AGENTS.md 到 store（供 memory= 参数通过 StoreBackend 读取）
+    # 总是覆盖：AGENTS.md 是系统级规则文件（用户不直接改 store），保证最新版本生效
     agents_md_key = "/AGENTS.md"
-    if await store.aget(("__agent__",), agents_md_key) is None:
-        with open("AGENTS.md", "r", encoding="utf-8") as f:
-            content = f.read()
+    with open("AGENTS.md", "r", encoding="utf-8") as f:
+        content = f.read()
+    stored = await store.aget(("__agent__",), agents_md_key)
+    if stored is None or stored.value.get("content") != content:
         await store.aput(
             ("__agent__",),
             agents_md_key,
             {"content": content, "encoding": "utf-8"},
         )
-        logging.warning("[DIAG] AGENTS.md seeded to store")
+        logging.warning("[DIAG] AGENTS.md seeded to store (updated=%s)", stored is not None)
 
     app.state.store = store
 

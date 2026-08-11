@@ -236,7 +236,7 @@ async def chat(
                     _graph_input,
                     config={
                         **graph_config,
-                        "recursion_limit": 100,  # ← 最多 100 步，正常流程 25-35 步，留 2-3 倍余量
+                        "recursion_limit": 200,  # ← 最多 200 步（原 100）：大文档任务（80+页×2 PDF 逐章节提取）实测 100 步不够，报告都没来得及写；正常流程 25-35 步，200 是 5-8 倍余量
                     },
                     stream_mode=["messages", "updates"],
                     **invoke_kwargs,
@@ -365,9 +365,20 @@ async def chat(
                                 # 工具执行结果
                                 tool_name = last_msg.name
                                 tool_call_id = getattr(last_msg, "tool_call_id", None)
-                                content_str = (
-                                    str(last_msg.content) if last_msg.content else ""
-                                )
+                                # 结构化提取：MCP 工具返回 list[{'type':'text','text':...}]，
+                                # 直接 str() 会得到 Python repr（单引号），json.loads 会失败，
+                                # 进而误判 is_error（曾因 "error":null 命中 error 关键词把成功标为失败）
+                                raw = last_msg.content
+                                candidate = None
+                                if isinstance(raw, list) and raw:
+                                    first = raw[0]
+                                    if isinstance(first, dict) and first.get("text"):
+                                        candidate = first["text"]
+                                elif isinstance(raw, dict) and raw.get("text"):
+                                    candidate = raw["text"]
+                                elif isinstance(raw, str):
+                                    candidate = raw
+                                content_str = str(candidate) if candidate else ""
                                 is_error = False
                                 if content_str:
                                     # 优先尝试 JSON 解析：MCP 工具返回结构化 JSON 带 success 字段
@@ -377,25 +388,24 @@ async def chat(
                                             is_error = not parsed["success"]
                                         # 结构化 JSON 不走关键词匹配
                                     except (json.JSONDecodeError, TypeError):
-                                        # 非 JSON 内容，退回到关键词匹配
+                                        # 非 JSON 内容，退回到精确关键词匹配（去掉了宽泛的 "error"）
+                                        lower = content_str.lower()
                                         if tool_name == "execute":
                                             is_error = (
-                                                "command failed with exit code"
-                                                in content_str.lower()
+                                                "command failed with exit code" in lower
                                                 or content_str.startswith("Execution error:")
                                             )
                                         else:
                                             is_error = any(
-                                                kw in content_str.lower()
-                                                for kw in [
-                                                    "error",
+                                                marker in lower
+                                                for marker in [
                                                     "exception",
                                                     "traceback",
-                                                    "not found",
                                                     "failed",
                                                     "failure",
                                                     "timeout",
                                                     "permission denied",
+                                                    "no such file",
                                                 ]
                                             )
 
@@ -443,27 +453,55 @@ async def chat(
                                 # 不限定工具名，任何返回 /reports/ 路径的工具都能触发
                                 file_path_virtual = None
                                 if not is_error:
-                                    if tool_name in ("write_file", "write", "create_file"):
-                                        m = re.search(
-                                            r"Updated file\s+(/\S+)", content_str
-                                        )
-                                        if m:
-                                            file_path_virtual = m.group(1)
-                                    else:
-                                        # 其他工具（如 download_from_sandbox）：
-                                        # 在返回值中搜索 /reports/ 路径
-                                        m = re.search(
-                                            r'/reports/\S+', content_str
-                                        )
-                                        if m:
-                                            file_path_virtual = m.group(0).rstrip(
-                                                '"'
-                                            ).rstrip("}").rstrip(",")
+                                    # 1. 结构化解析：MCP 工具（如 download_from_sandbox）返回
+                                    #    list[{'type','text'}] 或 dict，text 里是 JSON 字符串；
+                                    #    直接用 json.loads 取路径字段，避免正则贪婪匹配吃进 JSON 尾巴
+                                    #    （旧实现 re.search(r'/reports/\S+') 会把
+                                    #    ","size":15758,"error":null 等尾巴一起吞掉 → 前端 404）
+                                    parsed_json = None
+                                    raw_content = getattr(last_msg, "content", None)
+                                    candidate = None
+                                    if isinstance(raw_content, list) and raw_content:
+                                        first = raw_content[0]
+                                        if isinstance(first, dict) and first.get("text"):
+                                            candidate = first["text"]
+                                    elif isinstance(raw_content, dict) and raw_content.get("text"):
+                                        candidate = raw_content["text"]
+                                    elif isinstance(raw_content, str):
+                                        candidate = raw_content
+                                    if isinstance(candidate, str):
+                                        try:
+                                            parsed_json = json.loads(candidate)
+                                        except (json.JSONDecodeError, TypeError):
+                                            parsed_json = None
+                                    if isinstance(parsed_json, dict):
+                                        for key in ("host_path", "path", "file_path", "output_path"):
+                                            val = parsed_json.get(key)
+                                            if isinstance(val, str) and val.strip():
+                                                file_path_virtual = val.strip()
+                                                break
+                                    # 2. 回退：非 JSON 输出（write_file 的 "Updated file ..."）用正则硬抠
+                                    if not file_path_virtual:
+                                        if tool_name in ("write_file", "write", "create_file"):
+                                            m = re.search(
+                                                r"Updated file\s+(/\S+)", content_str
+                                            )
+                                            if m:
+                                                file_path_virtual = m.group(1)
+                                        else:
+                                            # [^"\s,}\]]+ 匹配到中文等非分隔符字符为止（\w 不含中文）
+                                            m = re.search(
+                                                r'/reports/[^"\s,}\]]+', content_str
+                                            )
+                                            if m:
+                                                file_path_virtual = m.group(0).rstrip(
+                                                    '"'
+                                                ).rstrip("}").rstrip(",")
 
                                 # 规范化文件路径：如果 write_file 返回的路径是 WSL/宿主机完整路径
                                 # （如 /mnt/d/.../data/reports/.../file），从中提取 /reports/... 部分
                                 if file_path_virtual and not file_path_virtual.startswith("/reports/"):
-                                    reports_m = re.search(r'/reports/[\w/.-]+', file_path_virtual)
+                                    reports_m = re.search(r'/reports/[^"\s,}\]]+', file_path_virtual)
                                     if reports_m:
                                         file_path_virtual = reports_m.group(0)
                                         logger.debug(

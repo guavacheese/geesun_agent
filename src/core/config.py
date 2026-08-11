@@ -51,6 +51,20 @@ class Settings(BaseSettings):
     # 工具连续失败阈值：单轮内连续失败（error/超时）达到该次数即提前终止，
     # 避免模型在错误循环里空转直到烧满 recursion_limit（100 步，约几分钟白等）
     sandbox_tool_failure_threshold: int = 5
+    # ─── 加密文件识别（v3.1 护栏）───
+    # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
+    dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)
+    # 提示层用：这些扩展名"通常加密"，但最终以文件头为准（txt/py 也可能被加密）
+    dlp_encrypted_ext_hints: tuple[str, ...] = (
+        ".pdf", ".xlsx", ".xls", ".docx", ".doc", ".txt", ".py",
+    )
+    # read_file 硬拦截的二进制扩展名：直接读取会撑爆上下文或触发模型 API 501
+    # （Qwen 不支持 file part）。命中即拒绝并提示走 decrypt_and_upload_to_sandbox 链路
+    read_file_binary_exts: tuple[str, ...] = (
+        ".pdf", ".xlsx", ".xls", ".docx", ".doc",
+        ".zip", ".7z", ".rar",
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
+    )
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432

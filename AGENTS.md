@@ -102,9 +102,24 @@ download_from_sandbox(
 ## 解密规则
 - XML 文本文件不需要解密，用 `upload_to_sandbox` 直接上传到沙箱
 - Excel (.xlsx) 和 Word (.docx) 等 Office 文件会被公司加密，用 `decrypt_and_upload_to_sandbox` 解密后上传到沙箱
+- **判断文件是否加密：不靠扩展名，靠文件头**。公司 DLP 加密软件会在文件开头写入 `%TSD-Header` 魔数——**txt/py 等文本类文件也可能被加密**。不确定时：
+  1. 先尝试 `read_file`——如果被系统拒绝（二进制拦截提示），说明是加密/二进制文件
+  2. 或直接走 `decrypt_and_upload_to_sandbox`（它内部会检测，非加密文件同样能上传）
 - **禁止用 read_excel 直接读取 /uploads/ 下的加密 Office 文件**：`/uploads/` 是虚拟路径，只在虚拟文件系统（read_file/ls/glob/grep）和 MCP 传输工具里有效；read_excel 底层用真实文件系统 open()，宿主机与沙箱均无 `/uploads` 目录，必然报 No such file；且文件为密文，路径通了也读不出内容
-- 加密 Office 文件的正确读取流程：`decrypt_and_upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")` → 沙箱 `/home/user/` 下用 execute / read 处理
+- 加密文件的正确读取流程：`decrypt_and_upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")` → 沙箱 `/home/user/` 下用 execute / read 处理
 - 同一目录下的文件名可用 `ls /uploads/{user_id}/{session_id}/` 确认（虚拟文件系统可列出），但**不要**用 execute 在沙箱里验证 /uploads（沙箱内不存在）
+
+## 沙箱内文件写入（v3.1）
+- **write_file 支持直接写沙箱路径**：`/home/user/xxx` 和 `/tmp/xxx` 已放行，会经 e2b 上传通道写入沙箱（仅 UTF-8 文本）
+- 写脚本/中间文件直接用 `write_file /home/user/脚本.py`，或 `execute` 里 shell 创建，二选一即可
+- `/root/`、`/mnt/`、`/code/`、`/var/` 是沙箱内系统级/挂载路径，禁止写入
+- **沙箱内文件不算交付物**：要给用户看的报告必须 `download_from_sandbox` 到 `/reports/{user_id}/{session_id}/`
+
+## Skill 创建（v3.1）
+- Skill 分三层：`/skills/__system__/`（预装，只读）、`/skills/__agent__/`（agent 自创，**可写**）、`/skills/__user_{user_id}__/`（用户上传，归 /api/v1/skill/upload 管，AI 只读）
+- **创建/更新自创 skill**：`write_file /skills/__agent__/<skill_name>/SKILL.md`（YAML frontmatter 需含 name + description，name 与目录名一致；格式不合法该 skill 不会被加载）
+- **用户共享 skill**：通过 `/api/v1/skill/upload` 接口（前端"技能"面板上传），不要直接 write_file 用户目录
+- 不要写 `/skills/__system__/`（系统预装只读）
 
 ## 文件上传到沙箱的流程
 - 所有输入文件（XML / Excel / Word）：用对应的 MCP 工具直传沙箱，不经过 LLM 上下文

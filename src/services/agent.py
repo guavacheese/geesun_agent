@@ -11,7 +11,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
-from deepagents.backends.protocol import FileDownloadResponse, WriteResult
+from deepagents.backends.protocol import FileDownloadResponse, ReadResult, WriteResult
 from deepagents.backends.utils import file_data_to_string
 import base64
 from langchain.messages import trim_messages
@@ -57,24 +57,66 @@ class ValidatedCompositeBackend(CompositeBackend):
     模式返回可执行修正建议，把模型可能不记得的会话上下文直接算好塞回。
     """
 
-    ALLOWED_WRITE_PREFIXES = {"/reports/", "/workspace/memories/"}
+    # /conversation_history/ 是 SummarizationMiddleware 的 offload 路由（StateBackend，不落盘），
+    # 必须允许写，否则历史压缩后无法恢复（实测 2026-08-10 日志：Offloading failed, Older messages will not be recoverable）
+    # /skills/__agent__/：agent 自创 skill 层（三层设计：__system__ 预装 / __agent__ 自创 / __user_{id}__ 用户上传）
+    # /home/、/tmp/：沙箱内路径——write_file 走 sandbox backend 的 e2b 上传通道直写沙箱（仅 UTF-8 文本），
+    #   让 AI 直接 write_file 写脚本/中间文件，不必绕 execute heredoc（也更安全，无 shell 注入面）
+    ALLOWED_WRITE_PREFIXES = {
+        "/reports/", "/workspace/memories/", "/conversation_history/",
+        "/skills/__agent__/",
+        "/home/", "/tmp/",
+    }
 
-    # 沙箱内路径：write_file 本就不该碰，命中即提示走 MCP 传输或直接写 reports
-    SANDBOX_PATH_PREFIXES = ("/tmp/", "/home/", "/root/", "/mnt/", "/code/", "/var/")
-    # 虚拟文件系统内只读路径：命中即提示改 reports
+    # 沙箱内仍禁写的路径（/home/ /tmp/ 已放行直写沙箱；这些是系统级/挂载路径，AI 不应碰）
+    SANDBOX_PATH_PREFIXES = ("/root/", "/mnt/", "/code/", "/var/")
+    # 虚拟文件系统内只读路径：命中即提示改 reports（/skills/ 需细分提示，见 _reject_hint）
     VIRTUAL_READONLY_PREFIXES = ("/uploads/", "/skills/", "/workspace/agent-memory/")
 
     def __init__(self, default, routes, *, user_id: str = "", session_id: str = ""):
         super().__init__(default=default, routes=routes)
         self._report_prefix = f"/reports/{user_id}/{session_id}/" if user_id and session_id else "/reports/<user_id>/<session_id>/"
 
+    def _is_binary_read(self, file_path: str) -> str | None:
+        """read_file 二进制拦截：返回拦截提示（带下一步指引）或 None。
+
+        直接 read_file 读 PDF/Excel/Word 等二进制会把 base64 塞进 LLM 上下文：
+        1) 撑爆上下文；2) Qwen 不支持 file part → 501 崩溃；3) 密文内容进上下文后
+        可被 heredoc 绕道写进沙箱。故在 read 层直接拒绝并给出正确链路。
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in settings.read_file_binary_exts:
+            return None
+        return (
+            f"文件 '{file_path}' 是二进制/加密文档（{ext}），read_file 无法直接读取文本，"
+            f"直接读取会撑爆上下文或导致模型 API 报错（501 Unknown part type: file）。"
+            f"正确流程：decrypt_and_upload_to_sandbox(file_path='{file_path}', "
+            f"remote_path='/home/user/<文件名>', sandbox_id='<沙箱ID>') "
+            f"→ execute 在沙箱内用 python（pdfplumber 等）解析 → 文本返回。"
+            f"禁止用 read_file 读取 {ext} 文件。"
+        )
+
     def _reject_hint(self, file_path: str) -> str:
         """按路径类型生成修正建议（单条 ≤ 200 字，仅拒绝路径出现）。"""
+        # 沙箱内仍禁写的路径（/home/ /tmp/ 已放行，只剩 /root/ /mnt/ /code/ /var/）
         if file_path.startswith(self.SANDBOX_PATH_PREFIXES):
             return (
-                f"路径 '{file_path}' 是沙箱内路径，write_file 无法写入沙箱文件系统。"
-                f"沙箱内文件请用 upload_to_sandbox / copy_script_to_sandbox 传输；"
-                f"如需生成交付物，请直接写入 '{self._report_prefix}<文件名>'"
+                f"路径 '{file_path}' 是沙箱内系统级/挂载路径，禁止写入。"
+                f"沙箱内文件请用 write_file 写 '/home/user/<文件名>'（已支持直写沙箱）或 execute 创建；"
+                f"交付物请写入 '{self._report_prefix}<文件名>'"
+            )
+        # 用户共享 skill：归上传 API 管（SKILL.md 需 YAML 校验）
+        if file_path.startswith("/skills/__user_"):
+            return (
+                f"路径 '{file_path}' 是用户共享 skill 目录（只读，SKILL.md 需 YAML 校验）。"
+                f"创建/更新用户 skill 请通过 /api/v1/skill/upload 接口上传；"
+                f"agent 自创 skill 请写入 '/skills/__agent__/<skill_name>/'"
+            )
+        # 系统预装 skill：只读
+        if file_path.startswith("/skills/__system__"):
+            return (
+                f"路径 '{file_path}' 是系统预装 skill（只读），不可修改。"
+                f"如需新技能，agent 自创请写 '/skills/__agent__/<skill_name>/'，用户上传走 /api/v1/skill/upload"
             )
         if file_path.startswith(self.VIRTUAL_READONLY_PREFIXES):
             return (
@@ -113,6 +155,32 @@ class ValidatedCompositeBackend(CompositeBackend):
                 files_update=None,
             )
         return await super().awrite(file_path, content)
+
+    def read(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> ReadResult:
+        """read_file 二进制拦截：PDF/Excel/Word 等直接拒绝并提示走解密链路。"""
+        hint = self._is_binary_read(file_path)
+        if hint is not None:
+            logger.warning("[VALIDATED_CB] 拒绝读取二进制: path=%s", file_path)
+            return ReadResult(error=f"拒绝读取: {hint}", file_data=None)
+        return super().read(file_path, offset=offset, limit=limit)
+
+    async def aread(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> ReadResult:
+        """异步版 read_file 二进制拦截。"""
+        hint = self._is_binary_read(file_path)
+        if hint is not None:
+            logger.warning("[VALIDATED_CB] 拒绝读取二进制: path=%s", file_path)
+            return ReadResult(error=f"拒绝读取: {hint}", file_data=None)
+        return await super().aread(file_path, offset=offset, limit=limit)
 
 
 def build_backend(user_id: str, session_id: str, store, sandbox):
