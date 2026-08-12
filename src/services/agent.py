@@ -302,6 +302,12 @@ async def create_agent(
                     total += model.get_num_tokens(content)
                 except Exception:
                     total += len(content)  # 兜底：1 字符≈1 token（足够保守）
+        # 临时诊断：仅接近/超过阈值时打（避免每步刷屏）
+        if total > 100000:
+            logger.warning(
+                "[DIAG] _count_tokens_accurate: messages=%d, total=%d tokens（阈值 200000）",
+                len(messages), total,
+            )
         return total
 
     summarization_mw = _SummarizationAccurate(
