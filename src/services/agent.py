@@ -14,6 +14,16 @@ from deepagents.backends import (
 from deepagents.backends.protocol import FileDownloadResponse, ReadResult, WriteResult
 from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.summarization import SummarizationMiddleware
+
+
+class _SummarizationAccurate(SummarizationMiddleware):
+    """精确计数版 Summarization：实现与默认完全一致，仅类名不同。
+
+    langchain factory 按 middleware.name 去重（factory.py:1079）：
+    默认实例（deepagents graph.py:797 创建）name="SummarizationMiddleware"，
+    本子类 name=type(self).__name__="_SummarizationAccurate"，避免 AssertionError。
+    唯一差异：挂载用 model.get_num_tokens 精确计数的 token_counter（中文 token 低估修复）。
+    """
 import base64
 from langchain.messages import trim_messages
 from src.core.config import settings
@@ -294,7 +304,7 @@ async def create_agent(
                     total += len(content)  # 兜底：1 字符≈1 token（足够保守）
         return total
 
-    summarization_mw = SummarizationMiddleware(
+    summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
         trigger=("tokens", 200000),  # Qwen 262144 的 ~76%，留足输出/工具 schema 余量
