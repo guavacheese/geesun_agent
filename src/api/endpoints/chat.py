@@ -195,6 +195,222 @@ async def chat(
     else:
         graph_input = {"messages": [{"role": "user", "content": user_message}]}
 
+    async def _persist_session(
+        agent,
+        thread_id: str,
+        user_id: str,
+        session_id: str,
+        store,
+        body,
+        *,
+        generated_files: list | None = None,
+        completion_blocked: bool = False,
+        reason: str = "normal",
+    ) -> int:
+        """把 agent checkpoint 中的消息保存到会话历史（store）。
+
+        由 event_stream 两处调用：
+        - 正常路径（reason="normal"）：SSE 流完整结束
+        - 断连/取消路径（reason="interrupted"）：生成器被 GeneratorExit/CancelledError
+          打断时在 finally 中强制保存，防止用户刷新/关闭页面后本轮消息丢失
+          （2026-08-11 15:26 实测：断连后"写 skill"指令未保存，前端重拉即消失）。
+        函数内部只有 await 没有 yield，可在 finally 块中安全调用。
+        """
+        generated_files = generated_files or []
+        try:
+            # 读取最终状态中的消息
+            state = await agent.aget_state(
+                {
+                    "configurable": {"thread_id": thread_id},
+                }
+            )
+            logging.warning(
+                "[DIAG] %s: state=%s, has_values=%s",
+                "SSE 结束" if reason == "normal" else "SSE 中断强制保存",
+                type(state).__name__ if state else None,
+                hasattr(state, "values") if state else False,
+            )
+            if state and hasattr(state, "values"):
+                all_msgs = state.values.get("messages", [])
+                # 第一遍：建立 tool_call_id -> ToolMessage content 的映射
+                # 用于在保存 AIMessage 的 tool_calls 时填入 result 字段
+                tool_results: dict[str, str] = {}
+                for m in all_msgs:
+                    if getattr(m, "type", None) == "tool":
+                        tc_id = getattr(m, "tool_call_id", None)
+                        if tc_id:
+                            tool_results[tc_id] = str(m.content) if m.content else ""
+
+                # 提取人类可读的消息（只保留 user / assistant / tool 角色的核心信息）
+                history = []
+                for msg in all_msgs:
+                    role = getattr(msg, "type", "unknown")
+                    if role == "human":
+                        role = "user"
+                    content = str(msg.content) if msg.content else ""
+                    reasoning = ""
+
+                    # 1. 从 additional_kwargs 提取推理内容（DeepSeek/Groq/Ollama/XAI 等）
+                    if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
+                        kw_reasoning = msg.additional_kwargs.get("reasoning_content") or ""
+                        if kw_reasoning:
+                            reasoning = kw_reasoning
+
+                    # 2. Qwen 系：从 content 中移除 </think> 段
+                    # 关键：每条 AI 消息独立切分（之前的 `if not reasoning` 会让后一条
+                    # AI 消息的 <think> 段残留到 content 里）
+                    if "</think>" in content:
+                        think_end = content.find("</think>")
+                        thinking_part = content[:think_end]
+                        remaining = content[think_end + 8:]  # skip </think>
+                        if remaining.startswith("\n"):
+                            remaining = remaining[1:]
+                        if thinking_part.strip():
+                            # 保留 original reasoning（如有），附加本次 <think> 段
+                            if reasoning:
+                                reasoning = reasoning + "\n\n" + thinking_part
+                            else:
+                                reasoning = thinking_part
+                            content = remaining
+
+                    # 3. 截断长度
+                    content = content[:2000]
+                    reasoning = reasoning[:2000]
+
+                    # 4. 去掉 user 消息中的 path_hint 前缀
+                    if role == "user" and "\n\n" in content:
+                        parts = content.rsplit("\n\n", 1)
+                        content = (
+                            parts[-1].strip() if len(parts) > 1 else parts[0].strip()
+                        )
+
+                    # 5. 不再跳过中间 AI 消息
+                    #    之前跳过的初衷是避免"只有 thinking 折叠块 + 空正文"的奇怪气泡，
+                    #    但这会丢失 tool_call 渲染（流式阶段用户能看到 write_file 的 tool_call
+                    #    卡片 + 文件卡片，刷新后这部分消失，体验不一致）。
+                    #    现在保留所有 AI 消息：中间 AI 消息显示 thinking + ToolCallCard +
+                    #    GeneratedFileCard，最终 AI 消息显示 thinking + 真正的回复内容。
+
+                    entry = {
+                        "id": getattr(msg, "id", None),
+                        "role": role,
+                        "content": content,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if reasoning:
+                        entry["reasoning"] = reasoning
+                    # AI 消息附带 tool_calls 信息
+                    if role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
+                        entry["tool_calls"] = [
+                            {
+                                "id": tc.get("id") or f"tc-{i}",
+                                "tool": tc["name"],
+                                "args": tc["args"],
+                                "status": "success",
+                                "result": (tool_results.get(tc.get("id", "")) or "")[:2000],
+                            }
+                            for i, tc in enumerate(msg.tool_calls)
+                        ]
+                    history.append(entry)
+
+                # 循环结束后，将 generated_files 关联到合适的 AI 消息
+                # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
+                #  file_generated 事件在 tool_call 后立即到达，前端把文件卡片加到
+                #  当前最后一条 AI 消息，也就是发起 tool_call 的那条）。如果没有任何
+                #  AI 消息带 tool_call（比如文件由其他方式生成），fallback 到最后一条
+                #  AI 消息。
+                if generated_files:
+                    target_idx = None
+                    for i, e in enumerate(history):
+                        if e.get("role") == "ai" and e.get("tool_calls"):
+                            target_idx = i
+                            break
+                    if target_idx is None:
+                        for i in range(len(history) - 1, -1, -1):
+                            if history[i].get("role") == "ai":
+                                target_idx = i
+                                break
+                    if target_idx is not None:
+                        history[target_idx]["generated_files"] = list(generated_files)
+
+                # M3 完成门：零产出时在最后一条 AI 消息上标记失败状态，
+                # 前端可据此展示"未产出交付物"徽标，避免"状态不明"
+                if completion_blocked:
+                    for i in range(len(history) - 1, -1, -1):
+                        if history[i].get("role") == "ai":
+                            history[i]["completion"] = "blocked_no_output"
+                            break
+
+                # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
+                msg_namespace = ("messages", user_id, session_id)
+                await store.aput(msg_namespace, "messages", {"items": history})
+
+                # 更新会话元数据（标题、消息数、时间）
+                session_ns = ("sessions", user_id)
+                item = await store.aget(session_ns, session_id)
+                now_ts = datetime.now(timezone.utc).isoformat()
+
+                # 用用户实际输入作为默认标题
+                title = (
+                    body.message[:50] + ("..." if len(body.message) >= 50 else "")
+                    if body.message
+                    else "新会话"
+                )
+
+                if item is not None:
+                    data = item.value
+                    data["message_count"] = len(history)
+                    data["updated_at"] = now_ts
+                    old_title = data.get("title", "")
+                    # 覆盖旧的 path_hint 标题，或首次设置标题
+                    if (
+                        old_title.startswith("沙箱 ID")
+                        or old_title in ("新会话", "新对话")
+                        or not old_title
+                    ):
+                        data["title"] = title
+                else:
+                    # 会话不存在则创建（兼容直接调 /chat 而非 POST /sessions 的场景）
+                    data = {
+                        "title": title,
+                        "created_at": now_ts,
+                        "updated_at": now_ts,
+                        "message_count": len(history),
+                    }
+
+                # 确保会话在索引中（新增或已有都要维护）
+                # 注意：__index__ 必须以 dict 存储（{"items": [...]}），
+                # 因为 LangGraph PostgresStore 的 _row_to_item 对非 dict 值
+                # 会调用 json.loads()，导致列表类型报错
+                try:
+                    idx_item = await store.aget(session_ns, "__index__")
+                    idx_data = idx_item.value if idx_item else {}
+                    ids = (
+                        idx_data.get("items", []) if isinstance(idx_data, dict) else []
+                    )
+                except Exception as e:
+                    logger.warning("[DIAG] 索引读取失败，重新初始化: %s", e)
+                    ids = []
+                try:
+                    if session_id not in ids:
+                        ids.append(session_id)
+                    await store.aput(session_ns, "__index__", {"items": ids})
+                except Exception as e:
+                    logger.warning("[DIAG] 索引更新失败: %s", e)
+
+                await store.aput(session_ns, session_id, data)
+                logger.warning(
+                    "[DIAG] %s: user=%s, session=%s, msgs=%d",
+                    "会话保存完成" if reason == "normal" else "断连强制保存完成",
+                    user_id,
+                    session_id,
+                    len(history),
+                )
+                return len(history)
+        except Exception as e:
+            logger.warning("保存会话消息失败（非关键错误）: %s", e)
+        return 0
+
     async def event_stream():
         invoke_kwargs = {}
         # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
@@ -211,6 +427,9 @@ async def chat(
         # 记录本次流式生成过程中产生/下载的文件
         # 后续保存到 store 时关联到对应的 AI 消息 entry，确保刷新页面后还能看到文件卡片
         _generated_files: list[dict] = []
+        # 已推送 file_generated 事件的 file_path 集合（同会话内同一文件只推一次，
+        # 覆盖写/重复 write_file 不再触发重复卡片——2026-08-11 16:00 实测重复报告）
+        _emitted_files: set[str] = set()
         # 工具连续失败计数（跨 astream 轮共享声明，实际每轮在 _drain_astream 内重置）
         _consecutive_tool_failures = 0
         # M3 完成门：astream 前快照 /reports/ 目录，结束后做差集判定本轮产出
@@ -509,42 +728,71 @@ async def chat(
                                             file_path_virtual,
                                         )
 
-                                if file_path_virtual and file_path_virtual.startswith(
-                                    "/reports/"
-                                ):
-                                    prefix = f"/reports/{user_id}/{session_id}/"
-                                    if file_path_virtual.startswith(prefix):
-                                        filename = file_path_virtual[len(prefix) :]
-                                        file_size = 0
+                                # 触发条件：/reports/ 交付物 + /skills/__agent__/ 自创 skill
+                                # （A1：skill 文件也触发 file_generated，否则前端看不到 skill 卡片
+                                #   —— 2026-08-11 15:28 实测 SKILL.md 写成功但前端"文件不可用"）
+                                is_report_path = bool(
+                                    file_path_virtual
+                                    and file_path_virtual.startswith("/reports/")
+                                )
+                                is_agent_skill = bool(
+                                    file_path_virtual
+                                    and file_path_virtual.startswith("/skills/__agent__/")
+                                )
+                                if file_path_virtual and (is_report_path or is_agent_skill):
+                                    filename = None
+                                    file_size = 0
+                                    if is_report_path:
+                                        prefix = f"/reports/{user_id}/{session_id}/"
+                                        if file_path_virtual.startswith(prefix):
+                                            filename = file_path_virtual[len(prefix) :]
+                                        # 磁盘大小：report_root → agent_workspace/data/reports 兜底
+                                        # （write_file 可能写到了 /mnt/d/... 而不是 /data/myapp/...）
+                                        for base in (
+                                            settings.report_root,
+                                            os.path.join(
+                                                settings.agent_workspace, "data", "reports"
+                                            ),
+                                        ):
+                                            try:
+                                                disk_path = os.path.join(
+                                                    base, user_id, session_id, filename
+                                                )
+                                                if os.path.isfile(disk_path):
+                                                    file_size = os.path.getsize(disk_path)
+                                                    break
+                                            except Exception:
+                                                pass
+                                    else:  # /skills/__agent__/
+                                        filename = file_path_virtual[
+                                            len("/skills/__agent__/") :
+                                        ]
                                         try:
                                             disk_path = os.path.join(
-                                                settings.report_root,
-                                                user_id,
-                                                session_id,
-                                                filename,
+                                                settings.agent_workspace,
+                                                "skills", "__agent__", filename,
                                             )
                                             if os.path.isfile(disk_path):
                                                 file_size = os.path.getsize(disk_path)
-                                            else:
-                                                # 如果 report_root 路径不存在，尝试 agent_workspace 下的 data 目录
-                                                # （write_file 可能写到了 /mnt/d/... 而不是 /data/myapp/...）
-                                                wsl_path = os.path.join(
-                                                    settings.agent_workspace,
-                                                    "data", "reports",
-                                                    user_id, session_id, filename,
-                                                )
-                                                if os.path.isfile(wsl_path):
-                                                    file_size = os.path.getsize(wsl_path)
                                         except Exception:
                                             pass
-                                        # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
-                                        if file_size == 0:
-                                            size_m = re.search(
-                                                r'"size"\s*:\s*(\d+)', content_str
-                                            )
-                                            if size_m:
-                                                file_size = int(size_m.group(1))
+                                    # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
+                                    if file_size == 0:
+                                        size_m = re.search(
+                                            r'"size"\s*:\s*(\d+)', content_str
+                                        )
+                                        if size_m:
+                                            file_size = int(size_m.group(1))
 
+                                    # B：同会话内同一文件只推送一次（覆盖写/重复 write_file 去重）
+                                    if file_path_virtual in _emitted_files:
+                                        # 事件已发过，仅更新 _generated_files 里的大小，不重复推送
+                                        for _f in _generated_files:
+                                            if _f["file_path"] == file_path_virtual:
+                                                _f["file_size"] = file_size
+                                                break
+                                    else:
+                                        _emitted_files.add(file_path_virtual)
                                         yield f"data: {
                                                     json.dumps(
                                                         {
@@ -587,234 +835,71 @@ async def chat(
         # v2 自动继续：注入 SystemMessage 让模型再跑一轮（受 auto_continue / max_retries 开关控制，
         # 异常由 _drain_astream 内部吞掉 → 本轮零产出仍会递增重试，超限终止）。
         _completion_retries = 0
-        while True:
-            async for _ev in _drain_astream(_graph_input):
-                yield _ev
-            _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
-            _new_files = _after_files - _before_files
-            if _generated_files or _new_files:
-                break  # 有本轮产出，放行
-            if not settings.sandbox_completion_gate_enabled:
-                break  # 完成门关闭（回滚开关）
-            if (
-                _completion_retries >= settings.sandbox_completion_gate_max_retries
-                or not settings.sandbox_completion_gate_auto_continue
-            ):
-                _completion_blocked = True
+        # 断连强制保存：正常路径保存成功后置 True；流被 GeneratorExit/CancelledError
+        # 打断时 finally 兜底强制保存（2026-08-11 15:26 断连丢"写 skill"指令的修复）
+        _saved = False
+        try:
+            while True:
+                async for _ev in _drain_astream(_graph_input):
+                    yield _ev
+                _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
+                _new_files = _after_files - _before_files
+                if _generated_files or _new_files:
+                    break  # 有本轮产出，放行
+                if not settings.sandbox_completion_gate_enabled:
+                    break  # 完成门关闭（回滚开关）
+                if (
+                    _completion_retries >= settings.sandbox_completion_gate_max_retries
+                    or not settings.sandbox_completion_gate_auto_continue
+                ):
+                    _completion_blocked = True
+                    logger.warning(
+                        "[M3] 完成门拦截（本轮零产出）: user=%s, session=%s, generated=%d, new_files=%d, retries=%d",
+                        user_id, session_id, len(_generated_files), len(_new_files), _completion_retries,
+                    )
+                    yield f"data: {json.dumps({
+                        'type': 'completion_blocked',
+                        'reason': '本轮任务未产出任何交付物（/reports 为空）',
+                        'hint': '请检查是否遗漏 download_from_sandbox / write_file 步骤',
+                        'terminated': _completion_retries >= settings.sandbox_completion_gate_max_retries,
+                    }, ensure_ascii=False)}\n\n"
+                    break
+                _completion_retries += 1
                 logger.warning(
-                    "[M3] 完成门拦截（本轮零产出）: user=%s, session=%s, generated=%d, new_files=%d, retries=%d",
-                    user_id, session_id, len(_generated_files), len(_new_files), _completion_retries,
+                    "[M3] 零产出，注入 SystemMessage 自动继续（第 %d/%d 次）: user=%s, session=%s",
+                    _completion_retries, settings.sandbox_completion_gate_max_retries, user_id, session_id,
                 )
-                yield f"data: {json.dumps({
-                    'type': 'completion_blocked',
-                    'reason': '本轮任务未产出任何交付物（/reports 为空）',
-                    'hint': '请检查是否遗漏 download_from_sandbox / write_file 步骤',
-                    'terminated': _completion_retries >= settings.sandbox_completion_gate_max_retries,
-                }, ensure_ascii=False)}\n\n"
-                break
-            _completion_retries += 1
-            logger.warning(
-                "[M3] 零产出，注入 SystemMessage 自动继续（第 %d/%d 次）: user=%s, session=%s",
-                _completion_retries, settings.sandbox_completion_gate_max_retries, user_id, session_id,
-            )
-            _graph_input = {"messages": [SystemMessage(
-                f"系统检测：/reports/{user_id}/{session_id}/ 当前无本轮新文件，本轮任务未产出任何交付物。"
-                "请检查是否遗漏 download_from_sandbox / write_file 步骤，并继续完成。"
-            )]}
-            _before_files = _after_files  # 重新基线
+                _graph_input = {"messages": [SystemMessage(
+                    f"系统检测：/reports/{user_id}/{session_id}/ 当前无本轮新文件，本轮任务未产出任何交付物。"
+                    "请检查是否遗漏 download_from_sandbox / write_file 步骤，并继续完成。"
+                )]}
+                _before_files = _after_files  # 重新基线
+            _saved = True  # 循环正常结束（未被取消/打断），finally 不再兜底保存
+        finally:
+            # 断连/取消/异常路径：流被中断，正常保存逻辑未执行，强制保存 checkpoint 状态
+            if not _saved:
+                try:
+                    logger.warning(
+                        "[DIAG] SSE 流中断（断连/取消），强制保存当前会话: user=%s, session=%s",
+                        user_id, session_id,
+                    )
+                    await _persist_session(
+                        agent, thread_id, user_id, session_id, store, body,
+                        generated_files=_generated_files,
+                        completion_blocked=_completion_blocked,
+                        reason="interrupted",
+                    )
+                except Exception as e:
+                    logger.warning("断连强制保存失败（非关键错误）: %s", e)
 
         # ─── SSE 流结束，先保存消息到会话历史，再发 [DONE] ───
         # 防止前端 [DONE] 后立即编辑导致竞态（消息尚未落盘 → from_index 越界）
-        try:
-            # 读取最终状态中的消息
-            state = await agent.aget_state(
-                {
-                    "configurable": {"thread_id": thread_id},
-                }
-            )
-            logging.warning(
-                "[DIAG] SSE 结束, state=%s, has_values=%s",
-                type(state).__name__ if state else None,
-                hasattr(state, "values") if state else False,
-            )
-            if state and hasattr(state, "values"):
-                all_msgs = state.values.get("messages", [])
-                # 第一遍：建立 tool_call_id -> ToolMessage content 的映射
-                # 用于在保存 AIMessage 的 tool_calls 时填入 result 字段
-                tool_results: dict[str, str] = {}
-                for m in all_msgs:
-                    if getattr(m, "type", None) == "tool":
-                        tc_id = getattr(m, "tool_call_id", None)
-                        if tc_id:
-                            tool_results[tc_id] = str(m.content) if m.content else ""
-
-                # 提取人类可读的消息（只保留 user / assistant / tool 角色的核心信息）
-                history = []
-                for msg in all_msgs:
-                    role = getattr(msg, "type", "unknown")
-                    if role == "human":
-                        role = "user"
-                    content = str(msg.content) if msg.content else ""
-                    reasoning = ""
-
-                    # 1. 从 additional_kwargs 提取推理内容（DeepSeek/Groq/Ollama/XAI 等）
-                    if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
-                        kw_reasoning = msg.additional_kwargs.get("reasoning_content") or ""
-                        if kw_reasoning:
-                            reasoning = kw_reasoning
-
-                    # 2. Qwen 系：从 content 中移除 </think> 段
-                    # 关键：每条 AI 消息独立切分（之前的 `if not reasoning` 会让后一条
-                    # AI 消息的 <think> 段残留到 content 里）
-                    if "</think>" in content:
-                        think_end = content.find("</think>")
-                        thinking_part = content[:think_end]
-                        remaining = content[think_end + 8:]  # skip </think>
-                        if remaining.startswith("\n"):
-                            remaining = remaining[1:]
-                        if thinking_part.strip():
-                            # 保留 original reasoning（如有），附加本次 <think> 段
-                            if reasoning:
-                                reasoning = reasoning + "\n\n" + thinking_part
-                            else:
-                                reasoning = thinking_part
-                            content = remaining
-
-                    # 3. 截断长度
-                    content = content[:2000]
-                    reasoning = reasoning[:2000]
-
-                    # 4. 去掉 user 消息中的 path_hint 前缀
-                    if role == "user" and "\n\n" in content:
-                        parts = content.rsplit("\n\n", 1)
-                        content = (
-                            parts[-1].strip() if len(parts) > 1 else parts[0].strip()
-                        )
-
-                    # 5. 不再跳过中间 AI 消息
-                    #    之前跳过的初衷是避免"只有 thinking 折叠块 + 空正文"的奇怪气泡，
-                    #    但这会丢失 tool_call 渲染（流式阶段用户能看到 write_file 的 tool_call
-                    #    卡片 + 文件卡片，刷新后这部分消失，体验不一致）。
-                    #    现在保留所有 AI 消息：中间 AI 消息显示 thinking + ToolCallCard +
-                    #    GeneratedFileCard，最终 AI 消息显示 thinking + 真正的回复内容。
-
-                    entry = {
-                        "id": getattr(msg, "id", None),
-                        "role": role,
-                        "content": content,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    if reasoning:
-                        entry["reasoning"] = reasoning
-                    # AI 消息附带 tool_calls 信息
-                    if role == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
-                        entry["tool_calls"] = [
-                            {
-                                "id": tc.get("id") or f"tc-{i}",
-                                "tool": tc["name"],
-                                "args": tc["args"],
-                                "status": "success",
-                                "result": (tool_results.get(tc.get("id", "")) or "")[:2000],
-                            }
-                            for i, tc in enumerate(msg.tool_calls)
-                        ]
-                    history.append(entry)
-
-                # 循环结束后，将 _generated_files 关联到合适的 AI 消息
-                # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
-                #  file_generated 事件在 tool_call 后立即到达，前端把文件卡片加到
-                #  当前最后一条 AI 消息，也就是发起 tool_call 的那条）。如果没有任何
-                #  AI 消息带 tool_call（比如文件由其他方式生成），fallback 到最后一条
-                #  AI 消息。
-                if _generated_files:
-                    target_idx = None
-                    for i, e in enumerate(history):
-                        if e.get("role") == "ai" and e.get("tool_calls"):
-                            target_idx = i
-                            break
-                    if target_idx is None:
-                        for i in range(len(history) - 1, -1, -1):
-                            if history[i].get("role") == "ai":
-                                target_idx = i
-                                break
-                    if target_idx is not None:
-                        history[target_idx]["generated_files"] = list(_generated_files)
-
-                # M3 完成门：零产出时在最后一条 AI 消息上标记失败状态，
-                # 前端可据此展示"未产出交付物"徽标，避免"状态不明"
-                if _completion_blocked:
-                    for i in range(len(history) - 1, -1, -1):
-                        if history[i].get("role") == "ai":
-                            history[i]["completion"] = "blocked_no_output"
-                            break
-
-                # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
-                msg_namespace = ("messages", user_id, session_id)
-                await store.aput(msg_namespace, "messages", {"items": history})
-
-                # 更新会话元数据（标题、消息数、时间）
-                session_ns = ("sessions", user_id)
-                item = await store.aget(session_ns, session_id)
-                now_ts = datetime.now(timezone.utc).isoformat()
-
-                # 用用户实际输入作为默认标题
-                title = (
-                    body.message[:50] + ("..." if len(body.message) >= 50 else "")
-                    if body.message
-                    else "新会话"
-                )
-
-                if item is not None:
-                    data = item.value
-                    data["message_count"] = len(history)
-                    data["updated_at"] = now_ts
-                    old_title = data.get("title", "")
-                    # 覆盖旧的 path_hint 标题，或首次设置标题
-                    if (
-                        old_title.startswith("沙箱 ID")
-                        or old_title in ("新会话", "新对话")
-                        or not old_title
-                    ):
-                        data["title"] = title
-                else:
-                    # 会话不存在则创建（兼容直接调 /chat 而非 POST /sessions 的场景）
-                    data = {
-                        "title": title,
-                        "created_at": now_ts,
-                        "updated_at": now_ts,
-                        "message_count": len(history),
-                    }
-
-                # 确保会话在索引中（新增或已有都要维护）
-                # 注意：__index__ 必须以 dict 存储（{"items": [...]}），
-                # 因为 LangGraph PostgresStore 的 _row_to_item 对非 dict 值
-                # 会调用 json.loads()，导致列表类型报错
-                try:
-                    idx_item = await store.aget(session_ns, "__index__")
-                    idx_data = idx_item.value if idx_item else {}
-                    ids = (
-                        idx_data.get("items", []) if isinstance(idx_data, dict) else []
-                    )
-                except Exception as e:
-                    logger.warning("[DIAG] 索引读取失败，重新初始化: %s", e)
-                    ids = []
-                try:
-                    if session_id not in ids:
-                        ids.append(session_id)
-                    await store.aput(session_ns, "__index__", {"items": ids})
-                except Exception as e:
-                    logger.warning("[DIAG] 索引更新失败: %s", e)
-
-                await store.aput(session_ns, session_id, data)
-                logger.warning(
-                    "[DIAG] 会话保存完成: user=%s, session=%s, msgs=%d",
-                    user_id,
-                    session_id,
-                    len(history),
-                )
-        except Exception as e:
-            logger.warning("保存会话消息失败（非关键错误）: %s", e)
-
+        await _persist_session(
+            agent, thread_id, user_id, session_id, store, body,
+            generated_files=_generated_files,
+            completion_blocked=_completion_blocked,
+            reason="normal",
+        )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -13,6 +13,7 @@ from deepagents.backends import (
 )
 from deepagents.backends.protocol import FileDownloadResponse, ReadResult, WriteResult
 from deepagents.backends.utils import file_data_to_string
+from deepagents.middleware.summarization import SummarizationMiddleware
 import base64
 from langchain.messages import trim_messages
 from src.core.config import settings
@@ -276,6 +277,31 @@ async def create_agent(
     backend = build_backend(user_id, session_id, store, sandbox)
     model = create_model()
 
+    # ─── SummarizationMiddleware（历史 offload 精确计数版）───
+    # deepagents 默认挂的 Summarization 用 count_tokens_approximately（4 字符/token），
+    # 对中文低估 ~2 倍（2026-08-12 实测：真实 1501 vs 近似 769），导致 262k 真实 tokens
+    # 的上下文不触发 offload → Qwen 400（max context 262144）。这里显式加一个用
+    # model.get_num_tokens（tiktoken 兜底）精确计数的实例；默认那个因低估恒 no-op，不冲突。
+    def _count_tokens_accurate(messages, *, tools=None) -> int:
+        """用 model.get_num_tokens 逐条精确计数（tiktoken 兜底），解决中文低估。"""
+        total = 0
+        for m in messages:
+            content = str(getattr(m, "content", "")) if getattr(m, "content", None) else ""
+            if content:
+                try:
+                    total += model.get_num_tokens(content)
+                except Exception:
+                    total += len(content)  # 兜底：1 字符≈1 token（足够保守）
+        return total
+
+    summarization_mw = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=("tokens", 200000),  # Qwen 262144 的 ~76%，留足输出/工具 schema 余量
+        keep=("messages", 10),
+        token_counter=_count_tokens_accurate,
+    )
+
     return create_deep_agent(
         model=model,
         tools=tools,
@@ -283,7 +309,7 @@ async def create_agent(
         system_prompt=PLC_AUDITOR_SYSTEM_PROMPT,
         skills=skills,
         memory=[AGENTS_MD_PATH],
-        middleware=[switch_model],
+        middleware=[switch_model, summarization_mw],
         interrupt_on={
             "write_file": False,
             "read_file": False,

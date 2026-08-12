@@ -20,6 +20,36 @@ from .api.router import api_router
 from .infra.database import _build_dsn, ReconnectingAsyncPostgresStore, ReconnectingAsyncPostgresSaver
 
 
+# ──────────────────────────────────────────────
+# 禁用 langgraph 1.0.x 的调试 print（必须在 router 导入之后执行——此时 langgraph 已加载）
+# 现象：langgraph 把每个 step 的完整 state 用 print() 打到 stdout（日志里满屏
+# [values]/[updates] 快照、无时间戳前缀）。大会话时一次 print 几百 KB，stdout
+# 为非阻塞管道时抛 BlockingIOError 导致 SSE 流崩溃（2026-08-11 实测 913cfdb2
+# 会话 174 条消息在 astream 内 _output 的 print 处崩）。
+# 方案：patch langgraph.pregel.main._output，把 print_mode 参数置空——
+# yield 行为完全不变，仅跳过 print(完整 state)。
+# ──────────────────────────────────────────────
+def _disable_langgraph_print() -> None:
+    import logging  # 局部导入：本函数在模块底部 import logging 之前执行
+
+    try:
+        import langgraph.pregel.main as _lg_main
+
+        _ORIG_OUTPUT = _lg_main._output
+
+        def _silenced_output(stream_mode, print_mode, *args, **kwargs):
+            # print_mode 置空：保留原 yield 逻辑，跳过调试 print
+            yield from _ORIG_OUTPUT(stream_mode, (), *args, **kwargs)
+
+        _lg_main._output = _silenced_output
+        logging.warning("[DIAG] langgraph 调试 print 已禁用（print_mode 置空）")
+    except Exception as e:
+        logging.warning("禁用 langgraph print 失败（不影响运行）: %s", e)
+
+
+_disable_langgraph_print()
+
+
 from src.core.config import settings
 import os
 import logging
