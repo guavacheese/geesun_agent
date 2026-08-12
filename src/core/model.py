@@ -68,3 +68,52 @@ async def switch_model(
         temperature=0,
     )
     return await handler(request.override(model=model))
+
+
+# ─── 图片 file block → image_url 转换 middleware ───
+
+@wrap_model_call
+async def file_to_image(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], ModelResponse],
+) -> ModelResponse:
+    """模型请求前把图片 file block 转成 image_url（启用 Qwen 视觉能力）。
+
+    背景（2026-08-12 实测）：Qwen3.6-35B-A3B 支持 image_url part（能看图），
+    但不支持 file part（read_file 读图返回 {'type':'file', base64, mime_type}
+    → langchain 转 file part → Qwen 501）。本 middleware 在模型调用前：
+    - image/* mime 的 file block → image_url block（data:image/...;base64,...）
+    - 其他二进制 file block（pdf/xlsx 等）→ 文本占位（防 501，提示走沙箱链路）
+    """
+    for msg in request.messages:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        new_blocks = []
+        changed = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "file":
+                mime = block.get("mime_type") or ""
+                b64 = block.get("base64") or ""
+                filename = block.get("filename") or "二进制文件"
+                if mime.startswith("image/") and b64:
+                    # 图片：转 image_url，Qwen 视觉直接理解
+                    new_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    })
+                else:
+                    # 非图片二进制：占位提示（防 501 + 引导正确链路）
+                    new_blocks.append({
+                        "type": "text",
+                        "text": (
+                            f"[文件内容省略：{filename}（{mime}）。二进制内容不直接传给模型；"
+                            "如需解析请用 decrypt_and_upload_to_sandbox 上传沙箱后处理]"
+                        ),
+                    })
+                changed = True
+            else:
+                new_blocks.append(block)
+        if changed:
+            msg.content = new_blocks
+    return await handler(request)

@@ -60,10 +60,11 @@ class Settings(BaseSettings):
     )
     # read_file 硬拦截的二进制扩展名：直接读取会撑爆上下文或触发模型 API 501
     # （Qwen 不支持 file part）。命中即拒绝并提示走 decrypt_and_upload_to_sandbox 链路
+    # 注意：图片类（png/jpg/gif 等）不在拦截名单——Qwen 支持 image_url part（2026-08-12 实测），
+    # 图片由 file_to_image middleware 转成 image_url 后可直接视觉理解，无需拦截
     read_file_binary_exts: tuple[str, ...] = (
         ".pdf", ".xlsx", ".xls", ".docx", ".doc",
         ".zip", ".7z", ".rar",
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
     )
 
     postgres_host: str = "localhost"
