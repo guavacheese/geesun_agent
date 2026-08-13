@@ -11,7 +11,7 @@ from langchain_cubesandbox import CubeSandbox
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "cube-ca.pem"))
+ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "rootCA.pem"))
 
 # 用户发消息时 — 有就复用，没有就新建
 sandbox = CubeSandbox.get_or_create(
