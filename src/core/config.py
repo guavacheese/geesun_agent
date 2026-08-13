@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     sandbox_disk_hard_mb: int = 50
     # 环境快照缓存 TTL（秒）：同一 thread_id 的沙箱在 TTL 内复用快照，避免每轮 chat 重跑探测
     sandbox_probe_ttl_sec: int = 60
+    # 沙箱空闲回收 TTL（秒）：CubeSandbox v0.6.0 起 cube-lifecycle-manager 按此值回收空闲沙箱；
+    # 每次 execute 会自动续期（POST /sandboxes/:id/timeout），-1 = 永不过期。
+    # 若任务存在两轮工具调用间隙 > 此值的场景（如模型长思考），调大该值。
+    # 300 → 3600：AI 单步生成（大脚本/长文本）可达数分钟，300s 会在思考期间被回收
+    # （2026-08-13 实测 CubeMaster 130404 sandbox id not found：沙箱闲置 5 分钟过期，
+    #  execute 前 refresh_timeout 救不回已死的沙箱）
+    sandbox_idle_timeout_sec: int = 3600
     # ─── M3 完成门（设计文档）：零产出不放行结束 ───
     # 总开关（M1/M2/M3 回滚开关，False = 全部关闭护栏）
     sandbox_guardrails_enabled: bool = True
