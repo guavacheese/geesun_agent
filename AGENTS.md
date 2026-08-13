@@ -108,6 +108,11 @@ download_from_sandbox(
 - **禁止用 read_excel 直接读取 /uploads/ 下的加密 Office 文件**：`/uploads/` 是虚拟路径，只在虚拟文件系统（read_file/ls/glob/grep）和 MCP 传输工具里有效；read_excel 底层用真实文件系统 open()，宿主机与沙箱均无 `/uploads` 目录，必然报 No such file；且文件为密文，路径通了也读不出内容
 - 加密文件的正确读取流程：`decrypt_and_upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")` → 沙箱 `/home/user/` 下用 execute / read 处理
 - 同一目录下的文件名可用 `ls /uploads/{user_id}/{session_id}/` 确认（虚拟文件系统可列出），但**不要**用 execute 在沙箱里验证 /uploads（沙箱内不存在）
+- **PDF 解析必须用标准库 API，禁止手动遍历 PDF 内部对象**：
+  1. `fitz`（PyMuPDF）：`doc = fitz.open(path)` → `doc[页码].get_text()` 提取文本
+  2. 或 `pdfplumber`：`with pdfplumber.open(path) as pdf` → `page.extract_text()`
+  3. **禁止**自己写脚本遍历 PDF 的 CMap 字符映射/对象流——那会把二进制映射数据当文本输出，表现为"乱码"（2026-08-13 实测：AI 手动遍历 CMap 得到 65309 条乱码段；同文件用 fitz.get_text() 解析完全正常）
+  4. 若 `get_text()` 返回空/乱码，先检查文件头：`%TSD-Header` 说明仍是密文（未解密），重新 `decrypt_and_upload_to_sandbox`；`%PDF-` 才是明文
 
 ## 沙箱内文件写入（v3.1）
 - **write_file 支持直接写沙箱路径**：`/home/user/xxx` 和 `/tmp/xxx` 已放行，会经 e2b 上传通道写入沙箱（仅 UTF-8 文本）
