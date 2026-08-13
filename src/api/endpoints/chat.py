@@ -560,6 +560,21 @@ async def chat(
 
                             last_msg = messages[-1]
 
+                            # ─── model 节点可观测性日志：AI 回复/思考摘要 + 工具调用列表 ───
+                            # 屏蔽 langgraph print 后，模型输出不再出现在日志（原 values/updates
+                            # 快照）；这里补一条精简日志，每步 model 一次（2026-08-13 补）
+                            if node_name == "model" and hasattr(last_msg, "content"):
+                                _ai_content = str(getattr(last_msg, "content", ""))
+                                _tool_names = [
+                                    tc.get("name", "?")
+                                    for tc in (getattr(last_msg, "tool_calls", None) or [])
+                                ]
+                                logger.warning(
+                                    "[DIAG] model: content=%s tool_calls=%s",
+                                    (_ai_content or "(空)")[:150],
+                                    _tool_names or [],
+                                )
+
                             if (
                                 node_name == "model"
                                 and hasattr(last_msg, "tool_calls")
@@ -627,6 +642,16 @@ async def chat(
                                                     "no such file",
                                                 ]
                                             )
+
+                                # ─── tool 节点可观测性日志：工具名 + 成功/失败 + 结果截断 ───
+                                # 屏蔽 langgraph print 后工具调用过程不再出现在日志，
+                                # 排查时看不到 AI 在调什么工具（2026-08-13 补）
+                                logger.warning(
+                                    "[DIAG] tool %s → %s | %s",
+                                    tool_name,
+                                    "OK" if not is_error else "FAIL",
+                                    content_str[:150] if content_str else "(空)",
+                                )
 
                                 yield f"data: {
                                     json.dumps(
