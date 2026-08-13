@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "cube-ca.pem"))
+ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "rootCA.pem"))
 
 
 # ─── 环境快照（设计文档 M1：环境预检注入，消除"模型现场探索环境"）───────────
@@ -23,9 +23,13 @@ class SandboxEnvSnapshot:
     """一次沙箱环境探测的结构化结果，注入 system 消息供模型直接使用。"""
 
     ok: bool  # 探测是否成功（失败 = 降级，不阻断任务）
-    commands: dict[str, str | None] = field(default_factory=dict)  # 命令 -> 绝对路径或 None
+    commands: dict[str, str | None] = field(
+        default_factory=dict
+    )  # 命令 -> 绝对路径或 None
     disk_avail_mb: int | None = None  # df -h / 可用空间（MB）
-    toolchains: list[str] = field(default_factory=list)  # rustup toolchain list（如存在）
+    toolchains: list[str] = field(
+        default_factory=list
+    )  # rustup toolchain list（如存在）
     error: str | None = None  # 探测失败原因（降级时非 None）
 
     def to_hint(self) -> str:
@@ -45,7 +49,9 @@ class SandboxEnvSnapshot:
             if self.toolchains:
                 parts.append(f"  rustup toolchains: {', '.join(self.toolchains)}")
         else:
-            parts.append(f"  环境探测失败: {self.error or '未知原因'}，请自行确认可用工具与磁盘空间")
+            parts.append(
+                f"  环境探测失败: {self.error or '未知原因'}，请自行确认可用工具与磁盘空间"
+            )
         return "\n".join(parts)
 
 
@@ -81,14 +87,16 @@ def probe_sandbox_env(sandbox) -> SandboxEnvSnapshot:
         probe_list = _probe_commands()
         cmd = (
             "for c in %s; do p=$(command -v $c 2>/dev/null); "
-            "if [ -n \"$p\" ]; then echo \"CMD:$c=$p\"; fi; done; "
+            'if [ -n "$p" ]; then echo "CMD:$c=$p"; fi; done; '
             "echo '---'; df -h / | tail -1; echo '---'; "
             "if command -v rustup >/dev/null 2>&1; then rustup toolchain list 2>/dev/null; fi"
             % " ".join(probe_list)
         )
         resp = sandbox.execute(cmd, timeout=30)
         if resp.exit_code != 0:
-            raise RuntimeError(f"probe 命令退出码 {resp.exit_code}: {resp.output[:200]}")
+            raise RuntimeError(
+                f"probe 命令退出码 {resp.exit_code}: {resp.output[:200]}"
+            )
 
         output = resp.output or ""
         section = "cmds"
@@ -134,7 +142,9 @@ def _df_avail_to_mb(avail: str) -> int | None:
         return None
 
 
-def get_env_snapshot(sandbox, thread_id: str | None = None) -> SandboxEnvSnapshot | None:
+def get_env_snapshot(
+    sandbox, thread_id: str | None = None
+) -> SandboxEnvSnapshot | None:
     """带缓存的快照入口：TTL 内同一 thread_id 复用，避免每轮 chat 重跑探测。
 
     返回 None 表示无沙箱（本地模式）或 thread_id 缺失，调用方跳过注入。
@@ -165,6 +175,7 @@ def create_sandbox(thread_id: str):
             api_url=settings.cube_api_url,
             api_key=key,
             ssl_cert=str(ca_path),
+            timeout=settings.sandbox_idle_timeout_sec,
         )
 
         # 沙箱内配置 pip 国内镜像源（清华优先 + PyPI 官方兜底）
