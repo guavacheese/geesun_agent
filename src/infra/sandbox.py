@@ -5,12 +5,20 @@ from pathlib import Path
 import logging
 import json
 import time
+import threading
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "rootCA.pem"))
+
+# ─── 沙箱实例缓存 ────────────────────────────────────────────────
+# 同 thread_id 复用同一 CubeSandbox 实例：避免每次 POST /api/v1/chat 重建对象，
+# 旧对象被 GC 后触发 SDK __del__ 误杀沙箱（2026-08-14 实测：活跃沙箱被 DELETE，
+# 后续 execute 全 504）。配合 langchain-cubesandbox 的 close 不销毁修复双保险。
+_sandbox_cache: dict[str, object] = {}
+_sandbox_cache_lock = threading.Lock()
 
 
 # ─── 环境快照（设计文档 M1：环境预检注入，消除"模型现场探索环境"）───────────
@@ -167,6 +175,12 @@ def create_sandbox(thread_id: str):
     if not key or not key.startswith("e2b_"):
         return None  # key 无效，不尝试创建，静默跳过
 
+    # 同 thread_id 复用已缓存的沙箱实例（不重建对象，避免旧实例 GC 误杀沙箱）
+    with _sandbox_cache_lock:
+        cached = _sandbox_cache.get(thread_id)
+        if cached is not None:
+            return cached
+
     try:
         from langchain_cubesandbox import CubeSandbox
 
@@ -215,6 +229,9 @@ def create_sandbox(thread_id: str):
                     logger.warning("[DIAG] 沙箱注入 cube-egress CA 失败: %s", e)
             else:
                 logger.warning("[DIAG] certs/cube-root-ca.crt 不存在，跳过 CA 注入")
+            # 首次创建完成后缓存实例，同 thread_id 后续请求复用
+            with _sandbox_cache_lock:
+                _sandbox_cache[thread_id] = sandbox
             return sandbox
         return None
     except Exception as e:
