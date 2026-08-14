@@ -17,3 +17,5 @@ skills/
 !docs/*.md
 *.json
 *.venv
+.env
+!sandbox-pypi-mirror-setup.md

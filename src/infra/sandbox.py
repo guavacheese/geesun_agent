@@ -1,5 +1,6 @@
 from src.core.config import settings
 import os
+import base64
 from pathlib import Path
 import logging
 import json
@@ -178,15 +179,42 @@ def create_sandbox(thread_id: str):
             timeout=settings.sandbox_idle_timeout_sec,
         )
 
-        # 沙箱内配置 pip 国内镜像源（清华优先 + PyPI 官方兜底）
+        # 沙箱内配置 pip 指向内网 devpi 源（136 出口干净，绕开 AC 认证网关/egress MITM）
+        # 按需安装：AI 需要时才 pip install，沙箱创建时不预装
         if hasattr(sandbox, "_sandbox") and sandbox._sandbox is not None:
             try:
-                sandbox.execute(
-                    "pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple "
-                    "&& pip config set global.extra-index-url https://pypi.org/simple"
+                _r = sandbox.execute(
+                    "pip config set global.index-url http://192.168.10.136:3141/root/pypi/+simple/ "
+                    "&& pip config set global.trusted-host 192.168.10.136"
                 )
-            except Exception:
-                pass  # pip 配置非关键，失败不影响沙箱使用
+                # 记录执行结果（不静默吞）：排查 pip config 是否真正生效
+                logger.warning("[DIAG] 沙箱 pip config 结果: %s", str(_r)[:200])
+            except Exception as e:
+                logger.warning("[DIAG] 沙箱 pip config 失败: %s", e)
+
+            # 注入 cube-egress MITM 根 CA（治本：沙箱信任后 https 出站全通，pip/curl 不再报
+            # CERTIFICATE_VERIFY_FAILED）。CA 由部署时从 CubeSandbox 控制面同步到 certs/。
+            # 背景：沙箱 https 出站被 cube-egress 透明代理用 cube-root-ca.crt 签发证书，
+            # 沙箱不信任该 CA → SSL 验证失败（2026-08-13 实测 pip install 全挂）。
+            _ca_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "certs", "cube-root-ca.crt",
+            )
+            if os.path.isfile(_ca_file):
+                try:
+                    with open(_ca_file, "rb") as _f:
+                        _ca_b64 = base64.b64encode(_f.read()).decode()
+                    _r = sandbox.execute(
+                        f"echo {_ca_b64} | base64 -d > /tmp/cube-root-ca.crt "
+                        "&& mkdir -p /usr/local/share/ca-certificates "
+                        "&& cp /tmp/cube-root-ca.crt /usr/local/share/ca-certificates/cube-root-ca.crt "
+                        "&& update-ca-certificates 2>&1 | tail -2"
+                    )
+                    logger.warning("[DIAG] 沙箱注入 cube-egress CA 结果: %s", str(_r)[:200])
+                except Exception as e:
+                    logger.warning("[DIAG] 沙箱注入 cube-egress CA 失败: %s", e)
+            else:
+                logger.warning("[DIAG] certs/cube-root-ca.crt 不存在，跳过 CA 注入")
             return sandbox
         return None
     except Exception as e:
