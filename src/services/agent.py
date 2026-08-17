@@ -46,13 +46,18 @@ class _SummarizationAccurate(SummarizationMiddleware):
         return super()._partition_messages(conversation_messages, cutoff_index)
 
     def _build_new_messages_with_path(self, summary, file_path):
-        """在摘要消息后追加"真实资源清单"（SystemMessage），agent 恢复时不猜路径。"""
+        """在摘要消息前插入"真实资源清单"（SystemMessage），agent 恢复时不猜路径。
+
+        注意：OpenAI 兼容 API 要求 SystemMessage 必须位于消息列表开头
+        （'System message must be at the beginning'，2026-08-17 实测 400），
+        所以用 insert(0) 而不是 append。
+        """
         msgs = super()._build_new_messages_with_path(summary, file_path)
         if self._inventory_provider is not None:
             try:
                 inventory = self._inventory_provider()
                 if inventory:
-                    msgs.append(SystemMessage(content=inventory))
+                    msgs.insert(0, SystemMessage(content=inventory))
             except Exception as e:
                 logger.warning("[DIAG] inventory 注入失败: %s", e)
         return msgs
@@ -88,12 +93,13 @@ class _SummarizationAccurate(SummarizationMiddleware):
             result = [summary_msg]
             result.extend(messages[cutoff_idx:])
 
-        # 修复②：恢复路径同样注入资源清单
+        # 修复②：恢复路径同样注入资源清单（SystemMessage 必须放列表开头，
+        # 否则 OpenAI 兼容 API 报 'System message must be at the beginning' 400）
         if self._inventory_provider is not None:
             try:
                 inventory = self._inventory_provider()
                 if inventory:
-                    result.append(SystemMessage(content=inventory))
+                    result.insert(0, SystemMessage(content=inventory))
             except Exception as e:
                 logger.warning("[DIAG] inventory 注入失败(恢复路径): %s", e)
         return result
