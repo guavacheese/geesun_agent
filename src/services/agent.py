@@ -46,18 +46,19 @@ class _SummarizationAccurate(SummarizationMiddleware):
         return super()._partition_messages(conversation_messages, cutoff_index)
 
     def _build_new_messages_with_path(self, summary, file_path):
-        """在摘要消息前插入"真实资源清单"（SystemMessage），agent 恢复时不猜路径。
+        """在摘要消息后追加"真实资源清单"（HumanMessage），agent 恢复时不猜路径。
 
-        注意：OpenAI 兼容 API 要求 SystemMessage 必须位于消息列表开头
-        （'System message must be at the beginning'，2026-08-17 实测 400），
-        所以用 insert(0) 而不是 append。
+        用 HumanMessage 而非 SystemMessage：OpenAI 兼容 API（vLLM）要求 system 消息
+        连续位于开头，恢复的 checkpoint 消息里可能混有 system（2026-08-17 实测
+        insert(0) 后仍 400 'System message must be at the beginning'）；
+        HumanMessage 无 role 位置约束，语义上也更贴近"对话中的资源事实陈述"。
         """
         msgs = super()._build_new_messages_with_path(summary, file_path)
         if self._inventory_provider is not None:
             try:
                 inventory = self._inventory_provider()
                 if inventory:
-                    msgs.insert(0, SystemMessage(content=inventory))
+                    msgs.append(HumanMessage(content=inventory))
             except Exception as e:
                 logger.warning("[DIAG] inventory 注入失败: %s", e)
         return msgs
@@ -93,19 +94,27 @@ class _SummarizationAccurate(SummarizationMiddleware):
             result = [summary_msg]
             result.extend(messages[cutoff_idx:])
 
-        # 修复②：恢复路径同样注入资源清单（SystemMessage 必须放列表开头，
-        # 否则 OpenAI 兼容 API 报 'System message must be at the beginning' 400）
+        # 诊断：打印消息类型序列，定位 400 'System message must be at the beginning' 来源
+        if logger.isEnabledFor(logging.DEBUG) or True:
+            types = [type(m).__name__ for m in result]
+            logger.warning(
+                "[DIAG] 恢复后消息序列: count=%d types=%s",
+                len(types), types[:10],
+            )
+
+        # 修复②：恢复路径同样注入资源清单（用 HumanMessage，无 role 位置约束；
+        # SystemMessage 会与 checkpoint 历史中可能存在的 system 消息冲突导致 400）
         if self._inventory_provider is not None:
             try:
                 inventory = self._inventory_provider()
                 if inventory:
-                    result.insert(0, SystemMessage(content=inventory))
+                    result.append(HumanMessage(content=inventory))
             except Exception as e:
                 logger.warning("[DIAG] inventory 注入失败(恢复路径): %s", e)
         return result
 import base64
 from pathlib import Path
-from langchain.messages import trim_messages, SystemMessage
+from langchain.messages import trim_messages, SystemMessage, HumanMessage
 from src.core.config import settings
 from src.core.model import create_model, switch_model, file_to_image
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
