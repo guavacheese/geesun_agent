@@ -23,9 +23,42 @@ class _SummarizationAccurate(SummarizationMiddleware):
     默认实例（deepagents graph.py:797 创建）name="SummarizationMiddleware"，
     本子类 name=type(self).__name__="_SummarizationAccurate"，避免 AssertionError。
     唯一差异：挂载用 model.get_num_tokens 精确计数的 token_counter（中文 token 低估修复）。
+    2026-08-17 追加：① cutoff 越界防御（恢复会话时 cutoff > 消息数的 bug）；
+    ② 摘要生成后注入"当前会话真实资源清单"，避免 agent 恢复后 read_file 猜路径。
     """
+
+    def __init__(self, *args, inventory_provider=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 回调返回"当前会话真实资源清单"文本（uploads/reports 文件 + 沙箱状态），
+        # 由 create_agent 注入闭包（持有 user_id/session_id/sandbox 上下文）
+        self._inventory_provider = inventory_provider
+
+    def _partition_messages(self, conversation_messages, cutoff_index):
+        """防御：checkpoint 恢复时 cutoff_index 可能超过当前消息数（实测 404 > 21），
+        超界会导致剩余切片为空并产生异常路径。裁剪到消息总数后再走默认逻辑。"""
+        n = len(conversation_messages)
+        if cutoff_index > n:
+            logger.warning(
+                "[DIAG] summarization cutoff_index=%s > messages=%s，裁剪到 %s",
+                cutoff_index, n, n,
+            )
+            cutoff_index = n
+        return super()._partition_messages(conversation_messages, cutoff_index)
+
+    def _build_new_messages_with_path(self, summary, file_path):
+        """在摘要消息后追加"真实资源清单"（SystemMessage），agent 恢复时不猜路径。"""
+        msgs = super()._build_new_messages_with_path(summary, file_path)
+        if self._inventory_provider is not None:
+            try:
+                inventory = self._inventory_provider()
+                if inventory:
+                    msgs.append(SystemMessage(content=inventory))
+            except Exception as e:
+                logger.warning("[DIAG] inventory 注入失败: %s", e)
+        return msgs
 import base64
-from langchain.messages import trim_messages
+from pathlib import Path
+from langchain.messages import trim_messages, SystemMessage
 from src.core.config import settings
 from src.core.model import create_model, switch_model, file_to_image
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
@@ -310,12 +343,41 @@ async def create_agent(
             )
         return total
 
+    def _build_inventory_provider(user_id, session_id, sandbox):
+        """构造"当前会话真实资源清单"回调，随摘要注入 SystemMessage。
+
+        数据源：settings.upload_root/report_root 下的真实文件 + 沙箱状态。
+        目的：会话恢复（summarization）后 agent 直接照清单干活，
+        不再 read_file 猜测 /uploads/ 下不存在的沙箱脚本/skill 文件
+        （2026-08-17 实测：恢复后 read_file extract_pdf.py 等 5 连败触发 M3）。
+        """
+        def provider() -> str:
+            lines = ["【当前会话真实资源清单】（系统注入，直接使用，勿猜测路径）"]
+            up = Path(settings.upload_root) / user_id / session_id
+            try:
+                files = sorted(p.name for p in up.iterdir()) if up.exists() else []
+            except Exception:
+                files = []
+            lines.append(f"- 输入文件 /uploads/{user_id}/{session_id}/: {files or '（空）'}")
+            rp = Path(settings.report_root) / user_id / session_id
+            try:
+                reports = sorted(p.name for p in rp.iterdir()) if rp.exists() else []
+            except Exception:
+                reports = []
+            lines.append(f"- 报告 /reports/{user_id}/{session_id}/: {reports or '（空）'}")
+            sid = getattr(sandbox, "sandbox_id", "") if sandbox else ""
+            lines.append(f"- 沙箱: {'活跃 ' + sid if sid else '无（execute 不可用）'}")
+            lines.append("- 沙箱内文件（/home/user/）用 MCP 工具 copy/upload/download，不要 read_file 虚拟路径")
+            return "\n".join(lines)
+        return provider
+
     summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
         trigger=("tokens", 200000),  # Qwen 262144 的 ~76%，留足输出/工具 schema 余量
         keep=("messages", 10),
         token_counter=_count_tokens_accurate,
+        inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
     )
 
     return create_deep_agent(
