@@ -56,6 +56,47 @@ class _SummarizationAccurate(SummarizationMiddleware):
             except Exception as e:
                 logger.warning("[DIAG] inventory 注入失败: %s", e)
         return msgs
+
+    def _apply_event_to_messages(self, messages, event):
+        """恢复会话时应用已保存的 summarization event（修复 2026-08-17 实测两问题）。
+
+        ① checkpoint 里保存的 cutoff_index 是历史值（如 404），恢复后的消息数
+           远小于它（如 21/32）→ 原实现（@staticmethod）超界时只返回
+           [summary_msg]，把保留消息全丢，agent 恢复后无上下文可循 →
+           read_file 猜路径 5 连败触发 M3；
+        ② 恢复路径原本没有资源清单注入（原注入只在"新触发 summarization"
+           _build_new_messages_with_path 时发生），这里补齐。
+        """
+        if event is None:
+            return list(messages)
+        try:
+            summary_msg = event["summary_message"]
+            cutoff_idx = event["cutoff_index"]
+        except (KeyError, TypeError) as exc:
+            logger.warning("Malformed _summarization_event (missing keys): %s", exc)
+            return list(messages)
+
+        n = len(messages)
+        if cutoff_idx > n:
+            # 修复①：超界不丢保留消息（原实现 return [summary_msg]）
+            logger.warning(
+                "[DIAG] _apply_event_to_messages: cutoff=%s > messages=%s，保留全部消息",
+                cutoff_idx, n,
+            )
+            result = [summary_msg, *messages]
+        else:
+            result = [summary_msg]
+            result.extend(messages[cutoff_idx:])
+
+        # 修复②：恢复路径同样注入资源清单
+        if self._inventory_provider is not None:
+            try:
+                inventory = self._inventory_provider()
+                if inventory:
+                    result.append(SystemMessage(content=inventory))
+            except Exception as e:
+                logger.warning("[DIAG] inventory 注入失败(恢复路径): %s", e)
+        return result
 import base64
 from pathlib import Path
 from langchain.messages import trim_messages, SystemMessage
