@@ -240,6 +240,46 @@ def _to_client_config(entry: dict) -> dict:
     return cfg
 
 
+def _guard_download_tool(tools: list[BaseTool]) -> list[BaseTool]:
+    """包装 download_from_sandbox：参数错（误传 file_path/缺 host_path）时
+    返回友好中文提示，而非 langchain_mcp_adapters 的 pydantic 原始异常——
+    原始异常对模型不可行动（2026-08-18 实测：模型传 file_path 报
+    'Missing required argument host_path'，反复重试直到 M3 零产出）。
+
+    幂等：已包装过的工具（_download_guard_active=True）跳过，避免重复包裹。
+    """
+    for t in tools:
+        if getattr(t, "name", "") != "download_from_sandbox":
+            continue
+        if getattr(t, "_download_guard_active", False):
+            continue
+        orig_ainvoke = t.ainvoke
+
+        async def guarded_ainvoke(input, config=None, **kwargs):
+            # 参数预检：download_from_sandbox 只有 sandbox_id/sandbox_path/host_path
+            if isinstance(input, dict):
+                if "file_path" in input:
+                    return (
+                        "参数错误：download_from_sandbox 没有 file_path 参数！"
+                        "正确参数是 sandbox_id + sandbox_path（沙箱内路径，如 /home/user/x.pdf）"
+                        "+ host_path（宿主机 /reports/{user_id}/{session_id}/ 落盘路径）。"
+                        "若该文件是 write_file 刚写入 /reports/ 的交付物，"
+                        "它已在宿主机上，无需调用本工具。"
+                    )
+                if "host_path" not in input or "sandbox_path" not in input:
+                    return (
+                        "参数缺失：download_from_sandbox 需要 sandbox_id + sandbox_path"
+                        "+ host_path 三个参数（沙箱内路径 → 宿主机 /reports/ 落盘路径）。"
+                        "若文件是 write_file 刚写的 /reports/ 交付物，无需调用本工具。"
+                    )
+            return await orig_ainvoke(input, config, **kwargs)
+
+        # 实例属性遮蔽类方法（闭包捕获 orig_ainvoke），调用签名 (input, config) 不变
+        t.ainvoke = guarded_ainvoke
+        t._download_guard_active = True
+    return tools
+
+
 async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
     """获取 MCP 工具。
 
@@ -281,8 +321,8 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
             ", ".join(failed),
         )
 
-    _tools_cache[cache_key] = (None, results)
-    return results
+    _tools_cache[cache_key] = (None, _guard_download_tool(results))
+    return _tools_cache[cache_key][1]
 
 
 async def get_tool_info_map(
