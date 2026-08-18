@@ -27,7 +27,7 @@ import shutil
 import time
 from pathlib import Path
 
-from langchain.tools import BaseTool, ToolException
+from langchain.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import PrivateAttr
 from src.core.config import settings
@@ -241,28 +241,6 @@ def _to_client_config(entry: dict) -> dict:
     return cfg
 
 
-def _download_param_hint(input) -> str | None:
-    """download_from_sandbox 参数预检：误传 file_path / 缺 host_path/sandbox_path
-    时返回可行动中文提示（否则 None 走正常执行）。"""
-    if not isinstance(input, dict):
-        return None
-    if "file_path" in input:
-        return (
-            "参数错误：download_from_sandbox 没有 file_path 参数！"
-            "正确参数是 sandbox_id + sandbox_path（沙箱内路径，如 /home/user/x.pdf）"
-            "+ host_path（宿主机 /reports/{user_id}/{session_id}/ 落盘路径）。"
-            "若该文件是 write_file 刚写入 /reports/ 的交付物，"
-            "它已在宿主机上，无需调用本工具。"
-        )
-    if "host_path" not in input or "sandbox_path" not in input:
-        return (
-            "参数缺失：download_from_sandbox 需要 sandbox_id + sandbox_path"
-            "+ host_path 三个参数（沙箱内路径 → 宿主机 /reports/ 落盘路径）。"
-            "若文件是 write_file 刚写的 /reports/ 交付物，无需调用本工具。"
-        )
-    return None
-
-
 class _DownloadGuardTool(BaseTool):
     """代理包装 download_from_sandbox：参数错返回友好中文提示而非 pydantic
     原始异常（2026-08-18 实测模型误传 file_path 报英文校验错无法自纠）。
@@ -284,18 +262,19 @@ class _DownloadGuardTool(BaseTool):
         self._inner = inner
 
     async def ainvoke(self, input, config=None, **kwargs):
-        hint = _download_param_hint(input)
-        if hint is not None:
-            # 抛 ToolException → langgraph 捕获转成 ToolMessage(status="error")
-            # 返回给模型（可行动中文提示）；裸 str/dict 会触发
-            # _normalize_tool_response 'unexpected type' 崩流（16:33/19:45 实测）
-            raise ToolException(hint)
+        # 自动修正：模型误用 upload 系列参数名 file_path（实为它想要的 host_path）
+        # ——修正后走内层正常执行；其余参数错误由内层 pydantic 校验触发
+        # langgraph 原生错误通道（ValidationError→ToolInvocationError→error
+        # ToolMessage 给模型），不崩流（19:58 实测：自己抛 ToolException 会崩）
+        if isinstance(input, dict) and "file_path" in input and "host_path" not in input:
+            input = {**input, "host_path": input["file_path"]}
+            input.pop("file_path", None)
         return await self._inner.ainvoke(input, config, **kwargs)
 
     def invoke(self, input, config=None, **kwargs):
-        hint = _download_param_hint(input)
-        if hint is not None:
-            raise ToolException(hint)
+        if isinstance(input, dict) and "file_path" in input and "host_path" not in input:
+            input = {**input, "host_path": input["file_path"]}
+            input.pop("file_path", None)
         return self._inner.invoke(input, config, **kwargs)
 
     def _run(self, *args, **kwargs):  # pragma: no cover - 仅同步路径兜底
