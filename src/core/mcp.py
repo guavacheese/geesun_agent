@@ -286,13 +286,15 @@ class _DownloadGuardTool(BaseTool):
     async def ainvoke(self, input, config=None, **kwargs):
         hint = _download_param_hint(input)
         if hint is not None:
-            return hint
+            # 返回与原工具同构的 dict（success/error 结构），deepagents 才能
+            # 正确包成 ToolMessage——裸 str 会报 'returned unexpected type'（16:33 实测）
+            return {"success": False, "host_path": None, "size": 0, "error": hint}
         return await self._inner.ainvoke(input, config, **kwargs)
 
     def invoke(self, input, config=None, **kwargs):
         hint = _download_param_hint(input)
         if hint is not None:
-            return hint
+            return {"success": False, "host_path": None, "size": 0, "error": hint}
         return self._inner.invoke(input, config, **kwargs)
 
     def _run(self, *args, **kwargs):  # pragma: no cover - 仅同步路径兜底
