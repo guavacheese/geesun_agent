@@ -29,6 +29,7 @@ from pathlib import Path
 
 from langchain.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from pydantic import PrivateAttr
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -240,44 +241,75 @@ def _to_client_config(entry: dict) -> dict:
     return cfg
 
 
-def _guard_download_tool(tools: list[BaseTool]) -> list[BaseTool]:
-    """包装 download_from_sandbox：参数错（误传 file_path/缺 host_path）时
-    返回友好中文提示，而非 langchain_mcp_adapters 的 pydantic 原始异常——
-    原始异常对模型不可行动（2026-08-18 实测：模型传 file_path 报
-    'Missing required argument host_path'，反复重试直到 M3 零产出）。
+def _download_param_hint(input) -> str | None:
+    """download_from_sandbox 参数预检：误传 file_path / 缺 host_path/sandbox_path
+    时返回可行动中文提示（否则 None 走正常执行）。"""
+    if not isinstance(input, dict):
+        return None
+    if "file_path" in input:
+        return (
+            "参数错误：download_from_sandbox 没有 file_path 参数！"
+            "正确参数是 sandbox_id + sandbox_path（沙箱内路径，如 /home/user/x.pdf）"
+            "+ host_path（宿主机 /reports/{user_id}/{session_id}/ 落盘路径）。"
+            "若该文件是 write_file 刚写入 /reports/ 的交付物，"
+            "它已在宿主机上，无需调用本工具。"
+        )
+    if "host_path" not in input or "sandbox_path" not in input:
+        return (
+            "参数缺失：download_from_sandbox 需要 sandbox_id + sandbox_path"
+            "+ host_path 三个参数（沙箱内路径 → 宿主机 /reports/ 落盘路径）。"
+            "若文件是 write_file 刚写的 /reports/ 交付物，无需调用本工具。"
+        )
+    return None
 
-    幂等：已包装过的工具（_download_guard_active=True）跳过，避免重复包裹。
+
+class _DownloadGuardTool(BaseTool):
+    """代理包装 download_from_sandbox：参数错返回友好中文提示而非 pydantic
+    原始异常（2026-08-18 实测模型误传 file_path 报英文校验错无法自纠）。
+
+    注意：不能对 pydantic v2 模型做实例属性赋值（__setattr__ 校验拦截，
+    'StructuredTool object has no field ainvoke' 启动失败——16:21 实测），
+    必须用子类覆写 ainvoke/invoke 方法（合法方法定义，非属性遮蔽）。
     """
-    for t in tools:
-        if getattr(t, "name", "") != "download_from_sandbox":
-            continue
-        if getattr(t, "_download_guard_active", False):
-            continue
-        orig_ainvoke = t.ainvoke
 
-        async def guarded_ainvoke(input, config=None, **kwargs):
-            # 参数预检：download_from_sandbox 只有 sandbox_id/sandbox_path/host_path
-            if isinstance(input, dict):
-                if "file_path" in input:
-                    return (
-                        "参数错误：download_from_sandbox 没有 file_path 参数！"
-                        "正确参数是 sandbox_id + sandbox_path（沙箱内路径，如 /home/user/x.pdf）"
-                        "+ host_path（宿主机 /reports/{user_id}/{session_id}/ 落盘路径）。"
-                        "若该文件是 write_file 刚写入 /reports/ 的交付物，"
-                        "它已在宿主机上，无需调用本工具。"
-                    )
-                if "host_path" not in input or "sandbox_path" not in input:
-                    return (
-                        "参数缺失：download_from_sandbox 需要 sandbox_id + sandbox_path"
-                        "+ host_path 三个参数（沙箱内路径 → 宿主机 /reports/ 落盘路径）。"
-                        "若文件是 write_file 刚写的 /reports/ 交付物，无需调用本工具。"
-                    )
-            return await orig_ainvoke(input, config, **kwargs)
+    _inner: BaseTool = PrivateAttr()
 
-        # 实例属性遮蔽类方法（闭包捕获 orig_ainvoke），调用签名 (input, config) 不变
-        t.ainvoke = guarded_ainvoke
-        t._download_guard_active = True
-    return tools
+    def __init__(self, inner: BaseTool):
+        super().__init__(
+            name=inner.name,
+            description=inner.description,
+            args_schema=inner.args_schema,
+            return_direct=getattr(inner, "return_direct", False),
+        )
+        self._inner = inner
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        hint = _download_param_hint(input)
+        if hint is not None:
+            return hint
+        return await self._inner.ainvoke(input, config, **kwargs)
+
+    def invoke(self, input, config=None, **kwargs):
+        hint = _download_param_hint(input)
+        if hint is not None:
+            return hint
+        return self._inner.invoke(input, config, **kwargs)
+
+    def _run(self, *args, **kwargs):  # pragma: no cover - 仅同步路径兜底
+        raise NotImplementedError("download_from_sandbox 仅支持异步执行")
+
+    async def _arun(self, *args, **kwargs):  # pragma: no cover
+        raise NotImplementedError("download_from_sandbox 仅支持异步执行")
+
+
+def _guard_download_tool(tools: list[BaseTool]) -> list[BaseTool]:
+    """把 download_from_sandbox 替换为 _DownloadGuardTool 包装（幂等）。"""
+    return [
+        _DownloadGuardTool(t)
+        if t.name == "download_from_sandbox" and not isinstance(t, _DownloadGuardTool)
+        else t
+        for t in tools
+    ]
 
 
 async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
