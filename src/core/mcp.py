@@ -27,7 +27,7 @@ import shutil
 import time
 from pathlib import Path
 
-from langchain.tools import BaseTool
+from langchain.tools import BaseTool, ToolException
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import PrivateAttr
 from src.core.config import settings
@@ -286,15 +286,16 @@ class _DownloadGuardTool(BaseTool):
     async def ainvoke(self, input, config=None, **kwargs):
         hint = _download_param_hint(input)
         if hint is not None:
-            # 返回与原工具同构的 dict（success/error 结构），deepagents 才能
-            # 正确包成 ToolMessage——裸 str 会报 'returned unexpected type'（16:33 实测）
-            return {"success": False, "host_path": None, "size": 0, "error": hint}
+            # 抛 ToolException → langgraph 捕获转成 ToolMessage(status="error")
+            # 返回给模型（可行动中文提示）；裸 str/dict 会触发
+            # _normalize_tool_response 'unexpected type' 崩流（16:33/19:45 实测）
+            raise ToolException(hint)
         return await self._inner.ainvoke(input, config, **kwargs)
 
     def invoke(self, input, config=None, **kwargs):
         hint = _download_param_hint(input)
         if hint is not None:
-            return {"success": False, "host_path": None, "size": 0, "error": hint}
+            raise ToolException(hint)
         return self._inner.invoke(input, config, **kwargs)
 
     def _run(self, *args, **kwargs):  # pragma: no cover - 仅同步路径兜底
