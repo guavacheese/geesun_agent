@@ -113,6 +113,11 @@ download_from_sandbox(
   2. 或 `pdfplumber`：`with pdfplumber.open(path) as pdf` → `page.extract_text()`
   3. **禁止**自己写脚本遍历 PDF 的 CMap 字符映射/对象流——那会把二进制映射数据当文本输出，表现为"乱码"（2026-08-13 实测：AI 手动遍历 CMap 得到 65309 条乱码段；同文件用 fitz.get_text() 解析完全正常）
   4. 若 `get_text()` 返回空/乱码，先检查文件头：`%TSD-Header` 说明仍是密文（未解密），重新 `decrypt_and_upload_to_sandbox`；`%PDF-` 才是明文
+- **沙箱内 pip 装包默认走内网 devpi 源**（沙箱创建时已配置
+  `http://192.168.10.136:3141/root/pypi/+simple/`），直接 `pip install <包名>` 即可；
+  **不要改 pip 源/加 --trusted-host**——外网 pypi https 被公司上网认证网关
+  MITM 重签证书，公共 CA 不认，现场改源必然失败（2026-08-14 实测）
+- pymupdf/pdfplumber 等常用库已预装在镜像内，通常无需再装；装其他包（如 openpyxl）直接 pip install
 
 ## 沙箱内文件写入（v3.1）
 - **write_file 支持直接写沙箱路径**：`/home/user/xxx` 和 `/tmp/xxx` 已放行，会经 e2b 上传通道写入沙箱（仅 UTF-8 文本）
@@ -125,6 +130,20 @@ download_from_sandbox(
 - **创建/更新自创 skill**：`write_file /skills/__agent__/<skill_name>/SKILL.md`（YAML frontmatter 需含 name + description，name 与目录名一致；格式不合法该 skill 不会被加载）
 - **用户共享 skill**：通过 `/api/v1/skill/upload` 接口（前端"技能"面板上传），不要直接 write_file 用户目录
 - 不要写 `/skills/__system__/`（系统预装只读）
+
+## Skill 优先使用规则（强制，违反即白烧步数）
+- **接到任务先查 skill**：`ls /skills/__system__/`、`ls /skills/__agent__/`、
+  `ls /skills/__user_*__/`，确认是否存在覆盖当前任务能力的 skill
+  （PDF 比对/PLC 审查等高频场景都有现成 skill）。
+- **有匹配 skill 必须用**：按该 skill 的 SKILL.md 流程执行
+  （copy_script_to_sandbox 传脚本 → execute 运行），**禁止**绕开 skill
+  自己现场写同等能力的算法脚本。
+- **禁止"造轮子"**：不得以"脚本有 bug 我重写一个更好的"为由另起炉灶——
+  已有 skill 时，任何现场编写的同功能脚本都是重复劳动。
+- **唯一例外**：确认全部 skill 目录（__system__/__agent__/__user_*__）
+  均无覆盖任务能力的 skill 后，才允许写一次性脚本；写完直接执行，
+  不要陷入"写脚本→报错→改脚本→重跑"循环，连续 2 次运行失败即停手
+  汇报问题，禁止无限调试。
 
 ## 文件上传到沙箱的流程
 - 所有输入文件（XML / Excel / Word）：用对应的 MCP 工具直传沙箱，不经过 LLM 上下文
