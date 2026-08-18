@@ -1,5 +1,7 @@
 import os
+import asyncio
 import logging
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +13,13 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
-from deepagents.backends.protocol import FileDownloadResponse, ReadResult, WriteResult
+from deepagents.backends.protocol import (
+    FileDownloadResponse,
+    GlobResult,
+    GrepResult,
+    ReadResult,
+    WriteResult,
+)
 from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.summarization import SummarizationMiddleware
 
@@ -173,9 +181,173 @@ class ValidatedCompositeBackend(CompositeBackend):
     # 虚拟文件系统内只读路径：命中即提示改 reports（/skills/ 需细分提示，见 _reject_hint）
     VIRTUAL_READONLY_PREFIXES = ("/uploads/", "/skills/", "/workspace/agent-memory/")
 
+    # B2: glob 扫描保险丝超时（秒）——同步/异步 glob 超过该时长即中止返回错误，
+    # 防止任何意外长扫描（含未拦截的宽泛模式）阻塞 asyncio 事件循环
+    GLOB_TIMEOUT_SEC = 10
+
     def __init__(self, default, routes, *, user_id: str = "", session_id: str = ""):
         super().__init__(default=default, routes=routes)
         self._report_prefix = f"/reports/{user_id}/{session_id}/" if user_id and session_id else "/reports/<user_id>/<session_id>/"
+
+    def _reject_glob_scan(self, pattern: str, path: str | None) -> str | None:
+        """B1: 拦截 '**' 全盘扫描（2026-08-18 根因修复）。
+
+        CompositeBackend.glob 在 path 为 None 或 "/" 时会遍历 default（sandbox）
+        + 全部路由 backend 做同步 rglob；配合 '**' 通配符 = 对虚拟文件系统全量递归，
+        单条工具调用即可把 asyncio 事件循环冻死（实测 2026-08-18：agent 调
+        glob '**/tech-spec-pdf-diff/**' 后整个后端 6 分钟无响应、CLOSE_WAIT 堆积）。
+
+        拦截条件：
+        - pattern 含 '**'（平台规则本就禁止该通配符）
+        - 且 path 未限定到具体路由（None 或 "/" 会触发全路由遍历）
+        命中即返回拒绝提示（含修正指引），不执行实际扫描。
+        """
+        if "**" not in pattern:
+            return None
+        if path and path != "/":
+            # 已限定到具体路径/路由 → CompositeBackend 只扫单 backend，范围可控，放行
+            return None
+        return (
+            f"glob 模式 '{pattern}' 含 '**' 全盘通配符且未限定搜索路径，平台禁止对虚拟文件系统"
+            f"做 '**' 递归扫描（会扫描 sandbox + 全部路由，严重阻塞服务）。"
+            f"请改为限定路径：glob(pattern='{pattern}', path='/skills/__system__/') "
+            f"或直接用 ls / read_file 在具体目录（/uploads/、/reports/）下精确操作。"
+        )
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """B1 拦截全盘 '**' 扫描；B2 同步扫描放线程池并限时，防止冻结事件循环。"""
+        hint = self._reject_glob_scan(pattern, path)
+        if hint:
+            logger.warning("[VALIDATED_CB] 拒绝全盘 glob: pattern=%s path=%s", pattern, path)
+            return GlobResult(error=f"拒绝执行: {hint}", matches=[])
+
+        # B2 保险丝：同步 glob（CompositeBackend 内部 rglob/sandbox execute 均同步）
+        # 放 ThreadPoolExecutor 执行并限时；超时不等待线程（shutdown(wait=False)），
+        # 事件循环最多阻塞 GLOB_TIMEOUT_SEC，不会永久冻结。
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(super().glob, pattern, path)
+        try:
+            return future.result(timeout=self.GLOB_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "[VALIDATED_CB] glob 超时(>%ss)已中止: pattern=%s path=%s",
+                self.GLOB_TIMEOUT_SEC, pattern, path,
+            )
+            return GlobResult(
+                error=f"glob 扫描超时（>{self.GLOB_TIMEOUT_SEC}s），已中止。请缩小搜索范围："
+                f"限定 path 到具体目录，或避免宽泛模式。",
+                matches=[],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[VALIDATED_CB] glob 异常: pattern=%s err=%s", pattern, e)
+            return GlobResult(error=f"glob 失败: {e}", matches=[])
+        finally:
+            # 关键：不等待未完成线程（线程自身最终会被解释器清理），
+            # 否则 TimeoutError 后 with/join 会再次阻塞
+            pool.shutdown(wait=False)
+
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """B1 拦截全盘 '**' 扫描；B2 异步版用 asyncio.wait_for 限时。"""
+        hint = self._reject_glob_scan(pattern, path)
+        if hint:
+            logger.warning("[VALIDATED_CB] 拒绝全盘 glob: pattern=%s path=%s", pattern, path)
+            return GlobResult(error=f"拒绝执行: {hint}", matches=[])
+
+        try:
+            return await asyncio.wait_for(
+                super().aglob(pattern, path), timeout=self.GLOB_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[VALIDATED_CB] aglob 超时(>%ss)已中止: pattern=%s path=%s",
+                self.GLOB_TIMEOUT_SEC, pattern, path,
+            )
+            return GlobResult(
+                error=f"glob 扫描超时（>{self.GLOB_TIMEOUT_SEC}s），已中止。请缩小搜索范围："
+                f"限定 path 到具体目录，或避免宽泛模式。",
+                matches=[],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[VALIDATED_CB] aglob 异常: pattern=%s err=%s", pattern, e)
+            return GlobResult(error=f"glob 失败: {e}", matches=[])
+
+    def _reject_grep_scan(self, path: str | None) -> str | None:
+        """B1: 拦截 grep 无路径限定的全路由遍历（与 glob 同构风险）。
+
+        CompositeBackend.grep 在 path 为 None 或 "/" 时同样会遍历 default（sandbox）
+        + 全部路由 backend 做同步全量扫描（FilesystemBackend.grep 内部 rglob("*")）。
+        grep 没有 '**' 通配符，但"无限定路径"与 glob '**' 是同一个危险面，
+        故对 path=None/"/" 的 grep 也直接拒绝，要求限定到具体目录。
+        """
+        if path and path != "/":
+            return None
+        return (
+            "grep 未限定搜索路径，平台禁止对虚拟文件系统做全盘全文搜索"
+            f"（会扫描 sandbox + 全部路由，严重阻塞服务）。"
+            f"请改为限定路径：grep(pattern='{path or ''}', path='/skills/__system__/') "
+            f"或指定具体目录（/uploads/、/reports/、/workspace/memories/ 等）。"
+        )
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        """B1 拦截无路径限定的全路由 grep；B2 同步扫描放线程池并限时。"""
+        hint = self._reject_grep_scan(path)
+        if hint:
+            logger.warning("[VALIDATED_CB] 拒绝全盘 grep: path=%s", path)
+            return GrepResult(error=f"拒绝执行: {hint}")
+
+        # B2 保险丝：同步 grep 放线程池执行并限时，防止冻结事件循环
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(super().grep, pattern, path, glob)
+        try:
+            return future.result(timeout=self.GLOB_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "[VALIDATED_CB] grep 超时(>%ss)已中止: pattern=%s path=%s",
+                self.GLOB_TIMEOUT_SEC, pattern, path,
+            )
+            return GrepResult(
+                error=f"grep 搜索超时（>{self.GLOB_TIMEOUT_SEC}s），已中止。"
+                f"请缩小搜索范围：限定 path 到具体目录。"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[VALIDATED_CB] grep 异常: pattern=%s err=%s", pattern, e)
+            return GrepResult(error=f"grep 失败: {e}")
+        finally:
+            pool.shutdown(wait=False)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        """B1 拦截无路径限定的全路由 grep；B2 异步版用 asyncio.wait_for 限时。"""
+        hint = self._reject_grep_scan(path)
+        if hint:
+            logger.warning("[VALIDATED_CB] 拒绝全盘 grep: path=%s", path)
+            return GrepResult(error=f"拒绝执行: {hint}")
+
+        try:
+            return await asyncio.wait_for(
+                super().agrep(pattern, path, glob), timeout=self.GLOB_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[VALIDATED_CB] agrep 超时(>%ss)已中止: pattern=%s path=%s",
+                self.GLOB_TIMEOUT_SEC, pattern, path,
+            )
+            return GrepResult(
+                error=f"grep 搜索超时（>{self.GLOB_TIMEOUT_SEC}s），已中止。"
+                f"请缩小搜索范围：限定 path 到具体目录。"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[VALIDATED_CB] agrep 异常: pattern=%s err=%s", pattern, e)
+            return GrepResult(error=f"grep 失败: {e}")
 
     def _is_binary_read(self, file_path: str) -> str | None:
         """read_file 二进制拦截：返回拦截提示（带下一步指引）或 None。
