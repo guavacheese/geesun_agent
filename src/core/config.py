@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     no_progress_max_injections: int = 1
     # 无进展窗口判定：重复 N 次内是否有新交付物（file_generated / reports 新文件）
     no_progress_window_files: int = 3
+    # ─── model 调用总时长超时（2026-08-19 新增）───
+    # openai SDK 的 timeout 是"字节间隔超时"（httpx read timeout），vLLM 慢速流式时
+    # 永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时）。
+    # 此处为"总时长"超时：单次 model 调用（含 prefill+decode 全流）超过即中止，
+    # 抛错 → SSE error → M3 兜底，防永久挂起。
+    model_call_timeout_sec: int = 600
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

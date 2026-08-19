@@ -168,7 +168,7 @@ import base64
 from pathlib import Path
 from langchain.messages import trim_messages, SystemMessage, HumanMessage
 from src.core.config import settings
-from src.core.model import create_model, switch_model, file_to_image
+from src.core.model import create_model, switch_model, file_to_image, model_call_guard
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
 
 # ─── Monkey-patch: 给 StoreBackend 补上 adownload_files ─────────────────
@@ -659,7 +659,7 @@ async def create_agent(
         system_prompt=PLC_AUDITOR_SYSTEM_PROMPT,
         skills=skills,
         memory=[AGENTS_MD_PATH],
-        middleware=[switch_model, file_to_image, summarization_mw],
+        middleware=[switch_model, file_to_image, model_call_guard, summarization_mw],
         interrupt_on={
             "write_file": False,
             "read_file": False,

@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field, asdict
 from typing import Callable
+import asyncio
+import logging
 
 from langchain_openai import ChatOpenAI
 from langchain.agents.middleware import (
@@ -8,6 +10,8 @@ from langchain.agents.middleware import (
     ModelResponse,
 )
 from src.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
@@ -117,3 +121,37 @@ async def file_to_image(
         if changed:
             msg.content = new_blocks
     return await handler(request)
+
+
+# ─── model 调用总时长超时 + 请求量 DIAG（2026-08-19 新增）───
+
+@wrap_model_call
+async def model_call_guard(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], ModelResponse],
+) -> ModelResponse:
+    """① 打印本轮实际发送给模型的请求量（messages 数 + 字符数）——用于诊断
+    Summarization 压缩是否生效（压缩后应为 keep 条，全量则几百条/几十万字符）；
+    ② 总时长超时：openai SDK 的 timeout 是 httpx"字节间隔"超时，vLLM 慢速
+    流式时永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时），
+    这里用 asyncio.wait_for 包整个 handler 做总时长兜底（config 可调），
+    超时抛 TimeoutError → chat.py 外层捕获 → SSE error → M3 兜底，防永久挂起。
+    """
+    msgs = request.messages
+    total_chars = sum(len(str(getattr(m, "content", ""))) for m in msgs)
+    total_tokens = sum(
+        len(str(getattr(m, "content", ""))) // 2 for m in msgs
+    )  # 粗估：中英混排 1 字符≈0.5~1 token，取保守下限
+    logger.warning(
+        "[DIAG] model_call_guard: messages=%d, chars=%d（≈%d tokens）, timeout=%ss",
+        len(msgs), total_chars, total_tokens, settings.model_call_timeout_sec,
+    )
+    try:
+        return await asyncio.wait_for(
+            handler(request), timeout=settings.model_call_timeout_sec
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"model 调用超过 {settings.model_call_timeout_sec}s 总时长（"
+            f"messages={len(msgs)}, chars={total_chars}）——vLLM 无响应或过慢，已中止"
+        ) from None
