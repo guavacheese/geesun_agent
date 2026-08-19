@@ -22,6 +22,12 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.skills import (
+    SkillsMiddleware,
+    SkillsStateUpdate,
+    _alist_skills_with_errors,
+    _list_skills_with_errors,
+)
 
 
 def _strip_system_messages(request):
@@ -45,6 +51,81 @@ def _strip_system_messages(request):
         )
         return request.override(messages=clean)
     return None
+
+
+class _FreshSkillsMiddleware(SkillsMiddleware):
+    """每轮强制重扫 skill 源，绕过 deepagents 的 checkpoint 固化。
+
+    问题（2026-08-19 实测，Postgres checkpoint_writes 实证）：
+    deepagents 默认 SkillsMiddleware 的 before_agent/abefore_agent 在
+    `"skills_metadata" in state` 时直接 return None（skills.py:960/1006）——
+    skills_metadata 只标 PrivateStateAttr（控制 input/output schema 省略），
+    无 EphemeralValue，会被 Postgres checkpoint 持久化。会话首扫后永不重扫，
+    会话创建之后新上传的 skill 永远不可见（tech-spec-pdf-diff 8-18 19:43
+    上传，会话 dda7a644 首扫 15:45，此后 agent 上下文永远没有该 skill，
+    只能自写逐页 diff 脚本自由发挥，引发死循环）。
+
+    本子类职责：
+    - before_agent/abefore_agent：每轮重新扫描 sources 并刷新 state 里的
+      skills_metadata（与旧值相同则返回 None，避免每 step 重复写 checkpoint）；
+    - modify_request：no-op（不重复注入 system prompt）——注入仍由
+      create_deep_agent 内部按 skills= 参数装配的默认 SkillsMiddleware 完成，
+      它读取的是本实例刷新后的 state。
+
+    装配：create_agent 保留 skills= 参数（默认实例负责注入 + GP subagent
+    覆盖），本实例追加进 middleware 列表（name=_FreshSkillsMiddleware，
+    与默认 SkillsMiddleware 不同名，langchain factory 按 name 去重不冲突）。
+    """
+
+    def _scan(self, state, backend):
+        all_skills: dict[str, dict] = {}
+        errors: list[str] = []
+        for source_path in self.sources:
+            source_skills, source_error = _list_skills_with_errors(backend, source_path)
+            if source_error is not None:
+                errors.append(source_error)
+            for skill in source_skills:
+                all_skills[skill["name"]] = skill
+        skills = list(all_skills.values())
+        if state.get("skills_metadata") == skills and not errors:
+            return None
+        update = SkillsStateUpdate(skills_metadata=skills)
+        if errors:
+            logger.warning("[FRESH_SKILLS] 加载错误: %s", errors)
+            update["skills_load_errors"] = errors
+        return update
+
+    async def _ascan(self, state, backend):
+        all_skills: dict[str, dict] = {}
+        errors: list[str] = []
+        for source_path in self.sources:
+            source_skills, source_error = await _alist_skills_with_errors(backend, source_path)
+            if source_error is not None:
+                errors.append(source_error)
+            for skill in source_skills:
+                all_skills[skill["name"]] = skill
+        skills = list(all_skills.values())
+        if state.get("skills_metadata") == skills and not errors:
+            return None
+        update = SkillsStateUpdate(skills_metadata=skills)
+        if errors:
+            logger.warning("[FRESH_SKILLS] 加载错误: %s", errors)
+            update["skills_load_errors"] = errors
+        return update
+
+    def before_agent(self, state, runtime, config):
+        """每轮重扫（不做 checkpoint 固化 skip）。"""
+        backend = self._get_backend(state, runtime, config)
+        return self._scan(state, backend)
+
+    async def abefore_agent(self, state, runtime, config):
+        """每轮重扫（异步版，不做 checkpoint 固化 skip）。"""
+        backend = self._get_backend(state, runtime, config)
+        return await self._ascan(state, backend)
+
+    def modify_request(self, request):
+        """no-op：注入交给默认 SkillsMiddleware，避免 system prompt 重复两段。"""
+        return request
 
 
 class _SummarizationAccurate(SummarizationMiddleware):
@@ -659,7 +740,17 @@ async def create_agent(
         system_prompt=PLC_AUDITOR_SYSTEM_PROMPT,
         skills=skills,
         memory=[AGENTS_MD_PATH],
-        middleware=[switch_model, file_to_image, model_call_guard, summarization_mw],
+        middleware=[
+            # ★ 每轮重扫 skill 源（绕过 checkpoint 固化），排在链首：
+            # 其 abefore_agent 先刷新 state["skills_metadata"]，随后默认
+            # SkillsMiddleware.modify_request 注入的就是最新 skill 清单
+            # （2026-08-19 实证：默认固化导致新上传 skill 永不进上下文）
+            _FreshSkillsMiddleware(backend=backend, sources=skills),
+            switch_model,
+            file_to_image,
+            model_call_guard,
+            summarization_mw,
+        ],
         interrupt_on={
             "write_file": False,
             "read_file": False,
