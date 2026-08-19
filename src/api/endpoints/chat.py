@@ -482,6 +482,28 @@ async def chat(
             nonlocal _last_debug_step, thinking_emitted, _think_buffer, _think_done, _generated_files, _consecutive_tool_failures
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
+            # ─── 清洗：messages 里不应有 SystemMessage ───
+            # 主 system 由 deepagents 的 system_message 字段承载（factory 最内层
+            # 前置 + memory middleware append_to_system_message），messages 中出现
+            # system 均为异常数据：历史 checkpoint 可能残留旧版 P0 收敛注入的
+            # SystemMessage（2026-08-19 09:44 旧代码注入后被保存进 state，09:57
+            # 重启恢复后第一轮 model 调用即 400 'System message must be at the
+            # beginning'——vLLM 要求 system 连续位于开头）。统一过滤掉。
+            _raw_msgs = _input.get("messages", [])
+            _filtered_system = sum(
+                1 for m in _raw_msgs if getattr(m, "type", "") == "system"
+            )
+            if _filtered_system:
+                logger.warning(
+                    "[DIAG] astream 输入已清洗 %d 条中间 SystemMessage（checkpoint 残留）",
+                    _filtered_system,
+                )
+            _input = {
+                **_input,
+                "messages": [
+                    m for m in _raw_msgs if getattr(m, "type", "") != "system"
+                ],
+            }
             # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
             try:
                 async for mode, data in agent.astream(
