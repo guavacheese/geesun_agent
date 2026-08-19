@@ -24,6 +24,29 @@ from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.summarization import SummarizationMiddleware
 
 
+def _strip_system_messages(request):
+    """过滤 request.messages 中的 SystemMessage（model 调用前最终清洗）。
+
+    vLLM 要求所有 system 消息连续位于开头；主 system 由 request.system_message
+    字段承载（memory/skills middleware 用 append_to_system_message 注入），
+    messages 中出现 system 均为异常数据——历史 checkpoint 可能残留旧版 P0
+    收敛注入的 SystemMessage（2026-08-19 实测重启恢复后第一轮即 400
+    'System message must be at the beginning'）。
+
+    返回清洗后的新 request；无 system 时返回 None（调用方直接用原 request）。
+    """
+    raw = request.messages
+    clean = [m for m in raw if getattr(m, "type", "") != "system"]
+    if len(clean) != len(raw):
+        logger.warning(
+            "[DIAG] wrap_model_call 清洗 %d 条中间 SystemMessage（残留: %s）",
+            len(raw) - len(clean),
+            [getattr(m, "type", "?") for m in raw],
+        )
+        return request.override(messages=clean)
+    return None
+
+
 class _SummarizationAccurate(SummarizationMiddleware):
     """精确计数版 Summarization：实现与默认完全一致，仅类名不同。
 
@@ -120,6 +143,27 @@ class _SummarizationAccurate(SummarizationMiddleware):
             except Exception as e:
                 logger.warning("[DIAG] inventory 注入失败(恢复路径): %s", e)
         return result
+
+    # ─── 中间 SystemMessage 兜底清洗（2026-08-19 04:xx 第三次 400 修复）───
+    # wrap_model_call 是 model 调用前的最后一环：此时 request.messages 已包含
+    # checkpoint 恢复的历史消息 + 本轮的注入/新消息，是"最终完整列表"。
+    # vLLM 要求所有 system 连续位于开头，历史 checkpoint 里残留的中间 system
+    # （旧版 P0 收敛注入 SystemMessage 等）会永久触发 400——在入口（_drain_astream）
+    # 清洗覆盖不到 deepagents 内部恢复的历史，必须在此最终清洗。
+    # 主 system 在 request.system_message 字段（memory/skills 用 append_to_system_message
+    # 注入），messages 中出现 system 本就是异常数据，全部过滤安全。
+
+    def wrap_model_call(self, request, handler):
+        cleaned = _strip_system_messages(request)
+        if cleaned is not None:
+            request = cleaned
+        return super().wrap_model_call(request, handler)
+
+    async def awrap_model_call(self, request, handler):
+        cleaned = _strip_system_messages(request)
+        if cleaned is not None:
+            request = cleaned
+        return await super().awrap_model_call(request, handler)
 import base64
 from pathlib import Path
 from langchain.messages import trim_messages, SystemMessage, HumanMessage
