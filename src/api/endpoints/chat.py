@@ -31,6 +31,43 @@ def _tool_intent_sig(tool_name: str, result_str: str) -> str:
     return f"{tool_name}:{s[:80]}" if s else tool_name
 
 
+def _missing_skill_artifacts(
+    report_root: str,
+    user_id: str,
+    session_id: str,
+    stage1_done: bool,
+    stage3_done: bool,
+) -> list[str]:
+    """确定性校验 skill 工作流关键产物（M3 扩展，2026-08-19）。
+
+    本轮跑过 run_pdf_diff_stage1/stage3（成功）后，reports 必须出现对应产物
+    （agent 用 download_from_sandbox 拉回）。缺失即视为"流程未走完"，
+    由 M3 完成门注入收敛提示继续，不信任模型自陈"做完了"。
+
+    Returns: 缺失项描述列表（空 = 齐）。
+    """
+    missing: list[str] = []
+    rp = os.path.join(report_root, user_id, session_id)
+    if stage1_done and not os.path.isfile(os.path.join(rp, "diff_pages.json")):
+        missing.append(
+            "diff_pages.json（run_pdf_diff_stage1 产物，需 download_from_sandbox 拉回再读）"
+        )
+    if stage3_done:
+        try:
+            has_report = any(
+                n.startswith("技术协议差异对比报告_")
+                and n.endswith((".md", ".html"))
+                for n in os.listdir(rp)
+            ) if os.path.isdir(rp) else False
+        except OSError:
+            has_report = False
+        if not has_report:
+            missing.append(
+                "技术协议差异对比报告_*（run_pdf_diff_stage3 产物，需 download_from_sandbox 拉回）"
+            )
+    return missing
+
+
 class ToolLoopAbortError(Exception):
     """工具连续失败超限，提前终止本轮流式生成。
 
@@ -718,6 +755,13 @@ async def chat(
                                     "OK" if not is_error else "FAIL",
                                     content_str[:150] if content_str else "(空)",
                                 )
+                                # skill workflow 阶段标记（M3 产物校验用）：
+                                # 成功跑过 stage1/stage3 → 后续要求 reports 出现对应产物
+                                if not is_error:
+                                    if tool_name == "run_pdf_diff_stage1":
+                                        _skill_state["stage1"] = True
+                                    elif tool_name == "run_pdf_diff_stage3":
+                                        _skill_state["stage3"] = True
 
                                 yield f"data: {
                                     json.dumps(
@@ -998,6 +1042,8 @@ async def chat(
         # v2 自动继续：注入 SystemMessage 让模型再跑一轮（受 auto_continue / max_retries 开关控制，
         # 异常由 _drain_astream 内部吞掉 → 本轮零产出仍会递增重试，超限终止）。
         _completion_retries = 0
+        # skill workflow 阶段标记（M3 产物校验用）：本轮是否成功跑过 stage1/stage3
+        _skill_state = {"stage1": False, "stage3": False}
         # P0：NoProgressAbortError 触发标记——收敛轮跳过 M3 零产出拦截
         # （收敛轮刚注入提示，本轮零产出是预期的，不应被完成门拦截）
         _no_progress_triggered = False
@@ -1016,7 +1062,43 @@ async def chat(
                     _before_files = _after_files  # 重新基线
                     continue
                 if _generated_files or _new_files:
-                    break  # 有本轮产出，放行
+                    # 有本轮产出 → 再校验 skill 工作流关键产物（跑过 stage1/stage3 时）。
+                    # 缺失即"流程没走完"（如 stage1 产物没拉回 reports），不放行，
+                    # 注入收敛提示继续——不信任模型自陈"做完了"。
+                    _missing = _missing_skill_artifacts(
+                        settings.report_root, user_id, session_id,
+                        _skill_state["stage1"], _skill_state["stage3"],
+                    )
+                    if not _missing:
+                        break  # 产物齐，放行
+                    if (
+                        _completion_retries >= settings.sandbox_completion_gate_max_retries
+                        or not settings.sandbox_completion_gate_auto_continue
+                    ):
+                        _completion_blocked = True
+                        logger.warning(
+                            "[M3] skill 产物缺失且重试耗尽: user=%s, session=%s, missing=%s",
+                            user_id, session_id, _missing,
+                        )
+                        yield f"data: {json.dumps({
+                            'type': 'completion_blocked',
+                            'reason': f'skill 工作流产物缺失: {_missing}',
+                            'hint': '请检查是否遗漏 download_from_sandbox 拉回产物',
+                            'terminated': True,
+                        }, ensure_ascii=False)}\n\n"
+                        break
+                    _completion_retries += 1
+                    logger.warning(
+                        "[M3] skill 产物缺失，注入收敛继续（%d/%d）: missing=%s",
+                        _completion_retries, settings.sandbox_completion_gate_max_retries, _missing,
+                    )
+                    _graph_input = {"messages": [HumanMessage(
+                        f"系统校验：本轮 skill 工作流关键产物缺失：{'、'.join(_missing)}。"
+                        f"请立即用 download_from_sandbox 将对应文件拉回 /reports/{user_id}/{session_id}/，"
+                        "然后继续完成。禁止自写替代代码或跳过流程步骤。"
+                    )]}
+                    _before_files = _after_files  # 重新基线
+                    continue
                 if not settings.sandbox_completion_gate_enabled:
                     break  # 完成门关闭（回滚开关）
                 if (
