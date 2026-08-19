@@ -928,15 +928,19 @@ async def chat(
                 logger.warning("工具连续失败超限提前终止: %s", e)
                 yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
             except NoProgressAbortError as e:
-                # ─── P0 无进展循环：中断本轮，注入收敛 SystemMessage 让模型收敛 ───
+                # ─── P0 无进展循环：中断本轮，注入收敛提示让模型收敛 ───
                 # 触发后 _graph_input 被替换为收敛提示，外层 while 循环继续跑一轮；
                 # 收敛轮再触发（超 no_progress_max_injections）则不再注入，
                 # 由 except Exception 兜底转 error 终止（防无限收敛轮）。
+                # 注意：必须用 HumanMessage 而非 SystemMessage——vLLM 要求所有
+                # system 消息连续位于开头，本提示与 checkpoint 恢复的历史消息合并
+                # 后不保证位置（2026-08-19 09:44:54 实测 400 'System message must
+                # be at the beginning'；资源清单 13dab48→f093303 同款教训）。
                 _no_progress_triggered = True  # 标记：收敛轮跳过 M3 零产出拦截
                 logger.warning("[P0] 无进展循环，注入收敛提示: %s", e)
                 yield f"data: {json.dumps({'type': 'agent_status', 'status': 'no_progress', 'content': f'{str(e)[:200]}'}, ensure_ascii=False)}\n\n"
-                # 收敛 SystemMessage：让模型停止重复，验证已有产出并交付
-                _graph_input = {"messages": [SystemMessage(
+                # 收敛提示：让模型停止重复，验证已有产出并交付
+                _graph_input = {"messages": [HumanMessage(
                     f"系统检测到无进展循环：你已连续多轮重复相同操作（{str(e)[:150]}）"
                     "且未产生新交付物。请立即收敛："
                     "1) 检查 /reports/{user_id}/{session_id}/ 下是否已有可交付的报告文件，"
