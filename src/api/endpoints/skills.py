@@ -6,6 +6,8 @@ import tempfile
 import shutil
 import logging
 
+import yaml
+
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
 from src.core.config import settings
 
@@ -22,6 +24,10 @@ def _validate_skill_md(content: str) -> dict:
 
     要求：
     - 开头必须有两行 --- 包裹的 YAML 块
+    - YAML 语法必须可被 yaml.safe_load 解析（与 deepagents 扫描端
+      skills.py:401 同一解析器——2026-08-19 实证：旧版正则逐行解析放过了
+      `description: ... Triggers: "..."` 的 ASCII 冒号+空格，skill 上传
+      成功但永远无法被 deepagents 加载，静默 skip）
     - 必须包含 name 和 description 字段
 
     Returns: {"valid": bool, "name": str|None, "description": str|None, "error": str|None}
@@ -40,20 +46,19 @@ def _validate_skill_md(content: str) -> dict:
 
     yaml_block = content_clean[3:second_dash].strip()
 
-    # 简单解析 key: value 行（不依赖 PyYAML，避免引入额外依赖）
-    name = None
-    description = None
-    for line in yaml_block.split("\n"):
-        line = line.strip()
-        # 去掉引号包裹的值
-        m = re.match(r"^name\s*:\s*(.+)$", line, re.IGNORECASE)
-        if m:
-            name = m.group(1).strip().strip("\"'").strip()
-            continue
-        m = re.match(r"^description\s*:\s*(.+)$", line, re.IGNORECASE)
-        if m:
-            description = m.group(1).strip().strip("\"'").strip()
-            continue
+    # 语法级解析（与 deepagents 扫描端一致）；YAMLError 透出具体行/列信息
+    try:
+        data = yaml.safe_load(yaml_block)
+    except yaml.YAMLError as e:
+        return {"valid": False, "name": None, "description": None,
+                "error": f"frontmatter YAML 语法错误: {e}"}
+
+    if not isinstance(data, dict):
+        return {"valid": False, "name": None, "description": None,
+                "error": "frontmatter YAML 解析结果不是键值映射（空块或列表等）"}
+
+    name = str(data.get("name", "")).strip()
+    description = str(data.get("description", "")).strip()
 
     errors = []
     if not name:
