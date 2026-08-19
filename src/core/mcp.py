@@ -294,6 +294,19 @@ def _guard_download_tool(tools: list[BaseTool]) -> list[BaseTool]:
     ]
 
 
+def _first_exception(exc: BaseException) -> BaseException | None:
+    """递归展开 ExceptionGroup/TaskGroup 包装，返回最内层首个异常。
+
+    asyncio.TaskGroup 失败时抛 ExceptionGroup，其 str() 只显示
+    "unhandled errors in a TaskGroup (N sub-exception)"，真实根因
+    （ConnectError/TimeoutError/ProtocolError 等）在子异常里。此函数
+    沿第一个子异常链递归到底，供日志透出可诊断信息。
+    """
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return exc
+
+
 async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
     """获取 MCP 工具。
 
@@ -321,7 +334,18 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
             results.extend(tools)
         except Exception as e:  # noqa: BLE001
             failed.append(name)
-            logger.warning("MCP server [%s] 加载工具失败: %s", name, e)
+            # TaskGroup/ExceptionGroup 的 str() 只显示 "unhandled errors in a TaskGroup
+            # (N sub-exception)"，真实原因（连接拒绝/超时/协议错）被吞在子异常里——
+            # 递归展开到最内层首个异常，日志一眼可见真因（2026-08-19 实测踩坑：
+            # decrypt-file 加载失败但日志无任何可诊断信息，只能靠外部探测端口）。
+            inner = _first_exception(e)
+            if inner is not None and inner is not e:
+                logger.warning(
+                    "MCP server [%s] 加载工具失败: %s（子异常: %s）",
+                    name, e, inner,
+                )
+            else:
+                logger.warning("MCP server [%s] 加载工具失败: %s", name, e)
 
     await asyncio.gather(
         *[connect_one(name, entry) for name, entry in entries.items()]
