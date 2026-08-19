@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     # 工具连续失败阈值：单轮内连续失败（error/超时）达到该次数即提前终止，
     # 避免模型在错误循环里空转直到烧满 recursion_limit（100 步，约几分钟白等）
     sandbox_tool_failure_threshold: int = 5
+    # ─── P0 无进展循环检测（2026-08-19 新增）───
+    # 工具"成功但无进展"死循环兜底：同一工具调用意图（工具名+参数指纹）
+    # 连续出现 N 次且期间零新交付物 → 判定循环，注入收敛 SystemMessage。
+    # 与 sandbox_tool_failure_threshold 互补：那个管"失败循环"，这个管"成功空转"。
+    no_progress_repeat_threshold: int = 5
+    # 收敛注入最多次数：超限后不再注入，直接放弃终止（防无限收敛轮）
+    no_progress_max_injections: int = 1
+    # 无进展窗口判定：重复 N 次内是否有新交付物（file_generated / reports 新文件）
+    no_progress_window_files: int = 3
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

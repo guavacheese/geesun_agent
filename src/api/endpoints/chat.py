@@ -17,12 +17,37 @@ from src.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _tool_intent_sig(tool_name: str, result_str: str) -> str:
+    """提取工具调用意图指纹：工具名 + 结果内容的关键特征。
+
+    用于 P0 无进展检测——判断模型是否在重复执行同一件事。
+    - execute：取结果前 60 字符（命令相同 → 结果通常相同，指纹稳定）
+    - 其他工具：取结果前 80 字符
+    结果为空时退化为纯工具名（同工具重复也算重复意图）。
+    """
+    s = (result_str or "").strip()
+    if tool_name == "execute":
+        return f"{tool_name}:{s[:60]}"
+    return f"{tool_name}:{s[:80]}" if s else tool_name
+
+
 class ToolLoopAbortError(Exception):
     """工具连续失败超限，提前终止本轮流式生成。
 
     与 GraphRecursionError 的区别：后者要烧满 recursion_limit（100 步）才抛，
     期间模型会反复空转；本异常在连续失败达到阈值时立刻抛出，
     由 _drain_astream 的 except 分支捕获后转为 SSE error 事件，秒级止损。
+    """
+
+
+class NoProgressAbortError(Exception):
+    """工具"成功但无进展"循环检测，中断当前轮并触发收敛注入。
+
+    与 ToolLoopAbortError 的区别：那个管"工具连续失败"（错误循环），
+    本异常管"工具全部成功但模型反复执行同一意图、零新交付物"的空转
+    （2026-08-17/08-18 两次 Recursion limit 死循环实证：execute 全 OK、
+    报告已生成，但模型不断"重新构建 diff.json"永不收敛）。
+    由外层捕获后注入收敛 SystemMessage，让模型收敛交付而非烧满 200 步。
     """
 
 
@@ -442,17 +467,25 @@ async def chat(
         _graph_input = graph_input
 
         # ─── 流式生成（多轮共用：首轮 + 完成门自动继续轮）───
-        async def _drain_astream(_graph_input):
+        # P0 无进展循环检测状态（跨轮共享，收敛注入后重置）：
+        # _last_tool_sig / _repeat_count：连续同一工具意图计数；
+        # _files_in_window：本轮重复窗口内是否有新交付物（有则不算空转）
+        _last_tool_sig = None
+        _repeat_count = 0
+        _files_in_window = 0
+        _no_progress_injections = 0
+        async def _drain_astream(_input):
             """消费一轮 agent.astream，实时 yield SSE 事件；内部吞掉异常不崩流。
             M3-v2 继续轮传入 {'messages': [SystemMessage(...)]} 追加系统消息，
             依赖 deepagents astream 继续模式（spike 验证，未通过时自动继续保持关闭）。
             """
             nonlocal _last_debug_step, thinking_emitted, _think_buffer, _think_done, _generated_files, _consecutive_tool_failures
+            nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
             try:
                 async for mode, data in agent.astream(
-                    _graph_input,
+                    _input,
                     config={
                         **graph_config,
                         "recursion_limit": 200,  # ← 最多 200 步（原 100）：大文档任务（80+页×2 PDF 逐章节提取）实测 100 步不够，报告都没来得及写；正常流程 25-35 步，200 是 5-8 倍余量
@@ -693,6 +726,51 @@ async def chat(
                                 else:
                                     _consecutive_tool_failures = 0
 
+                                # ─── P0 无进展循环检测：工具成功但反复同一意图 ───
+                                # 模型在"工具全成功但任务未收敛"时空转（2026-08-17/18 两次
+                                # Recursion limit 实证：execute 全 OK、报告已生成，模型仍不断
+                                # "重新构建 diff.json"）。连续同一工具意图 + 窗口内零新交付物
+                                # → 判定循环 → 抛 NoProgressAbortError 由外层注入收敛提示。
+                                if not is_error:
+                                    sig = _tool_intent_sig(tool_name, content_str)
+                                    if sig == _last_tool_sig:
+                                        _repeat_count += 1
+                                    else:
+                                        _last_tool_sig = sig
+                                        _repeat_count = 1
+                                    # 重复窗口内出现新交付物 → 重置（不是空转）
+                                    if _files_in_window >= settings.no_progress_window_files:
+                                        _files_in_window = 0
+                                        _repeat_count = 0
+                                    if (
+                                        _repeat_count >= settings.no_progress_repeat_threshold
+                                    ):
+                                        if (
+                                            _no_progress_injections
+                                            < settings.no_progress_max_injections
+                                        ):
+                                            _no_progress_injections += 1
+                                            logger.warning(
+                                                "[P0] 无进展循环检测: 工具 %s 连续 %d 次同一意图且无新交付物"
+                                                "（最近结果: %s）→ 注入收敛提示",
+                                                tool_name, _repeat_count, content_str[:120],
+                                            )
+                                            raise NoProgressAbortError(
+                                                f"检测到无进展循环：工具 {tool_name} 连续 "
+                                                f"{_repeat_count} 次重复相同操作且无新产出"
+                                            )
+                                        else:
+                                            # 收敛注入已耗尽仍未收敛 → 直接终止（防烧满 recursion_limit）
+                                            logger.warning(
+                                                "[P0] 无进展循环收敛注入已耗尽（%d 次），终止: 工具 %s 连续 %d 次同一意图",
+                                                _no_progress_injections, tool_name, _repeat_count,
+                                            )
+                                            raise ToolLoopAbortError(
+                                                f"检测到无进展循环：已注入 {_no_progress_injections} 次收敛提示"
+                                                f"仍未收敛（最近: {tool_name} 连续 {_repeat_count} 次重复），"
+                                                "判定任务无法继续，已提前终止"
+                                            )
+
                                 # ─── 检测工具返回的文件信息，提取生成/下载的文件 ───
                                 # 不限定工具名，任何返回 /reports/ 路径的工具都能触发
                                 file_path_virtual = None
@@ -818,6 +896,7 @@ async def chat(
                                                 break
                                     else:
                                         _emitted_files.add(file_path_virtual)
+                                        _files_in_window += 1  # P0：新交付物计数（非空转信号）
                                         yield f"data: {
                                                     json.dumps(
                                                         {
@@ -848,6 +927,28 @@ async def chat(
                 # 只向前端发 error 事件（比 GraphRecursionError 快几十步）
                 logger.warning("工具连续失败超限提前终止: %s", e)
                 yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
+            except NoProgressAbortError as e:
+                # ─── P0 无进展循环：中断本轮，注入收敛 SystemMessage 让模型收敛 ───
+                # 触发后 _graph_input 被替换为收敛提示，外层 while 循环继续跑一轮；
+                # 收敛轮再触发（超 no_progress_max_injections）则不再注入，
+                # 由 except Exception 兜底转 error 终止（防无限收敛轮）。
+                _no_progress_triggered = True  # 标记：收敛轮跳过 M3 零产出拦截
+                logger.warning("[P0] 无进展循环，注入收敛提示: %s", e)
+                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'no_progress', 'content': f'{str(e)[:200]}'}, ensure_ascii=False)}\n\n"
+                # 收敛 SystemMessage：让模型停止重复，验证已有产出并交付
+                _graph_input = {"messages": [SystemMessage(
+                    f"系统检测到无进展循环：你已连续多轮重复相同操作（{str(e)[:150]}）"
+                    "且未产生新交付物。请立即收敛："
+                    "1) 检查 /reports/{user_id}/{session_id}/ 下是否已有可交付的报告文件，"
+                    "   如有则直接确认交付，停止重新生成；"
+                    "2) 若确需重跑，先说明与上一轮的具体差异，一次完成，不要重复相同命令；"
+                    "3) 若无法收敛，明确向用户说明卡点和已完成的产出。"
+                )]}
+                # 重置无进展计数（收敛轮重新统计），基线重设
+                _last_tool_sig = None
+                _repeat_count = 0
+                _files_in_window = 0
+                _before_files = snapshot_report_files(settings.report_root, user_id, session_id)
             except Exception as e:
                 # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
                 logger.exception("Agent 流式处理异常: %s", e)
@@ -860,6 +961,9 @@ async def chat(
         # v2 自动继续：注入 SystemMessage 让模型再跑一轮（受 auto_continue / max_retries 开关控制，
         # 异常由 _drain_astream 内部吞掉 → 本轮零产出仍会递增重试，超限终止）。
         _completion_retries = 0
+        # P0：NoProgressAbortError 触发标记——收敛轮跳过 M3 零产出拦截
+        # （收敛轮刚注入提示，本轮零产出是预期的，不应被完成门拦截）
+        _no_progress_triggered = False
         # 断连强制保存：正常路径保存成功后置 True；流被 GeneratorExit/CancelledError
         # 打断时 finally 兜底强制保存（2026-08-11 15:26 断连丢"写 skill"指令的修复）
         _saved = False
@@ -869,6 +973,11 @@ async def chat(
                     yield _ev
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
                 _new_files = _after_files - _before_files
+                if _no_progress_triggered:
+                    # 收敛轮：跳过零产出拦截，直接继续下一轮（_graph_input 已换成收敛提示）
+                    _no_progress_triggered = False
+                    _before_files = _after_files  # 重新基线
+                    continue
                 if _generated_files or _new_files:
                     break  # 有本轮产出，放行
                 if not settings.sandbox_completion_gate_enabled:
