@@ -685,18 +685,29 @@ async def chat(
                                                 or content_str.startswith("Execution error:")
                                             )
                                         else:
-                                            is_error = any(
-                                                marker in lower
-                                                for marker in [
-                                                    "exception",
-                                                    "traceback",
-                                                    "failed",
-                                                    "failure",
-                                                    "timeout",
-                                                    "permission denied",
-                                                    "no such file",
-                                                ]
-                                            )
+                                            if tool_name == "read_file":
+                                                # read_file 是内容型工具：成功返回全文（带行号），
+                                                # 内容里可能含 failed/no such file 等正常文本（2026-08-19
+                                                # 实测：tech-spec-pdf-diff/SKILL.md 第 25 行
+                                                # "No such file or directory" 命中旧关键词 → 成功误判 FAIL）。
+                                                # deepagents 失败必以 "Error: " 前缀开头
+                                                # （middleware/filesystem.py:1094 content=f"Error: {error}"）。
+                                                is_error = content_str.startswith(
+                                                    ("Error: ", "error: ")
+                                                )
+                                            else:
+                                                is_error = any(
+                                                    marker in lower
+                                                    for marker in [
+                                                        "exception",
+                                                        "traceback",
+                                                        "failed",
+                                                        "failure",
+                                                        "timeout",
+                                                        "permission denied",
+                                                        "no such file",
+                                                    ]
+                                                )
 
                                 # ─── tool 节点可观测性日志：工具名 + 成功/失败 + 结果截断 ───
                                 # 屏蔽 langgraph print 后工具调用过程不再出现在日志，
