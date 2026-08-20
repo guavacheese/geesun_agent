@@ -37,6 +37,18 @@ agent_created: true
 - `tail_only_a/b`：超出较短文档的尾部页，是文档末尾新增内容的候选，需重点核查；
 - `diff_pages` 已剔除噪声页，仅含真候选差异页。
 
+> ⚠️ **对齐模式（--aligned）召回风险与强制复核规则（违反即漏报）**
+> `--aligned` 用条款级 LCS 反推差异页，会把"整条相似度高、仅局部一行不同"的页筛掉（如数值/措辞变更），也会把"被顺移错配"的新增模块页漏标。实测曾导致 7 条真实差异漏报。**对齐仅用于收窄候选，绝不授权跳过复核。** 必须遵守：
+> 1. **候选集取并集**：除 stage1 的 `--aligned` 结果外，必须再跑一次 `diff_pages.py --union`（= legacy 位置 1:1 高召回 ∪ aligned 低噪声），以并集作为待审页清单。legacy 单独标出而 aligned 未标的页，往往是被对齐错配的真实差异页，**必须逐页行级 diff**。
+> 2. **出现以下任一信号，该章节禁止判"无差异"，必须 `diff_pages.py --full --pages <N-M>` 通读两文档原文做行级 diff**：
+>    - `alignment.stats.only_a` / `only_b` > 0（存在未匹配条款，可能是顺移或增删信号）；
+>    - 某章 `chapter_agg[].only_a` / `only_b` > 0；
+>    - `alignment.stats.low_conf` > 0 且该章内有 `low_conf` 条款（sim<0.9 但整条仍可能被当成等效）；
+>    - legacy 与 aligned 在该章标记的差异页集合不一致（并集有补集）；
+>    - 相邻条款页码出现跨页顺延（页码偏移 cascade）。
+> 3. **反模式（本次漏报主因，严禁）**：把 `matched + similarity≥0.9` 直接当"等效/无差异"。条款级整体相似度对"数值/措辞单行变更"不敏感，**必须展开该条款逐行比对**（尤其表格行：毛刺、厚度、风速、长度、时间等数值字段）。
+> 4. **新增整模块检测**：阳极对阴极新增一整个功能模块（如"加强筋模块"）会导致后续条款顺移，LCS 易把它错配到别处而不报 `only_b`。此类必须通过 `--union` 的 legacy 位置比对发现，并核对模块表/目录是否多出一节。
+
 **排版噪声（忽略，不写入 diff.json）**：
 - 纯空格/标点差异（如 `Φ1000mm 设计` vs `Φ 1000mm 设计`、`（DCM平台）` vs `（DCM 平台）`）
 - 换行/分页偏移（同一段文本出现在不同页，行切分位置不同）
@@ -80,7 +92,7 @@ agent_created: true
 
 - `extract_pdf.py` — DLP 检测 + 内存解密 + 分页文本提取 + 页眉页脚剔除 + 章节识别（含目录条目过滤 + 扫描件检测 avg_chars_per_page）
 - `diff_structures.py` — 章节级对齐与差异初筛（`--aligned` 内容感知对齐模式）
-- `diff_pages.py` — 差异页定位 + 行级 diff 摘要（`--aligned` 基于条款级 LCS 反推，含 noise_pages/tail_only）
+- `diff_pages.py` — 差异页定位 + 行级 diff 摘要（`--aligned` 基于条款级 LCS 反推，含 noise_pages/tail_only；**`--union` 取 legacy 位置 1:1 ∪ aligned 的并集作为高召回候选集，防对齐漏报**）
 - `align_blocks.py` — 内容感知对齐核心（条款级加权 LCS + 章节聚合推导，输出 alignment）
 - `generate_report.py` — 从 diff.json 生成 Markdown / HTML 报告
 

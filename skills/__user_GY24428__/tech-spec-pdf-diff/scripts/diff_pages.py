@@ -23,6 +23,10 @@ diff_pages.py — 逐页 diff 初筛：定位两份结构化 JSON（extract_pdf.
   # 4) 输出结构化 JSON（差异页 + 每页增删统计；不含全文行 diff，避免中间文件过大）
   python diff_pages.py docA.json docB.json --out diff_pages.json
 
+  # 5) 并集安全网：legacy(位置1:1 高召回) ∪ aligned(低噪声)，防对齐漏报真实差异页
+  #    legacy_only_pages = 仅 legacy 标出（对齐漏报候选，必须逐页复核）
+  python diff_pages.py docA.json docB.json --union --print
+
 依赖：仅标准库（json / difflib / argparse）
 Python：>=3.10
 """
@@ -93,6 +97,31 @@ def parse_pages(spec: str, max_page: int) -> list[int]:
     return sorted(out)
 
 
+def legacy_diff_pages(pages_a: list[str], pages_b: list[str]) -> dict:
+    """
+    位置 1:1 比对（高召回，旧行为，默认模式）。
+    逐页直接比较，凡文本不同即标为差异页——不依赖条款对齐，
+    因此能捕获"新增整模块导致顺移错配""整条相似度高仅一行不同"等 --aligned 会漏的页。
+    """
+    n = min(len(pages_a), len(pages_b))
+    diff_pages, per_page = [], {}
+    for i in range(n):
+        ta, tb = pages_a[i], pages_b[i]
+        if ta == tb:
+            continue
+        p = i + 1
+        diff_pages.append(p)
+        per_page[str(p)] = page_diff_summary(ta, tb)
+    return {
+        "doc_a_pages": len(pages_a),
+        "doc_b_pages": len(pages_b),
+        "diff_page_count": len(diff_pages),
+        "diff_pages": diff_pages,
+        "per_page": per_page,
+        "mode": "legacy",
+    }
+
+
 def aligned_diff_pages(doc_a_path: str, doc_b_path: str, pages_a: list[str], pages_b: list[str]) -> dict:
     """
     内容感知对齐模式：基于 align_blocks 的条款映射反推差异页。
@@ -147,6 +176,9 @@ def main():
     ap.add_argument("--out", help="输出结构化 JSON 到文件（差异页 + 每页增删统计）")
     ap.add_argument("--aligned", action="store_true",
                     help="内容感知对齐模式（条款级加权 LCS 反推差异页，消除页码偏移 cascade；默认位置 1:1 兼容旧行为）")
+    ap.add_argument("--union", action="store_true",
+                    help="并集安全网：同时跑 legacy(位置 1:1 高召回) 与 aligned(低噪声)，取差异页并集。"
+                         "legacy_only_pages 为仅 legacy 标出、对齐漏报的候选页，必须逐页复核以防漏报真实差异")
     args = ap.parse_args()
 
     pages_a = load_pages(args.docA)
@@ -155,28 +187,55 @@ def main():
     if len(pages_a) != len(pages_b):
         print(f"[提示] 页码不一致：A={len(pages_a)} 页 B={len(pages_b)} 页（按前 {n} 页比对）", file=sys.stderr)
 
-    if args.aligned:
-        result = aligned_diff_pages(args.docA, args.docB, pages_a, pages_b)
-        result["mode"] = "aligned"
-    else:
-        diff_pages, per_page = [], {}
-        for i in range(n):
-            ta, tb = pages_a[i], pages_b[i]
-            if ta == tb:
-                continue
-            p = i + 1
-            diff_pages.append(p)
-            per_page[str(p)] = page_diff_summary(ta, tb)
+    if args.union:
+        legacy_res = legacy_diff_pages(pages_a, pages_b)
+        aligned_res = aligned_diff_pages(args.docA, args.docB, pages_a, pages_b)
+        union_pages = sorted(set(legacy_res["diff_pages"]) | set(aligned_res["diff_pages"]))
+        per_page = {}
+        for p in union_pages:
+            lp = legacy_res["per_page"].get(str(p))
+            ap_ = aligned_res["per_page"].get(str(p))
+            merged = {}
+            if lp:
+                merged.update(lp)
+            if ap_:
+                merged.update({k: v for k, v in ap_.items() if k != "max_sim"})
+                merged["max_sim"] = ap_.get("max_sim")
+            flags = []
+            if lp:
+                flags.append("legacy")
+            if ap_:
+                flags.append("aligned")
+            merged["flagged_by"] = flags
+            per_page[str(p)] = merged
         result = {
             "doc_a_pages": len(pages_a),
             "doc_b_pages": len(pages_b),
-            "diff_page_count": len(diff_pages),
-            "diff_pages": diff_pages,
+            "diff_page_count": len(union_pages),
+            "diff_pages": union_pages,
             "per_page": per_page,
-            "mode": "legacy",
+            "legacy_diff_page_count": legacy_res["diff_page_count"],
+            "aligned_diff_page_count": aligned_res["diff_page_count"],
+            "legacy_only_pages": sorted(set(legacy_res["diff_pages"]) - set(aligned_res["diff_pages"])),
+            "aligned_only_pages": sorted(set(aligned_res["diff_pages"]) - set(legacy_res["diff_pages"])),
+            "noise_pages": aligned_res.get("noise_pages"),
+            "tail_only_a": aligned_res.get("tail_only_a"),
+            "tail_only_b": aligned_res.get("tail_only_b"),
+            "mode": "union",
         }
+    elif args.aligned:
+        result = aligned_diff_pages(args.docA, args.docB, pages_a, pages_b)
+        result["mode"] = "aligned"
+    else:
+        result = legacy_diff_pages(pages_a, pages_b)
 
     print(f"文档 A: {len(pages_a)} 页, 文档 B: {len(pages_b)} 页, 模式: {result['mode']}")
+    if result["mode"] == "union":
+        print(f"并集差异页 {result['diff_page_count']} 页 = legacy {result['legacy_diff_page_count']} ∪ aligned {result['aligned_diff_page_count']}")
+        if result.get("legacy_only_pages"):
+            print(f"  [仅 legacy 标出（对齐漏报候选，必须逐页复核）]: {result['legacy_only_pages']}")
+        if result.get("aligned_only_pages"):
+            print(f"  [仅 aligned 标出]: {result['aligned_only_pages']}")
     print(f"有差异的页（共 {result['diff_page_count']} 页）: {result['diff_pages']}")
     if result.get("noise_pages"):
         print(f"[对齐] 页码偏移噪声页（内容匹配仅页码不同）: {list(result['noise_pages'].keys())}")
@@ -204,7 +263,9 @@ def main():
                 continue
             s = result["per_page"].get(str(p), {})
             extra = f"  最高条款相似度={s.get('max_sim')}" if "max_sim" in s else ""
-            print(f"  p{p}: A行数={s.get('a_lines','?')} B行数={s.get('b_lines','?')} 增{s.get('added','?')}行 删{s.get('deleted','?')}行{extra}")
+            fb = s.get("flagged_by")
+            fb_s = f"  标记来源={fb}" if fb else ""
+            print(f"  p{p}: A行数={s.get('a_lines','?')} B行数={s.get('b_lines','?')} 增{s.get('added','?')}行 删{s.get('deleted','?')}行{extra}{fb_s}")
 
 
 if __name__ == "__main__":
