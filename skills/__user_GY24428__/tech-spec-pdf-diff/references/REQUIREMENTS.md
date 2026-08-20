@@ -7,7 +7,7 @@
 
 - 通用技术协议 PDF 差异比对（激光/卷绕/碟片/涂布/模切/分切等任意设备类型）。
 - 处理 CATL 等客户 DLP 加密 PDF（Sangfor ztsm `%TSD-Header-###%`），输出 Markdown 完整版 + HTML 仅差异版（红=A 旧值 / 绿=B 新值）。
-- 部署点：`geesun_agent/skills/__user_GY24428__/tech-spec-pdf-diff/`（agent 运行时加载，已入库）；`~/.workbuddy/skills/tech-spec-pdf-diff/`（WorkBuddy 本地副本，**注意可能滞后，以项目内为准**）。
+- 部署点：`geesun_agent/skills/__user_GY24428__/tech-spec-pdf-diff/`（agent 运行时加载，已入库）；`~/.workbuddy/skills/tech-spec-pdf-diff/`（WorkBuddy 本地副本，**已于 2026-08-20 末期经 cmp 逐字节校验与项目内同步一致**；后续任一副本变更须同步另一副本）。
 - 执行方式：提取/机械 diff/报告生成已黑盒化为 MCP 工具 `run_pdf_diff_stage1` / `run_pdf_diff_stage3`，agent 禁止自写替代代码；唯一 LLM 手工步骤是写 `diff.json`（语义判定）。
 
 ## 2. 架构三层
@@ -26,31 +26,32 @@
 | A1 | DLP 加密 PDF 检测 + 内存解密，明文不落盘 | ✅ |
 | A2 | 清洁文本提取（页眉页脚/标识码/页码/机密标记剔除） | ✅ |
 | A3 | 章节/小节结构识别（一、二、… + 1. 2.），含起始页码 | ✅ |
-| A4 | 扫描件/无文本层 PDF 检测，不静默出空报告 | ❌ 待加固⑤ |
+| A4 | 扫描件/无文本层 PDF 检测，不静默出空报告 | ✅（⑤已实施：extract_pdf avg_chars_per_page + stage1 <50 报错） |
 
 ### B. 差异定位（机械层）
 | # | 需求 | 状态 |
 |---|---|---|
 | B1 | 差异页机械定位 + 每页增删行统计（候选清单） | ✅ |
-| B2 | 章节对齐表（相同/标题差异/仅A/B有 + 页码） | ✅（有缺陷，见 B5/B6） |
+| B2 | 章节对齐表（相同/标题差异/仅A/B有 + 页码） | ✅（B5/B6 已闭环，召回兜底见 C8） |
 | B3 | 页码偏移识别（顺延 N 页不算差异） | 🟡 规则级 |
-| B4 | 排版噪声过滤（空格/标点/分页偏移） | 🟡 无阈值过滤，待加固② |
-| B5 | 内容平移/插入不 cascade（位置 1:1 缺陷） | ❌ 待加固① |
-| B6 | 平移不可见（如 A50==B60 无法识别） | ❌ 待加固① |
+| B4 | 排版噪声过滤（空格/标点/分页偏移） | ✅（②已实施：NOISE_SIM 0.99 + noise_pages） |
+| B5 | 内容平移/插入不 cascade（位置 1:1 缺陷） | ✅（①已实施：align_blocks.py；⚠️ 引入候选召回降维副效应，已由 C8 兜底） |
+| B6 | 平移不可见（如 A50==B60 无法识别） | ✅（①已实施：align_blocks.py；⚠️ 同上，已由 C8 兜底） |
 | B7 | 跨页表格合并比对 | 🟡 规则级 |
-| B8 | 尾部多出页检测（min 截断盲区） | ❌ 待加固③ |
-| B9 | 标题格式适配（第1章/Chapter 1/1.1 等） | ❌ 待加固（正则扩展） |
+| B8 | 尾部多出页检测（min 截断盲区） | ✅（③已实施：diff_pages tail_only_a/b） |
+| B9 | 标题格式适配（第1章/Chapter 1/1.1 等） | ✅（SECTION_RE 等标题正则已一并实施） |
 
 ### C. 语义判定（LLM 层）
 | # | 需求 | 状态 |
 |---|---|---|
-| C1 | 实质差异 vs 排版噪声判别规则 | 🟡 规则级 |
+| C1 | 实质差异 vs 排版噪声判别规则 | ✅（Step 2 已工程化为强制复核硬约束 + 反模式） |
 | C2 | 防幻觉（禁词频判等、禁标题即判新增章节） | 🟡 规则级 |
 | C3 | 数值差异精确到旧值→新值 | 🟡 规则级 |
 | C4 | 修订履历表比对 | 🟡 规则级 |
-| C5 | 跨章内容重组追踪（条款挪章/标题变更/章节拆合并） | ❌ 待加固①（条款级对齐后由证据支撑） |
-| C6 | 语义判定可校验（diff 条目可追溯机械证据） | ❌ 待加固④ |
+| C5 | 跨章内容重组追踪（条款挪章/标题变更/章节拆合并） | ✅（①已实施：条款级 LCS 对齐后由证据支撑） |
+| C6 | 语义判定可校验（diff 条目可追溯机械证据） | ✅（④已实施：stage3 _trace_check + trace_warnings） |
 | C7 | 判定交叉验证（双模型/抽检） | ❌ 待加固⑥（成本高可缓） |
+| C8 | 候选召回安全网（legacy∪aligned 并集候选 + 强制复核触发信号；消除"对齐降召回→跳过复核"漏报） | ✅ 已实施（diff_pages --union + SKILL.md Step 2 强制复核规则，commit 81c4518）2026-08-20 末期 |
 
 ### D. 报告产出
 | # | 需求 | 状态 |
@@ -76,7 +77,7 @@
 | F1 | xlsx 偏离项台账交叉核对 | 🟡 规则级 |
 | F2 | 报告交付前抽检 | ❌ 待加固⑥（低成本版） |
 
-**总览：✅ 18 项 / 🟡 9 项 / ❌ 9 项**（截至 2026-08-20 基线）
+**总览（按明细表逐项计数，2026-08-20 末期含 --union 召回修复 + M1–M6 状态回填）：✅ 23 项 / 🟡 8 项 / ❌ 2 项**（C1 升✅、新增 C8✅、A4/B4/B5/B6/B8/B9/C5/C6 由待加固①~⑤升✅；⚠️ B5/B6 虽闭环但引入候选召回降维，已由 C8 兜底；待加固⑥双模型交叉仍 ⬜ 未实施）
 
 ## 4. 边界场景与设计决策（2026-08-20 复盘确定）
 
@@ -99,6 +100,7 @@
 | ④ | diff 追溯校验（stage1 附相似度 + stage3 校验条目出处） | C6 | 高 | ✅ 已实施（stage3 _trace_check + trace_warnings）2026-08-20 |
 | ⑤ | 扫描件检测（文本量阈值） | A4 | 低 | ✅ 已实施（extract_pdf avg_chars_per_page + stage1 <50 报错）2026-08-20 |
 | ⑥ | 双模型交叉 / 人工抽检 | C7/F2 | 低 | ⬜ 未实施（成本高，抽检替代，后续按需） |
+| ⑦ | 对齐召回保障（legacy∪aligned 并集候选 + 强制复核触发信号；消除"对齐降召回→跳过复核"漏报） | C8/B5/B6 | 高 | ✅ 已实施（diff_pages --union + SKILL.md Step 2 强制复核规则，commit 81c4518）2026-08-20 末期 |
 
 前置依赖：B9（`SECTION_RE` 等标题正则扩展）是 ① 的硬前置——**已一并实施**（目录条目过滤 + 小数误匹配修复 + 章节/条款 end_page）。
 
@@ -107,7 +109,8 @@
 - skill 本体入库 commit：`2bed6d8`（geesun_agent，2026-08-20，`git add -f` 强制纳入 5 文件）
 - 需求基线入库 commit：`6836134`（geesun_agent，2026-08-20）
 - 加固实施 commit：geesun_agent（align_blocks.py + 三脚本改造 + SKILL.md）、geesun_mcp_server（stage1/stage3 契约）
-- 已知问题：`geesun_agent` 本地 `origin/master` tracking ref 陈旧（745e337 vs 远程 8eb49f8 分叉），判断推送状态以 `git ls-remote` 实时为准
+- 召回修复 commit：`81c4518`（geesun_agent，2026-08-20 末期，diff_pages `--union` + SKILL.md Step 2 强制复核规则与反模式）
+- 已知问题：`geesun_agent` 本地 `origin/master` tracking ref 缓存陈旧（仍显示 `745e337`），但实测 `git ls-remote origin master` 真实远端=**81c4518**、本地已同步无分叉；**判断推送/同步状态一律以 `git ls-remote origin master` 实时为准，勿信本地 `origin/master` 缓存**
 
 ## 7. 变更记录
 
@@ -116,3 +119,4 @@
 | 2026-08-20 | 创建本需求基线；确立 S1-S4 设计决策与 ①-⑥ 待加固项 | 8-19~8-20 复盘：机械脚本位置 1:1 缺陷、LLM 语义层无硬校验、扫描件盲区 |
 | 2026-08-20 | spike 验证（真实 CATL 010153/010154）：目录污染清洗、SECTION_RE 小数误匹配修复、加权 LCS 优于贪心、阈值 0.5/0.9 校准、条款索引判重 | 真实文档实测（data/uploads/GY24428/350e5f80） |
 | 2026-08-20 | 实施 ①-⑤：align_blocks.py（条款级加权 LCS + 章节聚合）、diff_pages/diff_structures --aligned 模式、stage1 扫描件检测、stage3 追溯校验（trace_warnings）、SKILL.md 更新 | M1-M6 里程碑，双仓 commit + push |
+| 2026-08-20 末期 | 修复对齐模式降召回漏报（实战发现 7 条真实差异被 --aligned 候选页 31→14 筛掉）：diff_pages.py 新增 --union（legacy∪aligned 并集 + legacy_only_pages），SKILL.md Step 2 新增强制复核规则与反模式（matched+sim≥0.9 当等效列为严禁）；真实 CATL 010153/010154 复跑召回 9/16→16/16，commit 81c4518 | 用户报告对比漏差异复盘 |
