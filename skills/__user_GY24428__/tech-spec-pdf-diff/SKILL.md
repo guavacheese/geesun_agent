@@ -75,3 +75,7 @@ agent_created: true
 - `diff_structures.py` — 章节级对齐与差异初筛
 - `diff_pages.py` — 逐页 diff 初筛：定位差异页 + 行级 diff 摘要（仅标准库）
 - `generate_report.py` — 从 diff.json 生成 Markdown / HTML 报告
+
+### references/
+
+- `REQUIREMENTS.md` — **需求基线**（背景、需求清单、边界场景 S1-S4 设计决策、待加固项 ①-⑥、变更记录）。需求变更或加固开发前先读此文档，变更后追加记录。
