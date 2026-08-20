@@ -91,21 +91,22 @@
 
 ## 5. 待加固项（映射需求编号）
 
-| 编号 | 内容 | 需求 | 优先级 | 备注 |
+| 编号 | 内容 | 需求 | 优先级 | 状态 |
 |---|---|---|---|---|
-| ① | 内容感知对齐（条款级 LCS 归位） | B5/B6/C5 | 高 | 一次改造同时消除 cascade、平移不可见、跨章重组 |
-| ② | 相似度阈值过滤噪声页 | B4 | 中 | 需真实文档调参，防止滤掉真差异（数值 4→6） |
-| ③ | 尾部页 tail_only 检测 | B8 | 中 | min 截断后多出的页单独点名 |
-| ④ | diff 追溯校验（stage1 附相似度 + stage3 校验条目出处） | C6 | 高 | 报告正确性最后防线，最小成本 |
-| ⑤ | 扫描件检测（文本量阈值） | A4 | 低 | 几行代码，防静默空报告 |
-| ⑥ | 双模型交叉 / 人工抽检 | C7/F2 | 低 | 成本高，抽检替代 |
+| ① | 内容感知对齐（条款级 LCS 归位） | B5/B6/C5 | 高 | ✅ 已实施（align_blocks.py）2026-08-20 |
+| ② | 相似度阈值过滤噪声页 | B4 | 中 | ✅ 已实施（NOISE_SIM 0.99 + noise_pages）2026-08-20 |
+| ③ | 尾部页 tail_only 检测 | B8 | 中 | ✅ 已实施（diff_pages tail_only_a/b）2026-08-20 |
+| ④ | diff 追溯校验（stage1 附相似度 + stage3 校验条目出处） | C6 | 高 | ✅ 已实施（stage3 _trace_check + trace_warnings）2026-08-20 |
+| ⑤ | 扫描件检测（文本量阈值） | A4 | 低 | ✅ 已实施（extract_pdf avg_chars_per_page + stage1 <50 报错）2026-08-20 |
+| ⑥ | 双模型交叉 / 人工抽检 | C7/F2 | 低 | ⬜ 未实施（成本高，抽检替代，后续按需） |
 
-前置依赖：B9（`SECTION_RE` 等标题正则扩展）是 ① 的硬前置——条款识别不出则条款级对齐退化为整章比对。
+前置依赖：B9（`SECTION_RE` 等标题正则扩展）是 ① 的硬前置——**已一并实施**（目录条目过滤 + 小数误匹配修复 + 章节/条款 end_page）。
 
 ## 6. 基线记录
 
 - skill 本体入库 commit：`2bed6d8`（geesun_agent，2026-08-20，`git add -f` 强制纳入 5 文件）
-- 关联代码：`geesun_mcp_server` stage1/stage3 工具（最新 `7aa540f`）
+- 需求基线入库 commit：`6836134`（geesun_agent，2026-08-20）
+- 加固实施 commit：geesun_agent（align_blocks.py + 三脚本改造 + SKILL.md）、geesun_mcp_server（stage1/stage3 契约）
 - 已知问题：`geesun_agent` 本地 `origin/master` tracking ref 陈旧（745e337 vs 远程 8eb49f8 分叉），判断推送状态以 `git ls-remote` 实时为准
 
 ## 7. 变更记录
@@ -113,3 +114,5 @@
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-20 | 创建本需求基线；确立 S1-S4 设计决策与 ①-⑥ 待加固项 | 8-19~8-20 复盘：机械脚本位置 1:1 缺陷、LLM 语义层无硬校验、扫描件盲区 |
+| 2026-08-20 | spike 验证（真实 CATL 010153/010154）：目录污染清洗、SECTION_RE 小数误匹配修复、加权 LCS 优于贪心、阈值 0.5/0.9 校准、条款索引判重 | 真实文档实测（data/uploads/GY24428/350e5f80） |
+| 2026-08-20 | 实施 ①-⑤：align_blocks.py（条款级加权 LCS + 章节聚合）、diff_pages/diff_structures --aligned 模式、stage1 扫描件检测、stage3 追溯校验（trace_warnings）、SKILL.md 更新 | M1-M6 里程碑，双仓 commit + push |

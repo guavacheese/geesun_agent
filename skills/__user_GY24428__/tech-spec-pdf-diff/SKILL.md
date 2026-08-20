@@ -30,6 +30,13 @@ agent_created: true
 
 基于 stage1 返回的差异页清单，用 `diff_pages.py --full --pages <N-M>`（或直接读沙箱内 JSON 文本）核对完整文本，**逐条判定实质差异后手工整理 `diff.json`**。
 
+**优先使用对齐证据（stage1 产物 diff_pages.json 已含 alignment）**：
+- `alignment.stats.low_conf`：**低置信实质差异候选**（条款内容相似度 <0.9）——重点判定对象，逐条核对后写入 diff.json；
+- `alignment.chapter_agg[].moved_out`：**挪章条款**（如 "2→五"）——报告写明"条款 X 从'四、'移至'五、'"；
+- `noise_pages`：页码偏移噪声（内容匹配仅页码不同），**不算差异**，报告说明"每章顺延 N 页"即可；
+- `tail_only_a/b`：超出较短文档的尾部页，是文档末尾新增内容的候选，需重点核查；
+- `diff_pages` 已剔除噪声页，仅含真候选差异页。
+
 **排版噪声（忽略，不写入 diff.json）**：
 - 纯空格/标点差异（如 `Φ1000mm 设计` vs `Φ 1000mm 设计`、`（DCM平台）` vs `（DCM 平台）`）
 - 换行/分页偏移（同一段文本出现在不同页，行切分位置不同）
@@ -43,7 +50,7 @@ agent_created: true
 - 附图增删（目录中"错误!未定义书签"通常是删除了对应内容）
 - 修订履历表（版本 A/B/C 修订记录）条目数差异与增删条目
 
-**diff.json 结构**：以 `generate_report.py` 头部注释定义的字段为准（章节/条款/表格/模块表逐条列出，无差异内容记入 no_diff 清单）。**禁止用脚本自动生成 diff.json**——机械文本 diff 会把排版噪声灌进报告，语义判定必须由你完成。**必须确保 diff.json 是合法 JSON**：数组/对象最后一项后禁止尾随逗号（trailing comma），写完自查 `json.loads` 能解析；若 run_pdf_diff_stage3 返回 `diff_json_validate` 错误，按其中的行/列信息修复后重试，不要盲目重写。
+**diff.json 结构**：以 `generate_report.py` 头部注释定义的字段为准（章节/条款/表格/模块表逐条列出，无差异内容记入 no_diff 清单）。**条目尽量带章节/条款定位**（如标题含"三、兼容设计及产品规格"、diff_list 的 loc 写"三、1. 来料兼容要求"）——stage3 会做**追溯校验**：diff.json 引用的章节号若在 alignment 对齐结果中不存在（凭空生成），返回 `trace_warnings` 告警，按告警核对修正。**禁止用脚本自动生成 diff.json**——机械文本 diff 会把排版噪声灌进报告，语义判定必须由你完成。**必须确保 diff.json 是合法 JSON**：数组/对象最后一项后禁止尾随逗号（trailing comma），写完自查 `json.loads` 能解析；若 run_pdf_diff_stage3 返回 `diff_json_validate` 错误，按其中的行/列信息修复后重试，不要盲目重写。
 
 ### Step 3：阶段3（确定性，工具执行）
 
@@ -71,9 +78,10 @@ agent_created: true
 
 ### scripts/（由 stage1/stage3 工具内部调用，你不直接运行；排障时参考）
 
-- `extract_pdf.py` — DLP 检测 + 内存解密 + 分页文本提取 + 页眉页脚剔除 + 章节识别
-- `diff_structures.py` — 章节级对齐与差异初筛
-- `diff_pages.py` — 逐页 diff 初筛：定位差异页 + 行级 diff 摘要（仅标准库）
+- `extract_pdf.py` — DLP 检测 + 内存解密 + 分页文本提取 + 页眉页脚剔除 + 章节识别（含目录条目过滤 + 扫描件检测 avg_chars_per_page）
+- `diff_structures.py` — 章节级对齐与差异初筛（`--aligned` 内容感知对齐模式）
+- `diff_pages.py` — 差异页定位 + 行级 diff 摘要（`--aligned` 基于条款级 LCS 反推，含 noise_pages/tail_only）
+- `align_blocks.py` — 内容感知对齐核心（条款级加权 LCS + 章节聚合推导，输出 alignment）
 - `generate_report.py` — 从 diff.json 生成 Markdown / HTML 报告
 
 ### references/

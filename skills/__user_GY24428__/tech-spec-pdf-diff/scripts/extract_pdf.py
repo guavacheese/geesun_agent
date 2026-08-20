@@ -130,18 +130,26 @@ def strip_header_footer(page_text: str) -> str:
 CHAPTER_RE = re.compile(r"^([一二三四五六七八九十]+)、\s*(.+?)\s*$")
 SECTION_RE = re.compile(r"^(\d+)[\.．、]\s*(.+?)\s*$")
 SUBSECTION_RE = re.compile(r"^(\d+)\)\s*(.+?)\s*$")
+# 目录条目特征：点线 + 页码结尾（如 "一、设备概述 ...... 4"），非正文标题
+TOC_DOT_RE = re.compile(r"\.{3,}\s*\d+\s*$")
+
+def is_toc_entry(line: str) -> bool:
+    """目录条目（点线+页码结尾）判为噪声，不进入章节结构。"""
+    return bool(TOC_DOT_RE.search(line))
+
 
 def detect_chapters(pages_text: list[str]) -> list[dict]:
     """
     遍历所有页文本，识别章节标题及其所在页。
     返回 [{"chapter": "一", "title": "...", "page": 3, "section": "..."}]
     章节标题后紧跟的"内容/描述/流程图"由 Agent 按文本上下文提取。
+    目录页条目（点线+页码，如 "一、设备概述 ...... 4"）会被剔除，避免污染章节树。
     """
     out = []
     for idx, text in enumerate(pages_text):
         for line in text.split("\n"):
             s = line.strip()
-            if not s:
+            if not s or is_toc_entry(s):
                 continue
             m = CHAPTER_RE.match(s)
             if m:
@@ -177,6 +185,8 @@ def main():
         "page_count": len(pages_text),
         "dlp_encrypted": is_dlp_encrypted(args.pdf),
         "pages": pages_text,
+        # 扫描件检测依据：无文本层 PDF（扫描件/图片型）平均每页字符数极低
+        "avg_chars_per_page": round(sum(len(t) for t in pages_text) / max(len(pages_text), 1), 1),
     }
     if args.chapters:
         result["chapters"] = detect_chapters(pages_text)

@@ -29,13 +29,21 @@ import sys
 
 
 CHAPTER_RE = re.compile(r"^([一二三四五六七八九十]+)、\s*(.+?)\s*$")
-SECTION_RE = re.compile(r"^(\d+)[\.．、]\s*(.+?)\s*$")
+# 条款号后排除紧跟数字（防 "0.5～1mm" 表格数值行被误当条款号 "0."，2026-08-20 实测吞 113 行）
+SECTION_RE = re.compile(r"^(\d{1,2})[\.．、]\s*(?![0-9])(.+)$")
+# 目录条目特征：点线 + 页码结尾（如 "一、设备概述 ...... 4"），非正文标题
+TOC_DOT_RE = re.compile(r"\.{3,}\s*\d+\s*$")
 
 # 页眉页脚之外的"噪声行"（数字页码等）在比对时忽略
 NOISE_PATTERNS = [
     r"^\s*\d+\s*$",
     r"^[A-Za-z0-9\-]+\s*$",
 ]
+
+
+def is_toc_entry(line: str) -> bool:
+    """目录条目（点线+页码结尾）判为噪声，不进入章节树。"""
+    return bool(TOC_DOT_RE.search(line))
 
 
 def load(path: str) -> dict:
@@ -71,7 +79,7 @@ def build_structure(data: dict) -> list[dict]:
     for pidx, text in enumerate(pages):
         for line in text.split("\n"):
             s = line.strip()
-            if not s:
+            if not s or is_toc_entry(s):
                 continue
             if any(re.match(p, s) for p in NOISE_PATTERNS):
                 continue
@@ -84,13 +92,21 @@ def build_structure(data: dict) -> list[dict]:
             sm = SECTION_RE.match(s)
             if sm and cur_chapter is not None:
                 flush_section()
-                cur_section = {"no": sm.group(1), "title": sm.group(2), "page": pidx + 1}
+                cur_section = {"no": sm.group(1), "title": sm.group(2), "page": pidx + 1, "lines": []}
                 continue
             if cur_chapter is not None:
                 cur_chapter["lines"].append(s)
                 if cur_section is not None:
-                    cur_section.setdefault("lines", []).append(s)
+                    cur_section["lines"].append(s)
     flush_chapter()
+    # 补 end_page（章节 = 下一章 start_page-1，末章 = 总页数；条款 = 下一条款 page-1，末条 = 章 end_page）
+    # max(..., start) 兜底：同页连续多个章节标题时避免 end < start
+    total = len(pages)
+    for i, ch in enumerate(struct):
+        ch["end_page"] = max(struct[i + 1]["start_page"] - 1, ch["start_page"]) if i + 1 < len(struct) else total
+        for j, sec in enumerate(ch["sections"]):
+            nxt = ch["sections"][j + 1]["page"] - 1 if j + 1 < len(ch["sections"]) else ch["end_page"]
+            sec["end_page"] = max(nxt, sec["page"])
     return struct
 
 
@@ -145,32 +161,52 @@ def main():
     ap.add_argument("json_b", help="文档 B 的结构 JSON")
     ap.add_argument("--out", help="写入对齐结果 JSON")
     ap.add_argument("--print", action="store_true", help="打印人类可读对齐表")
+    ap.add_argument("--aligned", action="store_true",
+                    help="内容感知对齐模式（条款级加权 LCS，消除位置 1:1 cascade；默认位置 1:1 兼容旧行为）")
     args = ap.parse_args()
 
     data_a, data_b = load(args.json_a), load(args.json_b)
-    struct_a = build_structure(data_a)
-    struct_b = build_structure(data_b)
-    rows = align(struct_a, struct_b)
+    struct_a, struct_b = build_structure(data_a), build_structure(data_b)
+
+    if args.aligned:
+        # 内容感知对齐：章节状态由条款映射聚合推导（S1-S4 全部覆盖）
+        from align_blocks import align_docs
+        alignment = align_docs(data_a, data_b)
+        rows = alignment["chapter_agg"]
+        extra = {"alignment": alignment, "mode": "aligned"}
+    else:
+        rows = align(struct_a, struct_b)
+        extra = {"mode": "legacy"}
 
     if args.print:
         print(f"文档 A: {data_a.get('source')}（{len(struct_a)} 章）")
         print(f"文档 B: {data_b.get('source')}（{len(struct_b)} 章）")
+        print(f"模式: {extra['mode']}")
         print("=" * 70)
-        print(f"{'章节':<6}{'状态':<12}{'A 页码':<8}{'B 页码':<8}A 标题")
-        for r in rows:
-            ta = r["title_a"] or "—"
-            tb = r["title_b"] or "—"
-            marker = {
-                "same": "相同",
-                "title_diff": "标题差异",
-                "only_a": "仅 A 有",
-                "only_b": "仅 B 有",
-            }.get(r["status"], r["status"])
-            print(f"{r['chapter']:<6}{marker:<12}{str(r['page_a']):<8}{str(r['page_b']):<8}{ta}")
-            if r["status"] == "title_diff":
-                print(f"{'':<6}{'':<12}{'':<8}{'':<8}B: {tb}")
+        if args.aligned:
+            print(f"{'章节':<6}{'状态':<18}{'A 页码':<8}{'B 页码':<8}条款(映射/低置信/仅A)  挪章")
+            for r in rows:
+                mv = ",".join(f"{m['no']}→{m['to']}" for m in r["moved_out"]) or "-"
+                print(f"{r['chapter']:<6}{r['status']:<18}{str(r['page_a']):<8}{str(r['page_b']):<8}"
+                      f"{r['clauses_total']}({r['mapped']}/{r['low_conf']}/{r['only_a']})  {mv}")
+                if r["status"] != "same":
+                    print(f"  A: {r['title_a']}\n  B: {r['title_b']}")
+        else:
+            print(f"{'章节':<6}{'状态':<12}{'A 页码':<8}{'B 页码':<8}A 标题")
+            for r in rows:
+                ta = r["title_a"] or "—"
+                tb = r["title_b"] or "—"
+                marker = {
+                    "same": "相同",
+                    "title_diff": "标题差异",
+                    "only_a": "仅 A 有",
+                    "only_b": "仅 B 有",
+                }.get(r["status"], r["status"])
+                print(f"{r['chapter']:<6}{marker:<12}{str(r['page_a']):<8}{str(r['page_b']):<8}{ta}")
+                if r["status"] == "title_diff":
+                    print(f"{'':<6}{'':<12}{'':<8}{'':<8}B: {tb}")
         print("=" * 70)
-        print("\n[提示] 章节标题对齐仅用于快速定位；条款文本的语义差异需基于")
+        print("\n[提示] 章节对齐仅用于快速定位；条款文本的语义差异需基于")
         print("extract_pdf.py 的完整分页文本由 Agent 逐章比对。")
 
     if args.out:
@@ -180,6 +216,7 @@ def main():
             "chapter_alignment": rows,
             "clause_count_a": count_clauses(struct_a),
             "clause_count_b": count_clauses(struct_b),
+            **extra,
         }
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=1)

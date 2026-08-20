@@ -93,6 +93,50 @@ def parse_pages(spec: str, max_page: int) -> list[int]:
     return sorted(out)
 
 
+def aligned_diff_pages(doc_a_path: str, doc_b_path: str, pages_a: list[str], pages_b: list[str]) -> dict:
+    """
+    内容感知对齐模式：基于 align_blocks 的条款映射反推差异页。
+    - 差异页 = only_a/only_b 条款页 ∪ 低置信匹配（sim<0.9）条款页 ∪ 页码不同且内容有变（sim<0.99）页
+    - noise_pages = 页码偏移噪声（内容匹配仅页码不同，sim>=0.99），不进差异候选
+    - tail_only_a/b = 页数不等时多出的尾部页（min 截断盲区补救）
+    """
+    import align_blocks
+    from diff_structures import load as _load
+
+    alignment = align_blocks.align_docs(_load(doc_a_path), _load(doc_b_path))
+    mapping = alignment["clause_mapping"]
+    diff_pages, sim_by_page = set(), {}
+    for m in mapping:
+        if m["status"] == "only_a":
+            diff_pages.add(m["a"]["page"])
+        elif m["status"] == "only_b":
+            diff_pages.add(m["b"]["page"])
+        else:  # matched
+            sim = m["similarity"]
+            for side, p in (("a", m["a"]["page"]), ("b", m["b"]["page"])):
+                if sim < align_blocks.LOW_CONF:
+                    diff_pages.add(p)                                   # 低置信 → 实质差异候选
+                elif m["a"]["page"] != m["b"]["page"] and sim < align_blocks.NOISE_SIM:
+                    diff_pages.add(p)                                   # 页码不同且内容有变（非纯偏移）
+                sim_by_page.setdefault(p, []).append(sim)
+    diff_pages = sorted(p for p in diff_pages if p <= max(len(pages_a), len(pages_b)))
+    per_page = {}
+    for p in diff_pages:
+        if p <= len(pages_a) and p <= len(pages_b):
+            per_page[str(p)] = {**page_diff_summary(pages_a[p - 1], pages_b[p - 1]),
+                                "max_sim": round(max(sim_by_page.get(p, [0.0])), 3)}
+    return {
+        "doc_a_pages": len(pages_a), "doc_b_pages": len(pages_b),
+        "diff_page_count": len(diff_pages),
+        "diff_pages": diff_pages,
+        "per_page": per_page,
+        "noise_pages": alignment["noise_pages"],
+        "tail_only_a": [p for p in range(len(pages_b) + 1, len(pages_a) + 1)],
+        "tail_only_b": [p for p in range(len(pages_a) + 1, len(pages_b) + 1)],
+        "alignment": alignment,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="技术协议 PDF 差异页初筛（基于 extract_pdf.py 输出）")
     ap.add_argument("docA", help="文档 A 的结构化 JSON（extract_pdf.py 输出）")
@@ -101,6 +145,8 @@ def main():
     ap.add_argument("--pages", help="页码范围，如 '40-46' / '40,42,45' / '42'（配合 --print/--full）")
     ap.add_argument("--full", action="store_true", help="打印完整文本对照（需配合 --pages）")
     ap.add_argument("--out", help="输出结构化 JSON 到文件（差异页 + 每页增删统计）")
+    ap.add_argument("--aligned", action="store_true",
+                    help="内容感知对齐模式（条款级加权 LCS 反推差异页，消除页码偏移 cascade；默认位置 1:1 兼容旧行为）")
     args = ap.parse_args()
 
     pages_a = load_pages(args.docA)
@@ -109,35 +155,42 @@ def main():
     if len(pages_a) != len(pages_b):
         print(f"[提示] 页码不一致：A={len(pages_a)} 页 B={len(pages_b)} 页（按前 {n} 页比对）", file=sys.stderr)
 
-    diff_pages = []
-    per_page = {}
-    for i in range(n):
-        ta, tb = pages_a[i], pages_b[i]
-        if ta == tb:
-            continue
-        p = i + 1
-        diff_pages.append(p)
-        per_page[str(p)] = page_diff_summary(ta, tb)
-
-    print(f"文档 A: {len(pages_a)} 页, 文档 B: {len(pages_b)} 页")
-    print(f"有差异的页（共 {len(diff_pages)} 页）: {diff_pages}")
-
-    if args.out:
+    if args.aligned:
+        result = aligned_diff_pages(args.docA, args.docB, pages_a, pages_b)
+        result["mode"] = "aligned"
+    else:
+        diff_pages, per_page = [], {}
+        for i in range(n):
+            ta, tb = pages_a[i], pages_b[i]
+            if ta == tb:
+                continue
+            p = i + 1
+            diff_pages.append(p)
+            per_page[str(p)] = page_diff_summary(ta, tb)
         result = {
             "doc_a_pages": len(pages_a),
             "doc_b_pages": len(pages_b),
             "diff_page_count": len(diff_pages),
             "diff_pages": diff_pages,
             "per_page": per_page,
+            "mode": "legacy",
         }
+
+    print(f"文档 A: {len(pages_a)} 页, 文档 B: {len(pages_b)} 页, 模式: {result['mode']}")
+    print(f"有差异的页（共 {result['diff_page_count']} 页）: {result['diff_pages']}")
+    if result.get("noise_pages"):
+        print(f"[对齐] 页码偏移噪声页（内容匹配仅页码不同）: {list(result['noise_pages'].keys())}")
+    if result.get("tail_only_a") or result.get("tail_only_b"):
+        print(f"[对齐] 尾部独有页: 仅A={result.get('tail_only_a')} 仅B={result.get('tail_only_b')}（超出较短文档的页，需重点核查）")
+
+    if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=1)
         print(f"[OK] JSON 已写入: {args.out}", file=sys.stderr)
-        # --print 与 --out 可同时使用；若只 --out 不带 --print，仍打印摘要行
 
     if args.pages:
-        for p in parse_pages(args.pages, n):
-            if p not in diff_pages:
+        for p in parse_pages(args.pages, max(len(pages_a), len(pages_b))):
+            if p > n or p not in result["diff_pages"]:
                 print(f"\n第 {p} 页: 无差异")
                 continue
             if args.full:
@@ -145,9 +198,13 @@ def main():
             else:
                 print_page_diff(p, pages_a[p - 1], pages_b[p - 1])
     elif args.print:
-        for p in diff_pages:
-            s = per_page[str(p)]
-            print(f"  p{p}: A行数={s['a_lines']} B行数={s['b_lines']} 增{s['added']}行 删{s['deleted']}行")
+        for p in result["diff_pages"]:
+            if p > n:
+                print(f"  p{p}: 尾部独有页（仅 {'B' if p > len(pages_a) else 'A'} 侧）")
+                continue
+            s = result["per_page"].get(str(p), {})
+            extra = f"  最高条款相似度={s.get('max_sim')}" if "max_sim" in s else ""
+            print(f"  p{p}: A行数={s.get('a_lines','?')} B行数={s.get('b_lines','?')} 增{s.get('added','?')}行 删{s.get('deleted','?')}行{extra}")
 
 
 if __name__ == "__main__":
