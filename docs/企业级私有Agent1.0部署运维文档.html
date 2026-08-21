@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>企业级私有 Agent 1.0 部署运维文档</title>
+<style>
+    :root{
+      --fg:#1f2328; --muted:#57606a; --line:#d8dee4; --bg:#ffffff;
+      --accent:#0969da; --accent-soft:#ddf4ff; --code-bg:#f6f8fa;
+      --th-bg:#f0f3f6; --th-fg:#1f2328;
+    }
+    *{box-sizing:border-box;}
+    body{
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+        "Hiragino Sans GB","Microsoft YaHei",sans-serif;
+      color:var(--fg); background:var(--bg); line-height:1.75;
+      margin:0; padding:0; font-size:15px;
+    }
+    .page{max-width:920px; margin:0 auto; padding:48px 40px 96px;}
+    header.doc-head{
+      border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:28px;
+    }
+    header.doc-head h1{font-size:28px; margin:0 0 6px;}
+    header.doc-head .sub{color:var(--muted); font-size:13px;}
+    .toc{
+      background:var(--accent-soft); border:1px solid #b6e3ff; border-radius:10px;
+      padding:18px 22px; margin:0 0 36px;
+    }
+    .toc h2{font-size:15px; margin:0 0 10px; color:var(--accent); letter-spacing:.5px;}
+    .toc ul{list-style:none; padding:0; margin:0;}
+    .toc li{margin:4px 0;}
+    .toc-h1>a{font-weight:600;}
+    .toc-h2{padding-left:18px;}
+    .toc a{color:var(--fg); text-decoration:none;}
+    .toc a:hover{color:var(--accent); text-decoration:underline;}
+    h1{font-size:23px; margin:38px 0 14px; padding-bottom:8px; border-bottom:1px solid var(--line);}
+    h2{font-size:18px; margin:28px 0 10px; color:#24292f;}
+    p{margin:10px 0;}
+    ul{margin:10px 0; padding-left:24px;}
+    li{margin:5px 0;}
+    strong{color:#24292f;}
+    code{background:var(--code-bg); border:1px solid var(--line); border-radius:4px;
+      padding:1px 5px; font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
+      font-size:13px; color:#cf222e;}
+    .table-wrap{overflow-x:auto; margin:14px 0;}
+    table{border-collapse:collapse; width:100%; font-size:13.5px;
+      border:1px solid var(--line);}
+    th,td{border:1px solid var(--line); padding:8px 12px; text-align:left; vertical-align:top;}
+    thead th{background:var(--th-bg); font-weight:600; white-space:nowrap;}
+    tbody tr:nth-child(even){background:#fafbfc;}
+    footer.doc-foot{margin-top:56px; padding-top:16px; border-top:1px solid var(--line);
+      color:var(--muted); font-size:12px;}
+    @media print{
+      body{font-size:12px;} .page{padding:0 12px;}
+      .toc{break-after:page;} h1,h2{break-after:avoid;} .table-wrap{break-inside:avoid;}
+    }
+    </style>
+</head>
+<body>
+<div class="page">
+<header class="doc-head">
+  <h1>企业级私有 Agent 1.0 部署运维文档</h1>
+  <div class="sub">内部部署运维手册 · 重构自 .docx 版本 · 最后更新 2026-08-21</div>
+</header>
+<nav class="toc"><h2>目录</h2><ul><li class="toc-h1"><a href="#0-文档说明">0. 文档说明</a></li><li class="toc-h2"><a href="#0-1-适用范围">0.1 适用范围</a></li><li class="toc-h2"><a href="#0-2-术语表">0.2 术语表</a></li><li class="toc-h1"><a href="#1-系统架构总览">1. 系统架构总览</a></li><li class="toc-h2"><a href="#1-1-组件清单">1.1 组件清单</a></li><li class="toc-h2"><a href="#1-2-端口速查">1.2 端口速查</a></li><li class="toc-h2"><a href="#1-3-调用与数据流">1.3 调用与数据流</a></li><li class="toc-h2"><a href="#1-4-三仓关系-关键">1.4 三仓关系（关键）</a></li><li class="toc-h1"><a href="#2-前置依赖与环境">2. 前置依赖与环境</a></li><li class="toc-h2"><a href="#2-1-硬件与操作系统">2.1 硬件与操作系统</a></li><li class="toc-h2"><a href="#2-2-网络与证书">2.2 网络与证书</a></li><li class="toc-h2"><a href="#2-3-账号与凭据">2.3 账号与凭据</a></li><li class="toc-h2"><a href="#2-4-基础运行时与-SDK-版本要求">2.4 基础运行时与 SDK 版本要求</a></li><li class="toc-h1"><a href="#3-逐项组件部署">3. 逐项组件部署</a></li><li class="toc-h2"><a href="#3-1-CubeSandbox-0-6-0-底座">3.1 CubeSandbox 0.6.0 底座</a></li><li class="toc-h2"><a href="#3-2-vLLM-模型服务">3.2 vLLM 模型服务</a></li><li class="toc-h2"><a href="#3-3-PostgreSQL">3.3 PostgreSQL</a></li><li class="toc-h2"><a href="#3-4-LDAP-AD-接入">3.4 LDAP/AD 接入</a></li><li class="toc-h2"><a href="#3-5-geesun_agent-后端">3.5 geesun_agent 后端</a></li><li class="toc-h2"><a href="#3-6-geesun_mcp_server">3.6 geesun_mcp_server</a></li><li class="toc-h2"><a href="#3-7-geesun_agent_web-前端">3.7 geesun_agent_web 前端</a></li><li class="toc-h2"><a href="#3-8-Arize-Phoenix-Langfuse">3.8 Arize Phoenix + Langfuse</a></li><li class="toc-h1"><a href="#4-集成与联调">4. 集成与联调</a></li><li class="toc-h2"><a href="#4-1-端到端冒烟测试">4.1 端到端冒烟测试</a></li><li class="toc-h2"><a href="#4-2-会话与状态">4.2 会话与状态</a></li><li class="toc-h1"><a href="#5-安全与合规">5. 安全与合规</a></li><li class="toc-h1"><a href="#6-运维手册">6. 运维手册</a></li><li class="toc-h2"><a href="#6-1-启停">6.1 启停</a></li><li class="toc-h2"><a href="#6-2-健康检查">6.2 健康检查</a></li><li class="toc-h2"><a href="#6-3-监控与告警">6.3 监控与告警</a></li><li class="toc-h2"><a href="#6-4-版本升级与回滚">6.4 版本升级与回滚</a></li><li class="toc-h1"><a href="#7-常见故障-FAQ">7. 常见故障 FAQ</a></li><li class="toc-h1"><a href="#8-附录">8. 附录</a></li><li class="toc-h2"><a href="#8-1-端口速查-汇总">8.1 端口速查（汇总）</a></li><li class="toc-h2"><a href="#8-2-仓库与分支索引">8.2 仓库与分支索引</a></li><li class="toc-h2"><a href="#8-3-相关文档">8.3 相关文档</a></li></ul></nav>
+<p><strong>企业级私有 Agent 1.0
+部署与运维文档</strong></p>
+<p>Digital-Factory Brain · geesun_agent 平台</p>
+<p>版本 v1.0  ·  适用环境：内网私有化部署  ·  读者：IT 运维 / 接手工程师</p>
+<h1 id="0-文档说明">0. 文档说明</h1>
+<p>本文档面向内部 IT 运维与新接手工程师，覆盖企业级私有 Agent 1.0（代号 Digital-Factory Brain）从 0 到 1 的部署、组件集成、日常运维与常见故障处理。平台定位为内网安全 + 业务效率的企业级私有 Agent，全部组件私有化部署，不出公网。</p>
+<h2 id="0-1-适用范围">0.1 适用范围</h2>
+<ul><li>前端：geesun_agent_web（Next.js 16 + React 19）</li></ul>
+<ul><li>后端：geesun_agent（FastAPI + LangGraph + DeepAgents）</li></ul>
+<ul><li>MCP 服务：geesun_mcp_server（FastMCP，含 DLP 解密与沙箱文件通道）</li></ul>
+<ul><li>沙箱底座：CubeSandbox 0.6.0（MicroVM）+ langchain-cubesandbox 桥接库</li></ul>
+<ul><li>模型服务：vLLM（Qwen3.6-35B-A3B）</li></ul>
+<ul><li>可观测：Arize Phoenix + Langfuse（OpenTelemetry 双通道）</li></ul>
+<ul><li>数据与目录：PostgreSQL（langgraph checkpoint）、LDAP/AD 统一认证</li></ul>
+<h2 id="0-2-术语表">0.2 术语表</h2>
+<div class="table-wrap"><table><thead><tr><th>术语</th><th>含义</th></tr></thead><tbody><tr><td>MicroVM</td><td>CubeSandbox 提供的轻量隔离虚拟机，承载代码沙箱执行</td></tr><tr><td>DLP (ztsm)</td><td>深信服数据防泄漏客户端，文件头 %TSD-Header 标记加密，明文禁止落盘</td></tr><tr><td>AC-gateway</td><td>内网 SSL 中间人网关，使用伪造 CA 做 HTTPS 审计</td></tr><tr><td>egress</td><td>出网管控节点（192.168.10.136），仅放行白名单网段，内置 devpi 镜像</td></tr><tr><td>TTL</td><td>沙箱空闲回收时间（默认 5 分钟）</td></tr><tr><td>OTLP</td><td>OpenTelemetry 协议，tracing 数据上报通道（gRPC / HTTP）</td></tr><tr><td>SSE</td><td>Server-Sent Events，后端向浏览器推送流式响应</td></tr><tr><td>checkpoint</td><td>LangGraph 对话/状态持久化存储（PostgreSQL 或 SQLite）</td></tr></tbody></table></div>
+<h1 id="1-系统架构总览">1. 系统架构总览</h1>
+<p>整体为五层拓扑：边缘接入 → 应用层 → 平台/AI 服务 → 沙箱底座 → 基础设施与合规。请求主链路：浏览器经 Nginx 反代访问前端（:3000），前端调用后端 API（:8009），后端编排 LLM、持久化、认证，并通过本地 MCP（:8000）完成 DLP 解密与沙箱文件通道，沙箱底座（CubeAPI :6000）拉起 MicroVM 执行代码。</p>
+<h2 id="1-1-组件清单">1.1 组件清单</h2>
+<div class="table-wrap"><table><thead><tr><th>组件</th><th>角色</th><th>仓库</th><th>端口</th><th>部署位置</th></tr></thead><tbody><tr><td>geesun_agent_web</td><td>前端 ChatGPT 风格 UI</td><td>geesun_agent_web</td><td>3000</td><td>应用服务器 / Nginx 前</td></tr><tr><td>geesun_agent</td><td>后端 Agent 编排</td><td>geesun_agent</td><td>8009</td><td>应用服务器</td></tr><tr><td>geesun_mcp_server</td><td>MCP（DLP解密+沙箱通道）</td><td>geesun_mcp_server</td><td>8000</td><td>与后端同机 localhost</td></tr><tr><td>vLLM</td><td>大模型推理 Qwen3.6-35B</td><td>独立部署</td><td>8003</td><td>172.16.66.13 裸金属</td></tr><tr><td>PostgreSQL</td><td>langgraph checkpoint</td><td>独立部署</td><td>5433</td><td>192.168.10.136</td></tr><tr><td>LDAP/AD</td><td>统一认证</td><td>现有域控</td><td>389</td><td>192.168.1.241</td></tr><tr><td>Phoenix+Langfuse</td><td>链路追踪</td><td>独立/本地</td><td>OTLP</td><td>可服务端部署</td></tr><tr><td>CubeSandbox 0.6.0</td><td>沙箱底座（MicroVM）</td><td>CubeSandbox-master</td><td>6000</td><td>172.16.66.13 裸金属</td></tr><tr><td>langchain-cubesandbox</td><td>Agent→Cube 桥接库</td><td>langchain-cubesandbox</td><td>—</td><td>以 editable 引入后端</td></tr><tr><td>Harbor</td><td>容器/沙箱镜像仓库</td><td>独立</td><td>8333</td><td>172.16.220.74</td></tr></tbody></table></div>
+<h2 id="1-2-端口速查">1.2 端口速查</h2>
+<div class="table-wrap"><table><thead><tr><th>端口</th><th>服务</th><th>协议</th><th>说明</th></tr></thead><tbody><tr><td>3000</td><td>geesun_agent_web</td><td>HTTP</td><td>Next.js 生产（next start）</td></tr><tr><td>8009</td><td>geesun_agent</td><td>HTTP</td><td>FastAPI / uvicorn</td></tr><tr><td>8000</td><td>geesun_mcp_server</td><td>HTTP(streamable)</td><td>仅 127.0.0.1 监听</td></tr><tr><td>8003</td><td>vLLM</td><td>HTTP/OpenAI</td><td>Qwen3.6-35B-A3B /v1</td></tr><tr><td>6000</td><td>CubeAPI</td><td>HTTP</td><td>CubeSandbox 控制面</td></tr><tr><td>5433</td><td>PostgreSQL</td><td>TCP</td><td>agent_mem 库</td></tr><tr><td>389</td><td>LDAP/AD</td><td>TCP</td><td>目录认证</td></tr><tr><td>8333</td><td>Harbor</td><td>HTTP</td><td>沙箱镜像仓库</td></tr><tr><td>13000</td><td>CubeProxy(dev)</td><td>HTTP</td><td>192.168.10.136 开发环境</td></tr></tbody></table></div>
+<h2 id="1-3-调用与数据流">1.3 调用与数据流</h2>
+<ul><li>浏览器 → Nginx(:80/443) → 前端(:3000) → 后端(:8009)</li></ul>
+<ul><li>后端 → vLLM(:8003) 推理；→ PostgreSQL(:5433) checkpoint；→ LDAP(:389) 认证；→ Phoenix/Langfuse(OTLP) 埋点</li></ul>
+<ul><li>后端 → MCP(:8000 localhost)：DLP 解密、沙箱文件上传/下载、PDF 比对 stage 编排</li></ul>
+<ul><li>MCP → DLP 解密 API（%TSD-Header 密文解密）；→ CubeAPI(:6000) 连接 MicroVM</li></ul>
+<ul><li>CubeAPI → MicroVM 执行代码；Harbor 供给 sandbox-code 镜像</li></ul>
+<h2 id="1-4-三仓关系-关键">1.4 三仓关系（关键）</h2>
+<p>后端 geesun_agent 通过 pyproject.toml 的 [tool.uv.sources] 以 editable 本地路径引入 langchain-cubesandbox，因此二者须在构建机同层目录（../langchain-cubesandbox）。geesun_agent_web 与 geesun_mcp_server 为独立仓库，分别部署。skill 目录（含 tech-spec-pdf-diff）位于 geesun_agent/skills/__user_&lt;uid&gt;__/ 下，由 MCP 运行时按全局搜索加载。</p>
+<h1 id="2-前置依赖与环境">2. 前置依赖与环境</h1>
+<h2 id="2-1-硬件与操作系统">2.1 硬件与操作系统</h2>
+<ul><li>模型/沙箱底座：Rocky Linux 9 裸金属 @ 172.16.66.13（部署 vLLM + Cubelet 栈）</li></ul>
+<ul><li>开发/出网节点：OpenCloudOS 9 虚拟机 @ 192.168.10.136（4 vCPU / 7.5Gi，规划扩 16/16Gi）</li></ul>
+<ul><li>开发机：Windows（D:/workspace 工作区），WSL2 默认 Ubuntu 发行版</li></ul>
+<h2 id="2-2-网络与证书">2.2 网络与证书</h2>
+<ul><li>egress 192.168.10.136：clean 出网 + devpi PyPI 镜像(:3141) + cube-proxy</li></ul>
+<ul><li>AC-gateway 172.16.66.13：SSL 中间人，需信任其伪造 CA（cube-root-ca.pem / VeriSign fake）</li></ul>
+<ul><li>Harbor 172.16.220.74:8333：沙箱镜像源，需提前登录/pull 权限</li></ul>
+<ul><li>沙箱模板需带 --allow-out-cidr 192.168.10.136/32 放行 devpi 网段</li></ul>
+<h2 id="2-3-账号与凭据">2.3 账号与凭据</h2>
+<ul><li>DLP ztsm 客户端（ztsmdlp.exe 等）须在本机运行，否则加密文件无法解密</li></ul>
+<ul><li>CubeMaster 凭据（root/Geesun2020.），cube-root-ca.pem 证书</li></ul>
+<ul><li>LDAP bind 账号（geesunai）+ base DN；JWT_SECRET 随机串</li></ul>
+<p><strong>所有凭据通过 .env 注入，严禁入库（.env 已在 .gitignore）。</strong></p>
+<h2 id="2-4-基础运行时与-SDK-版本要求">2.4 基础运行时与 SDK 版本要求</h2>
+<p>本平台由「Python 后端组（3 个组件）+ Node.js 前端组（1 个组件）」构成。部署前须确认目标主机已安装以下基础运行时与包管理器，且版本满足约束，否则依赖安装或前端构建会失败。</p>
+<div class="table-wrap"><table><thead><tr><th>组件</th><th>语言 / 运行时</th><th>版本约束</th><th>包管理器</th><th>说明</th></tr></thead><tbody><tr><td>geesun_agent</td><td>Python</td><td>≥3.13, &lt;3.14（即 3.13.x）</td><td>uv</td><td>后端 FastAPI 服务；依赖 langchain / langgraph / deepagents / pydantic</td></tr><tr><td>geesun_mcp_server</td><td>Python</td><td>≥3.13（即 3.13.x）</td><td>uv</td><td>MCP 服务（FastMCP）</td></tr><tr><td>langchain-cubesandbox</td><td>Python</td><td>≥3.13（即 3.13.x）</td><td>uv</td><td>沙箱集成库，以 editable 方式被后端引用（见 pyproject [tool.uv.sources]）</td></tr><tr><td>geesun_agent_web</td><td>Node.js + bun</td><td>Node 22.x；bun 最新稳定版</td><td>bun</td><td>前端 Next.js 16.2.9 / React 19.2.4（Turbopack）</td></tr><tr><td>构建机 / CI</td><td>uv + bun</td><td>uv ≥0.5；bun 最新稳定版</td><td>—</td><td>建议统一托管依赖安装与构建，避免版本漂移</td></tr></tbody></table></div>
+<ul><li>三个 Python 组件建议统一使用 Python 3.13.x，并用 uv 管理依赖；geesun_agent 约束最严（&lt;3.14），请勿跨 3.14，也勿降到 3.12 及以下。</li></ul>
+<ul><li>前端 geesun_agent_web 须 Node.js ≥20.9（生产推荐 22.x LTS），并使用 bun 作为包管理器与运行时；勿用 npm/yarn 替代以免 lockfile 漂移。</li></ul>
+<ul><li>构建机上 uv 与 bun 须预装：uv 建议 ≥0.5，bun 取最新稳定版；二者均经 egress 192.168.10.136 白名单出网或从内网镜像获取。</li></ul>
+<h1 id="3-逐项组件部署">3. 逐项组件部署</h1>
+<h2 id="3-1-CubeSandbox-0-6-0-底座">3.1 CubeSandbox 0.6.0 底座</h2>
+<p>裸金属 Rocky Linux 9 @ 172.16.66.13。核心组件：CubeMaster（控制面，root/Geesun2020.）、CubeAPI(:6000)、CubeProxy（openresty 反代）、CubeEgress（MITM，证书 /etc/cube/ca/cube-root-ca.crt）、cube-lifecycle-manager（默认 5 分钟空闲 TTL）。</p>
+<p>部署方式（任选其一，来自 CubeSandbox-0.6.0/deploy）：</p>
+<ul><li>one-click：单主机离线发布包，目标机解包后 install.sh 一键装（推荐首次）</li></ul>
+<ul><li>kubernetes：容器编排部署</li></ul>
+<ul><li>pvm / guest-image：裸 MicroVM 镜像或客户机镜像路线</li></ul>
+<p><code># 单节点配置示例（configs/single-node）</code>
+<code># cubelet.yaml / cubemaster.yaml / network-agent.yaml</code>
+<code># NETWORK_CIDR 疑在:</code>
+<code>#   /usr/local/services/cubetoolbox/Cubelet/config/config.toml</code>
+<code># 镜像源:</code>
+<code>#   sandbox-code:latest  from Harbor 172.16.220.74:8333</code></p>
+<p>已知注意点（部署时核对）：v1.4.9 CPU 过滤 fencepost 曾致 2 核沙箱被拒；cubemaster snapshot_reconciler 在 sandbox_list.go:132 对 GetTraceInfo 返回 nil 做 DeepCopy 会累计 panic；openresty proxy_read_timeout 默认 60s 需调到 300s 并同步 e2b SDK upload gateway timeout，否则大文件上传 504。</p>
+<h2 id="3-2-vLLM-模型服务">3.2 vLLM 模型服务</h2>
+<p><code># 默认模型（OpenAI 兼容 /v1）</code>
+<code>MODEL_NAME=Qwen3.6-35B-A3B</code>
+<code>BASE_URL=http://172.16.66.13:8003/v1</code></p>
+<ul><li>vision 仅支持 image_url part；不支持 file type（返回 501 'Unknown part type: file'）——PDF/PPT 须走沙箱侧 pdfplumber/pdftotext 抽文本后再送</li></ul>
+<ul><li>可动态切换 Kimi / GLM，默认 vLLM Qwen3.6-35B-A3B（MoE 35B）</li></ul>
+<h2 id="3-3-PostgreSQL">3.3 PostgreSQL</h2>
+<p><code>POSTGRES_HOST=192.168.10.136</code>
+<code>POSTGRES_PORT=5433</code>
+<code>POSTGRES_DB=agent_mem</code>
+<code>POSTGRES_USER=geesun</code>
+<code>POSTGRES_PASSWORD=&lt;占位符，向 IT 索取&gt;</code></p>
+<p>承载 langgraph checkpoint（postgres / sqlite 双后端支持）。建议每日逻辑备份 + WAL 归档；升级前先 pg_dump agent_mem。</p>
+<h2 id="3-4-LDAP-AD-接入">3.4 LDAP/AD 接入</h2>
+<p><code>LDAP_SERVER=ldap://192.168.1.241:389</code>
+<code>LDAP_BASE_DN=DC=geesun,DC=li</code>
+<code>LDAP_BIND_USER=geesunai</code>
+<code>LDAP_BIND_PASSWORD=&lt;占位符&gt;</code>
+<code>LDAP_ADMIN_GROUP_DN=CN=geesun-admins,CN=Users,DC=geesun,DC=li</code>
+<code>LDAP_DOMAIN_FORMAT=%s@geesun.li</code></p>
+<h2 id="3-5-geesun_agent-后端">3.5 geesun_agent 后端</h2>
+<p>Python &gt;= 3.13，使用 uv 管理。启动命令（start.sh）：</p>
+<p><code>uv run uvicorn src.server:app --host 0.0.0.0 --port 8009 2&gt;&amp;1 | tee server.log</code></p>
+<p>langchain-cubesandbox 以 editable 本地装配：</p>
+<p><code># geesun_agent/pyproject.toml</code>
+<code>[tool.uv.sources]</code>
+<code>langchain-cubesandbox = { path = "../langchain-cubesandbox", editable = true }</code></p>
+<p>.env 全字段（占位符，真实值向 IT 索取）：</p>
+<p><code>OPENAI_API_KEY=&lt;占位符&gt;</code>
+<code>MODEL_NAME=Qwen3.6-35B-A3B</code>
+<code>BASE_URL=http://172.16.66.13:8003/v1</code>
+<code>EXTRA_MODELS='[]'</code>
+
+<code># Arize Phoenix 追踪（OTLP gRPC）</code>
+<code>PHOENIX_COLLECTOR_ENDPOINT=&lt;占位符&gt;</code>
+<code># Langfuse 追踪（OTLP HTTP ingest）</code>
+<code>LANGFUSE_SECRET_KEY=&lt;占位符&gt;</code>
+<code>LANGFUSE_PUBLIC_KEY=&lt;占位符&gt;</code>
+<code>LANGFUSE_BASE_URL=&lt;占位符&gt;</code>
+
+<code>AGENT_WORKSPACE=/mnt/d/workspace/geesun_agent</code>
+<code>UPLOAD_ROOT=/mnt/d/workspace/geesun_agent/data/uploads</code>
+<code>REPORT_ROOT=/mnt/d/workspace/geesun_agent/data/reports</code>
+
+<code># CubeSandbox</code>
+<code>CUBE_TEMPLATE_ID=&lt;占位符，cubemastercli tpl list 查询&gt;</code>
+<code>CUBE_API_URL=http://172.16.66.13:6000</code>
+<code>CUBE_API_KEY=e2b_0000000000000000000000000000000000000000</code>
+<code>SSL_CERT_FILE=/home/dhp/projects/cube-cert/rootCA.pem</code>
+
+<code># 数据库 / 认证 / JWT</code>
+<code>POSTGRES_HOST=192.168.10.136</code>
+<code>POSTGRES_PORT=5433</code>
+<code>POSTGRES_DB=agent_mem</code>
+<code>POSTGRES_USER=geesun</code>
+<code>POSTGRES_PASSWORD=&lt;占位符&gt;</code>
+<code>LDAP_SERVER=ldap://192.168.1.241:389</code>
+<code>LDAP_BASE_DN=DC=geesun,DC=li</code>
+<code>LDAP_BIND_USER=geesunai</code>
+<code>LDAP_BIND_PASSWORD=&lt;占位符&gt;</code>
+<code>LDAP_ADMIN_GROUP_DN=CN=geesun-admins,CN=Users,DC=geesun,DC=li</code>
+<code>LDAP_DOMAIN_FORMAT=%s@geesun.li</code>
+<code>JWT_SECRET=&lt;随机串，勿用示例&gt;</code>
+<code>JWT_EXPIRE_HOURS=168</code></p>
+<p>tracing 装配依赖：arize-phoenix-otel + openinference-instrumentation-langchain + opentelemetry-exporter-otlp-proto-http，自动对 LangChain/LangGraph 调用埋点。</p>
+<h2 id="3-6-geesun_mcp_server">3.6 geesun_mcp_server</h2>
+<p>FastMCP 服务，监听 127.0.0.1:8000（streamable-http），与后端同机 localhost 部署。</p>
+<p><code>mcp.run(host="127.0.0.1", port=8000, transport="streamable-http")</code></p>
+<p>关键工具：</p>
+<ul><li>decrypt_file / decrypt_file_to_base64 / decrypt_and_upload_to_sandbox：DLP 解密（按 %TSD-Header 文件头判定，不靠扩展名）</li></ul>
+<ul><li>copy_script_to_sandbox / upload_to_sandbox / download_from_sandbox：沙箱文件通道</li></ul>
+<ul><li>run_pdf_diff_stage1 / run_pdf_diff_stage3：技术协议 PDF 比对确定性流程</li></ul>
+<p>环境变量：</p>
+<p><code>DECRYPT_API_URL=&lt;DLP 解密 API 地址&gt;</code>
+<code>E2B_API_URL=&lt;CubeAPI 地址，同 CUBE_API_URL&gt;</code>
+<code>E2B_API_KEY=&lt;占位符&gt;</code>
+<code>SSL_CERT_FILE=&lt;cube-root-ca.pem 路径&gt;</code>
+<code>AGENT_WORKSPACE=&lt;同后端&gt;</code>
+<code>UPLOAD_ROOT=&lt;同后端&gt;</code>
+<code>REPORT_ROOT=&lt;同后端&gt;</code></p>
+<h2 id="3-7-geesun_agent_web-前端">3.7 geesun_agent_web 前端</h2>
+<p>Next.js 16.2.9 + React 19.2.4 + Tailwind + shadcn + @base-ui，Turbopack 构建，使用 bun。</p>
+<p><code># package.json scripts</code>
+<code>"dev": "next dev"</code>
+<code>"build": "next build"</code>
+<code>"start": "next start"</code>
+
+<code># .env.local</code>
+<code>NEXT_PUBLIC_API_BASE=http://localhost:8009</code></p>
+<p>生产：next build &amp;&amp; next start（默认 :3000），前置 Nginx 反代 :80/:443 到 :3000。注意：WSL 内启动的 dev server 与 Windows 侧 localhost 不通，验证需在 WSL 内或浏览器。</p>
+<h2 id="3-8-Arize-Phoenix-Langfuse">3.8 Arize Phoenix + Langfuse</h2>
+<p>双通道链路追踪并行采集：</p>
+<ul><li>Phoenix：OTLP gRPC，由 PHOENIX_COLLECTOR_ENDPOINT 指定 collector 地址</li></ul>
+<ul><li>Langfuse：OTLP HTTP ingest，由 LANGFUSE_SECRET_KEY/PUBLIC_KEY/BASE_URL 配置</li></ul>
+<ul><li>openinference-instrumentation-langchain 自动埋点 LangChain/LangGraph，用于调试、评估与回归分析</li></ul>
+<p>部署形态：可本地进程或独立服务端；建议独立服务以便长期留存 trace。</p>
+<h1 id="4-集成与联调">4. 集成与联调</h1>
+<h2 id="4-1-端到端冒烟测试">4.1 端到端冒烟测试</h2>
+<p>典型链路：上传加密 PDF → 前端 → 后端 → MCP decrypt_and_upload_to_sandbox（解密写沙箱，明文不落盘）→ 沙箱内跑 skill 脚本（extract → diff → generate）→ download_from_sandbox 拉回报告。</p>
+<p><code># 关键校验点</code>
+<code># 1) 加密文件上传须走 decrypt_and_upload_to_sandbox（upload_to_sandbox 会拒绝密文）</code>
+<code># 2) 沙箱内 pdfplumber 缺失时 stage1 自动 pip install（离线需配 devpi 镜像）</code>
+<code># 3) 扫描件/图片型 PDF（平均页字符 &lt; 50）会明确报错，不静默出空报告</code></p>
+<h2 id="4-2-会话与状态">4.2 会话与状态</h2>
+<ul><li>SSE 会话隔离：切换会话存在 race condition 致内容串流的已知 Bug，须使用已修复版本</li></ul>
+<ul><li>__index__ 索引：更新已有 session 须维护索引，否则 GET /sessions 返回空列表（历史 Bug）</li></ul>
+<ul><li>沙箱生命周期：业务沙箱由 Agent 管理，GC 不得 kill 业务沙箱（GC-kill 链曾致反复 504）</li></ul>
+<h1 id="5-安全与合规">5. 安全与合规</h1>
+<ul><li>DLP 不落盘：解密明文走 decrypt MCP 内存 base64，绝不 open(orig,'wb') 直写；0x80 为完整加密标志、0x00 为半加密态</li></ul>
+<ul><li>AC-gateway MITM：出网 HTTPS 经伪造 CA，客户端须信任 cube-root-ca.pem</li></ul>
+<ul><li>egress 管控：仅放行白名单网段；沙箱内 pip 走 devpi 镜像 192.168.10.136:3141</li></ul>
+<ul><li>JWT：JWT_SECRET 用随机串，有效期 168h；最小权限原则</li></ul>
+<ul><li>.env 不入库；凭据分级管理，禁止提交明文</li></ul>
+<h1 id="6-运维手册">6. 运维手册</h1>
+<h2 id="6-1-启停">6.1 启停</h2>
+<ul><li>后端：./start.sh（uv run uvicorn :8009）或 systemd 托管</li></ul>
+<ul><li>前端：next build &amp;&amp; next start（:3000），Nginx 反代</li></ul>
+<ul><li>MCP：与后端同机 uv run 启动（:8000）</li></ul>
+<ul><li>CubeSandbox：systemd 托管 CubeMaster / CubeAPI / CubeProxy / lifecycle-manager</li></ul>
+<h2 id="6-2-健康检查">6.2 健康检查</h2>
+<ul><li>端口监听：ss -ltnp | grep -E '8009|8000|6000|8003'</li></ul>
+<ul><li>后端日志：geesun_agent/server.log（含时间戳，注意 config.py 提前导入曾致无时间戳，已修复）</li></ul>
+<ul><li>沙箱日志：经 vsock 转宿主 /data/log/CubeShim/；cubemaster.log 在 CubeSandbox 工作区</li></ul>
+<h2 id="6-3-监控与告警">6.3 监控与告警</h2>
+<ul><li>链路：Phoenix / Langfuse 看 agent 调用链与耗时</li></ul>
+<ul><li>资源：GPU 显存（vLLM）、MicroVM 数量与空闲（lifecycle TTL）、磁盘（uploads/reports）</li></ul>
+<h2 id="6-4-版本升级与回滚">6.4 版本升级与回滚</h2>
+<ul><li>代码：git tag 固定版本；多仓变动逐文件 include/exclude 确认后提交</li></ul>
+<ul><li>镜像：Harbor 镜像版本固定；DB 变更先 pg_dump 再 migration</li></ul>
+<ul><li>回滚：保留上一镜像标签与 DB 备份，必要时 git revert + 重启</li></ul>
+<h1 id="7-常见故障-FAQ">7. 常见故障 FAQ</h1>
+<p><strong>Q：上传加密 PDF 报"检测到 DLP 加密文件"</strong></p>
+<p>A：说明文件是密文。必须用 decrypt_and_upload_to_sandbox 解密后传沙箱；upload_to_sandbox 会拒绝密文（密文进沙箱 AI 无法解析）。</p>
+<p><strong>Q：沙箱跑脚本报 pdfplumber 缺失</strong></p>
+<p>A：stage1 会自动 pip install pdfplumber；若离线/超时，需在沙箱模板配置 devpi 镜像 192.168.10.136:3141 或预装。</p>
+<p><strong>Q：模型返回 501 Unknown part type: file</strong></p>
+<p>A：Qwen API 不支持 file-type content。PDF/PPT 不能直传，须走沙箱侧 pdfplumber/pdftotext 抽文本再送模型。</p>
+<p><strong>Q：SSE 串会话 / GET /sessions 返回空</strong></p>
+<p>A：历史 race condition（切换会话内容串流）与 __index__ 索引未维护导致。升级到已修复版本，并确认 session 索引在更新时维护。</p>
+<p><strong>Q：沙箱调用反复 504</strong></p>
+<p>A：可能来自 GC-kill 链（沙箱对象 GC 时被 kill）或 openresty proxy_read_timeout 默认 60s 过短。将 proxy_read_timeout 调到 300s 并同步 e2b SDK upload gateway timeout。</p>
+<p><strong>Q：前端改完代码无变化</strong></p>
+<p>A：Turbopack 偶发 .next/dev/types/routes.d.ts 缓存失效。删 .next 目录后重启 dev server。</p>
+<p><strong>Q：解密后仍是明文 PK 未触发 0x80 完整加密</strong></p>
+<p>A：DLP 策略可能只产出半加密(0x00)。若需完整加密，用 Office 打开后"另存为"同路径，Office 保存会触发 DLP 完整加密(0x80)。</p>
+<p><strong>Q：沙箱内 pip 安装慢/超时</strong></p>
+<p>A：沙箱内统一走 devpi 镜像 192.168.10.136:3141（模板需 --allow-out-cidr 放行该网段），不要预打包全部依赖。</p>
+<h1 id="8-附录">8. 附录</h1>
+<h2 id="8-1-端口速查-汇总">8.1 端口速查（汇总）</h2>
+<div class="table-wrap"><table><thead><tr><th>端口</th><th>服务</th><th>位置</th></tr></thead><tbody><tr><td>3000</td><td>geesun_agent_web</td><td>应用服务器</td></tr><tr><td>8009</td><td>geesun_agent</td><td>应用服务器</td></tr><tr><td>8000</td><td>geesun_mcp_server</td><td>与后端同机</td></tr><tr><td>8003</td><td>vLLM</td><td>172.16.66.13</td></tr><tr><td>6000</td><td>CubeAPI</td><td>172.16.66.13</td></tr><tr><td>5433</td><td>PostgreSQL</td><td>192.168.10.136</td></tr><tr><td>389</td><td>LDAP/AD</td><td>192.168.1.241</td></tr><tr><td>8333</td><td>Harbor</td><td>172.16.220.74</td></tr><tr><td>13000</td><td>CubeProxy(dev)</td><td>192.168.10.136</td></tr></tbody></table></div>
+<h2 id="8-2-仓库与分支索引">8.2 仓库与分支索引</h2>
+<ul><li>geesun_agent：后端 + skills/ 目录（tech-spec-pdf-diff 等）</li></ul>
+<ul><li>geesun_agent_web：前端 Next.js</li></ul>
+<ul><li>langchain-cubesandbox：Agent→Cube 桥接库（editable 引入后端）</li></ul>
+<ul><li>geesun_mcp_server：MCP 服务（DLP 解密 + 沙箱通道）</li></ul>
+<ul><li>CubeSandbox-master：沙箱底座 0.6.0（deploy/、configs/、docs/）</li></ul>
+<h2 id="8-3-相关文档">8.3 相关文档</h2>
+<ul><li>各仓 AGENTS.md（开发约束与 lessons-learned）</li></ul>
+<ul><li>geesun_agent/skills/__user_*/tech-spec-pdf-diff/SKILL.md（PDF 比对 skill 工作流）</li></ul>
+<ul><li>CubeSandbox-0.6.0/README_zh.md、deploy/one-click/README_zh.md</li></ul>
+<p><em>（在 Word 中打开后按 F9 更新目录）</em></p>
+<footer class="doc-foot">
+  本文档由 .docx 重构为 HTML，便于内网门户/浏览器查阅与检索。内容与原部署运维文档一致。
+</footer>
+</div>
+</body>
+</html>
