@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import concurrent.futures
@@ -525,6 +526,48 @@ class ValidatedCompositeBackend(CompositeBackend):
             f"当前会话交付目录为 '{self._report_prefix}'"
         )
 
+    def _reject_directory_write(self, file_path: str) -> str | None:
+        """拦截把 file_path 写成目录的 write_file 调用。
+
+        2026-08-21 事故根因：模型调用 write_file 时 file_path 被传成目录
+        （/reports/uid/sid/ 或 /reports/uid/sid，漏了文件名），后端照写/报错，
+        前端 deriveGeneratedFiles 照单派生 → 空白文件名卡片 + HEAD 307/401 →
+        "文件不可用"。这里只对 /reports/ 交付物做严格校验（交付物必须带文件名，
+        前端按文件名渲染卡片/预览），命中即返回带正确示例的提示，逼模型重试。
+        """
+        if not file_path.startswith("/reports/"):
+            return None
+        # 尾斜杠 = 目录
+        if file_path.endswith("/"):
+            return (
+                f"路径 '{file_path}' 是目录而非文件：write_file 的 file_path 缺少文件名。"
+                f"请使用带文件名（含扩展名）的完整路径，例如 "
+                f"'{self._report_prefix}技术协议差异对比报告.md' 或 "
+                f"'{self._report_prefix}report.html'。"
+            )
+        # 路径就是会话交付目录本身（去掉尾斜杠后相等）
+        if file_path == self._report_prefix.rstrip("/"):
+            return (
+                f"路径 '{file_path}' 是会话交付目录本身，write_file 需要写入具体文件。"
+                f"请使用带文件名（含扩展名）的完整路径，例如 "
+                f"'{self._report_prefix}report.md'。"
+            )
+        # 最后一段是会话 ID 风格（8~32 位 hex、无扩展名）→ 目录
+        last = file_path.rsplit("/", 1)[-1]
+        if last and re.fullmatch(r"[0-9a-fA-F]{8,32}", last):
+            return (
+                f"路径 '{file_path}' 疑似目录（最后一段 '{last}' 无文件名/扩展名）。"
+                f"write_file 的 file_path 必须指向具体文件，例如 "
+                f"'{self._report_prefix}report.json'。"
+            )
+        # 最后一段为空（防御）
+        if not last:
+            return (
+                f"路径 '{file_path}' 未指定文件名，write_file 无法写入。"
+                f"请使用带文件名（含扩展名）的完整路径，例如 '{self._report_prefix}report.md'。"
+            )
+        return None
+
     def write(self, file_path: str, content: str) -> WriteResult:
         if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
             hint = self._reject_hint(file_path)
@@ -534,6 +577,17 @@ class ValidatedCompositeBackend(CompositeBackend):
             )
             return WriteResult(
                 error=f"拒绝写入: {hint}",
+                path=file_path,
+                files_update=None,
+            )
+        dir_hint = self._reject_directory_write(file_path)
+        if dir_hint:
+            logger.warning(
+                "[VALIDATED_CB] 拒绝目录写入: path=%s | hint=%s",
+                file_path, dir_hint,
+            )
+            return WriteResult(
+                error=f"拒绝写入: {dir_hint}",
                 path=file_path,
                 files_update=None,
             )
@@ -548,6 +602,17 @@ class ValidatedCompositeBackend(CompositeBackend):
             )
             return WriteResult(
                 error=f"拒绝写入: {hint}",
+                path=file_path,
+                files_update=None,
+            )
+        dir_hint = self._reject_directory_write(file_path)
+        if dir_hint:
+            logger.warning(
+                "[VALIDATED_CB] 拒绝目录写入: path=%s | hint=%s",
+                file_path, dir_hint,
+            )
+            return WriteResult(
+                error=f"拒绝写入: {dir_hint}",
                 path=file_path,
                 files_update=None,
             )
