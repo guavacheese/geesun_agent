@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from src.api.deps import get_store, get_current_user
+from src.core.config import settings
+from src.infra.reports import snapshot_report_files
 
 logger = logging.getLogger(__name__)
 
@@ -409,4 +411,111 @@ async def edit_session_message(
         raise HTTPException(status_code=500, detail=f"更新消息列表失败: {str(e)}")
 
     return {"success": True, "session_id": session_id, "from_index": body.from_index}
+
+
+# ─── 文件卡片修复（临时排查端点） ───
+
+
+@router.post("/admin/repair-session-files")
+async def repair_session_files(
+    session_id: str,
+    store=Depends(get_store),
+    current_user: dict = Depends(get_current_user),
+):
+    """一次性修复：清洗历史消息里的脏 generated_files 并用磁盘真实文件补全。
+
+    触发背景（2026-08-21）：模型 write_file 的 file_path 被传成目录（漏文件名），
+    旧后端逻辑（chat.py 保存消息时只用工具解析的 _generated_files、未合并磁盘差集）
+    emit 保存了 file_name="" 的 generated_files → 前端 "(未知文件) 文件不可用"
+    （清洗后则无卡片）。本端点：
+      1. 过滤 file_name 为空 / file_path 尾斜杠的脏条目；
+      2. 用 report_root 磁盘全量文件补全缺失的 generated_files（挂到最后一条 AI 消息）。
+    幂等：重复调用不会重复补已存在的 file_path。仅能操作当前登录用户自己的会话。
+    """
+    user_id = current_user["user_id"]
+    msg_namespace = _messages_namespace(user_id, session_id)
+
+    try:
+        item = await store.aget(msg_namespace, "messages")
+        msg_data = item.value if item else {}
+        messages = msg_data.get("items", []) if isinstance(msg_data, dict) else []
+    except Exception as e:
+        logger.error("修复会话消息失败（读取）: session_id=%s, error=%s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"读取消息失败: {e}")
+
+    # 1. 清洗脏条目（file_name 空 / file_path 空或尾斜杠）
+    removed = 0
+    for msg in messages:
+        gfs = msg.get("generated_files")
+        if not gfs:
+            continue
+        cleaned = [
+            g for g in gfs
+            if g.get("file_name") and g.get("file_path")
+            and not str(g["file_path"]).endswith("/")
+        ]
+        removed += len(gfs) - len(cleaned)
+        if cleaned:
+            msg["generated_files"] = cleaned
+        else:
+            msg.pop("generated_files", None)
+
+    # 2. 磁盘全量文件补全（挂到最后一条 AI 消息）
+    existing_fps = set()
+    for msg in messages:
+        for g in msg.get("generated_files", []):
+            if g.get("file_path"):
+                existing_fps.add(g["file_path"])
+    base = os.path.join(settings.report_root, user_id, session_id)
+    new_entries: list[dict] = []
+    for rel in snapshot_report_files(settings.report_root, user_id, session_id):
+        if not os.path.isfile(os.path.join(base, rel)):
+            continue  # 只补文件，跳过子目录
+        fp = f"/reports/{user_id}/{session_id}/{rel}"
+        if fp in existing_fps:
+            continue
+        file_name = rel.rsplit("/", 1)[-1]
+        try:
+            size = os.path.getsize(os.path.join(base, rel))
+        except OSError:
+            size = 0
+        new_entries.append({
+            "file_name": file_name,
+            "file_path": fp,
+            "file_size": size,
+            "file_type": _infer_file_type(file_name),
+        })
+
+    added = len(new_entries)
+    if new_entries:
+        target = None
+        for msg in reversed(messages):
+            if msg.get("role") == "ai":
+                target = msg
+                break
+        if target is not None:
+            target["generated_files"] = list(target.get("generated_files") or []) + new_entries
+        else:
+            logger.warning("修复会话文件：无 AI 消息可挂载，跳过补全: session=%s", session_id)
+            added = 0
+
+    # 3. 写回
+    try:
+        await store.aput(msg_namespace, "messages", {"items": messages})
+    except Exception as e:
+        logger.error("修复会话消息失败（写回）: session_id=%s, error=%s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"写回失败: {e}")
+
+    logger.info(
+        "修复会话文件: user=%s, session=%s, cleaned=%d, added=%d",
+        user_id, session_id, removed, added,
+    )
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "cleaned": removed,
+        "added": added,
+        "note": "已清洗空文件名条目并用磁盘真实文件补全；刷新前端会话即可看到文件卡片",
+    }
+
 

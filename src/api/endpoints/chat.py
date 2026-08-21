@@ -112,6 +112,46 @@ def _infer_file_type(file_name: str) -> str:
     return _FILE_TYPE_BY_EXT.get(ext, "other")
 
 
+def _merge_disk_diff_into_generated(
+    generated_files: list,
+    disk_files: frozenset[str],
+    report_root: str,
+    user_id: str,
+    session_id: str,
+) -> list:
+    """磁盘差集补全 generated_files（2026-08-21 根治）。
+
+    背景：_generated_files 来自模型/工具返回的 file_path 解析，可能脏——模型把
+    file_path 传成目录（漏文件名）时无法产出正确 file_name；而 snapshot_report_files
+    的磁盘差集（_new_files）是 report_root 下的真实文件名，是唯一可靠来源。
+    chat.py 旧实现算出差集却只用于 M3 完成门，保存消息时只用脏源 → 350e5f80 会话
+    全卡片 (未知文件)。此处按 file_path 去重，缺的用磁盘真实文件补齐。
+    """
+    result = list(generated_files)
+    base = os.path.join(report_root, user_id, session_id)
+    for rel in disk_files:
+        disk_full = os.path.join(base, rel)
+        if not os.path.isfile(disk_full):
+            continue  # snapshot 含子目录名，只补文件
+        fp = f"/reports/{user_id}/{session_id}/{rel}"
+        if any(g.get("file_path") == fp for g in result):
+            continue  # 已有（工具解析正确）保留原项，不重复
+        try:
+            size = os.path.getsize(disk_full)
+        except OSError:
+            size = 0
+        file_name = rel.rsplit("/", 1)[-1]
+        result.append(
+            {
+                "file_name": file_name,
+                "file_path": fp,
+                "file_size": size,
+                "file_type": _infer_file_type(file_name),
+            }
+        )
+    return result
+
+
 class ChatRequest(BaseModel):
     session_id: str = "default-session"
     message: str = ""
@@ -266,6 +306,7 @@ async def chat(
         body,
         *,
         generated_files: list | None = None,
+        disk_files: frozenset[str] | None = None,
         completion_blocked: bool = False,
         reason: str = "normal",
     ) -> int:
@@ -279,6 +320,13 @@ async def chat(
         函数内部只有 await 没有 yield，可在 finally 块中安全调用。
         """
         generated_files = generated_files or []
+        if disk_files:
+            # 磁盘差集补全：工具解析的 generated_files 可能脏（模型把 file_path 传成
+            # 目录），用 report_root 磁盘真实文件名补缺（2026-08-21 根治）
+            generated_files = _merge_disk_diff_into_generated(
+                generated_files, disk_files,
+                settings.report_root, user_id, session_id,
+            )
         try:
             # 读取最终状态中的消息
             state = await agent.aget_state(
@@ -496,6 +544,9 @@ async def chat(
         _consecutive_tool_failures = 0
         # M3 完成门：astream 前快照 /reports/ 目录，结束后做差集判定本轮产出
         _before_files = snapshot_report_files(settings.report_root, user_id, session_id)
+        # 每轮 after-before 差集（磁盘真实文件名）；断连路径（finally）也可能引用，
+        # 故在循环前初始化，避免 GeneratorExit 早抛时 NameError（2026-08-21）
+        _new_files: frozenset[str] = frozenset()
         _completion_blocked = False
         # graph_input 是 chat() 外层变量；event_stream 内若要重新赋值（完成门自动
         # 继续轮注入 SystemMessage），必须用独立局部变量 _graph_input，否则
@@ -1152,6 +1203,7 @@ async def chat(
                     await _persist_session(
                         agent, thread_id, user_id, session_id, store, body,
                         generated_files=_generated_files,
+                        disk_files=_new_files,
                         completion_blocked=_completion_blocked,
                         reason="interrupted",
                     )
@@ -1163,6 +1215,7 @@ async def chat(
         await _persist_session(
             agent, thread_id, user_id, session_id, store, body,
             generated_files=_generated_files,
+            disk_files=_new_files,
             completion_blocked=_completion_blocked,
             reason="normal",
         )
