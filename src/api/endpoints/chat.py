@@ -964,6 +964,19 @@ async def chat(
                                         if size_m:
                                             file_size = int(size_m.group(1))
 
+                                    # 目录路径不产生交付物：write_file 的 file_path 若为目录
+                                    # （漏文件名，如 /reports/uid/sid/ 或 /reports/uid/sid），
+                                    # 提取出的 filename 为空/会话ID，emit 后前端收到
+                                    # file_name="" 的 file_generated → "(未知文件)" 卡片 +
+                                    # 空 URL 请求 HEAD 307/401（2026-08-21 实测 350e5f80 会话；
+                                    # 与 agent.py _reject_directory_write 双保险）
+                                    if is_report_path and not filename:
+                                        logger.warning(
+                                            "[FILE_GEN] 忽略目录路径 file_generated: path=%s (无文件名)",
+                                            file_path_virtual,
+                                        )
+                                        continue
+
                                     # B：同会话内同一文件只推送一次（覆盖写/重复 write_file 去重）
                                     if file_path_virtual in _emitted_files:
                                         # 事件已发过，仅更新 _generated_files 里的大小，不重复推送
