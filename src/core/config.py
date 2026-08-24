@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     # 此处为"总时长"超时：单次 model 调用（含 prefill+decode 全流）超过即中止，
     # 抛错 → SSE error → M3 兜底，防永久挂起。
     model_call_timeout_sec: int = 600
+    # ─── model 单次调用输出上限（2026-08-24 新增）───
+    # 防"单次调用无限生成"：此前未设 max_tokens，vLLM 用 max_model_len=262144 兜底，
+    # Qwen3 thinking 失控可单次输出 8.5 分钟/几万 token（撞 600s 超时、内容丢弃）。
+    # 16384 ≈ 正常单次输出（0.5-1.5k tokens）的 10 倍余量；失控时 ~96s(@170tok/s) 截断。
+    model_max_tokens: int = 16384
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

@@ -37,6 +37,9 @@ def create_model() -> ChatOpenAI:
         temperature=0,
         max_retries=5,
         timeout=300,
+        # 单次调用输出上限：防 thinking 失控无限生成（2026-08-24 实测未设时
+        # vLLM 按 max_model_len=262144 无限生成，8.5min/87k tokens 撞 600s 超时）
+        max_tokens=settings.model_max_tokens,
     )
 
 
@@ -70,6 +73,7 @@ async def switch_model(
         base_url=cfg.base_url,
         api_key=cfg.api_key or "not-used",
         temperature=0,
+        max_tokens=settings.model_max_tokens,  # 与默认模型一致，防超长生成
     )
     return await handler(request.override(model=model))
 
@@ -153,5 +157,5 @@ async def model_call_guard(
     except asyncio.TimeoutError:
         raise TimeoutError(
             f"model 调用超过 {settings.model_call_timeout_sec}s 总时长（"
-            f"messages={len(msgs)}, chars={total_chars}）——vLLM 无响应或过慢，已中止"
+            f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
         ) from None
