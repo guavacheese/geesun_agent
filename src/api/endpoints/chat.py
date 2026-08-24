@@ -146,6 +146,22 @@ def _infer_file_type(file_name: str) -> str:
     return _FILE_TYPE_BY_EXT.get(ext, "other")
 
 
+def _sanitize_generated_path(file_path: str) -> str:
+    """清洗工具返回的文件路径（对称前端 deriveGeneratedFiles 清洗，2026-08-24 根治脏路径）。
+
+    上游（模型/技能工具）返回的 /reports/ 路径可能尾随单引号/空白等脏字符——
+    2026-08-24 实测 tech-spec-pdf-diff 返回 `.../diff.json'`（尾随单引号）：
+    磁盘上根本不存在该文件 → 后端 emit file_generated → 前端 HEAD 探测 404
+    → 红框"文件不可用"卡，连累整组报告卡片的预览/下载观感。
+    前端 deriveGeneratedFiles 只过滤 `file_path.endsWith("/")`，漏掉尾随引号，
+    故在后端 emit 前统一清洗（去首尾引号/空白）。清洗后再走磁盘查找/去重/emit，
+    `diff.json'` 自动归正为 `diff.json`（磁盘存在 → 正常预览下载，且与真实条目去重）。
+    """
+    if not file_path:
+        return file_path
+    return file_path.strip().strip("'\" \t")
+
+
 def _merge_disk_diff_into_generated(
     generated_files: list,
     disk_files: frozenset[str],
@@ -991,6 +1007,12 @@ async def chat(
                                             "[DIAG] 文件路径已规范化: path=%s",
                                             file_path_virtual,
                                         )
+
+                                # 清洗 file_path_virtual（对称前端清洗）：上游返回的路径可能
+                                # 尾随单引号/空白等脏字符（2026-08-24 实测 .../diff.json'），
+                                # 不清洗则磁盘 404 → 前端 HEAD 失败 → 红框"文件不可用"卡。
+                                if file_path_virtual:
+                                    file_path_virtual = _sanitize_generated_path(file_path_virtual)
 
                                 # 触发条件：/reports/ 交付物 + /skills/__agent__/ 自创 skill
                                 # （A1：skill 文件也触发 file_generated，否则前端看不到 skill 卡片
