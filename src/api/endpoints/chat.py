@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import re
 import logging
+import psycopg
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request, HTTPException
@@ -15,6 +17,38 @@ from src.api.deps import get_store, get_checkpointer, get_current_user
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+async def _aget_state_with_retry(agent, thread_id: str, max_attempts: int = 3):
+    """带重试地读取 agent 最终状态（防御性）。
+
+    断连兜底路径（reason="interrupted"）下，agent 图可能仍在写 checkpoint。
+    原单连接模式会在此撞 "another command is already in progress" 而静默丢消息
+    （server.log 16:30:09 checkpointer.aget_tuple 失败）。底层已换连接池后该碰撞
+    不再发生，此处仍加短暂重试作为纵深防御，避免瞬时争用直接丢本轮消息。
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await agent.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+        except (
+            psycopg.OperationalError,
+            psycopg.InterfaceError,
+            psycopg.ProgrammingError,
+        ) as e:
+            last_exc = e
+            logger.warning(
+                "[DIAG] aget_state 第 %d/%d 次失败（%s），重试...",
+                attempt, max_attempts, e,
+            )
+            await asyncio.sleep(0.2 * attempt)
+    logger.error(
+        "aget_state 重试 %d 次仍失败，放弃读取最终状态: %s",
+        max_attempts, last_exc,
+    )
+    raise last_exc
 
 
 def _tool_intent_sig(tool_name: str, result_str: str) -> str:
@@ -328,12 +362,9 @@ async def chat(
                 settings.report_root, user_id, session_id,
             )
         try:
-            # 读取最终状态中的消息
-            state = await agent.aget_state(
-                {
-                    "configurable": {"thread_id": thread_id},
-                }
-            )
+            # 读取最终状态中的消息（断连兜底路径下 agent 图可能仍在写 checkpoint，
+            # 用带重试的读取防御瞬时争用导致的 "another command is already in progress"）
+            state = await _aget_state_with_retry(agent, thread_id)
             logging.warning(
                 "[DIAG] %s: state=%s, has_values=%s",
                 "SSE 结束" if reason == "normal" else "SSE 中断强制保存",
@@ -518,7 +549,9 @@ async def chat(
                 )
                 return len(history)
         except Exception as e:
-            logger.warning("保存会话消息失败（非关键错误）: %s", e)
+            logger.error(
+                "保存会话消息失败（关键错误，本轮消息可能丢失）: %s", e, exc_info=True
+            )
         return 0
 
     async def event_stream():
@@ -1208,7 +1241,10 @@ async def chat(
                         reason="interrupted",
                     )
                 except Exception as e:
-                    logger.warning("断连强制保存失败（非关键错误）: %s", e)
+                    logger.error(
+                        "断连强制保存失败（关键错误，本轮消息可能丢失）: %s",
+                        e, exc_info=True,
+                    )
 
         # ─── SSE 流结束，先保存消息到会话历史，再发 [DONE] ───
         # 防止前端 [DONE] 后立即编辑导致竞态（消息尚未落盘 → from_index 越界）
