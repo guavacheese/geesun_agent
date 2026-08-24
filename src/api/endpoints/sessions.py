@@ -319,6 +319,13 @@ async def get_session_messages(
                     continue
                 seen.add(path)
                 filename = path.split("/")[-1]
+                if not filename:
+                    # 目录路径（AI 只写了 /reports/{uid}/{sid}/ 没写文件名，如
+                    # fe27a95a 会话最后一条 AI 的表格目录引用）不产生交付物，
+                    # 补全会产出 {file_name:"", file_path:".../"} 脏条目，前端
+                    # deriveGeneratedFiles 清洗后为空 → 吞掉真实文件卡
+                    # （2026-08-24 实测 md/html 报告卡不显示）。跳过。
+                    continue
                 files.append({
                     "file_name": filename,
                     "file_path": path,
