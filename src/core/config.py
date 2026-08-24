@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     # 200k 输出会 400，但 Summarization 在 20 万 tokens 触发压缩（keep=10 条），
     # 实际输入远小于上限；单次调用失控仍由 model_call_timeout_sec(600s) 兜底。
     model_max_tokens: int = 200000
+    # ─── vLLM 上下文总上限（prompt + max_tokens 不得超过）───
+    # 探活 /v1/models 得 max_model_len=262144；动态 max_tokens 用它做减法，
+    # 防止"输入 62k + 输出 200k = 262145 > 262144"被 vLLM 400 拒载（2026-08-24 实测）。
+    model_max_len: int = 262144
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

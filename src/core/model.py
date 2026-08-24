@@ -129,6 +129,11 @@ async def file_to_image(
 
 # ─── model 调用总时长超时 + 请求量 DIAG（2026-08-19 新增）───
 
+# 动态 max_tokens 的边距与下限（2026-08-24）
+_MODEL_MAX_TOKENS_MARGIN = 4096  # prompt 估算误差余量，防 vLLM 400
+_MODEL_MIN_OUTPUT_TOKENS = 1  # 数学上恒不超限：prompt 极端接近上限时放弃输出空间保不 400
+#（实际不会发生：Summarization 在 20 万 tokens 触发压缩 keep=10，输入远小于上限）
+
 @wrap_model_call
 async def model_call_guard(
     request: ModelRequest,
@@ -136,7 +141,10 @@ async def model_call_guard(
 ) -> ModelResponse:
     """① 打印本轮实际发送给模型的请求量（messages 数 + 字符数）——用于诊断
     Summarization 压缩是否生效（压缩后应为 keep 条，全量则几百条/几十万字符）；
-    ② 总时长超时：openai SDK 的 timeout 是 httpx"字节间隔"超时，vLLM 慢速
+    ② 动态 max_tokens：vLLM 约束 prompt + max_tokens ≤ model_max_len（262144），
+    静态 200000 在大输入时会 400（2026-08-24 实测：输入 62145 + 200000 = 262145
+    → BadRequestError → 模型零产出 → M3 拦截）。按输入长度动态收紧，永不超限；
+    ③ 总时长超时：openai SDK 的 timeout 是 httpx"字节间隔"超时，vLLM 慢速
     流式时永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时），
     这里用 asyncio.wait_for 包整个 handler 做总时长兜底（config 可调），
     超时抛 TimeoutError → chat.py 外层捕获 → SSE error → M3 兜底，防永久挂起。
@@ -150,6 +158,32 @@ async def model_call_guard(
         "[DIAG] model_call_guard: messages=%d, chars=%d（≈%d tokens）, timeout=%ss",
         len(msgs), total_chars, total_tokens, settings.model_call_timeout_sec,
     )
+
+    # ─── 动态 max_tokens：按输入长度收紧，保证 prompt+max_tokens ≤ model_max_len ───
+    prompt_tokens = 0
+    try:
+        sys_msg = request.system_message
+        prompt_msgs = ([sys_msg] if sys_msg is not None else []) + list(msgs)
+        prompt_tokens = request.model.get_num_tokens_from_messages(prompt_msgs)
+    except Exception:
+        # 回退：中英混排 ~2 字符/token（偏保守，宁小勿超）
+        prompt_tokens = total_chars // 2
+    effective_max = min(
+        settings.model_max_tokens,
+        settings.model_max_len - prompt_tokens - _MODEL_MAX_TOKENS_MARGIN,
+    )
+    effective_max = max(effective_max, _MODEL_MIN_OUTPUT_TOKENS)
+    if effective_max < settings.model_max_tokens:
+        logger.warning(
+            "[DIAG] 动态 max_tokens: prompt≈%d, 上限收紧 %d → %d",
+            prompt_tokens, settings.model_max_tokens, effective_max,
+        )
+    # model_settings 会被 langchain factory 以 model.bind(**model_settings) 传入
+    request = request.override(model_settings={
+        **request.model_settings,
+        "max_tokens": effective_max,
+    })
+
     try:
         return await asyncio.wait_for(
             handler(request), timeout=settings.model_call_timeout_sec
