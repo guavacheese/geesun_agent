@@ -135,6 +135,11 @@
 <code>BASE_URL=http://172.16.66.13:8003/v1</code></p>
 <ul><li>vision 仅支持 image_url part；不支持 file type（返回 501 'Unknown part type: file'）——PDF/PPT 须走沙箱侧 pdfplumber/pdftotext 抽文本后再送</li></ul>
 <ul><li>可动态切换 Kimi / GLM，默认 vLLM Qwen3.6-35B-A3B（MoE 35B）</li></ul>
+<p><strong>启动参数（重要，2026-08-24 实测根治 600s 超时）</strong></p>
+<ul><li>部署形态：systemd 裸进程 <code>vllm-qwen3.5.service</code>（admin 用户，Restart=always），非 docker/脚本；vLLM 0.19.0，模型 <code>Qwen3.6-35B-A3B-FP8</code>，<code>--tensor-parallel-size 4</code>。</li>
+<li><strong>禁止加 <code>--enforce-eager</code> 与 <code>--tokenizer-mode slow</code></strong>（过时 workaround）：eager 禁用 CUDA graph 致 decode 仅 12-14 tok/s，45k 长输入生成跑满 600s 客户端预算 → 抛 "model 调用超过 600s（vLLM 无响应或过慢）"；vLLM 侧自身无错（request_aborted=0），超时纯为引擎太慢。去掉两 flag 后 CUDA graph capture 成功（16s）、decode 恢复 ~185-202 tok/s（约 15× 提升），长请求正常完成。</li>
+<li>正确 ExecStart（CLEAN 基线，备份 <code>/tmp/vllm-clean.service</code>）：<code>vllm serve /home/admin/vllm_models/Qwen/Qwen3.6-35B-A3B-FP8 --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 4 --port 8003 --api-key &lt;占位符&gt; --gpu-memory-utilization 0.9 --trust-remote-code --enable-auto-tool-choice --tool-call-parser qwen3_xml</code>。</li>
+<li>验证：重启后 <code>journalctl -u vllm-qwen3.5.service</code> 应见 "Graph capturing finished in 16 secs"；长请求期间 <code>Avg generation throughput</code>（纯 decode 窗口）≥ 100 tok/s、无 ERROR/abort。</li></ul>
 <h2 id="3-3-PostgreSQL">3.3 PostgreSQL</h2>
 <p><code>POSTGRES_HOST=192.168.10.136</code>
 <code>POSTGRES_PORT=5433</code>
@@ -142,6 +147,11 @@
 <code>POSTGRES_USER=geesun</code>
 <code>POSTGRES_PASSWORD=&lt;占位符，向 IT 索取&gt;</code></p>
 <p>承载 langgraph checkpoint（postgres / sqlite 双后端支持）。建议每日逻辑备份 + WAL 归档；升级前先 pg_dump agent_mem。</p>
+<p><strong>连接池（重要，2026-08-24 实测根治"会话刷新丢消息/丢任务"）</strong></p>
+<ul><li>langgraph <code>AsyncPostgresStore/AsyncPostgresSaver</code> 的 <code>from_conn_string</code> 默认创建<strong>单条共享 AsyncConnection</strong>（非连接池）。并发时（流式任务写 checkpoint + 断连兜底 <code>aget_state</code> + 刷新 <code>GET /messages</code> 读 + <code>list_sessions</code> 读）同一连接被两个协程抢用 → psycopg 抛 <code>another command is already in progress</code>（server.log 实锤）→ 读失败被吞 → 已完成的会话"刷新空白"；断连兜底 <code>_persist_session</code> 写失败被吞 → 进行中任务的消息<strong>从未落库</strong>（真丢）。</li>
+<li>已修复（commit 2bbd075）：store 端 <code>from_conn_string</code> 传 <code>pool_config={"max_size": 20}</code>；saver 端 <code>from_conn_string</code> 不支持 pool，手动 <code>AsyncConnectionPool(dsn, min_size=1, max_size=20, open=False, kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row})</code> + <code>await pool.open()</code> 后 <code>AsyncPostgresSaver(conn=pool, serde=None)</code>。两端 <code>_reconnect</code>/<code>aclose</code> 关闭连接池（勿把 <code>_reconnect</code> 写成永久 <code>pool.close()</code>）。</li>
+<li>注意：saver 自带实例锁 <code>asyncio.Lock</code>（langgraph 已知行为），其操作仍串行化——连接池解决的是"连接级并发碰撞"（本次丢数据根因），<strong>不等同于 saver 全并行</strong>。</li>
+<li>并发量可调：<code>POSTGRES_POOL_MAX_SIZE</code>（默认 20），按在线会话数调整。</li></ul>
 <h2 id="3-4-LDAP-AD-接入">3.4 LDAP/AD 接入</h2>
 <p><code>LDAP_SERVER=ldap://192.168.1.241:389</code>
 <code>LDAP_BASE_DN=DC=geesun,DC=li</code>

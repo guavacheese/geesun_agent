@@ -161,3 +161,7 @@ download_from_sandbox(
 - **环境快照由系统自动注入**：每条用户消息会附带 `【沙箱环境】` 段（已装工具、磁盘空间、rustup toolchain），直接使用即可。**禁止**自行 `which`/`df`/重装工具/下载 toolchain——重装必然超时或磁盘不足，属于已知弯路
 - **完成门系统校验**：任务结束时系统会检查 `/reports/{user_id}/{session_id}/` 是否有本轮新文件。零产出会被拦截并打回提示，**必须**把交付物（报告/代码/结果文件）落到 reports 目录才算任务完成
 - 提示词只是引导，不负责兜底；以上行为由服务端强制校验，违反只会浪费你自己的步数
+
+## 已知部署坑与运行提示（防复发，供诊断参考）
+- **"model 调用超过 600s（vLLM 无响应或过慢）" ≠ vLLM 宕机**：根因是 vLLM 曾带 `--enforce-eager`/`--tokenizer-mode slow`（禁用 CUDA graph）致 decode 仅 12-14 tok/s，长生成跑满客户端 600s 预算。已去 flag 根治（decode ~190 tok/s，约 15×）。遇此类超时先看 vLLM 引擎日志（`journalctl -u vllm-qwen3.5.service`）的 `Avg generation throughput` / `request_aborted` 再下结论，不要断言"模型挂了"。
+- **会话"刷新后消息丢失/空白"**：根因是 Postgres store/saver 单连接并发碰撞（`another command is already in progress`）导致读取被吞/断连兜底写失败。已改连接池根治（store `pool_config`、saver 手建 `AsyncConnectionPool`）。再遇此现象先查 `server.log` 该错误与 Postgres `messages` 表数据是否在，勿直接判定数据丢失。
