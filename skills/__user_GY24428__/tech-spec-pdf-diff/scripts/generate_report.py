@@ -45,6 +45,24 @@ import json
 import sys
 
 
+def _normalize_doc(doc, data, key):
+    """归一化 doc_a / doc_b 字段，兼容两种 JSON 形状：
+    - 010153 形态：已是含 name/pages/version 的字典，原样返回；
+    - 010154 形态：字符串文件名（例如 "16-01-06-010154_C.pdf"），
+      补齐为字典，pages/version 回退到 {key}_pages / {key}_version（若无则留空）。
+    其它类型（理论上不会出现）兜底为字符串名。
+    """
+    if isinstance(doc, str):
+        return {
+            "name": doc,
+            "pages": data.get(f"{key}_pages", "") or "",
+            "version": data.get(f"{key}_version", "") or "",
+        }
+    if isinstance(doc, dict):
+        return doc
+    return {"name": str(doc), "pages": "", "version": ""}
+
+
 # ---------- Markdown 生成 ----------
 
 def render_md(data: dict) -> str:
@@ -271,6 +289,12 @@ def main():
 
     with open(args.diff_json, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    # 兼容两种 JSON 形状：doc_a/doc_b 可能是字符串文件名（010154 形态）
+    # 或含 name/pages/version 的字典（010153 形态）。渲染前统一归一化，
+    # 避免字符串形状下 da["name"] / d.items() 抛 TypeError 导致报告生成失败。
+    data["doc_a"] = _normalize_doc(data.get("doc_a"), data, "doc_a")
+    data["doc_b"] = _normalize_doc(data.get("doc_b"), data, "doc_b")
 
     content = render_html(data) if args.format == "html" else render_md(data)
     with open(args.out, "w", encoding="utf-8") as f:
