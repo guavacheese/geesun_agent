@@ -21,17 +21,19 @@
 
 | 文件类型 | 使用工具 | 说明 |
 |---------|---------|------|
-| Excel / Word（需解密） | `decrypt_and_upload_to_sandbox` | 解密后直传沙箱 |
-| XML / TXT（不解密） | `upload_to_sandbox` | 直读文件传沙箱 |
+| 任意文件（含加密） | `upload_to_sandbox` | **统一入口**：自动检测 `%TSD-Header` 加密头，命中即内部切换为解密上传（等价 `decrypt_and_upload_to_sandbox`，明文不落盘）；非加密文件直传沙箱 |
 | Skill 脚本 | `copy_script_to_sandbox` | 从 skills 目录传沙箱 |
 | 输出报告 | `download_from_sandbox` | 从沙箱拉到 /reports/ |
+
+> `decrypt_and_upload_to_sandbox` 仍保留可用，但模型**无需再手动区分**加密/非加密——一律用 `upload_to_sandbox` 即可，工具会自行兜底解密。
 
 ## 正确写入沙箱的方式
 **write_file 只能写虚拟文件系统路径（/reports/、/workspace/memories/），不能写 /home/user/！**
 往沙箱写文件只能通过 MCP 工具：
 
-- 加密文件（Excel/Word）：`decrypt_and_upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")`
-- 非加密文件（XML/TXT）：`upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")`
+- 任意文件（加密/非加密统一）：`upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")`
+  - 工具会自动检测 DLP 加密头（`%TSD-Header`），命中即内部解密上传，无需手动选工具
+  - （`decrypt_and_upload_to_sandbox` 仍可用，行为等价，但不再需要区分调用）
 
 不要使用 write_file /home/user/xxx —— write_file 写不到沙箱里。
 
@@ -62,7 +64,7 @@ write_file 通过 filesystem middleware 直写宿主机磁盘，不经沙箱。
 - read_file / write_file / ls / glob / grep → 访问 /uploads/、/reports/、/workspace/memories/
 - execute → 在沙箱中运行命令，沙箱内没有 /uploads/ 和 /reports/
 - write_file 只能用于写 /reports/ 下的报告和 /workspace/memories/ 下的用户偏好
-- 向沙箱写文件只能用 MCP 工具（decrypt_and_upload_to_sandbox / upload_to_sandbox）
+- 向沙箱写文件只能用 MCP 工具：`upload_to_sandbox`（统一入口，自动解密 DLP 加密文件）或 `decrypt_and_upload_to_sandbox`（等价，显式解密）
 - 不要在 execute 中访问 /uploads/ 或 /reports/ 路径
 
 ## 记忆存储规则
@@ -100,19 +102,19 @@ download_from_sandbox(
 注意：永远不要在 execute 中引用 /skills/、/uploads/、/reports/ 路径（沙箱内不存在）。
 
 ## 解密规则
-- XML 文本文件不需要解密，用 `upload_to_sandbox` 直接上传到沙箱
-- Excel (.xlsx) 和 Word (.docx) 等 Office 文件会被公司加密，用 `decrypt_and_upload_to_sandbox` 解密后上传到沙箱
+- **`upload_to_sandbox` 已内置 DLP 兜底**：自动检测 `%TSD-Header` 加密头，命中即内部切换为解密上传（与 `decrypt_and_upload_to_sandbox` 等价，明文不落盘）。因此**一律用 `upload_to_sandbox` 即可，无需判断文件是否加密、也无需手动换工具**。
+- `decrypt_and_upload_to_sandbox` 仍保留可用，行为完全等价，仅在需要显式表达"我要解密"语义时使用。
 - **判断文件是否加密：不靠扩展名，靠文件头**。公司 DLP 加密软件会在文件开头写入 `%TSD-Header` 魔数——**txt/py 等文本类文件也可能被加密**。不确定时：
   1. 先尝试 `read_file`——如果被系统拒绝（二进制拦截提示），说明是加密/二进制文件
-  2. 或直接走 `decrypt_and_upload_to_sandbox`（它内部会检测，非加密文件同样能上传）
+  2. 或直接走 `upload_to_sandbox`（它内部已自动检测加密头并兜底解密，非加密文件同样直传）
 - **禁止用 read_excel 直接读取 /uploads/ 下的加密 Office 文件**：`/uploads/` 是虚拟路径，只在虚拟文件系统（read_file/ls/glob/grep）和 MCP 传输工具里有效；read_excel 底层用真实文件系统 open()，宿主机与沙箱均无 `/uploads` 目录，必然报 No such file；且文件为密文，路径通了也读不出内容
-- 加密文件的正确读取流程：`decrypt_and_upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")` → 沙箱 `/home/user/` 下用 execute / read 处理
+- 加密文件的正确读取流程：`upload_to_sandbox(file_path="/uploads/...", remote_path="/home/user/文件名", sandbox_id="...")` → 工具自动解密 → 沙箱 `/home/user/` 下用 execute / read 处理
 - 同一目录下的文件名可用 `ls /uploads/{user_id}/{session_id}/` 确认（虚拟文件系统可列出），但**不要**用 execute 在沙箱里验证 /uploads（沙箱内不存在）
 - **PDF 解析必须用标准库 API，禁止手动遍历 PDF 内部对象**：
   1. `fitz`（PyMuPDF）：`doc = fitz.open(path)` → `doc[页码].get_text()` 提取文本
   2. 或 `pdfplumber`：`with pdfplumber.open(path) as pdf` → `page.extract_text()`
   3. **禁止**自己写脚本遍历 PDF 的 CMap 字符映射/对象流——那会把二进制映射数据当文本输出，表现为"乱码"（2026-08-13 实测：AI 手动遍历 CMap 得到 65309 条乱码段；同文件用 fitz.get_text() 解析完全正常）
-  4. 若 `get_text()` 返回空/乱码，先检查文件头：`%TSD-Header` 说明仍是密文（未解密），重新 `decrypt_and_upload_to_sandbox`；`%PDF-` 才是明文
+  4. 若 `get_text()` 返回空/乱码，先检查文件头：`%TSD-Header` 说明仍是密文（未解密），重新 `upload_to_sandbox`（会自动解密）；`%PDF-` 才是明文
 - **沙箱内 pip 装包默认走内网 devpi 源**（沙箱创建时已配置
   `http://192.168.10.136:3141/root/pypi/+simple/`），直接 `pip install <包名>` 即可；
   **不要改 pip 源/加 --trusted-host**——外网 pypi https 被公司上网认证网关
