@@ -129,10 +129,10 @@ async def file_to_image(
 
 # ─── model 调用总时长超时 + 请求量 DIAG（2026-08-19 新增）───
 
-# 动态 max_tokens 的边距与下限（2026-08-24）
-_MODEL_MAX_TOKENS_MARGIN = 4096  # prompt 估算误差余量，防 vLLM 400
-_MODEL_MIN_OUTPUT_TOKENS = 1  # 数学上恒不超限：prompt 极端接近上限时放弃输出空间保不 400
-#（实际不会发生：Summarization 在 20 万 tokens 触发压缩 keep=10，输入远小于上限）
+# 动态 max_tokens 的下限（2026-08-24）：数学上恒不超限——prompt 极端接近上限时
+# 放弃输出空间保不 400（实际不会发生：Summarization 触发即压缩 keep=10，输入远小于上限）。
+# 边距 model_max_tokens_margin 为可调配置（.env MODEL_MAX_TOKENS_MARGIN，默认 16384）。
+_MODEL_MIN_OUTPUT_TOKENS = 1
 
 @wrap_model_call
 async def model_call_guard(
@@ -170,7 +170,7 @@ async def model_call_guard(
         prompt_tokens = total_chars // 2
     effective_max = min(
         settings.model_max_tokens,
-        settings.model_max_len - prompt_tokens - _MODEL_MAX_TOKENS_MARGIN,
+        settings.model_max_len - prompt_tokens - settings.model_max_tokens_margin,
     )
     effective_max = max(effective_max, _MODEL_MIN_OUTPUT_TOKENS)
     if effective_max < settings.model_max_tokens:

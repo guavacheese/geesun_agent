@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     # 探活 /v1/models 得 max_model_len=262144；动态 max_tokens 用它做减法，
     # 防止"输入 62k + 输出 200k = 262145 > 262144"被 vLLM 400 拒载（2026-08-24 实测）。
     model_max_len: int = 262144
+    # ─── 动态 max_tokens 安全边距（tokens）───
+    # 防 prompt 估算低估触发 vLLM 400（2026-08-25 实测估算 125238 vs 实际 129335、
+    # 低估 4097，margin=4096 差 1 token 又被拒）。16384 留足余量（含 tools schema 等未计入部分）。
+    model_max_tokens_margin: int = 16384
+    # ─── Summarization 压缩触发阈值（tokens）───
+    # 上下文达此值即把历史压缩为摘要（keep 10 条 + 资源清单注入，前端消息表不受影响）。
+    # 2026-08-25 从 200000 降到 100000：fe27a95a 反复失败重跑历史膨胀到 12.9 万 tokens
+    # 仍未触发（阈值偏高 + get_num_tokens 对 Qwen 估算不稳定），prefill 慢且挤压输出空间。
+    summarization_trigger_tokens: int = 100000
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

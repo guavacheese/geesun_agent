@@ -792,7 +792,7 @@ async def create_agent(
     summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
-        trigger=("tokens", 200000),  # Qwen 262144 的 ~76%，留足输出/工具 schema 余量
+        trigger=("tokens", settings.summarization_trigger_tokens),  # 阈值可调（.env SUMMARIZATION_TRIGGER_TOKENS）
         keep=("messages", 10),
         token_counter=_count_tokens_accurate,
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
