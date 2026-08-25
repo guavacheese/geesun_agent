@@ -578,6 +578,8 @@ async def chat(
 
         # 标记当前是否刚发出过 thinking 事件
         thinking_emitted = False
+        # 标记当前是否刚发出过 generating 事件（答案 token 阶段，区别于 thinking/CoT）
+        generating_emitted = False
         # Qwen 系模型将推理放在 content 的 </think> 前，流式场景下可能跨 chunk 截断
         _think_buffer = ""
         _think_done = False
@@ -668,6 +670,7 @@ async def chat(
                                     yield f"data: {json.dumps({'type': 'ai_message_start'}, ensure_ascii=False)}\n\n"
                                 _last_debug_step = step
                                 thinking_emitted = False  # 新 step → 重置 thinking 标记
+                                generating_emitted = False  # 新 step → 重置 generating 标记
                                 # 关键：每条 AIMessage 独立切分 <think> 段
                                 # 之前 _think_done 跨消息保留导致第二条 AIMessage 的
                                 # <think> 段（被 langchain 拼在 ToolMessage 之后）无法切分
@@ -715,15 +718,18 @@ async def chat(
                                         yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
                                     yield f"data: {json.dumps({'type': 'reasoning', 'content': thinking_part}, ensure_ascii=False)}\n\n"
                                 if remaining:
+                                    if not generating_emitted:
+                                        generating_emitted = True
+                                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'generating'}, ensure_ascii=False)}\n\n"
                                     yield f"data: {json.dumps({'type': 'token', 'content': remaining}, ensure_ascii=False)}\n\n"
                         elif content:
-                            # 3. 正常 token：已过 </think> 或无推理内容
-                            if not thinking_emitted:
-                                thinking_emitted = True
-                                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
-                                yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
-                            else:
-                                yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+                            # 3. 正常 token：已过 </think> 或无推理内容——这是"写答案"阶段，
+                            #    状态应为 generating（生成中），而非 thinking（思考中）。
+                            #    之前误把首个答案 token 标成 thinking，导致整段答案生成都显示"思考中…"。
+                            if not generating_emitted:
+                                generating_emitted = True
+                                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'generating'}, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
 
                     elif mode == "updates":
                         # 根据 node 名称和输出内容解析 Agent 行为
