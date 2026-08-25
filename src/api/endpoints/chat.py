@@ -618,7 +618,7 @@ async def chat(
             M3-v2 继续轮传入 {'messages': [SystemMessage(...)]} 追加系统消息，
             依赖 deepagents astream 继续模式（spike 验证，未通过时自动继续保持关闭）。
             """
-            nonlocal _last_debug_step, thinking_emitted, _think_buffer, _think_done, _generated_files, _consecutive_tool_failures
+            nonlocal _last_debug_step, thinking_emitted, generating_emitted, _think_buffer, _think_done, _generated_files, _consecutive_tool_failures
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # ─── 清洗：messages 里不应有 SystemMessage ───
