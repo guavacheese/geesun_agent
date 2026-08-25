@@ -237,9 +237,9 @@
 <p>部署形态：可本地进程或独立服务端；建议独立服务以便长期留存 trace。</p>
 <h1 id="4-集成与联调">4. 集成与联调</h1>
 <h2 id="4-1-端到端冒烟测试">4.1 端到端冒烟测试</h2>
-<p>典型链路：上传加密 PDF → 前端 → 后端 → MCP decrypt_and_upload_to_sandbox（解密写沙箱，明文不落盘）→ 沙箱内跑 skill 脚本（extract → diff → generate）→ download_from_sandbox 拉回报告。</p>
+<p>典型链路：上传加密 PDF → 前端 → 后端 → MCP upload_to_sandbox（自动检测 %TSD-Header 解密写沙箱，明文不落盘；decrypt_and_upload_to_sandbox 为等价显式入口）→ 沙箱内跑 skill 脚本（extract → diff → generate）→ download_from_sandbox 拉回报告。</p>
 <p><code># 关键校验点</code>
-<code># 1) 加密文件上传须走 decrypt_and_upload_to_sandbox（upload_to_sandbox 会拒绝密文）</code>
+<code># 1) 加密文件上传用 upload_to_sandbox 即可（已内置 DLP 兜底：检测到 %TSD-Header 自动解密上传；decrypt_and_upload_to_sandbox 等价仍可用）</code>
 <code># 2) 沙箱内 pdfplumber 缺失时 stage1 自动 pip install（离线需配 devpi 镜像）</code>
 <code># 3) 扫描件/图片型 PDF（平均页字符 &lt; 50）会明确报错，不静默出空报告</code></p>
 <h2 id="4-2-会话与状态">4.2 会话与状态</h2>
@@ -271,7 +271,7 @@
 <ul><li>回滚：保留上一镜像标签与 DB 备份，必要时 git revert + 重启</li></ul>
 <h1 id="7-常见故障-FAQ">7. 常见故障 FAQ</h1>
 <p><strong>Q：上传加密 PDF 报"检测到 DLP 加密文件"</strong></p>
-<p>A：说明文件是密文。必须用 decrypt_and_upload_to_sandbox 解密后传沙箱；upload_to_sandbox 会拒绝密文（密文进沙箱 AI 无法解析）。</p>
+<p>A：说明文件是密文。用 upload_to_sandbox 上传即可（工具会自动检测 %TSD-Header 并解密上传，明文不落盘）；decrypt_and_upload_to_sandbox 为等价显式入口。</p>
 <p><strong>Q：沙箱跑脚本报 pdfplumber 缺失</strong></p>
 <p>A：stage1 会自动 pip install pdfplumber；若离线/超时，需在沙箱模板配置 devpi 镜像 192.168.10.136:3141 或预装。</p>
 <p><strong>Q：模型返回 501 Unknown part type: file</strong></p>
