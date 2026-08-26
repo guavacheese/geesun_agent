@@ -12,6 +12,7 @@
 |---|---|---|---|---|---|---|
 | geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 不发布（仅 appnet） | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun-mcp :8000、Phoenix/Langfuse |
 | geesun-mcp | `geesun_ai/geesun-mcp-server:<tag>` | 8000 | 不发布（仅 appnet） | 否 | 共享 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`（与 agent 同挂） | agent（经服务名）、DLP 解密 API、CubeSandbox(E2B) |
+| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet） | 经 Caddy :80 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
 | agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 不发布 | 否 | named volume `agent_pg_data` | — |
 | caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 80 / 6006 / 3000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
@@ -70,7 +71,8 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 1. `docker login 172.16.220.74:8333`
 2. 构建并 push `geesun-agent:<tag>`（→ `geesun_ai` 项目）
 3. `sync_mcp()` 构建并 push `geesun-mcp-server:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_mcp_server` 仓库根）
-4. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（公网拉不到时回退用本地已有镜像）
+4. `sync_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67/`）
+5. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（公网拉不到时回退用本地已有镜像）
 
 ### 2.3 镜像清单（源 → Harbor 目标）
 
@@ -197,6 +199,28 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
 
 ---
 
+### 4.7 前端（geesun_agent_web）容器化部署
+前端 Next.js 16 已容器化为 `geesun-agent-web` 服务（`docker-compose.web.yml`），与 agent 同处 `appnet`，内部 3000 不发布主机，由 Caddy :80 对外。
+
+**⚠️ 构建期注入（最容易踩的坑）**：`NEXT_PUBLIC_API_BASE` 是 Next.js **公共变量，浏览器直接读构建产物**——属于 build-time 内联，运行时改 `.env` **无效**。生产镜像默认内联 `http://10.10.10.67/`（经 Caddy 同域）；换环境必须用 `NEXT_PUBLIC_API_BASE=xxx bash deploy/build-push.sh` 重新构建镜像，不能靠改 `.env`。
+
+**⚠️ Caddy 路径路由（防 rewrite 回环）**：前端 `next.config.ts` 会把 `/api/*` rewrite 到 `NEXT_PUBLIC_API_BASE`（同域）。若 Caddy 把 `/` 整体代理到 web，`/api/*` 请求会 Caddy→web→rewrite→Caddy 无限循环。因此 `Caddyfile` 必须按路径分流：`/api/*`、`/docs`、`/openapi.json` 直连 `geesun-agent:8009`，其余走 `geesun-agent-web:3000`（已实现）。
+
+**前端本地 dev 不受影响**：dev 仍是 `bun run dev`（读 `.env.local`，默认 `http://localhost:8009`），`next.config.ts` 的 `output: "standalone"` 仅对 `next build` 生效，`next dev` 忽略；容器与 dev 是两套独立运行方式。
+
+**合并启动**（在 `deploy/` 目录，比 §4.6 多一个 `-f docker-compose.web.yml`）：
+```sh
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
+               -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml \
+               -f docker-compose.web.yml up -d
+```
+
+**排障**：
+- 前端打不开但后端通：`docker logs geesun-agent-web` 看是否 `next build` 产物缺失（确认镜像用 `sync_web` 重建，含 `.next/static` 与 `public`）。
+- `/api/*` 404 或回环：确认 Caddyfile 是路径分流版本（`handle /api/*` 在前），且前端镜像 `NEXT_PUBLIC_API_BASE` 为同域地址。
+
+---
+
 ## 5. 数据与挂载（防丢）
 
 ### 5.1 有状态服务 → named volume（推荐）
@@ -296,15 +320,15 @@ cron 示例（每天 03:07）：
 5. （可选）挂载 CubeSandbox `rootCA.pem` 到 agent 并设 `REQUESTS_CA_BUNDLE`（4.3）。
 6. 合并拉取镜像：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml pull
+   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml pull
    ```
 7. 启动（依赖与 healthcheck 会控制顺序）：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d
    ```
 8. 校验：
    - `docker compose ps` 全 healthy；
-   - `http://10.10.10.67/` → agent 文档页（Caddy）；
+   - `http://10.10.10.67/` → 前端页面（Caddy → geesun-agent-web）；API 文档 `http://10.10.10.67/docs`（Caddy → geesun-agent:8009）；
    - `http://10.10.10.67:6006` → Phoenix；
    - `http://10.10.10.67:3000` → Langfuse，注册首个账号；
    - `127.0.0.1:3100` → Grafana，看 Loki 数据源有日志。
@@ -328,6 +352,7 @@ cron 示例（每天 03:07）：
 - **不要 `-v` 删卷**：见 5.4。
 - **外部依赖可达性**：部署后先 `docker exec geesun-agent curl -s http://172.16.66.13:8003/v1/models` 验证 vLLM 连通，再验 CubeSandbox / MCP。
 - **MCP 容器化**：geesun_mcp_server 现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），合并 `up` 时加 `-f docker-compose.mcp.yml`；agent 经服务名 `geesun-mcp:8000` 访问，勿再手跑裸进程。部署拓扑与排障见 §4.6。
+- **前端容器化**：geesun_agent_web 已容器化为 `geesun-agent-web`（见 `docker-compose.web.yml`），合并 `up` 时加 `-f docker-compose.web.yml`；`NEXT_PUBLIC_API_BASE` 为构建期内联（运行时改 `.env` 无效）、Caddy 按路径分流防 rewrite 回环，详见 §4.7。
 - **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认主机端口空闲，避免 dev 残留进程占 3000/6006/8000 导致 `up` 失败。
 
 ---
@@ -344,8 +369,9 @@ cron 示例（每天 03:07）：
 | 6 | Harbor `geesun_ai` + `dockerhub` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置（步骤见 §11） |
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh sync_mcp + requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
+| 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh sync_web + Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
 
-> 实现项 #1–#5、#7–#8 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
+> 实现项 #1–#5、#7–#9 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 
 ---
 

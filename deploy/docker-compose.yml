@@ -2,13 +2,13 @@
 #
 # 合并启动（在 deploy/ 目录）：
 #   cp .env.example .env && vi .env        # 填全部密钥（含 REGISTRY_GEESUN / REGISTRY_HUB / Harbor 凭证）
-#   docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d
 #
 # 说明：
 #   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
 #     第三方通用镜像（pgvector/caddy/loki/promtail/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
-#   - 三个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
+#   - 多个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
 #   - 对外只暴露 caddy 的 80 / 6006 / 3000；数据库 / redis / clickhouse / minio(除 S3 9092) 不暴露到主机。
 #   - 日志：各服务 json-file 驱动做大小轮转（max-size/max-file），Promtail 采集入 Loki，Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
@@ -37,7 +37,7 @@ services:
       langfuse_public_key: "${LANGFUSE_PUBLIC_KEY}"
       langfuse_secret_key: "${LANGFUSE_SECRET_KEY}"
       otel_project_name: "${OTEL_PROJECT_NAME:-Geesun-Agent-prod}"
-      cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67:3000}"
+      cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67}"
     # 宿主机挂载：报告/上传/工作目录防容器重建丢失（AGENT_DATA_ROOT 见 .env）
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent

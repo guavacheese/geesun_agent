@@ -1,13 +1,28 @@
 # 反向代理 — 内网 LAN 用，plain HTTP（如需 TLS 在此加 `tls internal` 并改监听 443）。
 # 各后端均经 appnet 内网互访，仅 caddy 暴露主机端口。
-# 访问入口：agent http://10.10.10.67/ 、Phoenix http://10.10.10.67:6006 、Langfuse http://10.10.10.67:3000
+# 访问入口：前端 http://10.10.10.67/ 、Phoenix http://10.10.10.67:6006 、Langfuse http://10.10.10.67:3000
 
 {
   admin off
 }
 
+# 主入口：路径分流（防 rewrite 回环）
+# 前端 Next.js 的 /api/* 会 rewrite 到 NEXT_PUBLIC_API_BASE（同域 http://10.10.10.67/），
+# 若把 / 整体代理到 geesun-agent-web，/api/* 请求会回到 Caddy → web → rewrite → 无限循环。
+# 因此 /api/* 与 API 文档必须在 Caddy 层直连后端，其余才走前端。
 :80 {
-  reverse_proxy geesun-agent:8009
+  handle /api/* {
+    reverse_proxy geesun-agent:8009
+  }
+  handle /docs {
+    reverse_proxy geesun-agent:8009
+  }
+  handle /openapi.json {
+    reverse_proxy geesun-agent:8009
+  }
+  handle {
+    reverse_proxy geesun-agent-web:3000
+  }
 }
 
 :6006 {

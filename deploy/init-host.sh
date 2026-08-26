@@ -34,5 +34,6 @@ chmod 0755 "$DATA_ROOT" "$BACKUP_ROOT"
 chmod 0755 "$DATA_ROOT"/agent "$DATA_ROOT"/uploads "$DATA_ROOT"/reports
 
 echo "完成。可继续："
-echo "  docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d"
+echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml pull"
+echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d"
 echo "(若主机无 UID 1001 账户属正常；chown 按数字 UID 生效即可)"
