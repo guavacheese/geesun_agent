@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     langfuse_public_key: str = ""
     langfuse_base_url: str = ""
 
+    # OpenTelemetry 项目名（dev / prod 区分，便于在 Phoenix / Langfuse 中隔离 trace）
+    otel_project_name: str = "Geesun-Agent"
+
+    # 允许的前端跨域源（逗号分隔）；生产部署填 Web 实际域名 / IP
+    cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
     cube_template_id: str = ""
     cube_api_url: str = ""
     cube_api_key: str = "e2b_0000000000000000000000000000000000000000"

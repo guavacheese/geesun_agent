@@ -117,12 +117,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Geesun Agent", lifespan=lifespan)
 
-# CORS：开发阶段允许前端 localhost:3000 跨域访问
+# CORS：允许的前端源由 settings.cors_allow_origins 控制（逗号分隔，支持生产域名）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()
     ],
     allow_credentials=True,
     allow_methods=["*"],

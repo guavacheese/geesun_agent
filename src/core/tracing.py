@@ -50,7 +50,7 @@ def setup_tracing() -> bool:
 
         tracer_provider = trace_sdk.TracerProvider(
             resource=Resource.create({
-                "openinference.project.name": "Geesun-Agent-dev",
+                "openinference.project.name": settings.otel_project_name,
             })
         )
 
