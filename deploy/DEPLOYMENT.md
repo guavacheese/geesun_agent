@@ -153,17 +153,15 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 
 > named volume 物理存放于宿主 `/var/lib/docker/volumes/`。**named volume 不等于「免备份」**——磁盘损坏/误删仍会丢。见 5.3 备份。
 
-### 5.2 ⚠️ 待补充：geesun-agent 的工作目录必须挂宿主机
-当前 `docker-compose.yml` 的 `geesun-agent` **没有挂载** `agent_workspace` / `upload_root` / `report_root`（`.env` 里配了 `/data/agent`、`/data/uploads`、`/data/reports`）。不挂的话，容器内这些目录是临时的，容器一重建，已生成的报告/上传文件全丢。
-
-**落地项**：在 `geesun-agent` 服务加（建议宿主机统一基目录 `/opt/geesun/data`）：
+### 5.2 geesun-agent 的工作目录已挂宿主机
+`docker-compose.yml` 的 `geesun-agent` 已通过 `${AGENT_DATA_ROOT}` 挂载 `agent_workspace` / `upload_root` / `report_root`（`.env` 默认 `/opt/geesun/data`，容器内 `/data/{agent,uploads,reports}`）。容器重建后已生成的报告/上传文件不丢：
 ```yaml
     volumes:
-      - /opt/geesun/data/agent:/data/agent
-      - /opt/geesun/data/uploads:/data/uploads
-      - /opt/geesun/data/reports:/data/reports
+      - ${AGENT_DATA_ROOT}/agent:/data/agent
+      - ${AGENT_DATA_ROOT}/uploads:/data/uploads
+      - ${AGENT_DATA_ROOT}/reports:/data/reports
 ```
-并在目标机预先 `mkdir -p /opt/geesun/data/{agent,uploads,reports}`。
+目标机需预先 `mkdir -p /opt/geesun/data/{agent,uploads,reports}`（建议并入 `init-host.sh`，见 §9 #4）。
 
 ### 5.3 备份策略（真·防丢）
 - **Postgres（agent_mem / phoenix / langfuse）**：每日 `pg_dump` 到 `/opt/geesun/backup/postgres/`，保留 7–30 天。
@@ -193,8 +191,8 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 - `LOG_LEVEL`（默认 `INFO`）、`LOG_FORMAT=json|text` 由环境变量控制（`logging.py` 已实现）。
 - `loki-config.yaml` 已设 `retention_period: 720h` + `compactor` 启用删除；按需调整。
 
-### 6.4 ⚠️ 待补充：uvicorn.access 仍非 JSON
-业务日志已是 JSON，但 uvicorn 启动后重配了自己的 access log formatter（纯文本），导致 HTTP 访问日志字段无法被 Loki 结构化索引。彻底统一需给 uvicorn 注入 `--log-config`（一个 logging dictConfig，把 `uvicorn.access` 也指向 JSON formatter）。**建议补上**。
+### 6.4 uvicorn.access 已统一为 JSON
+业务日志已是 JSON；uvicorn 的 access 日志通过 Dockerfile CMD 注入 `--log-config logging.uvicorn.json`，把 `uvicorn.access` 也指向同一个 JSON formatter，HTTP 访问日志现在同为结构化 JSON，可被 Loki 按 `level` / `logger` / `msg` 字段索引。
 
 ### 6.5 与「链路追踪」区分
 - **应用日志**（stdout JSON，Loki 管）：error / request / business 流水。
@@ -262,5 +260,6 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 | 4 | 生产机 `/opt/geesun/data` 目录预创建脚本 | 并入 `build-push.sh` 或独立 `init-host.sh` | ⬜ 待落地 |
 | 5 | 每日备份脚本（pg_dump / minio mirror） | 新增 `backup.sh` + cron | ⬜ 待落地 |
 | 6 | Harbor `geesun_ai` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置 |
+| 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 
 > 以上均按「诊断→提议→确认后落地」执行；确认后我再逐个改文件并按四段式 message 提交。

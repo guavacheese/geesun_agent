@@ -8,7 +8,7 @@ services:
     depends_on:
       - phoenix-db
     environment:
-      - PHOENIX_SQL_DATABASE_URL=postgresql://phoenix:postgres_phoenix@phoenix-db:5432/phoenix
+      - PHOENIX_SQL_DATABASE_URL=${PHOENIX_SQL_DATABASE_URL}
       - PHOENIX_PORT=6006
       - PHOENIX_GRPC_PORT=4317
     networks: [appnet]
@@ -33,9 +33,9 @@ services:
     image: ${REGISTRY}/postgres:16.14
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=phoenix
-      - POSTGRES_PASSWORD=postgres_phoenix
-      - POSTGRES_DB=phoenix
+      - POSTGRES_USER=${PHOENIX_DB_USER}
+      - POSTGRES_PASSWORD=${PHOENIX_DB_PASSWORD}
+      - POSTGRES_DB=${PHOENIX_DB_NAME}
       - TZ=UTC
       - PGTZ=UTC
     volumes:
