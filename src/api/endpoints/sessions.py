@@ -335,59 +335,13 @@ async def get_session_messages(
             if files:
                 msg["generated_files"] = files
 
-    # ─── 目录扫描兜底：以磁盘真实文件为准补回 generated_files ───
-    # 解决 content 正则补全的盲区：老数据 content 里只写裸文件名（无 /reports/ 前缀，
-    # 如 fe27a95a 会话 [90] 的 md/html 在 markdown 表格反引号里）或只提 md 不提 html，
-    # 导致刷新后文件卡丢失（2026-08-25 实测：010153_vs_010958 的 md/html 刷新后消失，
-    # 只剩 010154 那一轮）。目录里有什么文件就补什么，不再依赖模型是否在 content 写全路径。
-    # 扫描 report_root 与 agent_workspace/data/reports 两个兜底目录（write_file 可能写错处）。
-    report_files: list[dict] = []
-    seen_paths: set[str] = set()
-    for base in (
-        settings.report_root,
-        os.path.join(settings.agent_workspace, "data", "reports"),
-    ):
-        rp = os.path.join(base, user_id, session_id)
-        if not os.path.isdir(rp):
-            continue
-        try:
-            for fn in sorted(os.listdir(rp)):
-                disk_path = os.path.join(rp, fn)
-                if not os.path.isfile(disk_path):
-                    continue
-                vpath = f"/reports/{user_id}/{session_id}/{fn}"
-                if vpath in seen_paths:
-                    continue
-                seen_paths.add(vpath)
-                report_files.append({
-                    "file_name": fn,
-                    "file_path": vpath,
-                    "file_size": os.path.getsize(disk_path),
-                    "file_type": _infer_file_type(fn),
-                })
-        except OSError:
-            pass
-
-    if report_files:
-        # 合并到会话中最后一条 AI 消息（前端 MessageItem 只在 isLastAi 渲染文件卡，
-        # 统一把全量交付物挂到最后一条 AI，刷新后用户能看到目录里所有报告文件）。
-        last_ai_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "ai":
-                last_ai_idx = i
-                break
-        if last_ai_idx is not None:
-            existing = {
-                f.get("file_path")
-                for f in messages[last_ai_idx].get("generated_files") or []
-                if isinstance(f, dict)
-            }
-            merged = list(messages[last_ai_idx].get("generated_files") or [])
-            for f in report_files:
-                if f["file_path"] not in existing:
-                    merged.append(f)
-                    existing.add(f["file_path"])
-            messages[last_ai_idx]["generated_files"] = merged
+    # ─── 目录扫描兜底已移除（2026-08-26）───
+    # 原逻辑把 report_root/{user}/{sid}/ 下全部磁盘文件挂到「最后一条 AI 消息」，
+    # 是为兼容旧 MessageItem（只在最后一条 AI 渲染文件卡）。前端改为 MessageGroup
+    # 按 user turn 分组后，最后一条 AI 落在最后一个轮次，导致刷新后所有历史文件
+    # 都显示在最后一个消息组（秋天/夏天/春天散文全挂在最后一条）。文件归属改由
+    # 前端 deriveGeneratedFiles 从各组 tool_calls 派生（write_file/download_from_sandbox
+    # 路径），不再依赖后端全量兜底。
 
     return {"session_id": session_id, "messages": messages}
 
