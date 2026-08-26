@@ -39,10 +39,12 @@ _CONFIG_DIR = Path(settings.agent_workspace)
 CONFIG_PATH = _CONFIG_DIR / "mcp.json"
 
 # 系统预装 MCP 默认配置（首次运行时写入）
+# url 取自 settings.mcp_server_url：dev 同机裸跑 = http://localhost:8000/mcp；
+# 生产 docker-compose 下 mcp 容器化进同一 appnet，由 .env 覆盖为 http://geesun-mcp:8000/mcp。
 _DEFAULT_SYSTEM_SERVERS = {
     "decrypt-file": {
         "type": "streamable-http",
-        "url": "http://localhost:8000/mcp",
+        "url": settings.mcp_server_url,
         "headers": {"Authorization": f"Bearer {settings.mcp_token}"},
         "scope": "system",
         "disabled": False,

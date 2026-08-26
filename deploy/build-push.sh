@@ -60,6 +60,10 @@ echo "==> 构建 $AGENT_IMAGE (context=$CONTEXT)"
 docker build -f "$REPO_ROOT/Dockerfile" -t "$AGENT_IMAGE" "$CONTEXT"
 docker push "$AGENT_IMAGE"
 
+# ── 2.5 构建并推送 geesun-mcp-server（→ geesun_ai 项目）──
+# 构建上下文为 geesun_mcp_server 仓库根（与 geesun_agent 同级目录）。
+sync_mcp
+
 # ── 3. 同步第三方镜像进 Harbor dockerhub 项目 ──
 # 用法: sync <公网镜像> <harbor内短名:tag>
 sync() {
@@ -75,6 +79,22 @@ sync() {
   fi
   docker tag "$src" "$dst"
   docker push "$dst"
+}
+
+# 自有应用：geesun-mcp-server（→ geesun_ai 项目）
+# 构建上下文为 geesun_mcp_server 仓库根（与 geesun_agent 同级目录 /d/workspace/geesun_mcp_server）。
+# 该仓库自带 Dockerfile（非 root UID 1001 mcpuser，与 agent 同 UID，便于共享挂载目录属主）。
+sync_mcp() {
+  local mcp_repo="$REPO_ROOT/../geesun_mcp_server"
+  if [[ ! -d "$mcp_repo" ]]; then
+    echo "    [警告] 未找到 $mcp_repo，跳过 mcp 镜像构建（请确认 geesun_mcp_server 与 geesun_agent 同级）" >&2
+    return 0
+  fi
+  local MCP_TAG="${MCP_TAG:-1.0.0}"
+  local MCP_IMAGE="$REGISTRY_GEESUN/geesun-mcp-server:$MCP_TAG"
+  echo "==> 构建 $MCP_IMAGE (context=$mcp_repo)"
+  docker build -f "$mcp_repo/Dockerfile" -t "$MCP_IMAGE" "$mcp_repo"
+  docker push "$MCP_IMAGE"
 }
 
 # 主栈依赖（dockerhub 项目）
@@ -98,5 +118,5 @@ echo "    后续在目标机执行："
 echo "      mkdir -p /opt/geesun/data/{agent,uploads,reports}"
 echo "      cd $REPO_ROOT/deploy"
 echo "      cp .env.example .env && vi .env"
-echo "      docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml pull"
-echo "      docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d"
+echo "      docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml pull"
+echo "      docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d"

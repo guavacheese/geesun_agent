@@ -8,23 +8,24 @@
 
 ## 0. 架构总览
 
-| 组件 | 镜像（Harbor） | 容器端口 | 对外 | 数据持久化 | 关键依赖 |
-|---|---|---|---|---|---|
-| geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun_mcp_server :8000、Phoenix/Langfuse |
-| agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 否 | named volume `agent_pg_data` | — |
-| caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
-| loki | `dockerhub/loki:3.2.0` | 3100 | 否（Grafana 接） | `loki_data` | — |
-| promtail | `dockerhub/promtail:3.2.0` | — | 否 | — | docker.sock |
-| grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | `grafana_data` | loki |
-| phoenix | `dockerhub/phoenix:19.1.0` | 6006 / 4317 | 经 Caddy | — | phoenix-db |
-| phoenix-db | `dockerhub/postgres:16.14` | 5432 | 否 | `phoenix_pg_data` | — |
-| langfuse-web / worker | `dockerhub/langfuse:3.224.3` | 3000 | 经 Caddy | — | langfuse 后端栈 |
-| langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | 否（minio S3 9092） | 多个 named volume | — |
+| 组件 | 镜像（Harbor） | 容器端口 | 主机发布端口 | 对外 | 数据持久化 | 关键依赖 |
+|---|---|---|---|---|---|---|
+| geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 不发布（仅 appnet） | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun-mcp :8000、Phoenix/Langfuse |
+| geesun-mcp | `geesun_ai/geesun-mcp-server:<tag>` | 8000 | 不发布（仅 appnet） | 否 | 共享 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`（与 agent 同挂） | agent（经服务名）、DLP 解密 API、CubeSandbox(E2B) |
+| agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 不发布 | 否 | named volume `agent_pg_data` | — |
+| caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 80 / 6006 / 3000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
+| loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
+| promtail | `dockerhub/promtail:3.2.0` | — | 不发布 | 否 | — | docker.sock |
+| grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki |
+| phoenix | `dockerhub/phoenix:19.1.0` | 6006 / 4317 | 不发布（经 Caddy 6006） | 经 Caddy | — | phoenix-db |
+| phoenix-db | `dockerhub/postgres:16.14` | 5432 | 不发布 | 否 | `phoenix_pg_data` | — |
+| langfuse-web / worker | `dockerhub/langfuse:3.224.3` | 3000 | 不发布（经 Caddy 3000） | 经 Caddy | — | langfuse 后端栈 |
+| langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | minio S3 9092 | 否（minio S3 9092） | 多个 named volume | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
 - **CubeSandbox**：`172.16.66.13`（cube-proxy / cube-egress MITM，sandbox 执行环境）
-- **geesun_mcp_server**：`:8000`（独立进程，提供 MCP 工具）
+- **geesun_mcp_server**：现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），与 agent 同处 `appnet`，agent 经服务名 `geesun-mcp:8000` 访问；容器内部端口 8000 **不发布到主机**（避免与 dev 的 :8000 冲突），仅 appnet 内互访。DLP 解密 API 仍在 compose 外，由 `.env` 的 `DECRYPT_API_URL` 提供。
 - **Harbor**：`172.16.220.74:8333`（HTTP，项目 `geesun_ai`（自有应用 geesun-agent）+ `dockerhub`（第三方通用镜像中央仓库 redis/minio/postgres/loki/grafana/phoenix/langfuse 等））
 
 ---
@@ -67,8 +68,9 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 ```
 脚本动作：
 1. `docker login 172.16.220.74:8333`
-2. 构建并 push `geesun-agent:<tag>`
-3. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（geesun-agent 另推入 `geesun_ai` 项目；公网拉不到时回退用本地已有镜像）
+2. 构建并 push `geesun-agent:<tag>`（→ `geesun_ai` 项目）
+3. `sync_mcp()` 构建并 push `geesun-mcp-server:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_mcp_server` 仓库根）
+4. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（公网拉不到时回退用本地已有镜像）
 
 ### 2.3 镜像清单（源 → Harbor 目标）
 
@@ -132,16 +134,66 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
   - 挂载 CA 到容器（如 `/etc/ssl/certs/cube-root-ca.crt`）；
   - 设 `REQUESTS_CA_BUNDLE=/etc/ssl/certs/cube-root-ca.crt`（或在 compose `environment` 注入）；
   - 否则 sandbox 内出网请求会因证书不受信失败。
+- **同理 `geesun-mcp` 容器也需信任该 CA**：`docker-compose.mcp.yml` 已默认挂载 `SSL_CERT_FILE` + CA 卷；若 sandbox 代理无 MITM 可删挂载与该变量（见 §4.6）。
+- **同理 `geesun-mcp` 容器也需信任该 CA**：`docker-compose.mcp.yml` 已默认挂载 `SSL_CERT_FILE` + CA 卷；若 sandbox 代理无 MITM 可删挂载与该变量（见 §4.6）。
 
 ### 4.4 TLS
 - Caddy 做 TLS 终止，使用内部 CA（mkcert 链）签发 `10.10.10.67` 证书；内网服务之间明文。证书存于 `caddy_data` volume。
 
-### 4.5 端口冲突速查
-| 端口 | 用途 | 处理 |
-|---|---|---|
-| 9090 | Phoenix prometheus / Langfuse 默认 | Phoenix 的 9090 **不映射**；Langfuse Minio 改 9092 |
-| 5432 | postgres ×3（agent/phoenix/langfuse） | 各自独立容器，仅内部；不冲突 |
-| 3000 | Langfuse / Grafana 内部 | 对外只给 Langfuse（Grafana 走 127.0.0.1:3100） |
+### 4.5 端口冲突速查（含部署前预检）
+容器**内部端口**（appnet 服务名互访）与**主机发布端口**（`ports:` 映射）是两回事：仅在 `ports:` 里声明的才占主机端口；容器间互访走服务名，不占主机端口。
+
+**部署前在 10.10.10.67 上预检主机端口占用**（重点排查现有 dev 服务）：
+```sh
+ss -tlnp | grep -E ':(80|3000|6006|5432|8009|8000|9092|3100)\b'
+```
+- 预期：上述端口**全部空闲**（prod 由 caddy 统一接管 80/3000/6006）。
+- 若 3000 / 6006 被 dev 的 Phoenix/Langfuse 占用 → 按 §10.3 处理（下线 dev 或挪端口）。
+- 若 8009（agent）/ 8000（dev mcp）/ 9092（minio S3）被占用 → 先停对应 dev 进程。
+
+| 端口 | 用途 | 主机发布? | 处理 |
+|---|---|---|---|
+| 80 / 6006 / 3000 | Caddy 入口（agent / Phoenix / Langfuse） | 是 | 唯一占用主机端口的服务；dev 同名端口须先释放 |
+| 8009 | geesun-agent | 否（仅 appnet） | 不冲突 |
+| 8000 | geesun-mcp | 否（仅 appnet） | 不发布，与 dev 裸跑的 :8000 不冲突 |
+| 9090 | Phoenix prometheus | 否（不映射） | Langfuse Minio S3 改 9092 避开 |
+| 5432 | postgres ×3（agent/phoenix/langfuse） | 否（仅内部） | 各自独立容器；不冲突 |
+| 3100 | Grafana | 127.0.0.1:3100 | 仅本机排障 |
+| 9092 | Minio S3 | 是（对外） | Langfuse 媒体桶外部访问 |
+
+---
+
+### 4.6 MCP（geesun_mcp_server）容器化部署
+开发期 mcp 与 agent 同机裸跑无问题，但 docker-compose 部署有两个真隐患（已修）：
+1. **agent 容器内 `localhost` 指向自身**：`mcp.json` 默认 `http://localhost:8000/mcp`，在容器内 localhost 是 agent 自己而非 mcp → 连不到。修复：`config.py` 新增 `mcp_server_url`（默认 dev 用 localhost，prod 由 `.env` 覆为 `http://geesun-mcp:8000/mcp`）；`mcp.py` 默认服务改读该值。
+2. **mcp 服务绑回环**：原 `main.py` 绑 `127.0.0.1:8000`，仅听本机回环，容器内 agent 经服务名访问不到。修复：`main.py` 改绑 `0.0.0.0:8000`（dev 同机裸跑仍兼容 127.0.0.1）。
+
+**拓扑**：`geesun-mcp` 服务与 `geesun-agent` 同处 `appnet`，agent 用服务名 `geesun-mcp:8000` 访问；mcp 容器内部端口 8000 **不发布到主机**（避免与 dev 裸跑的 :8000 冲突），仅 appnet 内互访。
+
+**共享挂载**：mcp 复用 agent 的 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`，因为 mcp 需：
+- 读 skills（`AGENT_WORKSPACE` 下的 `skills/`）；
+- 解析 `/uploads` `/reports` 虚拟路径（`_resolve_host_path`）。
+
+**外部依赖**：
+- DLP 解密网关 `DECRYPT_API_URL`（compose 外，由 `.env` 提供）；
+- CubeSandbox(E2B) `E2B_API_URL` / `E2B_API_KEY`（MCP 内 `e2b_code_interpreter` 用，需信任 egress CA，见 §4.3）。
+
+**⚠️ mcp.json 残留坑**：agent 首次启动会按 `mcp_server_url` 生成 `{AGENT_WORKSPACE}/mcp.json`。若你**之前**手动改过 `mcp.json`（或旧部署遗留），里面的 url 可能是 `localhost`，改 `.env` 的 `mcp_server_url` **不会自动覆盖**已存在的 `mcp.json`。修复：`rm {AGENT_DATA_ROOT}/agent/mcp.json` 让它用新默认值重新生成，或手动把里面 `decrypt-file.url` 改成 `http://geesun-mcp:8000/mcp`。
+
+**合并启动**（在 `deploy/` 目录）：
+```sh
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
+               -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
+```
+
+**镜像构建**：`build-push.sh` 已加 `sync_mcp()`，会把 `geesun_mcp_server` 仓库（上下文=其根）构建并推到 `geesun_ai/geesun-mcp-server:<MCP_TAG>`。基镜像已从 `python:3.11` 改 `python:3.13-slim-bookworm`，与 `pyproject.toml` 的 `requires-python>=3.13` 及 dev 运行时一致，避免 dev/prod 漂移。
+
+**排障 runbook**：
+- mcp 工具加载失败（agent 日志 `MCP server [decrypt-file] 加载工具失败`）：
+  1. `docker exec geesun-agent curl -s http://geesun-mcp:8000/mcp` 确认 appnet 内可达；
+  2. `docker logs geesun-mcp` 看是否 `ValidationError`（env 缺失）或 E2B/解密报错；
+  3. 确认 `mcp.json` 的 url 已是 `geesun-mcp:8000/mcp`（见上方残留坑）。
+- E2B 调用 TLS 报错：确认 `CA_MOUNT_SRC` 指向真实 CA 文件且 `SSL_CERT_FILE` 已注入（无 MITM 则删挂载+变量）。
 
 ---
 
@@ -219,15 +271,36 @@ cron 示例（每天 03:07）：
 1. 安装 Docker + compose plugin，配置 Harbor 不安全仓库（2.1）。
 2. `bash deploy/init-host.sh`（自动建 `/opt/geesun/data/{agent,uploads,reports}` 与备份目录，并把属主改成容器 UID 1001，避免 Docker 自动以 root 建目录导致容器无写权限；见 §9 #4 ✅）。
 3. 拷贝 `deploy/` 目录到生产机（或 git 拉取）。
-4. `cd deploy && cp .env.example .env && vi .env`：填全部 `CHANGEME` 密钥（`openssl rand` 生成）、确认 `REGISTRY_GEESUN` / `REGISTRY_HUB` / `GEESUN_AGENT_TAG` / 外部 IP（vLLM、CubeSandbox、Harbor、LAN IP）。
+4. `cd deploy && cp .env.example .env && vi .env`：按下方 **`.env` 初始化清单** 逐项填写（大部分不能用默认值）。
+
+   **`.env` 初始化清单（拷贝后逐项确认；漏填会在 `up` 时直接报错或功能静默失效）：**
+   - **A. 必改（无默认值，漏填容器 `ValidationError` 必崩）：**
+     - `base_url` / `openai_api_key` / `model_name` / `agent_workspace` / `upload_root` / `report_root`：agent 必填（`config.py` 无默认）。
+     - `AGENT_PG_PASSWORD` / `POSTGRES_PASSWORD`：两套 PG 各自强密码。
+     - `DECRYPT_API_URL`：DLP 解密网关（MCP 调用，compose 外）。
+     - `E2B_API_URL` / `E2B_API_KEY`：CubeSandbox(E2B) 代理（MCP 内 `e2b_code_interpreter` 用）。
+     - `NEXTAUTH_SECRET` / `ENCRYPTION_KEY`：`openssl rand -hex 32`。
+     - `SALT`：`openssl rand -hex 16`。
+     - `GRAFANA_PASSWORD` / `REDIS_AUTH` / `CLICKHOUSE_PASSWORD`：各自强密码。
+   - **B. 强匹配约束（漏改会静默功能失效，务必逐对核对）：**
+     - `PHOENIX_SQL_DATABASE_URL` 内密码 = `PHOENIX_DB_PASSWORD`
+     - `DATABASE_URL` 内密码 = `POSTGRES_PASSWORD`
+     - `LANGFUSE_S3_EVENT/MEDIA/BATCH_EXPORT_SECRET_ACCESS_KEY` 三者都 = `MINIO_ROOT_PASSWORD`
+     - `mcp_server_url` 必须 = `http://geesun-mcp:8000/mcp`（服务名，非 localhost）
+   - **C. 建议改（有默认值但应设真实值）：**
+     - `mcp_token`：agent 调 MCP 的 Bearer token（当前 mcp 服务未做服务端校验，但保持非默认以便日后开启鉴权）。
+     - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`：首次启动后从 Langfuse UI 取，回填后 `up -d geesun-agent` 重启生效（§7 阶段 C）。
+     - `CORS_ALLOW_ORIGINS`：按需改成 Web 实际域名/IP。
+   - **D. 可保持默认（通常无需改）：**
+     - `LOG_LEVEL`/`LOG_FORMAT`、`AGENT_PG_*`、`AGENT_DATA_ROOT`、`REGISTRY_GEESUN/HUB`、`GEESUN_AGENT_TAG`、`LANGFUSE_TAG`、`POSTGRES_VERSION`、`PHOENIX_DB_*`(名称)、`OTEL_PROJECT_NAME`、`*_BASE_URL`(服务名)、网络类 `REDIS_HOST/PORT` 等。
 5. （可选）挂载 CubeSandbox `rootCA.pem` 到 agent 并设 `REQUESTS_CA_BUNDLE`（4.3）。
 6. 合并拉取镜像：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml pull
+   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml pull
    ```
 7. 启动（依赖与 healthcheck 会控制顺序）：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
    ```
 8. 校验：
    - `docker compose ps` 全 healthy；
@@ -254,6 +327,8 @@ cron 示例（每天 03:07）：
 - **Langfuse 初始化**：官方 clickhouse migration 步骤务必在 `up` 前核对；首次启动 worker 会跑迁移，需等 healthy。
 - **不要 `-v` 删卷**：见 5.4。
 - **外部依赖可达性**：部署后先 `docker exec geesun-agent curl -s http://172.16.66.13:8003/v1/models` 验证 vLLM 连通，再验 CubeSandbox / MCP。
+- **MCP 容器化**：geesun_mcp_server 现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），合并 `up` 时加 `-f docker-compose.mcp.yml`；agent 经服务名 `geesun-mcp:8000` 访问，勿再手跑裸进程。部署拓扑与排障见 §4.6。
+- **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认主机端口空闲，避免 dev 残留进程占 3000/6006/8000 导致 `up` 失败。
 
 ---
 
@@ -268,8 +343,9 @@ cron 示例（每天 03:07）：
 | 5 | 每日备份脚本（pg_dump / minio mirror） | 新增 `backup.sh` + cron 示例 | ✅ 已落地 |
 | 6 | Harbor `geesun_ai` + `dockerhub` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置（步骤见 §11） |
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
+| 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh sync_mcp + requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
 
-> 实现项 #1–#5、#7 已落地并提交；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
+> 实现项 #1–#5、#7–#8 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 
 ---
 

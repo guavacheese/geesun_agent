@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     upload_root: str = "/data/myapp/uploads"
     report_root: str = "/data/myapp/reports"
     mcp_token: str = "YOUR_TOKEN"
+    # MCP 服务地址（streamable-http）。默认 dev 同机裸跑用 localhost:8000；
+    # 生产 docker-compose 下 mcp 容器化进同一 appnet，改为服务名 geesun-mcp:8000。
+    mcp_server_url: str = "http://localhost:8000/mcp"
 
     # Arize Phoenix 追踪（从 .env 或环境变量读取）
     phoenix_collector_endpoint: str = ""

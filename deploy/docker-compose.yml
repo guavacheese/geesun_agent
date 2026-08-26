@@ -18,6 +18,10 @@ services:
     # 自有应用镜像来自 Harbor geesun_ai 项目；构建/推送见 deploy/build-push.sh
     image: ${REGISTRY_GEESUN}/geesun-agent:${GEESUN_AGENT_TAG:-1.0.0}
     restart: unless-stopped
+    # 注入 deploy/.env 全部变量（base_url / openai_api_key / model_name /
+    # agent_workspace / mcp_token / upload_root / report_root / E2B_* 等必填项
+    # 仅靠上面 environment: 块无法覆盖，缺失会导致 config.py 校验失败容器起不来）
+    env_file: [.env]
     environment:
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       LOG_FORMAT: "${LOG_FORMAT:-json}"
