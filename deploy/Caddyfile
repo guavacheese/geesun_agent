@@ -1,0 +1,19 @@
+# 反向代理 — 内网 LAN 用，plain HTTP（如需 TLS 在此加 `tls internal` 并改监听 443）。
+# 各后端均经 appnet 内网互访，仅 caddy 暴露主机端口。
+# 访问入口：agent http://10.10.10.67/ 、Phoenix http://10.10.10.67:6006 、Langfuse http://10.10.10.67:3000
+
+{
+  admin off
+}
+
+:80 {
+  reverse_proxy geesun-agent:8009
+}
+
+:6006 {
+  reverse_proxy phoenix:6006
+}
+
+:3000 {
+  reverse_proxy langfuse-web:3000
+}

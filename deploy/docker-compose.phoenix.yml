@@ -1,0 +1,65 @@
+# Phoenix（Arize）可观测栈 — 与上述主栈合并启动。
+# 注意：web/grpc 端口不映射到主机，由 caddy 经 appnet 内网代理（:6006 / :4317 内部可达）。
+
+services:
+  phoenix:
+    image: ${REGISTRY}/phoenix:19.1.0
+    restart: unless-stopped
+    depends_on:
+      - phoenix-db
+    environment:
+      - PHOENIX_SQL_DATABASE_URL=postgresql://phoenix:postgres_phoenix@phoenix-db:5432/phoenix
+      - PHOENIX_PORT=6006
+      - PHOENIX_GRPC_PORT=4317
+    networks: [appnet]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:6006/').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  phoenix-db:
+    image: ${REGISTRY}/postgres:16.14
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=phoenix
+      - POSTGRES_PASSWORD=postgres_phoenix
+      - POSTGRES_DB=phoenix
+      - TZ=UTC
+      - PGTZ=UTC
+    volumes:
+      - phoenix_pg_data:/var/lib/postgresql/data
+    networks: [appnet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phoenix"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  appnet:
+    name: appnet
+
+volumes:
+  phoenix_pg_data:
