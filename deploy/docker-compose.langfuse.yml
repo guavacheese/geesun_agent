@@ -3,13 +3,14 @@
 #   - web/worker 不映射主机端口，由 caddy 经 appnet 代理 :3000。
 #   - minio S3 API 改映射到主机 9092（避开 9090 冲突），EXTERNAL 端点指向主机 LAN IP。
 #   - postgres/redis/clickhouse 仅绑定 127.0.0.1 供排障，不对外。
-#   - 所有镜像来自 Harbor（REGISTRY=172.16.220.74:8333/geesun_ai），需先由 build-push.sh 同步进 Harbor。
+#   - 所有第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub），
+#     需先由 build-push.sh 同步进 Harbor。
 #   - 全部环境变量来自 deploy/.env（单一可信源），无默认值；.env 漏填任一变量会在 up 时直接报错。
 # 部署前请与 git clone 的官方 docker-compose.yml 逐行核对（尤其 clickhouse / migration 步骤）。
 
 services:
   langfuse-worker:
-    image: ${REGISTRY}/langfuse:${LANGFUSE_TAG:-3}
+    image: ${REGISTRY_HUB}/langfuse:${LANGFUSE_TAG:-3}
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -75,7 +76,7 @@ services:
         max-file: "3"
 
   langfuse-web:
-    image: ${REGISTRY}/langfuse:${LANGFUSE_TAG:-3}
+    image: ${REGISTRY_HUB}/langfuse:${LANGFUSE_TAG:-3}
     restart: always
     depends_on: *langfuse-depends-on
     environment:
@@ -103,7 +104,7 @@ services:
         max-file: "3"
 
   clickhouse:
-    image: ${REGISTRY}/clickhouse-server:25.12
+    image: ${REGISTRY_HUB}/clickhouse-server:25.12
     restart: always
     user: "101:101"
     environment:
@@ -135,7 +136,7 @@ services:
         max-file: "3"
 
   minio:
-    image: ${REGISTRY}/minio:chainguard
+    image: ${REGISTRY_HUB}/minio:chainguard
     restart: always
     entrypoint: sh
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
@@ -166,7 +167,7 @@ services:
         max-file: "3"
 
   redis:
-    image: ${REGISTRY}/redis:7
+    image: ${REGISTRY_HUB}/redis:7
     restart: always
     command: >
       --requirepass ${REDIS_AUTH}
@@ -193,7 +194,7 @@ services:
         max-file: "3"
 
   postgres:
-    image: ${REGISTRY}/postgres:${POSTGRES_VERSION:-17}
+    image: ${REGISTRY_HUB}/postgres:${POSTGRES_VERSION:-17}
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

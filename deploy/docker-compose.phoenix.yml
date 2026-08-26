@@ -1,9 +1,10 @@
 # Phoenix（Arize）可观测栈 — 与上述主栈合并启动。
 # 注意：web/grpc 端口不映射到主机，由 caddy 经 appnet 内网代理（:6006 / :4317 内部可达）。
+# 第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub）。
 
 services:
   phoenix:
-    image: ${REGISTRY}/phoenix:19.1.0
+    image: ${REGISTRY_HUB}/phoenix:19.1.0
     restart: unless-stopped
     depends_on:
       - phoenix-db
@@ -30,7 +31,7 @@ services:
         max-file: "3"
 
   phoenix-db:
-    image: ${REGISTRY}/postgres:16.14
+    image: ${REGISTRY_HUB}/postgres:16.14
     restart: unless-stopped
     environment:
       - POSTGRES_USER=${PHOENIX_DB_USER}

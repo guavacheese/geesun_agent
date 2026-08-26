@@ -11,21 +11,21 @@
 | 组件 | 镜像（Harbor） | 容器端口 | 对外 | 数据持久化 | 关键依赖 |
 |---|---|---|---|---|---|
 | geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun_mcp_server :8000、Phoenix/Langfuse |
-| agent-postgres | `geesun_ai/pgvector:0.8.0-pg17` | 5432 | 否 | named volume `agent_pg_data` | — |
-| caddy | `geesun_ai/caddy:2.8-alpine` | 80 / 6006 / 3000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
-| loki | `geesun_ai/loki:3.2.0` | 3100 | 否（Grafana 接） | `loki_data` | — |
-| promtail | `geesun_ai/promtail:3.2.0` | — | 否 | — | docker.sock |
-| grafana | `geesun_ai/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | `grafana_data` | loki |
-| phoenix | `geesun_ai/phoenix:19.1.0` | 6006 / 4317 | 经 Caddy | — | phoenix-db |
-| phoenix-db | `geesun_ai/postgres:16.14` | 5432 | 否 | `phoenix_pg_data` | — |
-| langfuse-web / worker | `geesun_ai/langfuse:3.224.3` | 3000 | 经 Caddy | — | langfuse 后端栈 |
+| agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 否 | named volume `agent_pg_data` | — |
+| caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
+| loki | `dockerhub/loki:3.2.0` | 3100 | 否（Grafana 接） | `loki_data` | — |
+| promtail | `dockerhub/promtail:3.2.0` | — | 否 | — | docker.sock |
+| grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | `grafana_data` | loki |
+| phoenix | `dockerhub/phoenix:19.1.0` | 6006 / 4317 | 经 Caddy | — | phoenix-db |
+| phoenix-db | `dockerhub/postgres:16.14` | 5432 | 否 | `phoenix_pg_data` | — |
+| langfuse-web / worker | `dockerhub/langfuse:3.224.3` | 3000 | 经 Caddy | — | langfuse 后端栈 |
 | langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | 否（minio S3 9092） | 多个 named volume | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
 - **CubeSandbox**：`172.16.66.13`（cube-proxy / cube-egress MITM，sandbox 执行环境）
 - **geesun_mcp_server**：`:8000`（独立进程，提供 MCP 工具）
-- **Harbor**：`172.16.220.74:8333`（HTTP，项目 `geesun_ai`）
+- **Harbor**：`172.16.220.74:8333`（HTTP，项目 `geesun_ai`（自有应用 geesun-agent）+ `dockerhub`（第三方通用镜像中央仓库 redis/minio/postgres/loki/grafana/phoenix/langfuse 等））
 
 ---
 
@@ -68,24 +68,24 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 脚本动作：
 1. `docker login 172.16.220.74:8333`
 2. 构建并 push `geesun-agent:<tag>`
-3. `sync()` 拉取并将 11 个第三方镜像推入 `geesun_ai` 项目（公网拉不到时回退用本地已有镜像）
+3. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（geesun-agent 另推入 `geesun_ai` 项目；公网拉不到时回退用本地已有镜像）
 
 ### 2.3 镜像清单（源 → Harbor 目标）
 
 | 源镜像 | Harbor 目标 |
 |---|---|
-| `pgvector/pgvector:0.8.0-pg17` | `geesun_ai/pgvector:0.8.0-pg17` |
-| `caddy:2.8-alpine` | `geesun_ai/caddy:2.8-alpine` |
-| `grafana/loki:3.2.0` | `geesun_ai/loki:3.2.0` |
-| `grafana/promtail:3.2.0` | `geesun_ai/promtail:3.2.0` |
-| `grafana/grafana:11.3.0` | `geesun_ai/grafana:11.3.0` |
-| `arizephoenix/phoenix:19.1.0` | `geesun_ai/phoenix:19.1.0` |
-| `postgres:16.14` | `geesun_ai/postgres:16.14` |
-| `langfuse/langfuse:3.224.3` | `geesun_ai/langfuse:3.224.3` |
-| `clickhouse/clickhouse-server:25.12` | `geesun_ai/clickhouse-server:25.12` |
-| `cgr.dev/chainguard/minio` | `geesun_ai/minio:chainguard` |
-| `redis:7` | `geesun_ai/redis:7` |
-| `postgres:17` | `geesun_ai/postgres:17` |
+| `pgvector/pgvector:0.8.0-pg17` | `dockerhub/pgvector:0.8.0-pg17` |
+| `caddy:2.8-alpine` | `dockerhub/caddy:2.8-alpine` |
+| `grafana/loki:3.2.0` | `dockerhub/loki:3.2.0` |
+| `grafana/promtail:3.2.0` | `dockerhub/promtail:3.2.0` |
+| `grafana/grafana:11.3.0` | `dockerhub/grafana:11.3.0` |
+| `arizephoenix/phoenix:19.1.0` | `dockerhub/phoenix:19.1.0` |
+| `postgres:16.14` | `dockerhub/postgres:16.14` |
+| `langfuse/langfuse:3.224.3` | `dockerhub/langfuse:3.224.3` |
+| `clickhouse/clickhouse-server:25.12` | `dockerhub/clickhouse-server:25.12` |
+| `cgr.dev/chainguard/minio` | `dockerhub/minio:chainguard` |
+| `redis:7` | `dockerhub/redis:7` |
+| `postgres:17` | `dockerhub/postgres:17` |
 
 ---
 
@@ -96,13 +96,13 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 
 - **geesun-agent（生产）**：不可变 `<语义版本>-<gitsha>`（如 `1.0.0-a1b2c3d`），`GEESUN_AGENT_TAG` 在 `.env` 指定；**禁用 `latest`**（不可复现）。
 - **geesun-agent（开发）**：可用浮动 `dev-<branch>` 便于本地丢，但永不进生产。
-- **环境隔离（可选）**：若需物理隔离，Harbor 开 `geesun_ai-dev` / `geesun_ai` 两个项目；当前统一在 `geesun_ai`，用 tag 后缀 + `.env` 区分即可。
+- **环境隔离（可选）**：若需物理隔离，Harbor 可为自有应用开 `geesun_ai-dev` / `geesun_ai` 两个项目；第三方通用镜像统一在 `dockerhub`（跨项目共享，不区分环境）。当前 dev/prod 用 tag 后缀 + `.env` 区分即可。
 - **第三方**：已固定具体版本（loki 3.2.0、grafana 11.3.0、phoenix 19.1.0、pgvector 0.8.0-pg17、langfuse 3.224.3 等）。
 - **Langfuse 版本说明**：已 pin 到 `3.224.3`（当前可 `docker pull` 的最新稳定版）。`.env` 的 `LANGFUSE_TAG` 控制，`build-push.sh` 已同步 `langfuse:3.224.3`。
   > 注：本地 `langfuse` 源码仓库为 **v4.0.0**（你在开发的分支），但官方自托管**可拉取镜像**稳定线仍是 `:3`，`3.224.3` 是该线最新具体版本，与源码 `4.0.0` 并非同一号。若未来要从源码构建 `4.0.0` 镜像，需单独 `docker build` 并改 `LANGFUSE_TAG`，届时同步 `build-push.sh`。
 
 ### 3.2 Harbor 保留策略
-在 Harbor 项目 `geesun_ai` 配置 **Tag Retention**：
+在 Harbor 项目 `geesun_ai` 与 `dockerhub` 分别配置 **Tag Retention**：
 - `geesun-agent`：保留最近 10 个版本 + 带 `latest`/`release-*` 标签的永久保留。
 - 第三方：保留最近 3 个版本，避免无限增长。
 
@@ -213,13 +213,13 @@ cron 示例（每天 03:07）：
 **阶段 A — 构建机（能出网）**
 1. 安装 Docker + compose plugin。
 2. 配置 Harbor 不安全仓库（见 2.1）。
-3. `HARBOR_USER/PASSWORD bash deploy/build-push.sh <tag>` 把全量镜像推入 `geesun_ai`。
+3. `HARBOR_USER/PASSWORD bash deploy/build-push.sh <tag>` 把镜像推入 Harbor（geesun-agent→`geesun_ai`，第三方→`dockerhub`）。
 
 **阶段 B — 生产机（仅内网，从 Harbor 拉）**
 1. 安装 Docker + compose plugin，配置 Harbor 不安全仓库（2.1）。
 2. `bash deploy/init-host.sh`（自动建 `/opt/geesun/data/{agent,uploads,reports}` 与备份目录，并把属主改成容器 UID 1001，避免 Docker 自动以 root 建目录导致容器无写权限；见 §9 #4 ✅）。
 3. 拷贝 `deploy/` 目录到生产机（或 git 拉取）。
-4. `cd deploy && cp .env.example .env && vi .env`：填全部 `CHANGEME` 密钥（`openssl rand` 生成）、确认 `REGISTRY` / `GEESUN_AGENT_TAG` / 外部 IP（vLLM、CubeSandbox、Harbor、LAN IP）。
+4. `cd deploy && cp .env.example .env && vi .env`：填全部 `CHANGEME` 密钥（`openssl rand` 生成）、确认 `REGISTRY_GEESUN` / `REGISTRY_HUB` / `GEESUN_AGENT_TAG` / 外部 IP（vLLM、CubeSandbox、Harbor、LAN IP）。
 5. （可选）挂载 CubeSandbox `rootCA.pem` 到 agent 并设 `REQUESTS_CA_BUNDLE`（4.3）。
 6. 合并拉取镜像：
    ```sh
@@ -266,7 +266,7 @@ cron 示例（每天 03:07）：
 | 3 | uvicorn.access 注入 JSON formatter（`--log-config`） | `logging.uvicorn.json` + Dockerfile CMD | ✅ 已落地 |
 | 4 | 生产机 `/opt/geesun/data` 目录预创建脚本 | 独立 `init-host.sh`（含属主修正） | ✅ 已落地 |
 | 5 | 每日备份脚本（pg_dump / minio mirror） | 新增 `backup.sh` + cron 示例 | ✅ 已落地 |
-| 6 | Harbor `geesun_ai` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置（步骤见 §11） |
+| 6 | Harbor `geesun_ai` + `dockerhub` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置（步骤见 §11） |
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 
 > 实现项 #1–#5、#7 已落地并提交；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
@@ -309,17 +309,17 @@ PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
 
 ## 11. Harbor Tag Retention 手动配置（控制台，步骤 #6）
 
-Harbor 是 HTTP（`172.16.220.74:8333`），用浏览器访问并登录后，给 `geesun_ai` 项目设保留策略（脚本无法替你点，故手动）：
+Harbor 是 HTTP（`172.16.220.74:8333`），用浏览器访问并登录后，给 `geesun_ai`（自有应用）与 `dockerhub`（第三方通用镜像）两个项目**分别**设保留策略（脚本无法替你点，故手动）：
 
-1. 打开 `http://172.16.220.74:8333` → 登录（Harbor 管理员或 `geesun_ai` 项目 Maintainter 账号）。
-2. 左侧 **Projects** → 点 `geesun_ai` → 顶部 **Configuration** 标签 → **Tag Retention** 子页（旧版在 **Policies → Tag Retention**）。
+1. 打开 `http://172.16.220.74:8333` → 登录（Harbor 管理员或项目 Maintainter 账号）。
+2. 左侧 **Projects** → 分别点 `geesun_ai` 与 `dockerhub` → 顶部 **Configuration** 标签 → **Tag Retention** 子页（旧版在 **Policies → Tag Retention**）。两个项目各建一套规则。
 3. 点 **Add Rule**（或 **NEW RULE**），按两条分别建：
    - **规则 A（自研镜像）**：
      - Matched repositories：`geesun_ai/geesun-agent`
      - Retain：keep most recently pushed **10** tags
      - 额外：勾选 "with labels" 并填 `latest,release-*`（这些标签永久保留，不被清理）
    - **规则 B（第三方镜像）**：
-     - Matched repositories：`geesun_ai/pgvector`, `geesun_ai/caddy`, `geesun_ai/loki`, `geesun_ai/promtail`, `geesun_ai/grafana`, `geesun_ai/phoenix`, `geesun_ai/postgres`, `geesun_ai/langfuse`, `geesun_ai/clickhouse-server`, `geesun_ai/minio`, `geesun_ai/redis`
+     - Matched repositories：`dockerhub/pgvector`, `dockerhub/caddy`, `dockerhub/loki`, `dockerhub/promtail`, `dockerhub/grafana`, `dockerhub/phoenix`, `dockerhub/postgres`, `dockerhub/langfuse`, `dockerhub/clickhouse-server`, `dockerhub/minio`, `dockerhub/redis`
      - Retain：keep most recently pushed **3** tags
 4. **Save** → 可点 **Simulate Run** 预览哪些 tag 会被删，确认无误后 **Run Now** 立即执行一次，之后按调度周期自动跑（默认每日）。
 5. 验证：过一天后回看，确认旧 tag 已被清理、磁盘不再无限增长。

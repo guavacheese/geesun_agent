@@ -1,11 +1,13 @@
 # 生产部署 — 主栈（geesun_agent + 依赖 + 反向代理 + 日志集中）
 #
 # 合并启动（在 deploy/ 目录）：
-#   cp .env.example .env && vi .env        # 填全部密钥（含 REGISTRY / Harbor 凭证）
+#   cp .env.example .env && vi .env        # 填全部密钥（含 REGISTRY_GEESUN / REGISTRY_HUB / Harbor 凭证）
 #   docker compose -f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
 #
 # 说明：
-#   - 所有镜像均来自 Harbor（REGISTRY=172.16.220.74:8333/geesun_ai），由 deploy/build-push.sh 构建/同步。
+#   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
+#     第三方通用镜像（pgvector/caddy/loki/promtail/grafana）在 dockerhub 项目（REGISTRY_HUB），
+#     由 deploy/build-push.sh 构建 / 同步。
 #   - 三个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
 #   - 对外只暴露 caddy 的 80 / 6006 / 3000；数据库 / redis / clickhouse / minio(除 S3 9092) 不暴露到主机。
 #   - 日志：各服务 json-file 驱动做大小轮转（max-size/max-file），Promtail 采集入 Loki，Grafana 检索。
@@ -13,8 +15,8 @@
 
 services:
   geesun-agent:
-    # 镜像来自 Harbor；构建/推送见 deploy/build-push.sh
-    image: ${REGISTRY}/geesun-agent:${GEESUN_AGENT_TAG:-1.0.0}
+    # 自有应用镜像来自 Harbor geesun_ai 项目；构建/推送见 deploy/build-push.sh
+    image: ${REGISTRY_GEESUN}/geesun-agent:${GEESUN_AGENT_TAG:-1.0.0}
     restart: unless-stopped
     environment:
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
@@ -59,7 +61,7 @@ services:
         max-file: "5"
 
   agent-postgres:
-    image: ${REGISTRY}/pgvector:0.8.0-pg17
+    image: ${REGISTRY_HUB}/pgvector:0.8.0-pg17
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${AGENT_PG_USER:-geesun}
@@ -87,7 +89,7 @@ services:
         max-file: "3"
 
   caddy:
-    image: ${REGISTRY}/caddy:2.8-alpine
+    image: ${REGISTRY_HUB}/caddy:2.8-alpine
     restart: unless-stopped
     ports:
       - "80:80"
@@ -111,7 +113,7 @@ services:
         max-file: "3"
 
   loki:
-    image: ${REGISTRY}/loki:3.2.0
+    image: ${REGISTRY_HUB}/loki:3.2.0
     restart: unless-stopped
     command: -config.file=/etc/loki/loki-config.yaml
     volumes:
@@ -130,7 +132,7 @@ services:
         max-file: "3"
 
   promtail:
-    image: ${REGISTRY}/promtail:3.2.0
+    image: ${REGISTRY_HUB}/promtail:3.2.0
     restart: unless-stopped
     command: -config.file=/etc/promtail/promtail.yaml
     volumes:
@@ -151,7 +153,7 @@ services:
         max-file: "3"
 
   grafana:
-    image: ${REGISTRY}/grafana:11.3.0
+    image: ${REGISTRY_HUB}/grafana:11.3.0
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}

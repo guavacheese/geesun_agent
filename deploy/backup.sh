@@ -19,7 +19,8 @@ cd "$SCRIPT_DIR"
 
 BACKUP_ROOT="${BACKUP_ROOT:-/opt/geesun/backups}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
-REGISTRY="${REGISTRY:-172.16.220.74:8333/geesun_ai}"
+# 第三方镜像（minio）来自 Harbor dockerhub 项目
+REGISTRY_HUB="${REGISTRY_HUB:-172.16.220.74:8333/dockerhub}"
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml)
 COMPOSE=(docker compose "${COMPOSE_FILES[@]}")
 
@@ -55,7 +56,7 @@ echo "  -> minio mirror (bucket: $BUCKET)"
 mkdir -p "$DEST/minio"
 if docker run --rm --network appnet \
     -v "$DEST/minio":/backup \
-    "$REGISTRY/minio:chainguard" \
+    "$REGISTRY_HUB/minio:chainguard" \
     sh -c "mc alias set m http://minio:9000 '${MINIO_ROOT_USER:-minio}' '${MINIO_ROOT_PASSWORD}' && mc mb -p m/$BUCKET >/dev/null 2>&1; mc mirror m/$BUCKET /backup" 2>/dev/null; then
   echo "  minio 备份完成 -> $DEST/minio"
 else
