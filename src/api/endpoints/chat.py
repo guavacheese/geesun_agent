@@ -202,6 +202,35 @@ def _merge_disk_diff_into_generated(
     return result
 
 
+# ─── M3 完成门任务类型感知（2026-08-26 方案 A）───
+# 完成门为"必须有文件交付物"的任务设计（报告/对比/导出等），对内容型任务
+# （写散文/问答/解释，交付物=对话回复本身）零产出是正常结果，不应拦截。
+# 判断基于用户原始请求 body.message（不能用拼了 path_hint 的 user_message——
+# 里面含"报告输出:/reports/..."会误导命中报告关键词）。
+_DELIVERABLE_STRONG = (
+    "报告", "报表", "导出", "保存为", "保存到", "写入文件", "生成文件",
+    "输出文件", "创建文档", "生成文档", "制作文档", "整理成文档",
+    "工作簿", "交付物", "产物", "附件",
+    "xlsx", "excel", "word", "pdf", "csv", "pptx", "zip", "docx",
+)
+_DELIVERABLE_VERBS = ("对比", "差异", "diff", "分析", "总结", "汇总", "整理", "生成", "制作", "创建", "输出")
+# 组合式名词仅保留明确「产出物」语义的词；纪要/清单/大纲等常是输入材料或口头回复，
+# 命中会把口头总结误判为交付任务（2026-08-26 实测"总结一下会议纪要"误伤）
+_DELIVERABLE_NOUNS = ("报告", "报表", "表格", "文档", "文件", "工作簿")
+
+
+def _is_deliverable_task(text: str) -> bool:
+    """判断用户请求是否要求文件交付物（决定是否启用 M3 零产出拦截）。
+
+    启发式：强信号词（出现即判定）或「产出类动词 × 文件类名词」组合。
+    组合式避免"分析一下这个方案"这类口头任务误判——它命中动词但无数词。
+    """
+    t = (text or "").lower()
+    if any(k in t for k in _DELIVERABLE_STRONG):
+        return True
+    return any(v in t for v in _DELIVERABLE_VERBS) and any(n in t for n in _DELIVERABLE_NOUNS)
+
+
 class ChatRequest(BaseModel):
     session_id: str = "default-session"
     message: str = ""
@@ -599,6 +628,9 @@ async def chat(
         # 故在循环前初始化，避免 GeneratorExit 早抛时 NameError（2026-08-21）
         _new_files: frozenset[str] = frozenset()
         _completion_blocked = False
+        # M3 任务类型感知（方案 A）：仅"要求文件交付物"的任务启用零产出拦截，
+        # 内容型任务（散文/问答）交付物即回复本身，零产出直接放行。
+        _is_deliverable = _is_deliverable_task(body.message)
         # graph_input 是 chat() 外层变量；event_stream 内若要重新赋值（完成门自动
         # 继续轮注入 SystemMessage），必须用独立局部变量 _graph_input，否则
         # Python 会把 graph_input 判定为 event_stream 局部变量，首轮读取即
@@ -1224,8 +1256,10 @@ async def chat(
                     )]}
                     _before_files = _after_files  # 重新基线
                     continue
-                if not settings.sandbox_completion_gate_enabled:
-                    break  # 完成门关闭（回滚开关）
+                if not settings.sandbox_completion_gate_enabled or not _is_deliverable:
+                    # 完成门关闭（回滚开关），或本轮为非文件交付任务（内容型任务如
+                    # 散文/问答，交付物即对话回复本身）→ 零产出是正常结果，直接放行。
+                    break
                 if (
                     _completion_retries >= settings.sandbox_completion_gate_max_retries
                     or not settings.sandbox_completion_gate_auto_continue
