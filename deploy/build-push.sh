@@ -81,8 +81,8 @@ sync "grafana/grafana:11.3.0"                  "grafana:11.3.0"
 # Phoenix
 sync "arizephoenix/phoenix:19.1.0"            "phoenix:19.1.0"
 sync "postgres:16.14"                          "postgres:16.14"
-# Langfuse
-sync "langfuse/langfuse:3"                     "langfuse:3"
+# Langfuse（pin 3.224.3，与 .env 的 LANGFUSE_TAG 一致；4.0.0 非可拉取镜像 tag）
+sync "langfuse/langfuse:3.224.3"              "langfuse:3.224.3"
 sync "clickhouse/clickhouse-server:25.12"      "clickhouse-server:25.12"
 sync "cgr.dev/chainguard/minio"                "minio:chainguard"
 sync "redis:7"                                 "redis:7"

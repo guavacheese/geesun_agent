@@ -18,7 +18,7 @@
 | grafana | `geesun_ai/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | `grafana_data` | loki |
 | phoenix | `geesun_ai/phoenix:19.1.0` | 6006 / 4317 | 经 Caddy | — | phoenix-db |
 | phoenix-db | `geesun_ai/postgres:16.14` | 5432 | 否 | `phoenix_pg_data` | — |
-| langfuse-web / worker | `geesun_ai/langfuse:3` | 3000 | 经 Caddy | — | langfuse 后端栈 |
+| langfuse-web / worker | `geesun_ai/langfuse:3.224.3` | 3000 | 经 Caddy | — | langfuse 后端栈 |
 | langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | 否（minio S3 9092） | 多个 named volume | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
@@ -81,7 +81,7 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 | `grafana/grafana:11.3.0` | `geesun_ai/grafana:11.3.0` |
 | `arizephoenix/phoenix:19.1.0` | `geesun_ai/phoenix:19.1.0` |
 | `postgres:16.14` | `geesun_ai/postgres:16.14` |
-| `langfuse/langfuse:3` | `geesun_ai/langfuse:3` |
+| `langfuse/langfuse:3.224.3` | `geesun_ai/langfuse:3.224.3` |
 | `clickhouse/clickhouse-server:25.12` | `geesun_ai/clickhouse-server:25.12` |
 | `cgr.dev/chainguard/minio` | `geesun_ai/minio:chainguard` |
 | `redis:7` | `geesun_ai/redis:7` |
@@ -97,8 +97,9 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 - **geesun-agent（生产）**：不可变 `<语义版本>-<gitsha>`（如 `1.0.0-a1b2c3d`），`GEESUN_AGENT_TAG` 在 `.env` 指定；**禁用 `latest`**（不可复现）。
 - **geesun-agent（开发）**：可用浮动 `dev-<branch>` 便于本地丢，但永不进生产。
 - **环境隔离（可选）**：若需物理隔离，Harbor 开 `geesun_ai-dev` / `geesun_ai` 两个项目；当前统一在 `geesun_ai`，用 tag 后缀 + `.env` 区分即可。
-- **第三方**：已固定具体版本（loki 3.2.0、grafana 11.3.0、phoenix 19.1.0、pgvector 0.8.0-pg17 等）。
-- **例外 / 风险**：Langfuse 当前用浮动 tag `:3`，会随上游补丁漂移。生产建议 pin 到具体补丁版本（如 `3.x.y`），在 `docker-compose.langfuse.yml` 与 `build-push.sh` 同步改（待办 #2）。
+- **第三方**：已固定具体版本（loki 3.2.0、grafana 11.3.0、phoenix 19.1.0、pgvector 0.8.0-pg17、langfuse 3.224.3 等）。
+- **Langfuse 版本说明**：已 pin 到 `3.224.3`（当前可 `docker pull` 的最新稳定版）。`.env` 的 `LANGFUSE_TAG` 控制，`build-push.sh` 已同步 `langfuse:3.224.3`。
+  > 注：本地 `langfuse` 源码仓库为 **v4.0.0**（你在开发的分支），但官方自托管**可拉取镜像**稳定线仍是 `:3`，`3.224.3` 是该线最新具体版本，与源码 `4.0.0` 并非同一号。若未来要从源码构建 `4.0.0` 镜像，需单独 `docker build` 并改 `LANGFUSE_TAG`，届时同步 `build-push.sh`。
 
 ### 3.2 Harbor 保留策略
 在 Harbor 项目 `geesun_ai` 配置 **Tag Retention**：
@@ -164,11 +165,17 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 目标机需预先 `mkdir -p /opt/geesun/data/{agent,uploads,reports}`（建议并入 `init-host.sh`，见 §9 #4）。
 
 ### 5.3 备份策略（真·防丢）
-- **Postgres（agent_mem / phoenix / langfuse）**：每日 `pg_dump` 到 `/opt/geesun/backup/postgres/`，保留 7–30 天。
-- **Clickhouse（Langfuse）**：用 `clickhouse-backup` 或 `BACKUP TABLE ... TO ...`；或接受「重建后重新摄入」（trace 数据可重建）。
-- **Minio（Langfuse 对象）**：`mc mirror` 到独立存储；或定期 `mc cp`。
+已由 `deploy/backup.sh` 落地（待办 #5 ✅），每日 cron 执行：
+- **Postgres（agent_mem / phoenix / langfuse）**：`pg_dump` 三个库 → `/opt/geesun/backups/<时间戳>/*.sql.gz`，默认保留 7 天（`RETENTION_DAYS` 可调）。
+- **Minio（Langfuse 对象）**：用 `minio:chainguard` 镜像内 `mc` 把 `langfuse` 桶 `mirror` 到备份目录。
+- **Clickhouse（Langfuse）**：未自动备份（trace 数据可重建，接受「重建后重新摄入」）；如需可后续加 `clickhouse-backup`。
 - **Loki**：日志可重建，优先保 retention，不必备份。
 - **agent 报告/上传**：随 5.2 的 host 绑定目录，纳入宿主机的文件级备份（rsync / 存储快照）。
+
+cron 示例（每天 03:07）：
+```sh
+7 3 * * *  cd /opt/geesun/geesun_agent/deploy && BACKUP_ROOT=/opt/geesun/backups bash backup.sh >> /opt/geesun/backups/cron.log 2>&1
+```
 
 ### 5.4 危险操作红线
 - **禁止** `docker compose down -v`（`-v` 删 named volume，数据全毁）。
@@ -210,7 +217,7 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 
 **阶段 B — 生产机（仅内网，从 Harbor 拉）**
 1. 安装 Docker + compose plugin，配置 Harbor 不安全仓库（2.1）。
-2. `mkdir -p /opt/geesun/data/{agent,uploads,reports}`（5.2 落地后）。
+2. `bash deploy/init-host.sh`（自动建 `/opt/geesun/data/{agent,uploads,reports}` 与备份目录，并把属主改成容器 UID 1001，避免 Docker 自动以 root 建目录导致容器无写权限；见 §9 #4 ✅）。
 3. 拷贝 `deploy/` 目录到生产机（或 git 拉取）。
 4. `cd deploy && cp .env.example .env && vi .env`：填全部 `CHANGEME` 密钥（`openssl rand` 生成）、确认 `REGISTRY` / `GEESUN_AGENT_TAG` / 外部 IP（vLLM、CubeSandbox、Harbor、LAN IP）。
 5. （可选）挂载 CubeSandbox `rootCA.pem` 到 agent 并设 `REQUESTS_CA_BUNDLE`（4.3）。
@@ -255,11 +262,66 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 | # | 事项 | 文件 | 状态 |
 |---|---|---|---|
 | 1 | geesun-agent 挂载 `/data/{agent,uploads,reports}` 到宿主机 | `docker-compose.yml`（`${AGENT_DATA_ROOT}` 驱动） | ✅ 已落地 |
-| 2 | Langfuse 镜像 pin 到具体补丁版本 | `docker-compose.langfuse.yml` + `build-push.sh` | ⬜ 待落地 |
+| 2 | Langfuse 镜像 pin 到具体补丁版本（3.224.3） | `docker-compose.langfuse.yml`（`${LANGFUSE_TAG}`）+ `build-push.sh` + `.env.example` | ✅ 已落地 |
 | 3 | uvicorn.access 注入 JSON formatter（`--log-config`） | `logging.uvicorn.json` + Dockerfile CMD | ✅ 已落地 |
-| 4 | 生产机 `/opt/geesun/data` 目录预创建脚本 | 并入 `build-push.sh` 或独立 `init-host.sh` | ⬜ 待落地 |
-| 5 | 每日备份脚本（pg_dump / minio mirror） | 新增 `backup.sh` + cron | ⬜ 待落地 |
-| 6 | Harbor `geesun_ai` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置 |
+| 4 | 生产机 `/opt/geesun/data` 目录预创建脚本 | 独立 `init-host.sh`（含属主修正） | ✅ 已落地 |
+| 5 | 每日备份脚本（pg_dump / minio mirror） | 新增 `backup.sh` + cron 示例 | ✅ 已落地 |
+| 6 | Harbor `geesun_ai` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置（步骤见 §11） |
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 
-> 以上均按「诊断→提议→确认后落地」执行；确认后我再逐个改文件并按四段式 message 提交。
+> 实现项 #1–#5、#7 已落地并提交；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
+
+---
+
+## 10. 环境策略：dev / prod 区分（路线 A，已确认）
+
+**决策：路线 A** —— 单宿主机 `10.10.10.67`，只跑**一套** Phoenix + 一套 Langfuse，dev/prod 用「项目名 / 项目 key」区分；prod 的 geesun_agent 也部署在同一台。理由：Phoenix/Langfuse 是「可观测性」不是「业务数据」，共享后端可接受；业务数据（agent_mem）与 agent 应用本身已是独立容器/卷，隔离到位。
+
+### 10.1 Phoenix：靠 `openinference.project.name` 分项目
+- 已做成可配项（`config.py` 的 `otel_project_name`，`.env` 的 `OTEL_PROJECT_NAME`）。
+- dev agent → `OTEL_PROJECT_NAME=Geesun-Agent-dev`；prod agent → `OTEL_PROJECT_NAME=Geesun-Agent-prod`。
+- 同一个 Phoenix 实例，UI 里是两个独立 Project，可分别筛选。
+- 注：后端 PG 仍共享（dev/prod span 同库，仅 project 标签不同）。
+
+### 10.2 Langfuse：靠 Organization → Project + 独立 key 分项目
+- 同一个 Langfuse 实例内建两个 Project：`dev` 与 `prod`，各自有独立 `public_key` / `secret_key`。
+- dev agent `.env` 填 dev project 的 key；prod agent `.env` 填 prod project 的 key；二者的 `LANGFUSE_BASE_URL` 指向同一实例。
+- 注：后端 PG/Clickhouse/Minio 共享，逻辑隔离靠 key。
+
+### 10.3 端口冲突（路线 A 的前置动作，必须处理）
+- **现状**：dev 直接在 10.10.10.67 上占用 `:6006`（Phoenix）与 `:3000`（Langfuse）。
+- **prod compose 里 caddy 也要绑 `80 / 6006 / 3000`**（见 §4.2）。若 dev 仍在跑，`up` 会因端口占用失败。
+- **处理（二选一，推荐 a）**：
+  - **a. 下线 dev 的 Phoenix/Langfuse 占用**：停止 dev 的 `docker run` 进程，释放 6006/3000，让 prod 的 caddy 接管。dev 仍可经同一 Phoenix/Langfuse 实例的 dev/prod 项目继续用。
+  - **b. dev 挪端口 / 挪机器**：保留 dev 实例但改绑其他端口（如 dev Phoenix 16006、dev Langfuse 13000），prod 维持 6006/3000。
+
+### 10.4 agent 环境变量按环境切换
+prod 的 `geesun_agent/deploy/.env` 至少区分：
+```sh
+OTEL_PROJECT_NAME=Geesun-Agent-prod
+LANGFUSE_BASE_URL=http://10.10.10.67:3000
+LANGFUSE_PUBLIC_KEY=pk-lf-prod-xxxx
+LANGFUSE_SECRET_KEY=sk-lf-prod-xxxx
+PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
+```
+
+---
+
+## 11. Harbor Tag Retention 手动配置（控制台，步骤 #6）
+
+Harbor 是 HTTP（`172.16.220.74:8333`），用浏览器访问并登录后，给 `geesun_ai` 项目设保留策略（脚本无法替你点，故手动）：
+
+1. 打开 `http://172.16.220.74:8333` → 登录（Harbor 管理员或 `geesun_ai` 项目 Maintainter 账号）。
+2. 左侧 **Projects** → 点 `geesun_ai` → 顶部 **Configuration** 标签 → **Tag Retention** 子页（旧版在 **Policies → Tag Retention**）。
+3. 点 **Add Rule**（或 **NEW RULE**），按两条分别建：
+   - **规则 A（自研镜像）**：
+     - Matched repositories：`geesun_ai/geesun-agent`
+     - Retain：keep most recently pushed **10** tags
+     - 额外：勾选 "with labels" 并填 `latest,release-*`（这些标签永久保留，不被清理）
+   - **规则 B（第三方镜像）**：
+     - Matched repositories：`geesun_ai/pgvector`, `geesun_ai/caddy`, `geesun_ai/loki`, `geesun_ai/promtail`, `geesun_ai/grafana`, `geesun_ai/phoenix`, `geesun_ai/postgres`, `geesun_ai/langfuse`, `geesun_ai/clickhouse-server`, `geesun_ai/minio`, `geesun_ai/redis`
+     - Retain：keep most recently pushed **3** tags
+4. **Save** → 可点 **Simulate Run** 预览哪些 tag 会被删，确认无误后 **Run Now** 立即执行一次，之后按调度周期自动跑（默认每日）。
+5. 验证：过一天后回看，确认旧 tag 已被清理、磁盘不再无限增长。
+
+> 若 Harbor 版本 UI 不同（如 2.8+ 把 Retention 放在 **Policies** 下），以控制台实际布局为准；核心是「按 repository 设保留份数 + 保护 release/latest 标签」。
