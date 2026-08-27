@@ -106,7 +106,8 @@ sync_mcp() {
 # 自有应用：geesun-agent-web（Next.js 前端，→ geesun_ai 项目）
 # 构建上下文为 geesun_agent_web 仓库根（与 geesun_agent 同级目录）。
 # NEXT_PUBLIC_API_BASE 是 build-time 变量（浏览器直接读构建产物），
-# 默认 http://10.10.10.67/（经 Caddy 同域，/api/* 由 Caddy 转发后端）；换环境重构建。
+# 默认 http://10.10.10.67:18080/（共享机方案 A：Caddy 同域高端口，/api/* 由 Caddy 转发后端）；
+# 换环境重构建。
 sync_web() {
   local web_repo="$REPO_ROOT/../geesun_agent_web"
   if [[ ! -d "$web_repo" ]]; then
@@ -114,7 +115,7 @@ sync_web() {
     return 0
   fi
   local WEB_TAG="${WEB_TAG:-1.0.0}"
-  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67/}"
+  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67:18080/}"
   local WEB_IMAGE="$REGISTRY_GEESUN/geesun-agent-web:$WEB_TAG"
   echo "==> 构建 $WEB_IMAGE (context=$web_repo, NEXT_PUBLIC_API_BASE=$API_BASE)"
   docker build \

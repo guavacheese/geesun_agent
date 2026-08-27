@@ -9,7 +9,7 @@
 #     第三方通用镜像（pgvector/caddy/loki/promtail/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
 #   - 多个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
-#   - 对外只暴露 caddy 的 80 / 6006 / 3000；数据库 / redis / clickhouse / minio(除 S3 9092) 不暴露到主机。
+#   - 对外只暴露 caddy 的 18080 / 16006 / 13000（共享机方案 A 高端口映射）；数据库 / redis / clickhouse / minio(除 S3 19092) 不暴露到主机。
 #   - 日志：各服务 json-file 驱动做大小轮转（max-size/max-file），Promtail 采集入 Loki，Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
 
@@ -96,9 +96,11 @@ services:
     image: ${REGISTRY_HUB}/caddy:2.8-alpine
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "6006:6006"
-      - "3000:3000"
+      # 共享生产机方案 A：主机 80/3000 已被现有系统占用，Caddy 改映射高端口；
+      # 容器内仍监听 80/6006/3000（Caddyfile 不变），仅 host 侧映射调整。
+      - "18080:80"    # 前端主入口
+      - "16006:6006"  # Phoenix
+      - "13000:3000"  # Langfuse
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

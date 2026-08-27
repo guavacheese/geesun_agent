@@ -12,16 +12,16 @@
 |---|---|---|---|---|---|---|
 | geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 不发布（仅 appnet） | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun-mcp :8000、Phoenix/Langfuse |
 | geesun-mcp | `geesun_ai/geesun-mcp-server:<tag>` | 8000 | 不发布（仅 appnet） | 否 | 共享 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`（与 agent 同挂） | agent（经服务名）、DLP 解密 API、CubeSandbox(E2B) |
-| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet） | 经 Caddy :80 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
+| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet） | 经 Caddy :18080 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
 | agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 不发布 | 否 | named volume `agent_pg_data` | — |
-| caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 80 / 6006 / 3000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
+| caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 18080 / 16006 / 13000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
 | promtail | `dockerhub/promtail:3.2.0` | — | 不发布 | 否 | — | docker.sock |
 | grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki |
-| phoenix | `dockerhub/phoenix:19.1.0` | 6006 / 4317 | 不发布（经 Caddy 6006） | 经 Caddy | — | phoenix-db |
+| phoenix | `dockerhub/phoenix:19.1.0` | 6006 / 4317 | 不发布（经 Caddy 16006） | 经 Caddy | — | phoenix-db |
 | phoenix-db | `dockerhub/postgres:16.14` | 5432 | 不发布 | 否 | `phoenix_pg_data` | — |
-| langfuse-web / worker | `dockerhub/langfuse:3.224.3` | 3000 | 不发布（经 Caddy 3000） | 经 Caddy | — | langfuse 后端栈 |
-| langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | minio S3 9092 | 否（minio S3 9092） | 多个 named volume | — |
+| langfuse-web / worker | `dockerhub/langfuse:3.224.3` | 3000 | 不发布（经 Caddy 13000） | 经 Caddy | — | langfuse 后端栈 |
+| langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | minio S3 19092 | 否（minio S3 19092） | 多个 named volume | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
@@ -71,7 +71,7 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 1. `docker login 172.16.220.74:8333`
 2. 构建并 push `geesun-agent:<tag>`（→ `geesun_ai` 项目）
 3. `sync_mcp()` 构建并 push `geesun-mcp-server:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_mcp_server` 仓库根）
-4. `sync_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67/`）
+4. `sync_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67:18080/`）
 5. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（公网拉不到时回退用本地已有镜像）
 
 ### 2.3 镜像清单（源 → Harbor 目标）
@@ -125,9 +125,9 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 - 三个 compose 用 `-f` 合并时，各自的 `networks: [appnet]` 会加入同一网络（名称固定为 `appnet`）。
 
 ### 4.2 对外暴露（最小化）
-- 只暴露 **Caddy**：`80`（主入口）/ `6006`（Phoenix）/ `3000`（Langfuse）。
-- 数据库 / Redis / Clickhouse / Minio(除 S3 9092) **不映射主机端口**，仅经 `appnet` 内部访问；如需排障临时暴露，绑 `127.0.0.1`（已配置）。
-- Minio S3 API 映射主机 `9092`（避开 Phoenix 的 9090 冲突）；其 `EXTERNAL_ENDPOINT` 必须指向**主机 LAN IP**（`http://10.10.10.67:9092`），容器视角不能用 `localhost`。
+- 只暴露 **Caddy**：`18080`（前端主入口）/ `16006`（Phoenix）/ `13000`（Langfuse）——共享生产机方案 A：主机 80/3000 被现有系统（app-frontend/app-backend）占用，故映射到高端口；容器内 Caddy 仍监听 80/6006/3000，仅 host 侧映射不同。
+- 数据库 / Redis / Clickhouse / Minio(除 S3 19092) **不映射主机端口**，仅经 `appnet` 内部访问；如需排障临时暴露，绑 `127.0.0.1`（已配置）。
+- Minio S3 API 映射主机 `19092`（共享机 9092 被 tb-kafka 占用）；其 `EXTERNAL_ENDPOINT` 必须指向**主机 LAN IP**（`http://10.10.10.67:19092`），容器视角不能用 `localhost`。
 
 ### 4.3 访问外部物理机（vLLM / CubeSandbox / MCP）
 - 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP `172.16.66.13`，因此 agent 内配置 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
@@ -145,23 +145,23 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 ### 4.5 端口冲突速查（含部署前预检）
 容器**内部端口**（appnet 服务名互访）与**主机发布端口**（`ports:` 映射）是两回事：仅在 `ports:` 里声明的才占主机端口；容器间互访走服务名，不占主机端口。
 
-**部署前在 10.10.10.67 上预检主机端口占用**（重点排查现有 dev 服务）：
+**部署前在 10.10.10.67 上预检我方端口是否空闲**（该机为共享生产机，80/3000/9092/5432/6379 等已被现有系统占用，勿动）：
 ```sh
-ss -tlnp | grep -E ':(80|3000|6006|5432|8009|8000|9092|3100)\b'
+ss -tlnp | grep -E ':(18080|16006|13000|19092|8009|8000|3100)\b'
 ```
-- 预期：上述端口**全部空闲**（prod 由 caddy 统一接管 80/3000/6006）。
-- 若 3000 / 6006 被 dev 的 Phoenix/Langfuse 占用 → 按 §10.3 处理（下线 dev 或挪端口）。
-- 若 8009（agent）/ 8000（dev mcp）/ 9092（minio S3）被占用 → 先停对应 dev 进程。
+- 预期：`18080 / 16006 / 13000 / 19092 / 8009 / 8000 / 3100` **全部空闲**（这是我方要用的主机端口）。
+- 若被占用 → 换端口：改 `docker-compose.yml` 的 caddy `ports:` 映射 + `docker-compose.langfuse.yml` 的 minio 端口 + `.env` 的 `NEXTAUTH_URL`/`CORS_ALLOW_ORIGINS`/S3 `EXTERNAL_ENDPOINT` + 前端镜像 `NEXT_PUBLIC_API_BASE`（构建期）后重新部署。
 
 | 端口 | 用途 | 主机发布? | 处理 |
 |---|---|---|---|
-| 80 / 6006 / 3000 | Caddy 入口（agent / Phoenix / Langfuse） | 是 | 唯一占用主机端口的服务；dev 同名端口须先释放 |
+| 18080 / 16006 / 13000 | Caddy 入口（前端 / Phoenix / Langfuse） | 是 | 唯一占用我方主机端口的服务；80/3000 被现网占用故用高端口 |
+| 19092 | Minio S3 | 是（对外） | 共享机 9092 被 tb-kafka 占用，改 19092 |
 | 8009 | geesun-agent | 否（仅 appnet） | 不冲突 |
-| 8000 | geesun-mcp | 否（仅 appnet） | 不发布，与 dev 裸跑的 :8000 不冲突 |
-| 9090 | Phoenix prometheus | 否（不映射） | Langfuse Minio S3 改 9092 避开 |
-| 5432 | postgres ×3（agent/phoenix/langfuse） | 否（仅内部） | 各自独立容器；不冲突 |
+| 8000 | geesun-mcp | 否（仅 appnet） | 不发布，不冲突 |
+| 5432 | postgres ×3（agent/phoenix/langfuse） | 否（仅内部） | 各自独立容器；主机 5432 被 tb-postgres 占用也不影响 |
+| 6379 | langfuse redis | 否（仅内部） | 主机 6379 被 tb-redis 占用也不影响 |
 | 3100 | Grafana | 127.0.0.1:3100 | 仅本机排障 |
-| 9092 | Minio S3 | 是（对外） | Langfuse 媒体桶外部访问 |
+| 9092 / 5432 / 6379 / 80 / 3000 | 现网系统（tb-kafka / tb-postgres / tb-redis / app-frontend / app-backend） | 是（他人） | **非我方，勿占用、勿下线** |
 
 ---
 
@@ -202,7 +202,7 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
 ### 4.7 前端（geesun_agent_web）容器化部署
 前端 Next.js 16 已容器化为 `geesun-agent-web` 服务（`docker-compose.web.yml`），与 agent 同处 `appnet`，内部 3000 不发布主机，由 Caddy :80 对外。
 
-**⚠️ 构建期注入（最容易踩的坑）**：`NEXT_PUBLIC_API_BASE` 是 Next.js **公共变量，浏览器直接读构建产物**——属于 build-time 内联，运行时改 `.env` **无效**。生产镜像默认内联 `http://10.10.10.67/`（经 Caddy 同域）；换环境必须用 `NEXT_PUBLIC_API_BASE=xxx bash deploy/build-push.sh` 重新构建镜像，不能靠改 `.env`。
+**⚠️ 构建期注入（最容易踩的坑）**：`NEXT_PUBLIC_API_BASE` 是 Next.js **公共变量，浏览器直接读构建产物**——属于 build-time 内联，运行时改 `.env` **无效**。生产镜像默认内联 `http://10.10.10.67:18080/`（共享机方案 A：Caddy 同域高端口）；换环境必须用 `NEXT_PUBLIC_API_BASE=xxx bash deploy/build-push.sh` 重新构建镜像，不能靠改 `.env`。
 
 **⚠️ Caddy 路径路由（防 rewrite 回环）**：前端 `next.config.ts` 会把 `/api/*` rewrite 到 `NEXT_PUBLIC_API_BASE`（同域）。若 Caddy 把 `/` 整体代理到 web，`/api/*` 请求会 Caddy→web→rewrite→Caddy 无限循环。因此 `Caddyfile` 必须按路径分流：`/api/*`、`/docs`、`/openapi.json` 直连 `geesun-agent:8009`，其余走 `geesun-agent-web:3000`（已实现）。
 
@@ -328,9 +328,9 @@ cron 示例（每天 03:07）：
    ```
 8. 校验：
    - `docker compose ps` 全 healthy；
-   - `http://10.10.10.67/` → 前端页面（Caddy → geesun-agent-web）；API 文档 `http://10.10.10.67/docs`（Caddy → geesun-agent:8009）；
-   - `http://10.10.10.67:6006` → Phoenix；
-   - `http://10.10.10.67:3000` → Langfuse，注册首个账号；
+   - `http://10.10.10.67:18080/` → 前端页面（Caddy → geesun-agent-web）；API 文档 `http://10.10.10.67:18080/docs`（Caddy → geesun-agent:8009）；
+   - `http://10.10.10.67:16006` → Phoenix；
+   - `http://10.10.10.67:13000` → Langfuse，注册首个账号；
    - `127.0.0.1:3100` → Grafana，看 Loki 数据源有日志。
 
 **阶段 C — 接线**
@@ -343,7 +343,7 @@ cron 示例（每天 03:07）：
 
 - **Harbor HTTP**：务必配 `insecure-registries`，否则 login/pull 失败。
 - **构建上下文**：`geesun-agent` 必须在 `/d/workspace` 下构建，否则 `langchain-cubesandbox` 解析失败。
-- **9090 端口冲突**：Phoenix 的 9090 不映射；Langfuse Minio 改 9092 + EXTERNAL 指向 LAN IP。
+- **9090 端口冲突**：Phoenix 的 9090 不映射；Langfuse Minio 改 19092（共享机 9092 被 tb-kafka 占用）+ EXTERNAL 指向 LAN IP。
 - **三个 Postgres**：agent_mem / phoenix / langfuse 各自独立，资源占用偏高；后续若想省可合并实例（按安全域权衡）。
 - **密钥**：`.env` 必须 `chmod 600` 且**绝不进 git**；生产可进一步改用 compose `secrets:` 挂载。
 - **DB 不暴露**：仅 `127.0.0.1` 供排障；对外只走 Caddy。
@@ -353,7 +353,7 @@ cron 示例（每天 03:07）：
 - **外部依赖可达性**：部署后先 `docker exec geesun-agent curl -s http://172.16.66.13:8003/v1/models` 验证 vLLM 连通，再验 CubeSandbox / MCP。
 - **MCP 容器化**：geesun_mcp_server 现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），合并 `up` 时加 `-f docker-compose.mcp.yml`；agent 经服务名 `geesun-mcp:8000` 访问，勿再手跑裸进程。部署拓扑与排障见 §4.6。
 - **前端容器化**：geesun_agent_web 已容器化为 `geesun-agent-web`（见 `docker-compose.web.yml`），合并 `up` 时加 `-f docker-compose.web.yml`；`NEXT_PUBLIC_API_BASE` 为构建期内联（运行时改 `.env` 无效）、Caddy 按路径分流防 rewrite 回环，详见 §4.7。
-- **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认主机端口空闲，避免 dev 残留进程占 3000/6006/8000 导致 `up` 失败。
+- **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认**我方端口**（18080/16006/13000/19092/8009/8000/3100）空闲；本机为共享生产机，80/3000/9092/5432/6379 已被现网系统占用，**勿占用、勿下线**。
 
 ---
 
@@ -370,8 +370,9 @@ cron 示例（每天 03:07）：
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh sync_mcp + requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
 | 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh sync_web + Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
+| 10 | 共享生产机端口调整（方案 A：Caddy 18080/16006/13000 + Minio 19092，避开现网 80/3000/9092） | `docker-compose.yml` + `docker-compose.langfuse.yml` + `.env.example` + `Caddyfile` 注释 + 前端镜像 `NEXT_PUBLIC_API_BASE` | ✅ 已落地 |
 
-> 实现项 #1–#5、#7–#9 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
+> 实现项 #1–#5、#7–#10 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 
 ---
 
@@ -390,18 +391,16 @@ cron 示例（每天 03:07）：
 - dev agent `.env` 填 dev project 的 key；prod agent `.env` 填 prod project 的 key；二者的 `LANGFUSE_BASE_URL` 指向同一实例。
 - 注：后端 PG/Clickhouse/Minio 共享，逻辑隔离靠 key。
 
-### 10.3 端口冲突（路线 A 的前置动作，必须处理）
-- **现状**：dev 直接在 10.10.10.67 上占用 `:6006`（Phoenix）与 `:3000`（Langfuse）。
-- **prod compose 里 caddy 也要绑 `80 / 6006 / 3000`**（见 §4.2）。若 dev 仍在跑，`up` 会因端口占用失败。
-- **处理（二选一，推荐 a）**：
-  - **a. 下线 dev 的 Phoenix/Langfuse 占用**：停止 dev 的 `docker run` 进程，释放 6006/3000，让 prod 的 caddy 接管。dev 仍可经同一 Phoenix/Langfuse 实例的 dev/prod 项目继续用。
-  - **b. dev 挪端口 / 挪机器**：保留 dev 实例但改绑其他端口（如 dev Phoenix 16006、dev Langfuse 13000），prod 维持 6006/3000。
+### 10.3 端口冲突（已按方案 A 处理：换端口）
+- **现状（2026-08-26 实测）**：10.10.10.67 是**共享生产机**，已运行 Harbor(:8333)、ThingsBoard 栈、SlashAdmin、遥测服务等 15+ 容器，主机 `80`（app-frontend）、`3000`（app-backend）、`9092`（tb-kafka）、`5432`（tb-postgres）、`6379`（tb-redis）、`8080`（tb-node）、`9000`（app-python-service）均被现网占用——**不是 dev 残留，无法下线**。
+- **决策（方案 A）**：我方 Caddy 改映射高端口 `18080:80`、`16006:6006`、`13000:3000`（容器内监听不变，Caddyfile 不用动）；Minio S3 改 `19092`。入口：前端 `http://10.10.10.67:18080/`、Phoenix `:16006`、Langfuse `:13000`。
+- dev 的 Phoenix/Langfuse 如仍占 6006/3000，与现网不冲突，但如需与本 prod 并存须避免占用我方新端口（18080/16006/13000/19092）。
 
 ### 10.4 agent 环境变量按环境切换
 prod 的 `geesun_agent/deploy/.env` 至少区分：
 ```sh
 OTEL_PROJECT_NAME=Geesun-Agent-prod
-LANGFUSE_BASE_URL=http://10.10.10.67:3000
+LANGFUSE_BASE_URL=http://langfuse-web:3000
 LANGFUSE_PUBLIC_KEY=pk-lf-prod-xxxx
 LANGFUSE_SECRET_KEY=sk-lf-prod-xxxx
 PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317

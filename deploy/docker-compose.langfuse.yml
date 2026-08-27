@@ -1,7 +1,7 @@
 # Langfuse 可观测栈 — 与 Phoenix 并行保留（你已确认）。
 # 基于官方 docker-compose.yml 精简 / 硬化：
 #   - web/worker 不映射主机端口，由 caddy 经 appnet 代理 :3000。
-#   - minio S3 API 改映射到主机 9092（避开 9090 冲突），EXTERNAL 端点指向主机 LAN IP。
+#   - minio S3 API 改映射到主机 19092（共享机 9092 被 tb-kafka 占用），EXTERNAL 端点指向主机 LAN IP。
 #   - postgres/redis/clickhouse 仅绑定 127.0.0.1 供排障，不对外。
 #   - 所有第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub），
 #     需先由 build-push.sh 同步进 Harbor。
@@ -144,7 +144,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - 9092:9000          # S3 API → 主机 9092（避开 9090 冲突）
+      - 19092:9000         # S3 API → 主机 19092（共享机 9092 被 tb-kafka 占用，改避）
       - 127.0.0.1:9091:9001
     volumes:
       - langfuse_minio_data:/data
