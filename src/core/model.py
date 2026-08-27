@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Callable
 import asyncio
 import logging
+import re
 
 from langchain_openai import ChatOpenAI
 from langchain.agents.middleware import (
@@ -12,6 +13,9 @@ from langchain.agents.middleware import (
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# 模块级缓存的真实上下文上限（首次探活 / 首次 400 修正后填入，全局受益）
+_probed_max_len: int | None = None
 
 
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
@@ -134,6 +138,52 @@ async def file_to_image(
 # 边距 model_max_tokens_margin 为可调配置（.env MODEL_MAX_TOKENS_MARGIN，默认 16384）。
 _MODEL_MIN_OUTPUT_TOKENS = 1
 
+# ─── 上下文超限解析 + 探活（2026-08-27 新增）───
+
+def _parse_context_error(text: str) -> tuple[int, int] | None:
+    """从 vLLM 400 错误 message 解析 (real_limit, real_input)。
+
+    样例（server.log:411，API 真实返回，100% 可靠）：
+      "This model's maximum context length is 262144 tokens.
+       However, you requested 200000 output tokens and your prompt contains
+       at least 62145 input tokens"
+    → 返回 (262144, 62145)。非上下文超限错误返回 None。
+    """
+    if "context length" not in text and "maximum context" not in text:
+        return None
+    m_limit = re.search(r"maximum context length is (\d+)", text)
+    if not m_limit:
+        return None
+    limit = int(m_limit.group(1))
+    m_input = re.search(r"(\d+) input tokens", text)
+    inp = int(m_input.group(1)) if m_input else 0
+    return limit, inp
+
+
+async def probe_model_max_len() -> int:
+    """启动探活 /v1/models 拿真实上下文上限（best-effort）。
+
+    ⚠️ vLLM /v1/models 是否含 max_model_len 字段需实测确认；
+       解析失败 / 字段缺失 → 保留 config 默认值，不影响主流程。
+       真实上限最终以 400 错误 message 解析为准（见 model_call_guard）。
+    """
+    global _probed_max_len
+    if _probed_max_len is not None:
+        return _probed_max_len
+    try:
+        import httpx  # langchain_openai 依赖 httpx，必可用
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{settings.base_url.rstrip('/')}/v1/models")
+            data = r.json().get("data", [])
+            if data and "max_model_len" in data[0]:
+                _probed_max_len = int(data[0]["max_model_len"])
+                settings.model_max_len = _probed_max_len
+                logger.warning("[DIAG] 探活 model_max_len=%d", _probed_max_len)
+    except Exception as e:
+        logger.warning("[DIAG] 探活 model_max_len 失败，用默认值: %s", e)
+    return _probed_max_len or settings.model_max_len
+
+
 @wrap_model_call
 async def model_call_guard(
     request: ModelRequest,
@@ -184,12 +234,64 @@ async def model_call_guard(
         "max_tokens": effective_max,
     })
 
-    try:
-        return await asyncio.wait_for(
-            handler(request), timeout=settings.model_call_timeout_sec
-        )
-    except asyncio.TimeoutError:
-        raise TimeoutError(
-            f"model 调用超过 {settings.model_call_timeout_sec}s 总时长（"
-            f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
-        ) from None
+    # lazy 探活：首次调用时 best-effort 拿真实上限（失败保留默认，不阻断）
+    if _probed_max_len is None:
+        try:
+            await probe_model_max_len()
+        except Exception:
+            pass
+
+    # ─── 400 兜底：上下文超限 → 解析真实上限 → 收紧 max_tokens/trim → 重试 ───
+    # 这是唯一能扛住「token 计数低估中文」+「model_max_len 写死不准」的硬保险：
+    # 直接吃 API 自己的判决，不依赖任何本地假设，也**不依赖 deepagents 的
+    # ContextOverflowError 兜底**（已确认是死代码，见 docs/context-window-fix-draft.md）。
+    # 捕获用 `except Exception` + message 关键字，而非 `from openai import BadRequestError`
+    # 类捕获——避免异常经 langchain 多层包装后类身份丢失。最多重试 2 次，防无限循环。
+    _MAX_CTX_RETRIES = 2
+    attempt = 0
+    while True:
+        try:
+            return await asyncio.wait_for(
+                handler(request), timeout=settings.model_call_timeout_sec
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"model 调用超过 {settings.model_call_timeout_sec}s 总时长（"
+                f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
+            ) from None
+        except Exception as e:
+            parsed = _parse_context_error(str(e))
+            if parsed is None or attempt >= _MAX_CTX_RETRIES:
+                raise  # 非上下文超限错误，或重试耗尽 → 原样上抛（由 chat.py/M3 处理）
+            real_limit, real_input = parsed
+            # 用 API 真实上限修正 settings（后续所有调用永久受益）
+            settings.model_max_len = real_limit
+            logger.warning(
+                "[DIAG] 400 上下文超限 → 收紧重试 #%d: real_limit=%d, real_input=%d",
+                attempt + 1, real_limit, real_input,
+            )
+            # 重算 max_tokens：留 margin，保证 input + max_tokens ≤ real_limit
+            safe_max = max(
+                _MODEL_MIN_OUTPUT_TOKENS,
+                real_limit - real_input - settings.model_max_tokens_margin,
+            )
+            # 极端情况：input 本身就逼近/超过总上限，连 safe_max 都 ≤0 → 必须砍 input
+            if safe_max <= _MODEL_MIN_OUTPUT_TOKENS:
+                keep = max(4, len(msgs) - (attempt + 1) * 10)
+                trimmed = msgs[-keep:]
+                try:
+                    request = request.override(messages=trimmed)
+                    msgs = trimmed
+                except Exception:
+                    # ModelRequest.override(messages=...) 不支持时退化为仅收紧 max_tokens
+                    logger.warning("[DIAG] override(messages=...) 不支持，退化仅收紧 max_tokens")
+                safe_max = max(
+                    _MODEL_MIN_OUTPUT_TOKENS,
+                    real_limit - real_input // 2 - settings.model_max_tokens_margin,
+                )
+            request = request.override(model_settings={
+                **request.model_settings,
+                "max_tokens": safe_max,
+            })
+            attempt += 1
+            continue

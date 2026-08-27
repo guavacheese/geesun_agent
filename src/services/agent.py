@@ -753,11 +753,15 @@ async def create_agent(
                     total += model.get_num_tokens(content)
                 except Exception:
                     total += len(content)  # 兜底：1 字符≈1 token（足够保守）
-        # 临时诊断：仅接近/超过阈值时打（避免每步刷屏）
-        if total > 100000:
+        # 临时诊断：仅接近/超过触发阈值时打（避免每步刷屏）
+        # 阈值与 create_agent 里 effective_trigger 同源推导，不再写死
+        _trigger = (
+            settings.model_max_len - settings.model_max_tokens - settings.model_max_tokens_margin
+        )
+        if total > _trigger:
             logger.warning(
-                "[DIAG] _count_tokens_accurate: messages=%d, total=%d tokens（阈值 200000）",
-                len(messages), total,
+                "[DIAG] _count_tokens_accurate: messages=%d, total=%d tokens（触发阈值 %d）",
+                len(messages), total, _trigger,
             )
         return total
 
@@ -789,10 +793,16 @@ async def create_agent(
             return "\n".join(lines)
         return provider
 
+    # 触发阈值按真实上限推导（替代写死 100000，该值落在 400 死亡线之后永不触发）：
+    # 保证压缩在 400 之前发生；分母是真探活/400 修正后的 model_max_len，1M 模型自动放大。
+    effective_trigger = max(
+        settings.summarization_trigger_tokens,  # 下限保护（config 值）
+        settings.model_max_len - settings.model_max_tokens - settings.model_max_tokens_margin,
+    )
     summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
-        trigger=("tokens", settings.summarization_trigger_tokens),  # 阈值可调（.env SUMMARIZATION_TRIGGER_TOKENS）
+        trigger=("tokens", effective_trigger),  # 动态推导，提前压
         keep=("messages", 10),
         token_counter=_count_tokens_accurate,
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),

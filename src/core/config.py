@@ -82,26 +82,27 @@ class Settings(BaseSettings):
     # 此处为"总时长"超时：单次 model 调用（含 prefill+decode 全流）超过即中止，
     # 抛错 → SSE error → M3 兜底，防永久挂起。
     model_call_timeout_sec: int = 600
-    # ─── model 单次调用输出上限（2026-08-24 决策：thinking 保留，上限给足）───
-    # Qwen3 保留 thinking（复杂任务需要深度思考），max_tokens 取 200000，
-    # 接近 max_model_len=262144（~256k）上限、留 ~62k 余量。
-    # 注意：vLLM 约束 prompt + max_tokens ≤ max_model_len——输入接近 262k 时
-    # 200k 输出会 400，但 Summarization 在 20 万 tokens 触发压缩（keep=10 条），
-    # 实际输入远小于上限；单次调用失控仍由 model_call_timeout_sec(600s) 兜底。
-    model_max_tokens: int = 200000
+    # ─── model 单次调用输出上限 ───
+    # 2026-08-27 修正：从 200000 降到 65536。
+    # 原 200000 把 input 安全空间压到仅 45960（262144-200000-16384），
+    # 中文 context 稍长即触发 vLLM 400（server.log 实测 input 62145 + 200000 = 262145 > 262144）。
+    # 降到 65536 后 input 安全空间放大到 ~180k（262144-65536-16384），
+    # 即便 token 计数低估中文 ~3x 也触碰不到 400 线；报告类任务 64k 输出足够。
+    model_max_tokens: int = 65536
     # ─── vLLM 上下文总上限（prompt + max_tokens 不得超过）───
-    # 探活 /v1/models 得 max_model_len=262144；动态 max_tokens 用它做减法，
-    # 防止"输入 62k + 输出 200k = 262145 > 262144"被 vLLM 400 拒载（2026-08-24 实测）。
+    # 默认值 262144 仅作 fallback；真实上限由两路获得（按优先级）：
+    # ① model.py probe_model_max_len() 启动探活 /v1/models（best-effort，字段名待实测）；
+    # ② 模型调用 400 时从错误 message 解析 "maximum context length is N tokens"（API 返回，100% 可靠）。
+    # 注：原注释"探活 /v1/models 得 max_model_len=262144"此前未实现，本次于 model.py 补齐。
     model_max_len: int = 262144
     # ─── 动态 max_tokens 安全边距（tokens）───
-    # 防 prompt 估算低估触发 vLLM 400（2026-08-25 实测估算 125238 vs 实际 129335、
-    # 低估 4097，margin=4096 差 1 token 又被拒）。16384 留足余量（含 tools schema 等未计入部分）。
+    # 16384 留足余量（含 tools schema 等未计入部分 + 计数误差缓冲）。
     model_max_tokens_margin: int = 16384
-    # ─── Summarization 压缩触发阈值（tokens）───
-    # 上下文达此值即把历史压缩为摘要（keep 10 条 + 资源清单注入，前端消息表不受影响）。
-    # 2026-08-25 从 200000 降到 100000：fe27a95a 反复失败重跑历史膨胀到 12.9 万 tokens
-    # 仍未触发（阈值偏高 + get_num_tokens 对 Qwen 估算不稳定），prefill 慢且挤压输出空间。
-    summarization_trigger_tokens: int = 100000
+    # ─── Summarization 压缩触发阈值（tokens，仅作下限保护）───
+    # 2026-08-27 修正：不再写死 100000（该值落在 400 死亡线 62144 之后 → 永不触发）。
+    # 运行时在 agent.py 按 effective_trigger = model_max_len - model_max_tokens - margin 推导，
+    # 保证压缩在 400 之前触发；此处值仅防止推导异常过小时无下限。
+    summarization_trigger_tokens: int = 20000
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)
