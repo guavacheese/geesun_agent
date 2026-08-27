@@ -1,7 +1,9 @@
-# Langfuse 可观测栈 — 与 Phoenix 并行保留（你已确认）。
+# Langfuse 自托管可观测栈 — 作为「路线 B 兜底」始终保留在仓库，不删除。
+# 适用：现网没有共享 Phoenix/Langfuse 实例时（换机器 / 换环境 / 共用栈下线），
+#       把本文件与 docker-compose.phoenix.yml 一并 -f 并入主栈启动（见 DEPLOYMENT.md §4.9）。
 # 基于官方 docker-compose.yml 精简 / 硬化：
-#   - web/worker 不映射主机端口，由 caddy 经 appnet 代理 :3000。
-#   - minio S3 API 映射到主机 9092，EXTERNAL 端点指向主机 LAN IP（prod 复用现网共享实例，不跑本文件）。
+#   - web/worker 不映射主机端口，由 caddy 经 appnet 代理 :3000（路线 A 共用栈在跑时本文件不并入）。
+#   - minio S3 API 映射到主机 9092，EXTERNAL 端点指向主机 LAN IP（路线 B 自托管时即本机 minio）。
 #   - postgres/redis/clickhouse 仅绑定 127.0.0.1 供排障，不对外。
 #   - 所有第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub），
 #     需先由 build-push.sh 同步进 Harbor。
@@ -144,7 +146,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - 9092:9000          # S3 API → 主机 9092（共享实例已用此端口，prod 复用不再自建）
+      - 9092:9000          # S3 API → 主机 9092（路线 B 自托管时即本机 minio；路线 A 共用栈已占此端口，故不并入）
       - 127.0.0.1:9091:9001
     volumes:
       - langfuse_minio_data:/data

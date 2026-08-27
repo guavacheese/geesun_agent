@@ -18,7 +18,7 @@
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
 | promtail | `dockerhub/promtail:3.2.0` | — | 不发布 | 否 | — | docker.sock |
 | grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki |
-| ~~phoenix / langfuse~~ | **复用现网共享实例（路线 A）**：`opt-phoenix-1`(:6006/:4317/:9090)、`langfuse-*`(:3000)、`opt-db-1`(:5432)、`langfuse-minio-1`(:9092) 已由各自容器发布在 10.10.10.67，**不在本 compose 内**；agent 经主机 LAN IP 连接（`PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317`、`LANGFUSE_BASE_URL=http://10.10.10.67:3000`） | — | — | — | 各自 named volume（现网已有） | — |
+| phoenix / langfuse（可观测栈） | **路线 A（默认，当前 67）**：复用现网共享实例（见 §10.3），agent 经主机 LAN IP 连接（`PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317`、`LANGFUSE_BASE_URL=http://10.10.10.67:3000`），**本 compose 不并入这两个文件**。**路线 B（自托管兜底，两文件始终保留不删）**：无共享实例时把 `docker-compose.phoenix.yml`+`docker-compose.langfuse.yml` 一并 `-f` 并入，agent 经服务名 `phoenix:4317`/`langfuse-web:3000` 连接（见 §4.9）。 | 路线 A：是（他人已发布）；路线 B：否（仅 appnet） | 路线 A：他人已发布；路线 B：Caddy 可选代理 | 路线 B：各 named volume | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
@@ -174,7 +174,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 
 **⚠️ mcp.json 残留坑**：agent 首次启动会按 `mcp_server_url` 生成 `{AGENT_WORKSPACE}/mcp.json`。若你**之前**手动改过 `mcp.json`（或旧部署遗留），里面的 url 可能是 `localhost`，改 `.env` 的 `mcp_server_url` **不会自动覆盖**已存在的 `mcp.json`。修复：`rm {AGENT_DATA_ROOT}/agent/mcp.json` 让它用新默认值重新生成，或手动把里面 `decrypt-file.url` 改成 `http://geesun-mcp:8000/mcp`。
 
-**合并启动**（在 `deploy/` 目录；prod 仅 3 个文件，Phoenix/Langfuse 复用现网共享实例）：
+**合并启动**（路线 A：prod 仅 3 个文件，复用现网共享实例；需自托管见 §4.9 路线 B）：
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
                -f docker-compose.web.yml up -d
@@ -200,7 +200,7 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
 
 **前端本地 dev 不受影响**：dev 仍是 `bun run dev`（读 `.env.local`，默认 `http://localhost:8009`），`next.config.ts` 的 `output: "standalone"` 仅对 `next build` 生效，`next dev` 忽略；容器与 dev 是两套独立运行方式。
 
-**合并启动**（在 `deploy/` 目录；prod 仅 3 个文件，Phoenix/Langfuse 复用现网共享实例）：
+**合并启动**（路线 A：prod 仅 3 个文件，复用现网共享实例；需自托管见 §4.9 路线 B）：
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
                -f docker-compose.web.yml up -d
@@ -225,6 +225,35 @@ sandbox 访问域名形如 `49983-78083c0f5b044a3084a891a2c1f35b50.cube.app`，d
 **为什么不用 compose 的 `dns:` 字段**：它会顶掉 `127.0.0.11`，导致 agent/mcp 容器**无法用服务名**（`geesun-mcp`/`agent-postgres`/`geesun-agent-web`）互访——内嵌 DNS 是服务名解析的唯一通道。daemon 级 `dns` 则保留内嵌 DNS，仅把外部域名转发给 dnsmasq。
 
 **前提**：67 到 `192.168.10.136` 网络可达（与 dev 同内网段）。
+
+---
+
+### 4.9 可观测栈两种路线：A 复用共享实例（默认）/ B 自托管兜底
+
+Phoenix + Langfuse 有两条部署路线。**两个 compose 文件（`docker-compose.phoenix.yml`、`docker-compose.langfuse.yml`）始终留在仓库，不删除**——它们是路线 B 的兜底：万一下次换环境 / 换机器 / 共用栈下线、没有现成实例时，可直接拉起自托管栈。
+
+**路线 A — 复用现网共享实例（当前 67 默认）**
+- 现网 `10.10.10.67` 已跑一套 Phoenix/Langfuse（见 §10.3），prod 主栈**只并 3 个文件**（yml+mcp+web），不并 phoenix/langfuse 文件。
+- agent 经主机 LAN IP 连接：`PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317`、`LANGFUSE_BASE_URL=http://10.10.10.67:3000`。
+- 共享实例的 3000/6006/9092/5432 端口**勿占用、勿下线**（§4.5 预检表）。
+
+**路线 B — 自托管兜底（无共享实例时）**
+- 把两个可观测 compose 文件一并并入（与 yml/mcp/web 合并到同一 `appnet`）：
+```sh
+docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
+               -f docker-compose.web.yml \
+               -f docker-compose.phoenix.yml \
+               -f docker-compose.langfuse.yml up -d
+```
+- `.env` 须填全 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_* 等，`.env.example` 已含），并把追踪端点改走服务名：
+```sh
+PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
+LANGFUSE_BASE_URL=http://langfuse-web:3000
+```
+- 端口：phoenix(6006/4317)、langfuse-web(3000)、minio(9092) 在 `appnet` 内可达；langfuse 的 minio 映射到主机 9092、clickhouse/redis/postgres 仅绑 127.0.0.1（排障用）。只要同机无其它进程占 9092/8123/9000/6379/5432，路线 B 与主栈不冲突（主栈只映射 80 与 127.0.0.1:3100）。
+- 若想在路线 B 也从外部看 UI，可在 `Caddyfile` 加 `:6006`/`:3000` 代理块（前提：这些主机端口空闲、未被任何共享实例占用）；否则 UI 仅 appnet 内可达，不影响 agent 上报 trace。
+
+> 切换路线只改「并入哪几个 `-f` 文件」+ 对应 `*_BASE_URL` 端点，镜像与业务栈不变。
 
 ---
 
@@ -378,14 +407,14 @@ cron 示例（每天 03:07）：
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh sync_mcp + requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
 | 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh sync_web + Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
-| 10 | 复用现网共享可观测栈（路线 A）：prod compose 仅 yml+mcp+web 三文件，Caddy 只留 :80，agent 经 10.10.10.67:4317/:3000 连共享 Phoenix/Langfuse | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` | ✅ 已落地 |
+| 10 | 复用现网共享可观测栈（路线 A）：prod compose 仅 yml+mcp+web 三文件，Caddy 只留 :80，agent 经 10.10.10.67:4317/:3000 连共享 Phoenix/Langfuse；phoenix/langfuse 两个 compose 文件保留作路线 B 兜底（见 §4.9） | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 11 | CubeSandbox 信任与 DNS docker 化：agent/mcp CA 挂载 + REQUESTS_CA_BUNDLE/SSL_CERT_FILE；`setup-cube-dns.sh`（dnsmasq 转发 *.cube.app + daemon dns） | `docker-compose.yml` + `docker-compose.mcp.yml` + 新增 `setup-cube-dns.sh` + §4.3/§4.8 | ✅ 已落地 |
 
 > 实现项 #1–#5、#7–#11 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 
 ---
 
-## 10. 环境策略：dev / prod 区分（路线 A，已确认）
+## 10. 环境策略：dev / prod 区分（路线 A 默认；langfuse/phoenix 文件保留为路线 B 兜底）
 
 **决策：路线 A** —— 单宿主机 `10.10.10.67`，只跑**一套** Phoenix + 一套 Langfuse，dev/prod 用「项目名 / 项目 key」区分；prod 的 geesun_agent 也部署在同一台。理由：Phoenix/Langfuse 是「可观测性」不是「业务数据」，共享后端可接受；业务数据（agent_mem）与 agent 应用本身已是独立容器/卷，隔离到位。
 
@@ -402,7 +431,7 @@ cron 示例（每天 03:07）：
 
 ### 10.3 端口现状与处理（已按"复用共享可观测栈"落地）
 - **现状（2026-08-27 实测）**：10.10.10.67 上运行 **dev/共享可观测栈**（已 3 周）：`langfuse-langfuse-web-1`(:3000)、`langfuse-worker`(:3030 lo)、`opt-phoenix-1`(:6006/:4317/:9090)、`opt-db-1`(:5432)、`langfuse-minio-1`(:9092/:9091 lo)、langfuse postgres/redis/clickhouse（内部/lo）。**主机 80 空闲**。
-- **决策**：遵循路线 A——**复用**这套 Phoenix/Langfuse 作为 dev/prod 共享后端（project key 区分）；prod compose **只跑 3 个文件**（yml+mcp+web），不再自建可观测栈；Caddy 只用 :80（前端主入口）；agent 经 `http://10.10.10.67:4317` / `http://10.10.10.67:3000` 连接共享实例。共享实例的 3000/6006/9092/5432 等端口**勿占用、勿下线**。
+- **决策**：遵循路线 A——**复用**这套 Phoenix/Langfuse 作为 dev/prod 共享后端（project key 区分）；prod compose **只并 3 个文件**（yml+mcp+web），不并 phoenix/langfuse 文件；Caddy 只用 :80（前端主入口）；agent 经 `http://10.10.10.67:4317` / `http://10.10.10.67:3000` 连接共享实例。共享实例的 3000/6006/9092/5432 等端口**勿占用、勿下线**。两个可观测 compose 文件（`docker-compose.phoenix.yml`/`docker-compose.langfuse.yml`）**保留在仓库作路线 B 兜底，不删除**——换环境无共享实例时按 §4.9 并入即可。
 
 ### 10.4 agent 环境变量按环境切换
 prod 的 `geesun_agent/deploy/.env` 至少区分：
@@ -412,6 +441,12 @@ LANGFUSE_BASE_URL=http://10.10.10.67:3000
 LANGFUSE_PUBLIC_KEY=pk-lf-prod-xxxx
 LANGFUSE_SECRET_KEY=sk-lf-prod-xxxx
 PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317
+```
+
+- **路线 B（自托管兜底）** 的端点不同：把 `LANGFUSE_BASE_URL` / `PHOENIX_COLLECTOR_ENDPOINT` 改走服务名（同 `appnet` 内可达），其余 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_*）在 `.env` 填全（`.env.example` 已含）：
+```sh
+LANGFUSE_BASE_URL=http://langfuse-web:3000
+PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
 ```
 
 ---

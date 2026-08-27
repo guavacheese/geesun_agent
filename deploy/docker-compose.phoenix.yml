@@ -1,5 +1,7 @@
-# Phoenix（Arize）可观测栈 — 与上述主栈合并启动。
-# 注意：web/grpc 端口不映射到主机，由 caddy 经 appnet 内网代理（:6006 / :4317 内部可达）。
+# Phoenix（Arize）自托管可观测栈 — 作为「路线 B 兜底」始终保留在仓库，不删除。
+# 适用：现网没有共享 Phoenix 实例时，把本文件与 docker-compose.langfuse.yml 一并 -f 并入主栈启动（见 DEPLOYMENT.md §4.9）。
+# 注意：web/grpc 端口不映射到主机，由 caddy 经 appnet 内网代理（:6006 / :4317 内部可达）；
+#       路线 A（现网共用栈在跑）下本文件不并入，agent 经主机 LAN IP 连接共享实例。
 # 第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub）。
 
 services:

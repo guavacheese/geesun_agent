@@ -9,8 +9,10 @@
 #     第三方通用镜像（pgvector/caddy/loki/promtail/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
 #   - 多个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
-#   - 可观测性复用现网共享实例（路线 A）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
+#   - 可观测性复用现网共享实例（路线 A，默认）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
 #     已发布在主机，本 compose 不再跑 phoenix/langfuse 服务；agent 经主机 LAN IP 连接（见 .env）。
+#   - 需要自托管兜底（无共享实例）时，把 docker-compose.langfuse.yml / docker-compose.phoenix.yml
+#     一并 -f 并入（路线 B，见 DEPLOYMENT.md §4.9）；两文件始终保留在仓库，不删除。
 #   - 对外只暴露 caddy 的 80（前端主入口）；数据库 / loki / grafana(127.0.0.1:3100) 不暴露到主机。
 #   - 日志：各服务 json-file 驱动做大小轮转（max-size/max-file），Promtail 采集入 Loki，Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
