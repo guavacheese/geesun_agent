@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus 自身
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Alloy 自身健康指标（采集器可观测性）
+  - job_name: alloy
+    static_configs:
+      - targets: ['alloy:12345']
+
+  # agent 若暴露 Prometheus /metrics 则直接抓取（未暴露时为空，无害）
+  - job_name: geesun-agent
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['geesun-agent:8009']

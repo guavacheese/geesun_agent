@@ -1,6 +1,6 @@
 # geesun_agent 生产部署规划
 
-> 范围：geesun_agent 后端 + 依赖（Postgres/pgvector）+ 可观测性（Phoenix / Langfuse 并行）+ 日志集中（Loki / Promtail / Grafana）+ 反向代理（Caddy）。
+> 范围：geesun_agent 后端 + 依赖（Postgres/pgvector）+ 可观测性（Phoenix / Langfuse 并行）+ 日志/指标/追踪 集中（Loki / Alloy / Prometheus / Grafana，Alloy 替代原 Promtail 统一采集 logs+metrics+traces）+ 反向代理（Caddy）。
 > 目标形态：单宿主 `docker compose` 硬化部署，全部镜像托管在内部 Harbor，物理机仅暴露 Caddy 入口。
 > 本文档为规划稿，落地项见文末「待办清单」。
 
@@ -16,9 +16,10 @@
 | agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 不发布 | 否 | named volume `agent_pg_data` | — |
 | caddy | `dockerhub/caddy:2.8-alpine` | 80 | 80 | 是 | `caddy_data` `caddy_config` | geesun-agent / geesun-agent-web |
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
-| promtail | `dockerhub/promtail:3.2.0` | — | 不发布 | 否 | — | docker.sock |
-| grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki |
-| phoenix / langfuse（可观测栈） | **路线 A（默认，当前 67）**：复用现网共享实例（见 §10.3），agent 经主机 LAN IP 连接（`PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317`、`LANGFUSE_BASE_URL=http://10.10.10.67:3000`），**本 compose 不并入这两个文件**。**路线 B（自托管兜底，两文件始终保留不删）**：无共享实例时把 `docker-compose.phoenix.yml`+`docker-compose.langfuse.yml` 一并 `-f` 并入，agent 经服务名 `phoenix:4317`/`langfuse-web:3000` 连接（见 §4.9）。 | 路线 A：是（他人已发布）；路线 B：否（仅 appnet） | 路线 A：他人已发布；路线 B：Caddy 可选代理 | 路线 B：各 named volume | — |
+| alloy | `dockerhub/alloy:v1.19.2` | 4317/4321(OTLP)、12345(UI,仅 127.0.0.1) | 不发布（OTLP 仅 appnet） | 否 | `alloy_data` | loki、prometheus（docker.sock 仅读） |
+| prometheus | `dockerhub/prometheus:3.0` | 9090 | 127.0.0.1:9091 | 否 | `prometheus_data` | —（需 `--web.enable-remote-write-receiver` 接收 Alloy remote_write） |
+| grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki、prometheus |
+| phoenix / langfuse（可观测栈） | **路线 A（默认，当前 67）**：复用现网共享实例（见 §10.3），agent OTLP 统一发往 Alloy（`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`，由 Alloy 转发到 Phoenix `10.10.10.67:4317`）；Langfuse 仍直发（`LANGFUSE_BASE_URL=http://10.10.10.67:3000`），**本 compose 不并入这两个文件**。**路线 B（自托管兜底，两文件始终保留不删）**：无共享实例时把 `docker-compose.phoenix.yml`+`docker-compose.langfuse.yml` 一并 `-f` 并入，agent OTLP 仍发往 Alloy、由 Alloy 经 `PHOENIX_OTLP_ENDPOINT=phoenix:4317` 转发到 phoenix 服务名；Langfuse 经 `langfuse-web:3000` 服务名直连（见 §4.9）。 | 路线 A：是（他人已发布）；路线 B：否（仅 appnet） | 路线 A：他人已发布；路线 B：Caddy 可选代理 | 路线 B：各 named volume | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
@@ -40,7 +41,7 @@
   ```
 
 ### 1.2 第三方组件（无需构建，直接取公网镜像）
-Phoenix / Langfuse / Postgres / pgvector / Caddy / Loki / Promtail / Grafana / Clickhouse / Redis / Minio 均为上游官方镜像，`build-push.sh` 的 `sync()` 会 `pull → tag → push` 进 Harbor，**不需要 Dockerfile**。
+Phoenix / Langfuse / Postgres / pgvector / Caddy / Loki / Alloy / Prometheus / Grafana / Clickhouse / Redis / Minio 均为上游官方镜像，`build-push.sh` 的 `sync()` 会 `pull → tag → push` 进 Harbor，**不需要 Dockerfile**。
 
 ---
 
@@ -78,7 +79,8 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 | `pgvector/pgvector:0.8.0-pg17` | `dockerhub/pgvector:0.8.0-pg17` |
 | `caddy:2.8-alpine` | `dockerhub/caddy:2.8-alpine` |
 | `grafana/loki:3.2.0` | `dockerhub/loki:3.2.0` |
-| `grafana/promtail:3.2.0` | `dockerhub/promtail:3.2.0` |
+| `grafana/alloy:v1.19.2` | `dockerhub/alloy:v1.19.2` |
+| `prometheus:3.0` | `dockerhub/prometheus:3.0` |
 | `grafana/grafana:11.3.0` | `dockerhub/grafana:11.3.0` |
 | `arizephoenix/phoenix:19.1.0` | `dockerhub/phoenix:19.1.0` |
 | `postgres:16.14` | `dockerhub/postgres:16.14` |
@@ -304,7 +306,8 @@ cron 示例（每天 03:07）：
 - **日期留存 + 检索 + 告警** = Loki `retention_period: 720h`（30 天）+ Grafana。这正是 log4j 日期滚动的平台等价物，且带查询能力。
 
 ### 6.2 采集链路
-`geesun-agent(stdout JSON)` → Docker `json-file`(本地轮转) → Promtail(`docker_sd` 发现 appnet 容器、提取 JSON 字段) → Loki(30d 留存) → Grafana(检索/面板/告警)。
+`geesun-agent(stdout JSON)` → Docker `json-file`(本地轮转) → Alloy(`discovery.docker` 发现 appnet 容器、`loki.process` 提取 JSON 字段，并统一收 metrics→Prometheus / traces→Phoenix) → Loki(30d 留存) + Prometheus(metrics) → Grafana(检索/面板/告警)。
+- **验证**：进 alloy 容器看 UI `:12345`（本机 `127.0.0.1:12345`）；Prometheus `:9091` 查 `up`/`geesun-agent`/`alloy`；Phoenix（路线 A `10.10.10.67:6006`）确认 traces 到达。Alloy→Phoenix 转发经 `PHOENIX_OTLP_ENDPOINT` 控制（路线 B 改 `phoenix:4317`）。
 
 ### 6.3 配置要点
 - `LOG_LEVEL`（默认 `INFO`）、`LOG_FORMAT=json|text` 由环境变量控制（`logging.py` 已实现）。
@@ -463,7 +466,7 @@ Harbor 是 HTTP（`172.16.220.74:8333`），用浏览器访问并登录后，给
      - Retain：keep most recently pushed **10** tags
      - 额外：勾选 "with labels" 并填 `latest,release-*`（这些标签永久保留，不被清理）
    - **规则 B（第三方镜像）**：
-     - Matched repositories：`dockerhub/pgvector`, `dockerhub/caddy`, `dockerhub/loki`, `dockerhub/promtail`, `dockerhub/grafana`, `dockerhub/phoenix`, `dockerhub/postgres`, `dockerhub/langfuse`, `dockerhub/clickhouse-server`, `dockerhub/minio`, `dockerhub/redis`
+     - Matched repositories：`dockerhub/pgvector`, `dockerhub/caddy`, `dockerhub/loki`, `dockerhub/alloy`, `dockerhub/prometheus`, `dockerhub/grafana`, `dockerhub/phoenix`, `dockerhub/postgres`, `dockerhub/langfuse`, `dockerhub/clickhouse-server`, `dockerhub/minio`, `dockerhub/redis`
      - Retain：keep most recently pushed **3** tags
 4. **Save** → 可点 **Simulate Run** 预览哪些 tag 会被删，确认无误后 **Run Now** 立即执行一次，之后按调度周期自动跑（默认每日）。
 5. 验证：过一天后回看，确认旧 tag 已被清理、磁盘不再无限增长。

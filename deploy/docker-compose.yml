@@ -6,7 +6,7 @@
 #
 # 说明：
 #   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
-#     第三方通用镜像（pgvector/caddy/loki/promtail/grafana）在 dockerhub 项目（REGISTRY_HUB），
+#     第三方通用镜像（pgvector/caddy/loki/alloy/prometheus/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
 #   - 多个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
 #   - 可观测性复用现网共享实例（路线 A，默认）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
@@ -14,7 +14,7 @@
 #   - 需要自托管兜底（无共享实例）时，把 docker-compose.langfuse.yml / docker-compose.phoenix.yml
 #     一并 -f 并入（路线 B，见 DEPLOYMENT.md §4.9）；两文件始终保留在仓库，不删除。
 #   - 对外只暴露 caddy 的 80（前端主入口）；数据库 / loki / grafana(127.0.0.1:3100) 不暴露到主机。
-#   - 日志：各服务 json-file 驱动做大小轮转（max-size/max-file），Promtail 采集入 Loki，Grafana 检索。
+#   - 日志/指标/追踪：各服务 json-file 驱动做大小轮转（max-size/max-file），Alloy 统一采集（logs→Loki / metrics→Prometheus / traces→Phoenix，替代原 Promtail），Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
 #   - CubeSandbox 证书与 *.cube.app DNS：见 DEPLOYMENT.md §4.3 / §4.8 与 deploy/setup-cube-dns.sh。
 
@@ -37,7 +37,7 @@ services:
       POSTGRES_USER: "${AGENT_PG_USER:-geesun}"
       POSTGRES_PASSWORD: "${AGENT_PG_PASSWORD}"
       # 追踪（复用现网共享实例，经主机 LAN IP 已发布端口连接；phoenix/langfuse 不在本 compose）
-      phoenix_collector_endpoint: "${PHOENIX_COLLECTOR_ENDPOINT:-http://10.10.10.67:4317}"
+      phoenix_collector_endpoint: "${PHOENIX_COLLECTOR_ENDPOINT:-http://alloy:4317}"
       langfuse_base_url: "${LANGFUSE_BASE_URL:-http://10.10.10.67:3000}"
       langfuse_public_key: "${LANGFUSE_PUBLIC_KEY}"
       langfuse_secret_key: "${LANGFUSE_SECRET_KEY}"
@@ -145,21 +145,57 @@ services:
         max-size: "20m"
         max-file: "3"
 
-  promtail:
-    image: ${REGISTRY_HUB}/promtail:3.2.0
+  # ── Grafana Alloy：统一采集 logs→Loki / metrics→Prometheus / traces→Phoenix（替代原 Promtail）──
+  alloy:
+    image: ${REGISTRY_HUB}/alloy:${ALLOY_TAG:-v1.19.2}
     restart: unless-stopped
-    command: -config.file=/etc/promtail/promtail.yaml
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    # env_file 注入 PHOENIX_OTLP_ENDPOINT（Alloy→Phoenix 转发目标；路线 A=LAN IP，路线 B=phoenix:4317）
+    env_file: [.env]
     volumes:
-      - ./promtail.yaml:/etc/promtail/promtail.yaml:ro
+      - ./alloy.config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - alloy_data:/var/lib/alloy/data
+    # 仅发布 UI 到本机 127.0.0.1:12345 便于调试；OTLP 4317/4321 仅在 appnet 内由 agent 访问（不发布主机）
+    ports:
+      - "127.0.0.1:12345:12345"
     networks: [appnet]
-    depends_on: [loki]
+    depends_on: [loki, prometheus]
     deploy:
       resources:
         limits:
           cpus: "0.5"
-          memory: 256m
+          memory: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ── Prometheus：自建 metrics 后端（接收 Alloy remote_write + 直抓 agent / Alloy 自身）──
+  # 需 --web.enable-remote-write-receiver 才能接收 Alloy 的 prometheus.remote_write。
+  prometheus:
+    image: ${REGISTRY_HUB}/prometheus:${PROMETHEUS_TAG:-3.0}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9091:9090"
+    networks: [appnet]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
     logging:
       driver: json-file
       options:
@@ -177,7 +213,7 @@ services:
     ports:
       - "127.0.0.1:3100:3000"
     networks: [appnet]
-    depends_on: [loki]
+    depends_on: [loki, prometheus]
     deploy:
       resources:
         limits:
@@ -200,3 +236,5 @@ volumes:
   caddy_config:
   loki_data:
   grafana_data:
+  alloy_data:
+  prometheus_data:

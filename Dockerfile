@@ -29,6 +29,6 @@ USER appuser
 
 EXPOSE 8009
 
-# 日志由 Docker json-file 驱动轮转 + Promtail 采集，此处只打 stdout（JSON）
+# 日志由 Docker json-file 驱动轮转 + Alloy 采集（logs→Loki），此处只打 stdout（JSON）
 # --log-config 强制 uvicorn / uvicorn.access 也走统一 JSON 格式器（见 logging.uvicorn.json）
 CMD ["uv", "run", "uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "8009", "--log-config", "/app/logging.uvicorn.json"]

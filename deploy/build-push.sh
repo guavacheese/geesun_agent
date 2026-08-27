@@ -34,6 +34,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTEXT="$(cd "$REPO_ROOT/.." && pwd)"   # 必须含 langchain-cubesandbox
 
 AGENT_TAG="${1:-${GEESUN_AGENT_TAG:-1.0.0}}"
+# 第三方镜像 tag（与 .env.example 对应；可被环境变量覆盖）
+ALLOY_TAG="${ALLOY_TAG:-v1.19.2}"
+PROMETHEUS_TAG="${PROMETHEUS_TAG:-3.0}"
 
 echo "==> REGISTRY_GEESUN = $REGISTRY_GEESUN"
 echo "==> REGISTRY_HUB     = $REGISTRY_HUB"
@@ -127,8 +130,10 @@ sync_web() {
 sync "pgvector/pgvector:0.8.0-pg17"            "pgvector:0.8.0-pg17"
 sync "caddy:2.8-alpine"                        "caddy:2.8-alpine"
 sync "grafana/loki:3.2.0"                      "loki:3.2.0"
-sync "grafana/promtail:3.2.0"                  "promtail:3.2.0"
+sync "grafana/alloy:${ALLOY_TAG:-v1.19.2}"                  "alloy:${ALLOY_TAG:-v1.19.2}"
 sync "grafana/grafana:11.3.0"                  "grafana:11.3.0"
+# Alloy（统一采集，替代 Promtail；ALLOY_TAG 与 .env.example 一致）
+sync "prometheus:${PROMETHEUS_TAG:-3.0}"        "prometheus:${PROMETHEUS_TAG:-3.0}"
 # Phoenix（dockerhub 项目）
 sync "arizephoenix/phoenix:19.1.0"            "phoenix:19.1.0"
 sync "postgres:16.14"                          "postgres:16.14"

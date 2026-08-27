@@ -6,7 +6,7 @@
 
 生产 / 容器化约定：
 - 日志统一写 stdout/stderr（12-factor），Docker json-file 驱动负责大小轮转，
-  Loki/Promtail 负责集中留存与检索；应用内部不写轮转文件。
+  Loki/Alloy 负责集中留存与检索（logs→Loki，metrics→Prometheus，traces→Phoenix）；应用内部不写轮转文件。
 - 通过环境变量控制：
     LOG_LEVEL  日志级别，默认 INFO（排查时可设 DEBUG）
     LOG_FORMAT text | json，默认 json（容器 / 集中日志场景推荐 json）
