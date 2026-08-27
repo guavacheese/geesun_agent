@@ -18,10 +18,21 @@ skills/
 *.json
 *.venv
 .env
-!sandbox-pypi-mirror-setup.md
 
 # 部署配置与文档（需纳入版本控制，覆盖上方的 *.md / *.json 通配）
 !logging.uvicorn.json
 !deploy/DEPLOYMENT.md
 !deploy/*.json
 !deploy/.env.example
+
+# 证书 / CA（含 egress MITM rootCA，禁止进版本库）
+certs/
+
+# 运行时日志
+*.log
+
+# mcp.json 备份（*.json 已忽略 mcp.json，但 .bak.<ts> 后缀不匹配 *.json）
+mcp.json.bak.*
+
+# 临时探针脚本（tests/infra 下正式测试需保留，仅忽略该临时文件）
+tests/infra/*quick_probe.py
