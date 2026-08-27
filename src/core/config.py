@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # 完成门检测：False = 不做零产出校验（回到旧行为）
     sandbox_completion_gate_enabled: bool = True
     # 自动继续：零产出时注入 SystemMessage 让模型再跑一轮。
-    # ⚠ 依赖 deepagents astream 继续模式（spike_checkpoint_resume.py 验证），
+    # ⚠ 依赖 deepagents astream 继续模式（M3-v2 spike 已验证 astream 继续 + 消息注入可行），
     #   spike 通过前保持默认 False（此时完成门为纯检测 + blocked 事件，即 v1 行为）；
     #   验证通过后在 .env 设 SANDOX_COMPLETION_GATE_AUTO_CONTINUE=true 开启 v2。
     sandbox_completion_gate_auto_continue: bool = False

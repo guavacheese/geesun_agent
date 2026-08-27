@@ -1,5 +1,0 @@
-fix: CORS & PostgreSQL keepalive for frontend dev and long-running stability
-
-- src/server.py: add CORSMiddleware, allow localhost:3000 cross-origin requests
-- src/infra/database.py: add TCP keepalive params to DSN (keepalives_idle=60s)
-  to prevent PostgreSQL dropping idle connections after extended inactivity
