@@ -12,20 +12,17 @@
 |---|---|---|---|---|---|---|
 | geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 不发布（仅 appnet） | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun-mcp :8000、Phoenix/Langfuse |
 | geesun-mcp | `geesun_ai/geesun-mcp-server:<tag>` | 8000 | 不发布（仅 appnet） | 否 | 共享 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`（与 agent 同挂） | agent（经服务名）、DLP 解密 API、CubeSandbox(E2B) |
-| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet） | 经 Caddy :18080 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
+| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet） | 经 Caddy :80 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
 | agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 不发布 | 否 | named volume `agent_pg_data` | — |
-| caddy | `dockerhub/caddy:2.8-alpine` | 80 / 6006 / 3000 | 18080 / 16006 / 13000 | 是 | `caddy_data` `caddy_config` | geesun-agent / phoenix / langfuse-web |
+| caddy | `dockerhub/caddy:2.8-alpine` | 80 | 80 | 是 | `caddy_data` `caddy_config` | geesun-agent / geesun-agent-web |
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
 | promtail | `dockerhub/promtail:3.2.0` | — | 不发布 | 否 | — | docker.sock |
 | grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki |
-| phoenix | `dockerhub/phoenix:19.1.0` | 6006 / 4317 | 不发布（经 Caddy 16006） | 经 Caddy | — | phoenix-db |
-| phoenix-db | `dockerhub/postgres:16.14` | 5432 | 不发布 | 否 | `phoenix_pg_data` | — |
-| langfuse-web / worker | `dockerhub/langfuse:3.224.3` | 3000 | 不发布（经 Caddy 13000） | 经 Caddy | — | langfuse 后端栈 |
-| langfuse 后端 | `postgres:17` / `clickhouse-server:25.12` / `redis:7` / `minio:chainguard` | 各自 | minio S3 19092 | 否（minio S3 19092） | 多个 named volume | — |
+| ~~phoenix / langfuse~~ | **复用现网共享实例（路线 A）**：`opt-phoenix-1`(:6006/:4317/:9090)、`langfuse-*`(:3000)、`opt-db-1`(:5432)、`langfuse-minio-1`(:9092) 已由各自容器发布在 10.10.10.67，**不在本 compose 内**；agent 经主机 LAN IP 连接（`PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317`、`LANGFUSE_BASE_URL=http://10.10.10.67:3000`） | — | — | — | 各自 named volume（现网已有） | — |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
-- **CubeSandbox**：`172.16.66.13`（cube-proxy / cube-egress MITM，sandbox 执行环境）
+- **CubeSandbox**：`192.168.10.136`（cube-proxy / cube-egress MITM；dev/prod 共用；sandbox 域名 `*.cube.app` 经 DNS 指向 136，见 §4.8）
 - **geesun_mcp_server**：现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），与 agent 同处 `appnet`，agent 经服务名 `geesun-mcp:8000` 访问；容器内部端口 8000 **不发布到主机**（避免与 dev 的 :8000 冲突），仅 appnet 内互访。DLP 解密 API 仍在 compose 外，由 `.env` 的 `DECRYPT_API_URL` 提供。
 - **Harbor**：`172.16.220.74:8333`（HTTP，项目 `geesun_ai`（自有应用 geesun-agent）+ `dockerhub`（第三方通用镜像中央仓库 redis/minio/postgres/loki/grafana/phoenix/langfuse 等））
 
@@ -71,7 +68,7 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 1. `docker login 172.16.220.74:8333`
 2. 构建并 push `geesun-agent:<tag>`（→ `geesun_ai` 项目）
 3. `sync_mcp()` 构建并 push `geesun-mcp-server:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_mcp_server` 仓库根）
-4. `sync_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67:18080/`）
+4. `sync_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67/`）
 5. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（公网拉不到时回退用本地已有镜像）
 
 ### 2.3 镜像清单（源 → Harbor 目标）
@@ -121,23 +118,21 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 ## 4. 网络规划
 
 ### 4.1 Docker 内部网络
-- 所有服务加入自定义 bridge 网络 **`appnet`**，容器间用**服务名**互访（如 agent 配 `phoenix_collector_endpoint=http://phoenix:4317`、`langfuse_base_url=http://langfuse-web:3000`）。
-- 三个 compose 用 `-f` 合并时，各自的 `networks: [appnet]` 会加入同一网络（名称固定为 `appnet`）。
+- 所有服务加入自定义 bridge 网络 **`appnet`**，容器间用**服务名**互访（如 agent 配 `mcp_server_url=http://geesun-mcp:8000/mcp`）。
+- 多个 compose 用 `-f` 合并时，各自的 `networks: [appnet]` 会加入同一网络（名称固定为 `appnet`）。
+- ⚠️ **可观测性不在 appnet 内**：Phoenix/Langfuse 为现网共享实例（另一 compose），agent 经主机 LAN IP 已发布端口连接（`http://10.10.10.67:4317` / `http://10.10.10.67:3000`）。
 
 ### 4.2 对外暴露（最小化）
-- 只暴露 **Caddy**：`18080`（前端主入口）/ `16006`（Phoenix）/ `13000`（Langfuse）——共享生产机方案 A：主机 80/3000 被现有系统（app-frontend/app-backend）占用，故映射到高端口；容器内 Caddy 仍监听 80/6006/3000，仅 host 侧映射不同。
-- 数据库 / Redis / Clickhouse / Minio(除 S3 19092) **不映射主机端口**，仅经 `appnet` 内部访问；如需排障临时暴露，绑 `127.0.0.1`（已配置）。
-- Minio S3 API 映射主机 `19092`（共享机 9092 被 tb-kafka 占用）；其 `EXTERNAL_ENDPOINT` 必须指向**主机 LAN IP**（`http://10.10.10.67:19092`），容器视角不能用 `localhost`。
+- 只暴露 **Caddy**：`:80`（前端主入口，`/api/*` 路由到 agent）。Phoenix(`:6006`)、Langfuse(`:3000`)、Minio S3(`:9092`) 由现网共享容器直出，**不经 Caddy**（避免与其已发布端口冲突）。
+- 数据库 / Loki / Grafana(127.0.0.1:3100) **不映射主机端口**，仅经 `appnet` 内部访问。
 
-### 4.3 访问外部物理机（vLLM / CubeSandbox / MCP）
-- 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP `172.16.66.13`，因此 agent 内配置 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
-- 若用 Docker Desktop 或想解耦硬编码 IP，可加 `extra_hosts: ["host.docker.internal:host-gateway"]` 并用 `host.docker.internal` 指代宿主机；但指向**另一台物理机**时直接用其 LAN IP 更稳。
-- **CubeSandbox egress MITM**：CubeSandbox 走 `cube-egress` 做 TLS 拦截，提供 `rootCA.pem`。agent 容器若需信任该 CA，需：
-  - 挂载 CA 到容器（如 `/etc/ssl/certs/cube-root-ca.crt`）；
-  - 设 `REQUESTS_CA_BUNDLE=/etc/ssl/certs/cube-root-ca.crt`（或在 compose `environment` 注入）；
-  - 否则 sandbox 内出网请求会因证书不受信失败。
-- **同理 `geesun-mcp` 容器也需信任该 CA**：`docker-compose.mcp.yml` 已默认挂载 `SSL_CERT_FILE` + CA 卷；若 sandbox 代理无 MITM 可删挂载与该变量（见 §4.6）。
-- **同理 `geesun-mcp` 容器也需信任该 CA**：`docker-compose.mcp.yml` 已默认挂载 `SSL_CERT_FILE` + CA 卷；若 sandbox 代理无 MITM 可删挂载与该变量（见 §4.6）。
+### 4.3 访问外部物理机（vLLM / CubeSandbox / MCP）与 CA 信任
+- 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP（`172.16.66.13` vLLM、`192.168.10.136` CubeSandbox），agent 内 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
+- **CubeSandbox egress MITM CA（docker 化，已落地）**：CubeSandbox 走 `cube-egress` 做 TLS 拦截，提供 `rootCA.pem`。**agent 与 geesun-mcp 两个容器都已配好**（`docker-compose.yml` 与 `docker-compose.mcp.yml`）：
+  - bind mount：`${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}` → `/etc/ssl/certs/cube-root-ca.crt:ro`（相对 `deploy/` 目录；生产机把 `geesun_agent/certs/` 拷到 deploy 上级即可）；
+  - 环境变量：agent 设 `REQUESTS_CA_BUNDLE` + `SSL_CERT_FILE`；mcp 设 `SSL_CERT_FILE`；
+  - 若 sandbox 代理无 MITM，可删挂载与该变量。
+- 连接外网组件走 LAN IP 时，容器→主机→目标 NAT 自动完成，无需 `host.docker.internal`。
 
 ### 4.4 TLS
 - Caddy 做 TLS 终止，使用内部 CA（mkcert 链）签发 `10.10.10.67` 证书；内网服务之间明文。证书存于 `caddy_data` volume。
@@ -145,23 +140,20 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 ### 4.5 端口冲突速查（含部署前预检）
 容器**内部端口**（appnet 服务名互访）与**主机发布端口**（`ports:` 映射）是两回事：仅在 `ports:` 里声明的才占主机端口；容器间互访走服务名，不占主机端口。
 
-**部署前在 10.10.10.67 上预检我方端口是否空闲**（该机为共享生产机，80/3000/9092/5432/6379 等已被现有系统占用，勿动）：
+**部署前在 10.10.10.67 上预检我方端口是否空闲**（该机已跑共享可观测栈，见下表"复用"行，勿占用其端口）：
 ```sh
-ss -tlnp | grep -E ':(18080|16006|13000|19092|8009|8000|3100)\b'
+ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 ```
-- 预期：`18080 / 16006 / 13000 / 19092 / 8009 / 8000 / 3100` **全部空闲**（这是我方要用的主机端口）。
-- 若被占用 → 换端口：改 `docker-compose.yml` 的 caddy `ports:` 映射 + `docker-compose.langfuse.yml` 的 minio 端口 + `.env` 的 `NEXTAUTH_URL`/`CORS_ALLOW_ORIGINS`/S3 `EXTERNAL_ENDPOINT` + 前端镜像 `NEXT_PUBLIC_API_BASE`（构建期）后重新部署。
+- 预期：`80 / 8009 / 8000 / 3100` **全部空闲**（这是我方要用的主机端口）。
+- 若 80 被占用 → 换 Caddy 映射：改 `docker-compose.yml` 的 caddy `ports:` + `.env` 的 `CORS_ALLOW_ORIGINS` + 前端镜像 `NEXT_PUBLIC_API_BASE`（构建期）后重新部署。
 
 | 端口 | 用途 | 主机发布? | 处理 |
 |---|---|---|---|
-| 18080 / 16006 / 13000 | Caddy 入口（前端 / Phoenix / Langfuse） | 是 | 唯一占用我方主机端口的服务；80/3000 被现网占用故用高端口 |
-| 19092 | Minio S3 | 是（对外） | 共享机 9092 被 tb-kafka 占用，改 19092 |
+| 80 | Caddy 入口（前端 + `/api/*` → agent） | 是 | 我方唯一主机端口 |
 | 8009 | geesun-agent | 否（仅 appnet） | 不冲突 |
 | 8000 | geesun-mcp | 否（仅 appnet） | 不发布，不冲突 |
-| 5432 | postgres ×3（agent/phoenix/langfuse） | 否（仅内部） | 各自独立容器；主机 5432 被 tb-postgres 占用也不影响 |
-| 6379 | langfuse redis | 否（仅内部） | 主机 6379 被 tb-redis 占用也不影响 |
 | 3100 | Grafana | 127.0.0.1:3100 | 仅本机排障 |
-| 9092 / 5432 / 6379 / 80 / 3000 | 现网系统（tb-kafka / tb-postgres / tb-redis / app-frontend / app-backend） | 是（他人） | **非我方，勿占用、勿下线** |
+| 3000 / 6006 / 4317 / 9090 / 9092 / 5432 | **共享可观测栈**（现网 langfuse-web / opt-phoenix / langfuse-minio / opt-db） | 是（他人已发布） | **复用，勿占用、勿下线**；agent 经主机 IP 连接 |
 
 ---
 
@@ -182,10 +174,10 @@ ss -tlnp | grep -E ':(18080|16006|13000|19092|8009|8000|3100)\b'
 
 **⚠️ mcp.json 残留坑**：agent 首次启动会按 `mcp_server_url` 生成 `{AGENT_WORKSPACE}/mcp.json`。若你**之前**手动改过 `mcp.json`（或旧部署遗留），里面的 url 可能是 `localhost`，改 `.env` 的 `mcp_server_url` **不会自动覆盖**已存在的 `mcp.json`。修复：`rm {AGENT_DATA_ROOT}/agent/mcp.json` 让它用新默认值重新生成，或手动把里面 `decrypt-file.url` 改成 `http://geesun-mcp:8000/mcp`。
 
-**合并启动**（在 `deploy/` 目录）：
+**合并启动**（在 `deploy/` 目录；prod 仅 3 个文件，Phoenix/Langfuse 复用现网共享实例）：
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
-               -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
+               -f docker-compose.web.yml up -d
 ```
 
 **镜像构建**：`build-push.sh` 已加 `sync_mcp()`，会把 `geesun_mcp_server` 仓库（上下文=其根）构建并推到 `geesun_ai/geesun-mcp-server:<MCP_TAG>`。基镜像已从 `python:3.11` 改 `python:3.13-slim-bookworm`，与 `pyproject.toml` 的 `requires-python>=3.13` 及 dev 运行时一致，避免 dev/prod 漂移。
@@ -202,22 +194,37 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
 ### 4.7 前端（geesun_agent_web）容器化部署
 前端 Next.js 16 已容器化为 `geesun-agent-web` 服务（`docker-compose.web.yml`），与 agent 同处 `appnet`，内部 3000 不发布主机，由 Caddy :80 对外。
 
-**⚠️ 构建期注入（最容易踩的坑）**：`NEXT_PUBLIC_API_BASE` 是 Next.js **公共变量，浏览器直接读构建产物**——属于 build-time 内联，运行时改 `.env` **无效**。生产镜像默认内联 `http://10.10.10.67:18080/`（共享机方案 A：Caddy 同域高端口）；换环境必须用 `NEXT_PUBLIC_API_BASE=xxx bash deploy/build-push.sh` 重新构建镜像，不能靠改 `.env`。
+**⚠️ 构建期注入（最容易踩的坑）**：`NEXT_PUBLIC_API_BASE` 是 Next.js **公共变量，浏览器直接读构建产物**——属于 build-time 内联，运行时改 `.env` **无效**。生产镜像默认内联 `http://10.10.10.67/`（Caddy :80 同域）；换环境必须用 `NEXT_PUBLIC_API_BASE=xxx bash deploy/build-push.sh` 重新构建镜像，不能靠改 `.env`。
 
 **⚠️ Caddy 路径路由（防 rewrite 回环）**：前端 `next.config.ts` 会把 `/api/*` rewrite 到 `NEXT_PUBLIC_API_BASE`（同域）。若 Caddy 把 `/` 整体代理到 web，`/api/*` 请求会 Caddy→web→rewrite→Caddy 无限循环。因此 `Caddyfile` 必须按路径分流：`/api/*`、`/docs`、`/openapi.json` 直连 `geesun-agent:8009`，其余走 `geesun-agent-web:3000`（已实现）。
 
 **前端本地 dev 不受影响**：dev 仍是 `bun run dev`（读 `.env.local`，默认 `http://localhost:8009`），`next.config.ts` 的 `output: "standalone"` 仅对 `next build` 生效，`next dev` 忽略；容器与 dev 是两套独立运行方式。
 
-**合并启动**（在 `deploy/` 目录，比 §4.6 多一个 `-f docker-compose.web.yml`）：
+**合并启动**（在 `deploy/` 目录；prod 仅 3 个文件，Phoenix/Langfuse 复用现网共享实例）：
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
-               -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml \
                -f docker-compose.web.yml up -d
 ```
 
 **排障**：
 - 前端打不开但后端通：`docker logs geesun-agent-web` 看是否 `next build` 产物缺失（确认镜像用 `sync_web` 重建，含 `.next/static` 与 `public`）。
 - `/api/*` 404 或回环：确认 Caddyfile 是路径分流版本（`handle /api/*` 在前），且前端镜像 `NEXT_PUBLIC_API_BASE` 为同域地址。
+
+---
+
+### 4.8 CubeSandbox 域名（`*.cube.app`）与 DNS（docker 化）
+sandbox 访问域名形如 `49983-78083c0f5b044a3084a891a2c1f35b50.cube.app`，dev 在 WSL 里用 dnsmasq 转发（`server=/cube.app/192.168.10.136`）；**生产容器里同样要能解析**。
+
+**Docker 的 DNS 链**：容器 → `127.0.0.11`（docker 内嵌 DNS，只解 appnet 服务名）→ 转发其它域名给上游 resolver（daemon.json `dns` / resolv.conf）。
+
+**正确做法（已在 `deploy/setup-cube-dns.sh` 落地，root 执行一次）**：
+1. 宿主机装 dnsmasq，写入 `/etc/dnsmasq.d/cube.conf`：`server=/cube.app/192.168.10.136`（与 dev 一致；136 提供 `*.cube.app` 解析）；
+2. `/etc/docker/daemon.json` 加 `"dns": ["<dnsmasq 监听 IP>"]`（如 docker0 网关 `172.17.0.1`），重启 docker；
+3. 验证：`docker run --rm busybox nslookup xxx.cube.app`。
+
+**为什么不用 compose 的 `dns:` 字段**：它会顶掉 `127.0.0.11`，导致 agent/mcp 容器**无法用服务名**（`geesun-mcp`/`agent-postgres`/`geesun-agent-web`）互访——内嵌 DNS 是服务名解析的唯一通道。daemon 级 `dns` 则保留内嵌 DNS，仅把外部域名转发给 dnsmasq。
+
+**前提**：67 到 `192.168.10.136` 网络可达（与 dev 同内网段）。
 
 ---
 
@@ -317,20 +324,20 @@ cron 示例（每天 03:07）：
      - `CORS_ALLOW_ORIGINS`：按需改成 Web 实际域名/IP。
    - **D. 可保持默认（通常无需改）：**
      - `LOG_LEVEL`/`LOG_FORMAT`、`AGENT_PG_*`、`AGENT_DATA_ROOT`、`REGISTRY_GEESUN/HUB`、`GEESUN_AGENT_TAG`、`LANGFUSE_TAG`、`POSTGRES_VERSION`、`PHOENIX_DB_*`(名称)、`OTEL_PROJECT_NAME`、`*_BASE_URL`(服务名)、网络类 `REDIS_HOST/PORT` 等。
-5. （可选）挂载 CubeSandbox `rootCA.pem` 到 agent 并设 `REQUESTS_CA_BUNDLE`（4.3）。
+5. （可选但推荐）CubeSandbox 信任与 DNS：把 `geesun_agent/certs/`（含 `cube-root-ca.crt`）拷到生产机 deploy 上级目录（CA 挂载源），并 root 执行 `bash deploy/setup-cube-dns.sh`（dnsmasq 转发 `*.cube.app`，见 §4.8）。
 6. 合并拉取镜像：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml pull
+   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml pull
    ```
 7. 启动（依赖与 healthcheck 会控制顺序）：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d
    ```
 8. 校验：
    - `docker compose ps` 全 healthy；
-   - `http://10.10.10.67:18080/` → 前端页面（Caddy → geesun-agent-web）；API 文档 `http://10.10.10.67:18080/docs`（Caddy → geesun-agent:8009）；
-   - `http://10.10.10.67:16006` → Phoenix；
-   - `http://10.10.10.67:13000` → Langfuse，注册首个账号；
+   - `http://10.10.10.67/` → 前端页面（Caddy → geesun-agent-web）；API 文档 `http://10.10.10.67/docs`（Caddy → geesun-agent:8009）；
+   - `http://10.10.10.67:6006` → Phoenix（现网共享实例）；
+   - `http://10.10.10.67:3000` → Langfuse（现网共享实例），注册/使用 prod project 的 API key；
    - `127.0.0.1:3100` → Grafana，看 Loki 数据源有日志。
 
 **阶段 C — 接线**
@@ -343,7 +350,7 @@ cron 示例（每天 03:07）：
 
 - **Harbor HTTP**：务必配 `insecure-registries`，否则 login/pull 失败。
 - **构建上下文**：`geesun-agent` 必须在 `/d/workspace` 下构建，否则 `langchain-cubesandbox` 解析失败。
-- **9090 端口冲突**：Phoenix 的 9090 不映射；Langfuse Minio 改 19092（共享机 9092 被 tb-kafka 占用）+ EXTERNAL 指向 LAN IP。
+- **9090 端口冲突**：Phoenix 的 9090 由现网共享实例发布，prod 不再自建 Phoenix/Langfuse，无冲突。
 - **三个 Postgres**：agent_mem / phoenix / langfuse 各自独立，资源占用偏高；后续若想省可合并实例（按安全域权衡）。
 - **密钥**：`.env` 必须 `chmod 600` 且**绝不进 git**；生产可进一步改用 compose `secrets:` 挂载。
 - **DB 不暴露**：仅 `127.0.0.1` 供排障；对外只走 Caddy。
@@ -353,7 +360,8 @@ cron 示例（每天 03:07）：
 - **外部依赖可达性**：部署后先 `docker exec geesun-agent curl -s http://172.16.66.13:8003/v1/models` 验证 vLLM 连通，再验 CubeSandbox / MCP。
 - **MCP 容器化**：geesun_mcp_server 现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），合并 `up` 时加 `-f docker-compose.mcp.yml`；agent 经服务名 `geesun-mcp:8000` 访问，勿再手跑裸进程。部署拓扑与排障见 §4.6。
 - **前端容器化**：geesun_agent_web 已容器化为 `geesun-agent-web`（见 `docker-compose.web.yml`），合并 `up` 时加 `-f docker-compose.web.yml`；`NEXT_PUBLIC_API_BASE` 为构建期内联（运行时改 `.env` 无效）、Caddy 按路径分流防 rewrite 回环，详见 §4.7。
-- **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认**我方端口**（18080/16006/13000/19092/8009/8000/3100）空闲；本机为共享生产机，80/3000/9092/5432/6379 已被现网系统占用，**勿占用、勿下线**。
+- **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认**我方端口**（80/8009/8000/3100）空闲；3000/6006/9092/5432 为现网共享可观测栈，**复用勿动**。
+- **CubeSandbox DNS**：容器内 `*.cube.app` 解析必须配 dnsmasq + daemon `dns`（§4.8），**不要**用 compose `dns:`（会顶掉 127.0.0.11 导致服务名解析失效）。
 
 ---
 
@@ -370,9 +378,10 @@ cron 示例（每天 03:07）：
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh sync_mcp + requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
 | 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh sync_web + Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
-| 10 | 共享生产机端口调整（方案 A：Caddy 18080/16006/13000 + Minio 19092，避开现网 80/3000/9092） | `docker-compose.yml` + `docker-compose.langfuse.yml` + `.env.example` + `Caddyfile` 注释 + 前端镜像 `NEXT_PUBLIC_API_BASE` | ✅ 已落地 |
+| 10 | 复用现网共享可观测栈（路线 A）：prod compose 仅 yml+mcp+web 三文件，Caddy 只留 :80，agent 经 10.10.10.67:4317/:3000 连共享 Phoenix/Langfuse | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` | ✅ 已落地 |
+| 11 | CubeSandbox 信任与 DNS docker 化：agent/mcp CA 挂载 + REQUESTS_CA_BUNDLE/SSL_CERT_FILE；`setup-cube-dns.sh`（dnsmasq 转发 *.cube.app + daemon dns） | `docker-compose.yml` + `docker-compose.mcp.yml` + 新增 `setup-cube-dns.sh` + §4.3/§4.8 | ✅ 已落地 |
 
-> 实现项 #1–#5、#7–#10 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
+> 实现项 #1–#5、#7–#11 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 
 ---
 
@@ -391,19 +400,18 @@ cron 示例（每天 03:07）：
 - dev agent `.env` 填 dev project 的 key；prod agent `.env` 填 prod project 的 key；二者的 `LANGFUSE_BASE_URL` 指向同一实例。
 - 注：后端 PG/Clickhouse/Minio 共享，逻辑隔离靠 key。
 
-### 10.3 端口冲突（已按方案 A 处理：换端口）
-- **现状（2026-08-26 实测）**：10.10.10.67 是**共享生产机**，已运行 Harbor(:8333)、ThingsBoard 栈、SlashAdmin、遥测服务等 15+ 容器，主机 `80`（app-frontend）、`3000`（app-backend）、`9092`（tb-kafka）、`5432`（tb-postgres）、`6379`（tb-redis）、`8080`（tb-node）、`9000`（app-python-service）均被现网占用——**不是 dev 残留，无法下线**。
-- **决策（方案 A）**：我方 Caddy 改映射高端口 `18080:80`、`16006:6006`、`13000:3000`（容器内监听不变，Caddyfile 不用动）；Minio S3 改 `19092`。入口：前端 `http://10.10.10.67:18080/`、Phoenix `:16006`、Langfuse `:13000`。
-- dev 的 Phoenix/Langfuse 如仍占 6006/3000，与现网不冲突，但如需与本 prod 并存须避免占用我方新端口（18080/16006/13000/19092）。
+### 10.3 端口现状与处理（已按"复用共享可观测栈"落地）
+- **现状（2026-08-27 实测）**：10.10.10.67 上运行 **dev/共享可观测栈**（已 3 周）：`langfuse-langfuse-web-1`(:3000)、`langfuse-worker`(:3030 lo)、`opt-phoenix-1`(:6006/:4317/:9090)、`opt-db-1`(:5432)、`langfuse-minio-1`(:9092/:9091 lo)、langfuse postgres/redis/clickhouse（内部/lo）。**主机 80 空闲**。
+- **决策**：遵循路线 A——**复用**这套 Phoenix/Langfuse 作为 dev/prod 共享后端（project key 区分）；prod compose **只跑 3 个文件**（yml+mcp+web），不再自建可观测栈；Caddy 只用 :80（前端主入口）；agent 经 `http://10.10.10.67:4317` / `http://10.10.10.67:3000` 连接共享实例。共享实例的 3000/6006/9092/5432 等端口**勿占用、勿下线**。
 
 ### 10.4 agent 环境变量按环境切换
 prod 的 `geesun_agent/deploy/.env` 至少区分：
 ```sh
 OTEL_PROJECT_NAME=Geesun-Agent-prod
-LANGFUSE_BASE_URL=http://langfuse-web:3000
+LANGFUSE_BASE_URL=http://10.10.10.67:3000
 LANGFUSE_PUBLIC_KEY=pk-lf-prod-xxxx
 LANGFUSE_SECRET_KEY=sk-lf-prod-xxxx
-PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
+PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317
 ```
 
 ---

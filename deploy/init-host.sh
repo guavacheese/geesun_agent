@@ -33,7 +33,17 @@ chown -R "$APP_UID:$APP_GID" "$DATA_ROOT" "$BACKUP_ROOT"
 chmod 0755 "$DATA_ROOT" "$BACKUP_ROOT"
 chmod 0755 "$DATA_ROOT"/agent "$DATA_ROOT"/uploads "$DATA_ROOT"/reports
 
+# CubeSandbox CA 检查（agent/mcp 容器挂载源，相对 deploy/ 上级 certs/ 目录）
+CA_FILE="$SCRIPT_DIR/../certs/cube-root-ca.crt"
+if [ -f "$CA_FILE" ]; then
+  echo "==> CubeSandbox CA: $CA_FILE 存在（容器将挂载并注入 REQUESTS_CA_BUNDLE/SSL_CERT_FILE）"
+else
+  echo "    [警告] 未找到 $CA_FILE —— 请把 geesun_agent/certs/ 拷到 deploy 上级目录，"
+  echo "           否则 sandbox egress TLS 会因证书不受信失败（无 MITM 环境可忽略）"
+fi
+
 echo "完成。可继续："
-echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml pull"
-echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d"
+echo "  sudo bash deploy/setup-cube-dns.sh    # 可选但推荐：容器内解析 *.cube.app（§4.8）"
+echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml pull"
+echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d"
 echo "(若主机无 UID 1001 账户属正常；chown 按数字 UID 生效即可)"

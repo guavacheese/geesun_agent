@@ -106,8 +106,7 @@ sync_mcp() {
 # 自有应用：geesun-agent-web（Next.js 前端，→ geesun_ai 项目）
 # 构建上下文为 geesun_agent_web 仓库根（与 geesun_agent 同级目录）。
 # NEXT_PUBLIC_API_BASE 是 build-time 变量（浏览器直接读构建产物），
-# 默认 http://10.10.10.67:18080/（共享机方案 A：Caddy 同域高端口，/api/* 由 Caddy 转发后端）；
-# 换环境重构建。
+# 默认 http://10.10.10.67/（Caddy :80 同域，/api/* 由 Caddy 转发后端）；换环境重构建。
 sync_web() {
   local web_repo="$REPO_ROOT/../geesun_agent_web"
   if [[ ! -d "$web_repo" ]]; then
@@ -115,7 +114,7 @@ sync_web() {
     return 0
   fi
   local WEB_TAG="${WEB_TAG:-1.0.0}"
-  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67:18080/}"
+  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67/}"
   local WEB_IMAGE="$REGISTRY_GEESUN/geesun-agent-web:$WEB_TAG"
   echo "==> 构建 $WEB_IMAGE (context=$web_repo, NEXT_PUBLIC_API_BASE=$API_BASE)"
   docker build \
@@ -145,5 +144,6 @@ echo "    后续在目标机执行："
 echo "      mkdir -p /opt/geesun/data/{agent,uploads,reports}"
 echo "      cd $REPO_ROOT/deploy"
 echo "      cp .env.example .env && vi .env"
-echo "      docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml pull"
-echo "      docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d"
+echo "      sudo bash deploy/setup-cube-dns.sh   # 可选但推荐：*.cube.app DNS（§4.8）"
+echo "      docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml pull"
+echo "      docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d"

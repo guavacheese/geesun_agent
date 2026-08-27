@@ -2,16 +2,19 @@
 #
 # 合并启动（在 deploy/ 目录）：
 #   cp .env.example .env && vi .env        # 填全部密钥（含 REGISTRY_GEESUN / REGISTRY_HUB / Harbor 凭证）
-#   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml -f docker-compose.web.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d
 #
 # 说明：
 #   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
 #     第三方通用镜像（pgvector/caddy/loki/promtail/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
 #   - 多个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
-#   - 对外只暴露 caddy 的 18080 / 16006 / 13000（共享机方案 A 高端口映射）；数据库 / redis / clickhouse / minio(除 S3 19092) 不暴露到主机。
+#   - 可观测性复用现网共享实例（路线 A）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
+#     已发布在主机，本 compose 不再跑 phoenix/langfuse 服务；agent 经主机 LAN IP 连接（见 .env）。
+#   - 对外只暴露 caddy 的 80（前端主入口）；数据库 / loki / grafana(127.0.0.1:3100) 不暴露到主机。
 #   - 日志：各服务 json-file 驱动做大小轮转（max-size/max-file），Promtail 采集入 Loki，Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
+#   - CubeSandbox 证书与 *.cube.app DNS：见 DEPLOYMENT.md §4.3 / §4.8 与 deploy/setup-cube-dns.sh。
 
 services:
   geesun-agent:
@@ -31,18 +34,23 @@ services:
       POSTGRES_DB: "${AGENT_PG_DB:-agent_mem}"
       POSTGRES_USER: "${AGENT_PG_USER:-geesun}"
       POSTGRES_PASSWORD: "${AGENT_PG_PASSWORD}"
-      # 追踪（同网络内服务名）
-      phoenix_collector_endpoint: "${PHOENIX_COLLECTOR_ENDPOINT:-http://phoenix:4317}"
-      langfuse_base_url: "${LANGFUSE_BASE_URL:-http://langfuse-web:3000}"
+      # 追踪（复用现网共享实例，经主机 LAN IP 已发布端口连接；phoenix/langfuse 不在本 compose）
+      phoenix_collector_endpoint: "${PHOENIX_COLLECTOR_ENDPOINT:-http://10.10.10.67:4317}"
+      langfuse_base_url: "${LANGFUSE_BASE_URL:-http://10.10.10.67:3000}"
       langfuse_public_key: "${LANGFUSE_PUBLIC_KEY}"
       langfuse_secret_key: "${LANGFUSE_SECRET_KEY}"
       otel_project_name: "${OTEL_PROJECT_NAME:-Geesun-Agent-prod}"
       cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67}"
+      # CubeSandbox egress MITM CA（sandbox 出网 TLS 拦截证书，无 MITM 可删挂载+这两行）
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/cube-root-ca.crt
+      SSL_CERT_FILE: /etc/ssl/certs/cube-root-ca.crt
     # 宿主机挂载：报告/上传/工作目录防容器重建丢失（AGENT_DATA_ROOT 见 .env）
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/uploads:/data/uploads
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
+      # CubeSandbox CA（挂载源相对 deploy/ 目录，见 .env 的 CA_MOUNT_SRC）
+      - ${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}:/etc/ssl/certs/cube-root-ca.crt:ro
     depends_on:
       agent-postgres:
         condition: service_healthy
@@ -96,11 +104,9 @@ services:
     image: ${REGISTRY_HUB}/caddy:2.8-alpine
     restart: unless-stopped
     ports:
-      # 共享生产机方案 A：主机 80/3000 已被现有系统占用，Caddy 改映射高端口；
-      # 容器内仍监听 80/6006/3000（Caddyfile 不变），仅 host 侧映射调整。
-      - "18080:80"    # 前端主入口
-      - "16006:6006"  # Phoenix
-      - "13000:3000"  # Langfuse
+      # 仅主入口 :80（前端 + /api/* 路由）；Phoenix(:6006)/Langfuse(:3000) 由现网共享容器直出，
+      # 不经 Caddy 代理（避免与它们的已发布端口冲突）。
+      - "80:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
