@@ -736,34 +736,15 @@ async def create_agent(
     skills: list[str],
 ):
     backend = build_backend(user_id, session_id, store, sandbox)
-    model = create_model()
+    model = await create_model()
 
-    # ─── SummarizationMiddleware（历史 offload 精确计数版）───
-    # deepagents 默认挂的 Summarization 用 count_tokens_approximately（4 字符/token），
-    # 对中文低估 ~2 倍（2026-08-12 实测：真实 1501 vs 近似 769），导致 262k 真实 tokens
-    # 的上下文不触发 offload → Qwen 400（max context 262144）。这里显式加一个用
-    # model.get_num_tokens（tiktoken 兜底）精确计数的实例；默认那个因低估恒 no-op，不冲突。
-    def _count_tokens_accurate(messages, *, tools=None) -> int:
-        """用 model.get_num_tokens 逐条精确计数（tiktoken 兜底），解决中文低估。"""
-        total = 0
-        for m in messages:
-            content = str(getattr(m, "content", "")) if getattr(m, "content", None) else ""
-            if content:
-                try:
-                    total += model.get_num_tokens(content)
-                except Exception:
-                    total += len(content)  # 兜底：1 字符≈1 token（足够保守）
-        # 临时诊断：仅接近/超过触发阈值时打（避免每步刷屏）
-        # 阈值与 create_agent 里 effective_trigger 同源推导，不再写死
-        _trigger = (
-            settings.model_max_len - settings.model_max_tokens - settings.model_max_tokens_margin
-        )
-        if total > _trigger:
-            logger.warning(
-                "[DIAG] _count_tokens_accurate: messages=%d, total=%d tokens（触发阈值 %d）",
-                len(messages), total, _trigger,
-            )
-        return total
+    # ─── SummarizationMiddleware（历史 offload）───
+    # 触发改用 fraction（0.8 × model.profile["max_input_tokens"]）——vLLM 自定义模型名
+    # 不在 langchain 注册表 → profile 默认 None → 原 fraction 触发失效，故 create_model /
+    # switch_model 已注入 profile={"max_input_tokens": resolve_max_len(...)}（见 model.py）。
+    # token_counter 用 langchain 标准 model.get_num_tokens_from_messages（含 tools schema，
+    # 比被证伪低估的 _count_tokens_accurate 更稳）。计数低估导致触发偏晚的问题由
+    # model_call_guard 的 400 兜底 + 砍输入兜底（见 model.py）兜住，不再依赖本地计数。
 
     def _build_inventory_provider(user_id, session_id, sandbox):
         """构造"当前会话真实资源清单"回调，随摘要注入 SystemMessage。
@@ -793,18 +774,14 @@ async def create_agent(
             return "\n".join(lines)
         return provider
 
-    # 触发阈值按真实上限推导（替代写死 100000，该值落在 400 死亡线之后永不触发）：
-    # 保证压缩在 400 之前发生；分母是真探活/400 修正后的 model_max_len，1M 模型自动放大。
-    effective_trigger = max(
-        settings.summarization_trigger_tokens,  # 下限保护（config 值）
-        settings.model_max_len - settings.model_max_tokens - settings.model_max_tokens_margin,
-    )
+    # 触发用 fraction（见下），不再需要 tokens 阈值推导；summarization_trigger_tokens
+    # 仅作为无 profile 时的下限保护（config 值）。
     summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
-        trigger=("tokens", effective_trigger),  # 动态推导，提前压
+        trigger=("fraction", 0.8),  # 按 model.profile["max_input_tokens"] 的 0.8 触发，多模型自动适配
         keep=("messages", 10),
-        token_counter=_count_tokens_accurate,
+        token_counter=model.get_num_tokens_from_messages,  # langchain 标准计数，替代被证伪的 _count_tokens_accurate
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
     )
 
@@ -823,8 +800,8 @@ async def create_agent(
             _FreshSkillsMiddleware(backend=backend, sources=skills),
             switch_model,
             file_to_image,
-            model_call_guard,
             summarization_mw,
+            model_call_guard,
         ],
         interrupt_on={
             "write_file": False,

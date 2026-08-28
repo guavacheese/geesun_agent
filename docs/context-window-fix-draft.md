@@ -1,6 +1,8 @@
-# 上下文窗口超限修复 — 改动 Diff 草稿（已落地 2026-08-27，commit 9c32f08）
+# 上下文窗口超限修复 — 设计记录（v1 落地 2026-08-27 commit 9c32f08；v2 修订 2026-08-28）
 
-> 本文件是改动方案记录。方案已于 2026-08-27 按此落地（`src/core/config.py` / `src/core/model.py` / `src/services/agent.py`），commit `9c32f08`。
+> 本文是上下文窗口超限修复的演进记录。
+> - **v1（2026-08-27，commit `9c32f08`）**：已落地，但**被 2026-08-28 生产实证证伪**——`_MODEL_MIN_OUTPUT_TOKENS=1` 的 floor 在多模态大输入下触发死循环（见「〇、v2」章）。v1 章节（一~九）保留仅供追溯，**不再作为当前行为依据**。
+> - **v2（2026-08-28）**：推翻 v1 的 floor=1 / tokens 阈值 / 400-hero 思路，改为「fraction+profile 触发 + 动态 resolve_max_len + stream_usage + 流式空闲超时护长任务 + 超预算砍输入」。本章「〇」为当前有效方案。
 
 ## 一、改动总览
 
@@ -10,7 +12,50 @@
 | 2 | `src/core/model.py` | 新增 `_parse_context_error` / `probe_model_max_len`；`model_call_guard` 加 400 兜底重试循环 | **核心保险**：自己 catch 真实异常（非 deepagents 死代码 `ContextOverflowError`），吃 API 真实报错，自适应任何模型 |
 | 3 | `src/services/agent.py` (L792-799) | summarization 触发阈值改为 `model_max_len - model_max_tokens - margin` 动态推导 | 提前压，减少无谓的 400 次数 |
 
-## 二、关键证据（已验证）
+## 〇、v2 修订（2026-08-28）：v1 致命缺陷与生产实证
+
+### 〇.1 v1 为什么证伪（死循环根因）
+
+v1 把动态 `max_tokens` 的下限设为 `_MODEL_MIN_OUTPUT_TOKENS = 1`：
+
+```python
+effective_max = max(effective_max, _MODEL_MIN_OUTPUT_TOKENS)  # = 1
+```
+
+多模态审核会话中，图片 `image_url` 块的**视觉 token 被本地计数严重低估**（tiktoken 不数图 → `get_num_tokens_from_messages` 对 image 块≈0），
+Summarization 的 `tokens` 阈值不触发 → 真实 prompt 膨胀到 ~80 万 tokens。此时
+`effective_max = min(65536, 262144 - 80万 - 16384)` 算出**负值** → 被 floor 到 **1** →
+模型 `max_tokens=1` → 几乎零产出（截断在「用户」后无输出）→ **无 AIMessage** →
+agent 永不结束 → 反复空转。这就是「每次回答都一样、截断在'用户'后无输出」的真因。
+**结论：floor=1 是 v1 的致命缺陷，必须从根上删除。**
+
+### 〇.2 v2 整改清单（已随本 commit 落地）
+
+| # | 文件 | 改动 | 作用 |
+|---|---|---|---|
+| P0-1 | `src/core/model.py` | 删 `_MODEL_MIN_OUTPUT_TOKENS=1` → `1024`；超预算改砍输入（优先 image_url 块）后保底 1024，不再 floor 到 1 | 断死循环根因 |
+| P0-2 | `src/services/agent.py` | `summarization_mw` 移到 `model_call_guard` 之前 | 先压缩再算 max_tokens，避免 guard 先锁 1 |
+| P0-3 | `src/services/agent.py` | Summarization `trigger=("fraction",0.8)`、`token_counter=model.get_num_tokens_from_messages`、`keep=("messages",10)`；删被证伪的 `_count_tokens_accurate` | 用原版 fraction 触发（多模型自适应），标准计数 |
+| P1-4 | `src/core/model.py` | `probe_model_max_len` → `resolve_max_len(base_url, model_name, api_key)`，按 `(base_url,model_name)` 缓存 + fallback 小表 `_KNOWN_MAX_LEN` | 多模型各自拿真实上限 |
+| P1-5 | `src/core/model.py` | `create_model`/`switch_model` 注入 `profile={"max_input_tokens": resolve_max_len(...)}` 与 `stream_usage=True`、`stream_chunk_timeout` | fraction 触发生效 + usage 可见 + 流式空闲超时 |
+| P1-6 | `config.py` + `.env` | `MODEL_MAX_TOKENS` 归位 `65536`（.env 原 200000 覆盖运行值，需重启） | input 容错空间放大到 ~180k |
+| P1-7 | `src/core/model.py` | `resolve_max_len` 处「max_model_len 字段名待实测」→ 已实测确认 | 消除过期注释 |
+| P1-8 | `config.py` + `model.py` | 新增 `model_stream_chunk_timeout_sec=240`；ChatOpenAI 加 `stream_chunk_timeout`；`asyncio.wait_for` 由 600 抬到 1800 作灾难性兜底 | 长任务（200k 报告）不被墙钟误杀，对齐 deer-flow/deepseek-harness |
+| P1-9/10 | `docs/context-window-fix-draft.md` | 本文件：标注 v1 证伪 + 记录 v2 | 设计可追溯 |
+
+> 待办（P2，本次不做，单独立项）：大工具结果 offload（PDF 文本落盘/state，参考
+> deer-flow `tool_output_budget_middleware` / deepseek-harness `pruneSession`）——解决长 PDF
+> 精确比对时全文进上下文导致计数/触发失真，属架构级，不归本修复管。
+
+### 〇.3 原理核验（均已实测/源码确认，非假设）
+
+- **`/v1/models` 返回 `max_model_len`**：2026-08-28 curl 实测 vLLM 返回 `{"data":[{"id":"Qwen3.6-35B-A3B","max_model_len":262144}]}` → `resolve_max_len` 取数可靠。
+- **`stream_usage=True` 才有 usage_metadata**：隔离 venv 实测 `ChatOpenAI` 流式不带 `stream_usage` → `usage_metadata=None`，带 `stream_usage=True` → 有；非流式默认有。vLLM 响应本身带 usage（免费、含视觉 token），Langfuse 看不到是 OpenInference 0.1.67 字段名漂移，非模型层缺失。
+- **fraction 触发依赖 `model.profile`**：vLLM 自定义模型名不在 langchain 注册表 → `profile` 默认 `None` → fraction 失效；故 `create_model`/`switch_model` 显式注入 `profile={"max_input_tokens": resolve_max_len(...)}`（已确认 `BaseChatModel.profile` 是可构造注入字段）。
+- **`get_num_tokens_from_messages` 是标准计数**：接受 `tools=` 参数（deepagents `_token_counter_accepts_tools` 校验通过），比被证伪的 `_count_tokens_accurate`（忽略 tools、tiktoken 低估中文）更稳；残余低估由 `model_call_guard` 的 400 兜底 + 砍输入兜底兜住。
+- **长任务护盾对齐 deer-flow/deepseek-harness**：它们用「流式空闲超时」而非「墙钟总超时」护长生成；v2 用 `stream_chunk_timeout` 杀静默流、`asyncio.wait_for` 仅作 1800s 灾难性兜底，解决 v1 的 600s 误杀 200k 报告。
+
+## 二、关键证据（已验证，v1 章节，仅供追溯）
 
 - `server.log:411`：`This model's maximum context length is 262144 tokens. However, you requested 200000 output tokens and your prompt contains at least 62145 input tokens` → **API 真实返回**，三种数字均可正则解析，100% 可靠。
 - `config.py:95` 的 `model_max_len = 262144` 是**写死默认值**；注释声称的"探活 /v1/models"**未实现**（全代码无 `/v1/models` 调用）。
@@ -315,8 +360,8 @@ deepagents 的 `SummarizationMiddleware` **结构上**确实有 overflow → sum
 
 ## 八、⚠️ 待确认 / 风险点
 
-- [ ] **`request.override(messages=...)` 是否支持**：trim 路径（input 本身超总上限的极端情况）依赖它。若 `ModelRequest.override` 不支持 messages 参数，退化为「仅收紧 max_tokens」（案例 B 的 input 62145 不需 trim，足够救回）。需落地前确认或加 try/except 兜底。
-- [ ] **真探活字段名**：`/v1/models` 的 `max_model_len` 字段名待实测；解析失败安全（保留默认 262144），**建议仅作为可选前置优化**，400 兜底才是必选核心。
+- [x] **`request.override(messages=...)` 是否支持**：**已确认支持**（v1 的 400 重试路径即依赖它，且 v2 在 pre-guard 裁剪处也加了 try/except 兜底）。v2 章节「〇.2 P0-1」已落地。
+- [x] **真探活字段名**：**已实测确认** vLLM `/v1/models` 返回 `max_model_len` 字段（2026-08-28 curl 实测 =262144）；v2 重构成 `resolve_max_len` 按 `(base_url,model_name)` 缓存 + fallback 小表，见「〇.3」。
 - [ ] **捕获方式**：用 `except Exception` + message 关键字判断，**而非 `from openai import BadRequestError` 类捕获，也绝不依赖 deepagents 的 `ContextOverflowError` 兜底（已确认死代码，见第六章）**——避免异常经 langchain 多层包装后类身份丢失。
 - [ ] **重试上限 2 次**：防压缩后仍超限导致的无限循环。
 - [ ] **effective_trigger 构造时定死**：若 agent 实例被缓存而非每次请求重建，则触发阈值首次定死；但 400 兜底全局覆盖，不阻塞。

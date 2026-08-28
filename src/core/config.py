@@ -76,12 +76,20 @@ class Settings(BaseSettings):
     no_progress_max_injections: int = 1
     # 无进展窗口判定：重复 N 次内是否有新交付物（file_generated / reports 新文件）
     no_progress_window_files: int = 3
-    # ─── model 调用总时长超时（2026-08-19 新增）───
+    # ─── model 调用灾难性总时长超时（兜底中的兜底，2026-08-28 由 600 上调至 1800）───
     # openai SDK 的 timeout 是"字节间隔超时"（httpx read timeout），vLLM 慢速流式时
-    # 永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时）。
-    # 此处为"总时长"超时：单次 model 调用（含 prefill+decode 全流）超过即中止，
-    # 抛错 → SSE error → M3 兜底，防永久挂起。
-    model_call_timeout_sec: int = 600
+    # 永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时）；
+    # 真正防"静默卡死"靠下方的 model_stream_chunk_timeout_sec（流式块间隔空闲超时）。
+    # 本值仅作灾难性墙钟兜底：单次 model 调用（含 prefill+decode 全流）超过即中止，
+    # 抛错 → SSE error → M3 兜底。原为 600s 会误杀 200k token 报告（实测 ~8min 生成），
+    # 对齐 deer-flow / deepseek-harness「只在静默时杀、不按墙钟杀长生成」的思路上调到 1800。
+    model_call_timeout_sec: int = 1800
+    # ─── 流式块间隔空闲超时（2026-08-28 新增，真正的长任务护盾）───
+    # 注入 ChatOpenAI stream_chunk_timeout：两次解析出的流式 chunk 之间超过该值即判死、
+    # 抛错中止（只杀"引擎吐字停了"的静默流，不杀"正在正常长生成"的流）。
+    # 对齐 deer-flow / deepseek-harness 的 run_streaming 空闲超时护长任务，解决 600s 墙钟
+    # 误杀 200k 报告的问题。0/None 可关（依赖上方 model_call_timeout_sec 灾难性兜底）。
+    model_stream_chunk_timeout_sec: int = 240
     # ─── model 单次调用输出上限 ───
     # 2026-08-27 修正：从 200000 降到 65536。
     # 原 200000 把 input 安全空间压到仅 45960（262144-200000-16384），
@@ -91,17 +99,18 @@ class Settings(BaseSettings):
     model_max_tokens: int = 65536
     # ─── vLLM 上下文总上限（prompt + max_tokens 不得超过）───
     # 默认值 262144 仅作 fallback；真实上限由两路获得（按优先级）：
-    # ① model.py probe_model_max_len() 启动探活 /v1/models（best-effort，字段名待实测）；
+    # ① model.py resolve_max_len() 启动探活 /v1/models 的 max_model_len 字段
+    #   （2026-08-28 实测确认 vLLM 返回该字段，值为 262144），按 (base_url,model_name) 缓存；
     # ② 模型调用 400 时从错误 message 解析 "maximum context length is N tokens"（API 返回，100% 可靠）。
-    # 注：原注释"探活 /v1/models 得 max_model_len=262144"此前未实现，本次于 model.py 补齐。
+    # 注：原注释"探活 /v1/models 得 max_model_len=262144"此前未实现，已于 9c32f08 补齐为
+    #   probe_model_max_len，2026-08-28 重构成 resolve_max_len（多模型缓存 + fallback 小表）。
     model_max_len: int = 262144
     # ─── 动态 max_tokens 安全边距（tokens）───
     # 16384 留足余量（含 tools schema 等未计入部分 + 计数误差缓冲）。
     model_max_tokens_margin: int = 16384
-    # ─── Summarization 压缩触发阈值（tokens，仅作下限保护）───
-    # 2026-08-27 修正：不再写死 100000（该值落在 400 死亡线 62144 之后 → 永不触发）。
-    # 运行时在 agent.py 按 effective_trigger = model_max_len - model_max_tokens - margin 推导，
-    # 保证压缩在 400 之前触发；此处值仅防止推导异常过小时无下限。
+    # ─── Summarization 压缩触发阈值（tokens，仅作无 profile 时的下限保护）───
+    # 2026-08-28 起触发改用 fraction（0.8 × model.profile["max_input_tokens"]），不再推导
+    # effective_trigger；本值仅当模型 profile 缺失（fraction 退化）时作为下限保护。
     summarization_trigger_tokens: int = 20000
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）

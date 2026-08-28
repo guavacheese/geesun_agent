@@ -14,8 +14,13 @@ from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 模块级缓存的真实上下文上限（首次探活 / 首次 400 修正后填入，全局受益）
-_probed_max_len: int | None = None
+# 模块级缓存的真实上下文上限：按 (base_url, model_name) 缓存，
+# 首次探活 /v1/models 或首次 400 修正后填入，多模型各自独立受益
+_MAX_LEN_CACHE: dict[tuple[str, str], int] = {}
+# 已知模型的上下文上限小表（fallback：探活失败 / /v1/models 字段缺失时用）
+_KNOWN_MAX_LEN: dict[str, int] = {
+    "Qwen3.6-35B-A3B": 262144,
+}
 
 
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
@@ -32,8 +37,14 @@ class ModelConfig:
     api_key: str = settings.openai_api_key
 
 
-def create_model() -> ChatOpenAI:
+async def create_model() -> ChatOpenAI:
     """默认模型（内网 vLLM Qwen）"""
+    # 探活真实上下文上限，注入 model.profile["max_input_tokens"]，
+    # 使 SummarizationMiddleware 走 fraction 触发（vLLM 自定义模型名不在 langchain
+    # 注册表 → profile 默认 None → fraction 失效，才会落到写死的保守默认）。
+    max_len = await asyncio.to_thread(
+        resolve_max_len, settings.base_url, settings.model_name, settings.openai_api_key
+    )
     return ChatOpenAI(
         base_url=settings.base_url,
         model=settings.model_name,
@@ -44,6 +55,10 @@ def create_model() -> ChatOpenAI:
         # 单次调用输出上限：防 thinking 失控无限生成（2026-08-24 实测未设时
         # vLLM 按 max_model_len=262144 无限生成，8.5min/87k tokens 撞 600s 超时）
         max_tokens=settings.model_max_tokens,
+        # 注入上下文上限 → SummarizationMiddleware fraction 触发（见上）
+        profile={"max_input_tokens": max_len},
+        # 流式块间隔空闲超时：只杀静默流，不杀长生成（见 config 注释）
+        stream_chunk_timeout=settings.model_stream_chunk_timeout_sec,
     )
 
 
@@ -72,12 +87,19 @@ async def switch_model(
     else:
         return await handler(request)
 
+    max_len = await asyncio.to_thread(
+        resolve_max_len, cfg.base_url, cfg.model_name, cfg.api_key or "not-used"
+    )
     model = ChatOpenAI(
         model=cfg.model_name,
         base_url=cfg.base_url,
         api_key=cfg.api_key or "not-used",
         temperature=0,
         max_tokens=settings.model_max_tokens,  # 与默认模型一致，防超长生成
+        # 注入上下文上限 → SummarizationMiddleware fraction 触发（覆盖默认模型时的 profile）
+        profile={"max_input_tokens": max_len},
+        # 流式块间隔空闲超时：只杀静默流，不杀长生成（见 config 注释）
+        stream_chunk_timeout=settings.model_stream_chunk_timeout_sec,
     )
     return await handler(request.override(model=model))
 
@@ -136,7 +158,12 @@ async def file_to_image(
 # 动态 max_tokens 的下限（2026-08-24）：数学上恒不超限——prompt 极端接近上限时
 # 放弃输出空间保不 400（实际不会发生：Summarization 触发即压缩 keep=10，输入远小于上限）。
 # 边距 model_max_tokens_margin 为可调配置（.env MODEL_MAX_TOKENS_MARGIN，默认 16384）。
-_MODEL_MIN_OUTPUT_TOKENS = 1
+# 动态 max_tokens 的下限（2026-08-28 由 1 改为 1024）。
+# 原为 1 是死循环根因：prompt 因图片 token 被低估而膨胀到 ~80 万 tokens 时，
+# effective_max 被 floor 到 1 → max_tokens=1 → 模型几乎零产出（截断在"用户"后无输出）
+# → 无 AIMessage → agent 永不结束 → 反复空转。现改为超预算时砍输入（优先图片块）、
+# 保底 1024 输出空间，杜绝 floor=1 死循环（见 docs/context-window-fix-draft.md v2）。
+_MODEL_MIN_OUTPUT_TOKENS = 1024
 
 # ─── 上下文超限解析 + 探活（2026-08-27 新增）───
 
@@ -160,28 +187,79 @@ def _parse_context_error(text: str) -> tuple[int, int] | None:
     return limit, inp
 
 
-async def probe_model_max_len() -> int:
-    """启动探活 /v1/models 拿真实上下文上限（best-effort）。
+def resolve_max_len(base_url: str, model_name: str, api_key: str) -> int:
+    """拿真实上下文上限，按 (base_url, model_name) 缓存（多模型各自独立受益）。
 
-    ⚠️ vLLM /v1/models 是否含 max_model_len 字段需实测确认；
-       解析失败 / 字段缺失 → 保留 config 默认值，不影响主流程。
-       真实上限最终以 400 错误 message 解析为准（见 model_call_guard）。
+    优先级：① 探活 /v1/models 的 max_model_len 字段（2026-08-28 实测确认 vLLM
+    返回该字段，值为 262144）；② fallback 小表 _KNOWN_MAX_LEN；③ config 默认值
+    model_max_len。真实上限最终也会由 400 错误 message 解析修正（见 model_call_guard）。
     """
-    global _probed_max_len
-    if _probed_max_len is not None:
-        return _probed_max_len
+    key = (base_url, model_name)
+    if key in _MAX_LEN_CACHE:
+        return _MAX_LEN_CACHE[key]
+    limit: int = settings.model_max_len  # ③ 兜底
     try:
         import httpx  # langchain_openai 依赖 httpx，必可用
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"{settings.base_url.rstrip('/')}/v1/models")
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        with httpx.Client(timeout=5) as c:
+            r = c.get(f"{base_url.rstrip('/')}/v1/models", headers=headers)
             data = r.json().get("data", [])
-            if data and "max_model_len" in data[0]:
-                _probed_max_len = int(data[0]["max_model_len"])
-                settings.model_max_len = _probed_max_len
-                logger.warning("[DIAG] 探活 model_max_len=%d", _probed_max_len)
+            for m in data:
+                if m.get("id") == model_name and "max_model_len" in m:
+                    limit = int(m["max_model_len"])
+                    break
+            else:
+                # 列表里没精确匹配到本模型名，但首个模型带了上限字段则借用（单模型部署常见）
+                if data and "max_model_len" in data[0]:
+                    limit = int(data[0]["max_model_len"])
     except Exception as e:
-        logger.warning("[DIAG] 探活 model_max_len 失败，用默认值: %s", e)
-    return _probed_max_len or settings.model_max_len
+        logger.warning("[DIAG] 探活 model_max_len 失败，走 fallback: %s", e)
+    if limit == settings.model_max_len and model_name in _KNOWN_MAX_LEN:
+        limit = _KNOWN_MAX_LEN[model_name]  # ② 小表
+    _MAX_LEN_CACHE[key] = limit
+    if limit != settings.model_max_len:
+        logger.warning("[DIAG] 探活 model_max_len=%d (%s)", limit, model_name)
+    return limit
+
+
+# ─── 超预算输入裁剪辅助（2026-08-28 新增，死于 floor=1 死循环的修复）───
+
+def _estimate_tokens(messages) -> int:
+    """粗估 token 数（中英混排 ~2 字符/token，保守）。仅用于超预算时的裁剪决策，
+    真实上限以 400 解析为准。"""
+    return sum(len(str(getattr(m, "content", ""))) // 2 for m in messages)
+
+
+def _msg_has_image(m) -> bool:
+    """消息是否含 image_url 块（视觉 token 占比最大，超预算时优先丢弃）。"""
+    content = getattr(m, "content", None)
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(b, dict) and b.get("type") == "image_url" for b in content)
+
+
+def _trim_input_for_budget(msgs, max_len, margin, min_output):
+    """输入逼近/超上限时砍输入（优先丢含 image_url 的旧消息），直到估算
+    prompt + min_output ≤ max_len 或只剩最后 10 条。返回 (trimmed, est_tokens)。"""
+    budget = max_len - margin - min_output
+    keep = list(msgs)
+    # 丢弃优先级：含图消息优先，其次更旧的消息优先（index 小 = 旧）
+    order = sorted(range(len(keep)), key=lambda i: (0 if _msg_has_image(keep[i]) else 1, i))
+    removed: set[int] = set()
+    cur = _estimate_tokens(keep)
+    for i in order:
+        if cur <= budget or len(keep) - len(removed) <= 10:
+            break
+        removed.add(i)
+        cur = _estimate_tokens([keep[j] for j in range(len(keep)) if j not in removed])
+    trimmed = [keep[j] for j in range(len(keep)) if j not in removed]
+    if not trimmed:
+        trimmed = keep[-10:]
+    logger.warning(
+        "[DIAG] 输入超预算，砍图/裁剪消息 %d → %d（≈%d tokens）",
+        len(msgs), len(trimmed), _estimate_tokens(trimmed),
+    )
+    return trimmed, _estimate_tokens(trimmed)
 
 
 @wrap_model_call
@@ -194,10 +272,11 @@ async def model_call_guard(
     ② 动态 max_tokens：vLLM 约束 prompt + max_tokens ≤ model_max_len（262144），
     静态 200000 在大输入时会 400（2026-08-24 实测：输入 62145 + 200000 = 262145
     → BadRequestError → 模型零产出 → M3 拦截）。按输入长度动态收紧，永不超限；
-    ③ 总时长超时：openai SDK 的 timeout 是 httpx"字节间隔"超时，vLLM 慢速
-    流式时永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时），
-    这里用 asyncio.wait_for 包整个 handler 做总时长兜底（config 可调），
-    超时抛 TimeoutError → chat.py 外层捕获 → SSE error → M3 兜底，防永久挂起。
+    ③ 超时护盾（2026-08-28 重构）：真正防"静默卡死"靠 ChatOpenAI 的
+    stream_chunk_timeout（流式块间隔空闲超时，只杀吐字停了的静默流，不杀长生成，
+    见 config model_stream_chunk_timeout_sec）；此处 asyncio.wait_for 仅作灾难性墙钟
+    兜底（model_call_timeout_sec 已上调至 1800，避免误杀 200k token 报告），超时抛
+    TimeoutError → chat.py 外层捕获 → SSE error → M3 兜底。
     """
     msgs = request.messages
     total_chars = sum(len(str(getattr(m, "content", ""))) for m in msgs)
@@ -222,7 +301,24 @@ async def model_call_guard(
         settings.model_max_tokens,
         settings.model_max_len - prompt_tokens - settings.model_max_tokens_margin,
     )
-    effective_max = max(effective_max, _MODEL_MIN_OUTPUT_TOKENS)
+    # 不再 floor 到 1：输入逼近/超上限时不锁死输出空间（曾导致死循环：max_tokens=1
+    # → 模型零产出 → 无 AIMessage → 永不结束，见 docs/context-window-fix-draft.md v2）。
+    # 改为砍输入（优先图片块）后保底 _MODEL_MIN_OUTPUT_TOKENS 输出空间。
+    if effective_max < _MODEL_MIN_OUTPUT_TOKENS:
+        msgs, prompt_tokens = _trim_input_for_budget(
+            msgs, settings.model_max_len, settings.model_max_tokens_margin,
+            _MODEL_MIN_OUTPUT_TOKENS,
+        )
+        try:
+            request = request.override(messages=msgs)
+        except Exception:
+            # ModelRequest.override(messages=...) 不支持时退化为仅收紧 max_tokens
+            # （实际输入仍大，将由下方 400 兜底重试纠正）
+            logger.warning("[DIAG] override(messages=...) 不支持，退化仅收紧 max_tokens")
+        effective_max = max(
+            _MODEL_MIN_OUTPUT_TOKENS,
+            settings.model_max_len - prompt_tokens - settings.model_max_tokens_margin,
+        )
     if effective_max < settings.model_max_tokens:
         logger.warning(
             "[DIAG] 动态 max_tokens: prompt≈%d, 上限收紧 %d → %d",
@@ -234,12 +330,16 @@ async def model_call_guard(
         "max_tokens": effective_max,
     })
 
-    # lazy 探活：首次调用时 best-effort 拿真实上限（失败保留默认，不阻断）
-    if _probed_max_len is None:
-        try:
-            await probe_model_max_len()
-        except Exception:
-            pass
+    # 探活真实上限（同步、按 (base_url,model_name) 缓存，失败保留默认，不阻断）
+    try:
+        base = getattr(request.model, "openai_api_base", "") or settings.base_url
+        mname = getattr(request.model, "model_name", "") or settings.model_name
+        akey = getattr(request.model, "openai_api_key", "") or settings.openai_api_key
+        resolved = await asyncio.to_thread(resolve_max_len, base, mname, akey)
+        if resolved != settings.model_max_len:
+            settings.model_max_len = resolved
+    except Exception:
+        pass
 
     # ─── 400 兜底：上下文超限 → 解析真实上限 → 收紧 max_tokens/trim → 重试 ───
     # 这是唯一能扛住「token 计数低估中文」+「model_max_len 写死不准」的硬保险：
@@ -256,7 +356,7 @@ async def model_call_guard(
             )
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"model 调用超过 {settings.model_call_timeout_sec}s 总时长（"
+                f"model 调用超过 {settings.model_call_timeout_sec}s 灾难性总时长兜底（"
                 f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
             ) from None
         except Exception as e:
