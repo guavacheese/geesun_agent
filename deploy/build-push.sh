@@ -22,6 +22,16 @@
 # ───────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# 从 deploy/.env 载入部署期变量（REGISTRY_* / *_TAG 等），使构建与推送以 .env 为准。
+# 仅当文件存在时载入；构建机若尚未生成 .env，则回落到下方内置默认值，不报错。
+_DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "$_DEPLOY_DIR/.env" ]]; then
+  set -a
+  . "$_DEPLOY_DIR/.env"
+  set +a
+  echo "==> 已从 $_DEPLOY_DIR/.env 载入部署变量"
+fi
+
 REGISTRY_GEESUN="${REGISTRY_GEESUN:-172.16.220.74:8333/geesun_ai}"
 REGISTRY_HUB="${REGISTRY_HUB:-172.16.220.74:8333/dockerhub}"
 HARBOR_HOST="172.16.220.74:8333"

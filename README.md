@@ -229,9 +229,13 @@ cd deploy
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Langfuse 后端 postgres 自身凭据 |
 | `CLICKHOUSE_*` | Clickhouse 连接（url / user / password / cluster） |
 | `REDIS_*` | Redis 连接（host / port / auth） |
+| `LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK` | 跳过 BullMQ 对 Redis 版本校验（默认 `false`；内网 Redis 版本非官方检测范围时设 `true`） |
 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | MinIO 根凭据；**官方要求三个 `LANGFUSE_S3_*_SECRET_ACCESS_KEY` 必须等于它** |
 | `LANGFUSE_S3_*` | 事件/媒体/批量导出三个桶的 S3 配置（endpoint 默认 `http://minio:9000`） |
+| `LANGFUSE_USE_AZURE_BLOB` | S3 事件桶是否走 Azure Blob（默认 `false`；MinIO 自托管保持 `false`） |
 | `LANGFUSE_INIT_*` | 首次启动初始化组织/项目/用户（留空则 UI 手动创建） |
+| `TELEMETRY_ENABLED` | Langfuse 匿名遥测开关（默认 `false`，生产建议关） |
+| `LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES` | 启用实验特性（默认 `false`） |
 
 #### Grafana
 
