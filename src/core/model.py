@@ -21,6 +21,35 @@ _MAX_LEN_CACHE: dict[tuple[str, str], int] = {}
 _KNOWN_MAX_LEN: dict[str, int] = {
     "Qwen3.6-35B-A3B": 262144,
 }
+# ─── 每会话引擎真实 prompt_tokens 缓存（2026-08-31 新增）───
+# 替代本地估算：vLLM 每次响应自带 usage.prompt_tokens（含视觉 token，引擎侧计算，
+# 100% 准），模型_call_guard 在成功返回后写入这里，供 Summarization 触发 + dynamic
+# max_tokens 读取。本地 tiktoken 估算严重低估中文、且对图片视觉 token 一无所知（=0），
+# 正是死循环根因的同源问题；引擎报数才是 ground truth。首轮 cold（无缓存）退化本地估算。
+_session_prompt_tokens: dict[str, int] = {}
+
+
+def get_engine_prompt_tokens(session_id: str) -> int | None:
+    """返回该会话最近一次模型调用引擎报的真实 prompt_tokens；无缓存（cold 首轮）返回 None。"""
+    return _session_prompt_tokens.get(session_id)
+
+
+def _capture_usage(resp, request) -> None:
+    """每次模型成功回复后，把引擎真实 prompt_tokens 存进每会话缓存（含视觉 token）。"""
+    sid = getattr(request.model, "_session_id", None)
+    if not sid:
+        return
+    um = getattr(resp, "usage_metadata", None)
+    if not isinstance(um, dict):
+        return
+    real_in = um.get("input_tokens") or um.get("prompt_tokens")
+    if not real_in:
+        return
+    _session_prompt_tokens[sid] = real_in
+    # 简单防泄漏：长驻服务会话数不会过千，超限清一次（仅少量会话退化 cold，可接受）
+    if len(_session_prompt_tokens) > 2000:
+        _session_prompt_tokens.clear()
+    logger.debug("[DIAG] 引擎真实 prompt_tokens=%d (session=%s)", real_in, sid)
 
 
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
@@ -299,14 +328,23 @@ async def model_call_guard(
     )
 
     # ─── 动态 max_tokens：按输入长度收紧，保证 prompt+max_tokens ≤ model_max_len ───
-    prompt_tokens = 0
-    try:
-        sys_msg = request.system_message
-        prompt_msgs = ([sys_msg] if sys_msg is not None else []) + list(msgs)
-        prompt_tokens = request.model.get_num_tokens_from_messages(prompt_msgs)
-    except Exception:
-        # 回退：中英混排 ~2 字符/token（偏保守，宁小勿超）
-        prompt_tokens = total_chars // 2
+    # 优先用引擎真实 prompt_tokens（每会话缓存，含视觉 token，比本地估算准）；
+    # 无缓存（首轮/cold）才退化本地估算（get_num_tokens_from_messages 对自定义模型名
+    # 会 NotImplementedError，已被 try/except 兜成字符估算，低估图片但 400 兜底会纠正）。
+    sid = getattr(request.model, "_session_id", None)
+    cached = _session_prompt_tokens.get(sid) if sid else None
+    if cached:
+        prompt_tokens = cached
+        logger.debug("[DIAG] prompt_tokens 用引擎真实值=%d (session=%s)", prompt_tokens, sid)
+    else:
+        prompt_tokens = 0
+        try:
+            sys_msg = request.system_message
+            prompt_msgs = ([sys_msg] if sys_msg is not None else []) + list(msgs)
+            prompt_tokens = request.model.get_num_tokens_from_messages(prompt_msgs)
+        except Exception:
+            # 回退：中英混排 ~2 字符/token（偏保守，宁小勿超）
+            prompt_tokens = total_chars // 2
     effective_max = min(
         settings.model_max_tokens,
         settings.model_max_len - prompt_tokens - settings.model_max_tokens_margin,
@@ -361,7 +399,7 @@ async def model_call_guard(
     attempt = 0
     while True:
         try:
-            return await asyncio.wait_for(
+            resp = await asyncio.wait_for(
                 handler(request), timeout=settings.model_call_timeout_sec
             )
         except asyncio.TimeoutError:
@@ -405,3 +443,6 @@ async def model_call_guard(
             })
             attempt += 1
             continue
+        # 成功路径（未抛异常）：捕获引擎真实 prompt_tokens 回写每会话缓存，再返回
+        _capture_usage(resp, request)
+        return resp

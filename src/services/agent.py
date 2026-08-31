@@ -250,7 +250,7 @@ import base64
 from pathlib import Path
 from langchain.messages import trim_messages, SystemMessage, HumanMessage
 from src.core.config import settings
-from src.core.model import create_model, switch_model, file_to_image, model_call_guard
+from src.core.model import create_model, switch_model, file_to_image, model_call_guard, get_engine_prompt_tokens
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
 
 # ─── Monkey-patch: 给 StoreBackend 补上 adownload_files ─────────────────
@@ -737,15 +737,19 @@ async def create_agent(
 ):
     backend = build_backend(user_id, session_id, store, sandbox)
     model = await create_model()
+    # 给模型挂会话 ID：model_call_guard 据此把引擎真实 prompt_tokens 写回正确的会话缓存
+    model._session_id = session_id
 
     # ─── SummarizationMiddleware（历史 offload）───
     # 触发用 fraction（0.8 × model.profile["max_input_tokens"]）——vLLM 自定义模型名
     # 不在 langchain 注册表 → profile 默认 None → 原 fraction 触发失效，故 create_model /
     # switch_model 已注入 profile={"max_input_tokens": resolve_max_len(...)}（见 model.py）。
-    # 计数用 _safe_token_counter：langchain-openai 对自定义模型名（Qwen3.6-35B-A3B）未实现
-    # get_num_tokens_from_messages（2026-08-31 实测抛 NotImplementedError 直接杀流），
-    # 改为逐条 model.get_num_tokens（tiktoken cl100k，实测可用）+ 异常字符估算兜底；
-    # tools schema 不计（残余低估由 model_call_guard 的 400 兜底 + 砍输入兜底兜住）。
+    # 计数用 _engine_grounded_counter：优先读引擎真实 prompt_tokens（model_call_guard 每轮
+    # 从 usage_metadata 写入的每会话缓存，含视觉 token，100% 准），仅 cold 首轮无缓存时退化
+    # _safe_token_counter（本地 tiktoken 估算，会被中文 + 图片低估，但 400 兜底会纠正）。
+    # 注：langchain-openai 对自定义模型名（Qwen3.6-35B-A3B）未实现
+    # get_num_tokens_from_messages（2026-08-31 实测抛 NotImplementedError 直接杀流），故裸方法
+    # 不可用；_safe_token_counter 改逐条 get_num_tokens（tiktoken cl100k，实测可用）+ 字符兜底。
     def _safe_token_counter(messages, *, tools=None) -> int:
         """安全 token 计数：get_num_tokens_from_messages 对自定义模型名未实现，
         逐条 get_num_tokens + 字符估算兜底，杜绝 NotImplementedError 杀流。"""
@@ -759,6 +763,14 @@ async def create_agent(
             except Exception:
                 total += len(content)  # 兜底：1 字符≈1 token（足够保守）
         return total
+
+    def _engine_grounded_counter(messages, *, tools=None) -> int:
+        """Summarization 触发用计数器：优先引擎真实 prompt_tokens（每会话缓存），
+        cold 首轮无缓存才退化本地估算。闭包捕获 session_id 读缓存。"""
+        real = get_engine_prompt_tokens(session_id)
+        if real is not None:
+            return real
+        return _safe_token_counter(messages, tools=tools)
 
     def _build_inventory_provider(user_id, session_id, sandbox):
         """构造"当前会话真实资源清单"回调，随摘要注入 SystemMessage。
@@ -795,7 +807,7 @@ async def create_agent(
         backend=backend,
         trigger=("fraction", 0.8),  # 按 model.profile["max_input_tokens"] 的 0.8 触发，多模型自动适配
         keep=("messages", 10),
-        token_counter=_safe_token_counter,  # 安全计数：自定义模型名下不抛 NotImplementedError（2026-08-31 事故根因）
+        token_counter=_engine_grounded_counter,  # 引擎真实 prompt_tokens 优先，cold 才退化估算
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
     )
 
