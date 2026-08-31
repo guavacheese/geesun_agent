@@ -68,8 +68,8 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 脚本动作：
 1. `docker login 172.16.220.74:8333`
 2. 构建并 push `geesun-agent:<tag>`（→ `geesun_ai` 项目）
-3. `sync_mcp()` 构建并 push `geesun-mcp-server:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_mcp_server` 仓库根）
-4. `sync_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67/`）
+3. `build_push_mcp()` 构建并 push `geesun-mcp-server:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_mcp_server` 仓库根；旧名 `sync_mcp`）
+4. `build_push_web()` 构建并 push `geesun-agent-web:<tag>`（→ `geesun_ai` 项目，构建上下文 = `geesun_agent_web` 仓库根；`NEXT_PUBLIC_API_BASE` 构建期注入，默认 `http://10.10.10.67/`；旧名 `sync_web`）
 5. `sync()` 拉取并将 11 个第三方镜像推入 Harbor `dockerhub` 项目（公网拉不到时回退用本地已有镜像）
 
 ### 2.3 镜像清单（源 → Harbor 目标）
@@ -183,7 +183,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 #          -c docker-compose.web.yml --with-registry-auth --resolve-image=always --prune geesun
 ```
 
-**镜像构建**：`build-push.sh` 已加 `sync_mcp()`，会把 `geesun_mcp_server` 仓库（上下文=其根）构建并推到 `geesun_ai/geesun-mcp-server:<MCP_TAG>`。基镜像已从 `python:3.11` 改 `python:3.13-slim-bookworm`，与 `pyproject.toml` 的 `requires-python>=3.13` 及 dev 运行时一致，避免 dev/prod 漂移。
+**镜像构建**：`build-push.sh` 已加 `build_push_mcp()`（旧名 `sync_mcp`），会把 `geesun_mcp_server` 仓库（上下文=其根）构建并推到 `geesun_ai/geesun-mcp-server:<MCP_TAG>`。基镜像已从 `python:3.11` 改 `python:3.13-slim-bookworm`，与 `pyproject.toml` 的 `requires-python>=3.13` 及 dev 运行时一致，避免 dev/prod 漂移。
 
 **排障 runbook**：
 - mcp 工具加载失败（agent 日志 `MCP server [decrypt-file] 加载工具失败`）：
@@ -209,7 +209,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 ```
 
 **排障**：
-- 前端打不开但后端通：`docker logs geesun-agent-web` 看是否 `next build` 产物缺失（确认镜像用 `sync_web` 重建，含 `.next/static` 与 `public`）。
+- 前端打不开但后端通：`docker logs geesun-agent-web` 看是否 `next build` 产物缺失（确认镜像用 `build_push_web`（旧名 `sync_web`）重建，含 `.next/static` 与 `public`）。
 - `/api/*` 404 或回环：确认 Caddyfile 是路径分流版本（`handle /api/*` 在前），且前端镜像 `NEXT_PUBLIC_API_BASE` 为同域地址。
 
 ---
@@ -442,8 +442,8 @@ cron 示例（每天 03:07）：
 | 5 | 每日备份脚本（pg_dump / minio mirror） | 新增 `backup.sh` + cron 示例 | ✅ 已落地 |
 | 6 | Harbor `geesun_ai` + `dockerhub` 项目 Tag Retention 规则 | Harbor 控制台人工配置 | ⬜ 待配置（步骤见 §11） |
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
-| 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh sync_mcp + requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
-| 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh sync_web + Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
+| 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh build_push_mcp（旧名 sync_mcp）+ requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
+| 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh build_push_web（旧名 sync_web）+ Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
 | 10 | 复用现网共享可观测栈（路线 A）：prod compose 仅 yml+mcp+web 三文件，Caddy 只留 :80，agent 经 10.10.10.67:4317/:3000 连共享 Phoenix/Langfuse；phoenix/langfuse 两个 compose 文件保留作路线 B 兜底（见 §4.9） | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 11 | CubeSandbox 信任与 DNS docker 化：agent/mcp CA 挂载 + REQUESTS_CA_BUNDLE/SSL_CERT_FILE；`setup-cube-dns.sh`（dnsmasq 转发 *.cube.app + daemon dns） | `docker-compose.yml` + `docker-compose.mcp.yml` + 新增 `setup-cube-dns.sh` + §4.3/§4.8 | ✅ 已落地 |
 

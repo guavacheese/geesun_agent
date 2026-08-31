@@ -7,7 +7,7 @@
 #   前端与后端同域（http://10.10.10.67/），浏览器无 CORS 问题。
 #
 # ⚠️ NEXT_PUBLIC_API_BASE 是 build-time 变量（Next.js 公共变量构建时内联），
-#    在构建镜像时经 --build-arg 注入（见 build-push.sh sync_web / geesun_agent_web/Dockerfile），
+#    在构建镜像时经 --build-arg 注入（见 build-push.sh build_push_web（旧名 sync_web）/ geesun_agent_web/Dockerfile），
 #    本 compose 不传该变量，运行时改 .env 无效。
 # ───────────────────────────────────────────────────────────
 services:

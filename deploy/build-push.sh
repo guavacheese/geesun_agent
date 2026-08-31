@@ -73,37 +73,13 @@ echo "==> 构建 $AGENT_IMAGE (context=$CONTEXT)"
 docker build -f "$REPO_ROOT/Dockerfile" -t "$AGENT_IMAGE" "$CONTEXT"
 docker push "$AGENT_IMAGE"
 
-# ── 2.5 构建并推送 geesun-mcp-server（→ geesun_ai 项目）──
-# 构建上下文为 geesun_mcp_server 仓库根（与 geesun_agent 同级目录）。
-sync_mcp
-
-# ── 2.6 构建并推送 geesun-agent-web（→ geesun_ai 项目）──
-# 构建上下文为 geesun_agent_web 仓库根；NEXT_PUBLIC_API_BASE 为 build-time 内联，
-# 默认生产 http://10.10.10.67/（经 Caddy 同域路由，/api/* 由 Caddy 转发后端），
-# 换环境必须用 NEXT_PUBLIC_API_BASE=xxx 重新构建镜像。
-sync_web
-
-# ── 3. 同步第三方镜像进 Harbor dockerhub 项目 ──
-# 用法: sync <公网镜像> <harbor内短名:tag>
-sync() {
-  local src="$1" dst="$REGISTRY_HUB/$2"
-  echo "==> 同步 $src -> $dst"
-  if docker pull "$src" 2>/dev/null; then
-    :
-  elif docker image inspect "$src" >/dev/null 2>&1; then
-    echo "    (公网拉取失败，使用本地已存在的 $src)"
-  else
-    echo "    [错误] 无法拉取且本地无 $src，跳过" >&2
-    return 1
-  fi
-  docker tag "$src" "$dst"
-  docker push "$dst"
-}
-
-# 自有应用：geesun-mcp-server（→ geesun_ai 项目）
-# 构建上下文为 geesun_mcp_server 仓库根（与 geesun_agent 同级目录 /d/workspace/geesun_mcp_server）。
+# ── 2.5 构建并推送自有应用：geesun-mcp-server（→ geesun_ai 项目）──
+# 命名说明：本函数是「构建自家代码镜像 + push 进 Harbor geesun_ai 项目」（build + push），
+# 与下方 sync() 的「同步第三方镜像」（公网 pull → tag → push 进 dockerhub 项目）语义不同；
+# 旧名 sync_mcp 沿用 sync_ 前缀易误导，现按行为命名为 build_push_mcp。
+# 构建上下文为 geesun_mcp_server 仓库根（与 geesun_agent 同级 /d/workspace/geesun_mcp_server）。
 # 该仓库自带 Dockerfile（非 root UID 1001 mcpuser，与 agent 同 UID，便于共享挂载目录属主）。
-sync_mcp() {
+build_push_mcp() {
   local mcp_repo="$REPO_ROOT/../geesun_mcp_server"
   if [[ ! -d "$mcp_repo" ]]; then
     echo "    [警告] 未找到 $mcp_repo，跳过 mcp 镜像构建（请确认 geesun_mcp_server 与 geesun_agent 同级）" >&2
@@ -115,12 +91,15 @@ sync_mcp() {
   docker build -f "$mcp_repo/Dockerfile" -t "$MCP_IMAGE" "$mcp_repo"
   docker push "$MCP_IMAGE"
 }
+# 调用必须在定义之后（Bash 函数先定义后调用；旧版误把调用放在定义前导致 command not found）
+build_push_mcp
 
-# 自有应用：geesun-agent-web（Next.js 前端，→ geesun_ai 项目）
-# 构建上下文为 geesun_agent_web 仓库根（与 geesun_agent 同级目录）。
-# NEXT_PUBLIC_API_BASE 是 build-time 变量（浏览器直接读构建产物），
-# 默认 http://10.10.10.67/（Caddy :80 同域，/api/* 由 Caddy 转发后端）；换环境重构建。
-sync_web() {
+# ── 2.6 构建并推送自有应用：geesun-agent-web（Next.js 前端，→ geesun_ai 项目）──
+# 命名说明：同 2.5——「构建自有代码镜像 + push 进 geesun_ai 项目」，旧名 sync_web 易与
+# sync()（同步第三方镜像）混淆，故命名为 build_push_web。
+# NEXT_PUBLIC_API_BASE 是 build-time 变量（Next.js 公共变量构建时内联进浏览器产物），
+# 默认生产 http://10.10.10.67/（Caddy :80 同域，/api/* 由 Caddy 转发后端）；换环境重构建。
+build_push_web() {
   local web_repo="$REPO_ROOT/../geesun_agent_web"
   if [[ ! -d "$web_repo" ]]; then
     echo "    [警告] 未找到 $web_repo，跳过 web 镜像构建（请确认 geesun_agent_web 与 geesun_agent 同级）" >&2
@@ -134,6 +113,26 @@ sync_web() {
     --build-arg "NEXT_PUBLIC_API_BASE=$API_BASE" \
     -f "$web_repo/Dockerfile" -t "$WEB_IMAGE" "$web_repo"
   docker push "$WEB_IMAGE"
+}
+build_push_web
+
+# ── 3. 同步第三方镜像进 Harbor dockerhub 项目 ──
+# 用法: sync <公网镜像> <harbor内短名:tag>
+# 注意：sync() 是「同步第三方镜像」（公网 pull → tag → push 进 Harbor dockerhub 项目），
+# 与上面 build_push_mcp / build_push_web（构建自有代码镜像推 geesun_ai 项目）语义不同。
+sync() {
+  local src="$1" dst="$REGISTRY_HUB/$2"
+  echo "==> 同步 $src -> $dst"
+  if docker pull "$src" 2>/dev/null; then
+    :
+  elif docker image inspect "$src" >/dev/null 2>&1; then
+    echo "    (公网拉取失败，使用本地已存在的 $src)"
+  else
+    echo "    [错误] 无法拉取且本地无 $src，跳过" >&2
+    return 1
+  fi
+  docker tag "$src" "$dst"
+  docker push "$dst"
 }
 
 # 主栈依赖（dockerhub 项目）
