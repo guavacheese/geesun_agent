@@ -599,6 +599,46 @@ async def chat(
             )
         return 0
 
+    async def _astream_with_heartbeat(stream, interval: float = 15.0):
+        """把 agent.astream 包成带静默保活心跳的异步生成器。
+    
+        模型长思考不吐字节时（如 Qwen <think> 静默数分钟），TCP 连接会空闲超过代理
+        proxy_read_timeout（openresty / AC gateway 常见 60s）→ 被掐断 → 前端"思考消失、
+        无输出"。每 interval 秒无新 chunk 则 yield 心跳哨兵，消费方转成 SSE 注释行
+        ": ping\\n\\n" 保活连接（字节照传、前端忽略）。
+    
+        参考 deer-flow StreamBridge.subscribe(heartbeat_interval=15) → sse_consumer 转
+        ": heartbeat\\n\\n"。关键：用 asyncio.wait 竞速——token 先到则立即发（零延迟），
+        满 interval 秒无字节才发心跳；只 cancel 静默 sleep task，**绝不 cancel 生成器
+        task**，否则会破坏 agent.astream 这个异步生成器（asyncio.wait_for 超时则会
+        cancel 进生成器内部，导致后续 __anext__ 不可用）。
+        """
+        import asyncio
+    
+        _anext = asyncio.ensure_future(stream.__anext__())
+        try:
+            while True:
+                _sleep = asyncio.ensure_future(asyncio.sleep(interval))
+                _done, _ = await asyncio.wait(
+                    {_anext, _sleep}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if _anext not in _done:
+                    # 满 interval 秒无 chunk：发心跳，保持同一个生成器继续等下一项
+                    _sleep.cancel()
+                    yield ("__heartbeat__", None)
+                    continue
+                # token 先到：取消静默 sleep，取出真实 chunk 正常下发
+                _sleep.cancel()
+                try:
+                    item = _anext.result()
+                except StopAsyncIteration:
+                    break
+                yield item
+                _anext = asyncio.ensure_future(stream.__anext__())
+        finally:
+            _anext.cancel()
+
+
     async def event_stream():
         invoke_kwargs = {}
         # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
@@ -677,7 +717,7 @@ async def chat(
             }
             # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
             try:
-                async for mode, data in agent.astream(
+                _stream = agent.astream(
                     _input,
                     config={
                         **graph_config,
@@ -685,7 +725,14 @@ async def chat(
                     },
                     stream_mode=["messages", "updates"],
                     **invoke_kwargs,
-                ):
+                )
+                # 包静默保活心跳：模型长思考不吐字节时发 SSE 注释行维持 TCP 连接，
+                # 防止代理 proxy_read_timeout（60s）掐断 → 前端思考消失/无输出。
+                async for mode, data in _astream_with_heartbeat(_stream, 15.0):
+                    if mode == "__heartbeat__":
+                        yield ": ping\n\n"
+                        continue
+
                     if (
                         mode == "messages"
                     ):  # mode == "messages" 时，data 是 (AIMessageChunk, metadata) 的元组
@@ -1319,4 +1366,13 @@ async def chat(
         )
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # 禁用 nginx/openresty 缓冲，保证 SSE 实时逐字节下发（配合心跳保活）
+            "X-Accel-Buffering": "no",
+        },
+    )

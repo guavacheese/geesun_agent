@@ -34,13 +34,25 @@ def get_engine_prompt_tokens(session_id: str) -> int | None:
     return _session_prompt_tokens.get(session_id)
 
 
+_no_usage_warned = False  # 防字段漂移：usage_metadata 缺失仅告警一次（避免刷屏）
+
+
 def _capture_usage(resp, request) -> None:
     """每次模型成功回复后，把引擎真实 prompt_tokens 存进每会话缓存（含视觉 token）。"""
+    global _no_usage_warned
     sid = getattr(request.model, "_session_id", None)
     if not sid:
         return
     um = getattr(resp, "usage_metadata", None)
     if not isinstance(um, dict):
+        # 字段漂移告警：stream_usage=True 已开启却无 usage_metadata → 计数退化本地估算。
+        # 仅告警一次，足以暴露"引擎真实计数没接上"（OpenInference 0.1.67 字段漂移同类坑）。
+        if not _no_usage_warned:
+            _no_usage_warned = True
+            logger.warning(
+                "[DIAG] resp 无 usage_metadata（stream_usage 可能未生效 / 响应层字段漂移）；"
+                "本次及后续退化本地估算，引擎真实计数不可用"
+            )
         return
     real_in = um.get("input_tokens") or um.get("prompt_tokens")
     if not real_in:
@@ -49,7 +61,7 @@ def _capture_usage(resp, request) -> None:
     # 简单防泄漏：长驻服务会话数不会过千，超限清一次（仅少量会话退化 cold，可接受）
     if len(_session_prompt_tokens) > 2000:
         _session_prompt_tokens.clear()
-    logger.debug("[DIAG] 引擎真实 prompt_tokens=%d (session=%s)", real_in, sid)
+    logger.warning("[DIAG] 引擎真实 prompt_tokens=%d (session=%s)", real_in, sid)
 
 
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
