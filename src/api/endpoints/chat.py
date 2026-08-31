@@ -613,8 +613,6 @@ async def chat(
         task**，否则会破坏 agent.astream 这个异步生成器（asyncio.wait_for 超时则会
         cancel 进生成器内部，导致后续 __anext__ 不可用）。
         """
-        import asyncio
-    
         _anext = asyncio.ensure_future(stream.__anext__())
         try:
             while True:
