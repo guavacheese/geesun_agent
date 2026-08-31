@@ -59,6 +59,8 @@ async def create_model() -> ChatOpenAI:
         profile={"max_input_tokens": max_len},
         # 流式块间隔空闲超时：只杀静默流，不杀长生成（见 config 注释）
         stream_chunk_timeout=settings.model_stream_chunk_timeout_sec,
+        # 流式也返回 usage_metadata（vLLM 响应自带 usage，含视觉 token；Langfuse 可见）
+        stream_usage=True,
     )
 
 
@@ -100,6 +102,8 @@ async def switch_model(
         profile={"max_input_tokens": max_len},
         # 流式块间隔空闲超时：只杀静默流，不杀长生成（见 config 注释）
         stream_chunk_timeout=settings.model_stream_chunk_timeout_sec,
+        # 流式也返回 usage_metadata（vLLM 响应自带 usage，含视觉 token；Langfuse 可见）
+        stream_usage=True,
     )
     return await handler(request.override(model=model))
 
@@ -202,7 +206,13 @@ def resolve_max_len(base_url: str, model_name: str, api_key: str) -> int:
         import httpx  # langchain_openai 依赖 httpx，必可用
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         with httpx.Client(timeout=5) as c:
-            r = c.get(f"{base_url.rstrip('/')}/v1/models", headers=headers)
+            # base_url 可能已含 /v1 后缀（如 http://172.16.66.13:8003/v1），
+            # 直接拼 /v1/models 会变双 /v1 → 404（2026-08-31 server.log:83 实测）
+            models_url = base_url.rstrip("/")
+            if not models_url.endswith("/v1"):
+                models_url += "/v1"
+            models_url += "/models"
+            r = c.get(models_url, headers=headers)
             data = r.json().get("data", [])
             for m in data:
                 if m.get("id") == model_name and "max_model_len" in m:

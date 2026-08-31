@@ -739,12 +739,26 @@ async def create_agent(
     model = await create_model()
 
     # ─── SummarizationMiddleware（历史 offload）───
-    # 触发改用 fraction（0.8 × model.profile["max_input_tokens"]）——vLLM 自定义模型名
+    # 触发用 fraction（0.8 × model.profile["max_input_tokens"]）——vLLM 自定义模型名
     # 不在 langchain 注册表 → profile 默认 None → 原 fraction 触发失效，故 create_model /
     # switch_model 已注入 profile={"max_input_tokens": resolve_max_len(...)}（见 model.py）。
-    # token_counter 用 langchain 标准 model.get_num_tokens_from_messages（含 tools schema，
-    # 比被证伪低估的 _count_tokens_accurate 更稳）。计数低估导致触发偏晚的问题由
-    # model_call_guard 的 400 兜底 + 砍输入兜底（见 model.py）兜住，不再依赖本地计数。
+    # 计数用 _safe_token_counter：langchain-openai 对自定义模型名（Qwen3.6-35B-A3B）未实现
+    # get_num_tokens_from_messages（2026-08-31 实测抛 NotImplementedError 直接杀流），
+    # 改为逐条 model.get_num_tokens（tiktoken cl100k，实测可用）+ 异常字符估算兜底；
+    # tools schema 不计（残余低估由 model_call_guard 的 400 兜底 + 砍输入兜底兜住）。
+    def _safe_token_counter(messages, *, tools=None) -> int:
+        """安全 token 计数：get_num_tokens_from_messages 对自定义模型名未实现，
+        逐条 get_num_tokens + 字符估算兜底，杜绝 NotImplementedError 杀流。"""
+        total = 0
+        for m in messages:
+            content = str(getattr(m, "content", "")) if getattr(m, "content", None) else ""
+            if not content:
+                continue
+            try:
+                total += model.get_num_tokens(content)
+            except Exception:
+                total += len(content)  # 兜底：1 字符≈1 token（足够保守）
+        return total
 
     def _build_inventory_provider(user_id, session_id, sandbox):
         """构造"当前会话真实资源清单"回调，随摘要注入 SystemMessage。
@@ -781,7 +795,7 @@ async def create_agent(
         backend=backend,
         trigger=("fraction", 0.8),  # 按 model.profile["max_input_tokens"] 的 0.8 触发，多模型自动适配
         keep=("messages", 10),
-        token_counter=model.get_num_tokens_from_messages,  # langchain 标准计数，替代被证伪的 _count_tokens_accurate
+        token_counter=_safe_token_counter,  # 安全计数：自定义模型名下不抛 NotImplementedError（2026-08-31 事故根因）
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
     )
 
