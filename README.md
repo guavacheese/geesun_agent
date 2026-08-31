@@ -167,6 +167,23 @@ cd deploy
 | `report_root` | 容器内报告根（默认 `/data/reports`） |
 | `mcp_token` | MCP 调用鉴权 token |
 
+#### 应用可调优 / 覆盖项（geesun-agent 高级）
+
+容器经 `env_file:[.env]` 透传整个 `.env`，`config.py` 的 `Settings` 大小写不敏感匹配字段名；以下项 Docker 部署此前默认走代码值，生产需覆盖时在此填。完整清单与默认值见 `deploy/.env.example` 同节注释。
+
+| 变量 | 说明 |
+| --- | --- |
+| `extra_models` | 预装额外模型列表（默认 `[]`，`config.py:11`） |
+| `model_max_tokens` | 单次模型输出上限（默认 `65536`，`config.py:99`） |
+| `model_call_timeout_sec` | 模型调用墙钟兜底超时（默认 `1800`，`config.py:86`） |
+| `model_max_len` | vLLM 上下文上限（默认 `262144`，`config.py:107`） |
+| `model_max_tokens_margin` | 动态 `max_tokens` 边距（默认 `16384`，`config.py:110`） |
+| `summarization_trigger_tokens` | 上下文压缩触发阈值（默认 `20000`，`config.py:114`） |
+| `cube_template_id` / `cube_api_url` / `cube_api_key` | CubeSandbox 沙箱模板/代理地址/Key（默认空，走代码默认值，`config.py:35-37`） |
+| `ldap_server` / `ldap_base_dn` / `ldap_bind_user` / `ldap_bind_password` / `ldap_domain_format` / `ldap_admin_group_dn` | AD/LDAP 登录（默认空则关闭 LDAP 登录，`config.py:138-143`） |
+| `jwt_secret` / `jwt_algorithm` / `jwt_expire_hours` | 登录 JWT 密钥/算法/有效期（默认 `HS256` / `168` 小时；生产务必覆盖 `jwt_secret`，`config.py:146-148`） |
+| `sandbox_*`（十余项） | 沙箱护栏：`sandbox_disk_warn_mb`/`sandbox_disk_hard_mb`（磁盘阈值）、`sandbox_idle_timeout_sec`（空闲回收）、`sandbox_completion_gate_*`（完成门）、`no_progress_*`（无进展熔断）、`sandbox_probe_commands`/`sandbox_probe_ttl_sec`（探针）；默认见 `config.py:41-78` |
+
 #### MCP（geesun-mcp）
 
 | 变量 | 说明 |
