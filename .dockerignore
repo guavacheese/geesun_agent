@@ -22,3 +22,10 @@ geesun_agent_web
 **/reports
 **/certs
 **/.env
+
+# 宿主机 Python 虚拟环境（不应进镜像；Dockerfile 用 uv sync 从 uv.lock 装依赖）
+**/.venv
+**/venv
+
+# 非 agent 镜像所需的兄弟仓库（各有独立构建；减小 agent 构建上下文）
+geesun_mcp_server
