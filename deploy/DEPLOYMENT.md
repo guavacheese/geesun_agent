@@ -1,7 +1,7 @@
 # geesun_agent 生产部署规划
 
 > 范围：geesun_agent 后端 + 依赖（Postgres/pgvector）+ 可观测性（Phoenix / Langfuse 并行）+ 日志/指标/追踪 集中（Loki / Alloy / Prometheus / Grafana，Alloy 替代原 Promtail 统一采集 logs+metrics+traces）+ 反向代理（Caddy）。
-> 目标形态：单宿主 `docker compose` 硬化部署，全部镜像托管在内部 Harbor，物理机仅暴露 Caddy 入口。
+> 目标形态：单宿主 **Docker Swarm stack** 硬化部署（stack 名 `geesun`，与 flyctrl_deploy 的 `base` 隔离），全部镜像托管在内部 Harbor，物理机仅暴露 Caddy 入口；启动用 `deploy/start_stack.sh`（包装 `docker stack deploy`，内置 `build-push` 一键打包发布），停止用 `stop_stack.sh`、状态用 `service_stack.sh`。
 > 本文档为规划稿，落地项见文末「待办清单」。
 
 ---
@@ -178,8 +178,9 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 
 **合并启动**（路线 A：prod 仅 3 个文件，复用现网共享实例；需自托管见 §4.9 路线 B）：
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
-               -f docker-compose.web.yml up -d
+./start_stack.sh --with=mcp,web            # 默认先 build-push 打包再 stack deploy
+# 等价展开：docker stack deploy -c docker-compose.yml -c docker-compose.mcp.yml \
+#          -c docker-compose.web.yml --with-registry-auth --resolve-image=always --prune geesun
 ```
 
 **镜像构建**：`build-push.sh` 已加 `sync_mcp()`，会把 `geesun_mcp_server` 仓库（上下文=其根）构建并推到 `geesun_ai/geesun-mcp-server:<MCP_TAG>`。基镜像已从 `python:3.11` 改 `python:3.13-slim-bookworm`，与 `pyproject.toml` 的 `requires-python>=3.13` 及 dev 运行时一致，避免 dev/prod 漂移。
@@ -204,8 +205,7 @@ docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
 
 **合并启动**（路线 A：prod 仅 3 个文件，复用现网共享实例；需自托管见 §4.9 路线 B）：
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
-               -f docker-compose.web.yml up -d
+./start_stack.sh --with=mcp,web
 ```
 
 **排障**：
@@ -242,10 +242,7 @@ Phoenix + Langfuse 有两条部署路线。**两个 compose 文件（`docker-com
 **路线 B — 自托管兜底（无共享实例时）**
 - 把两个可观测 compose 文件一并并入（与 yml/mcp/web 合并到同一 `appnet`）：
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.mcp.yml \
-               -f docker-compose.web.yml \
-               -f docker-compose.phoenix.yml \
-               -f docker-compose.langfuse.yml up -d
+./start_stack.sh --with=phoenix,langfuse,mcp,web
 ```
 - `.env` 须填全 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_* 等，`.env.example` 已含），并把追踪端点改走服务名：
 ```sh
@@ -256,6 +253,42 @@ LANGFUSE_BASE_URL=http://langfuse-web:3000
 - 若想在路线 B 也从外部看 UI，可在 `Caddyfile` 加 `:6006`/`:3000` 代理块（前提：这些主机端口空闲、未被任何共享实例占用）；否则 UI 仅 appnet 内可达，不影响 agent 上报 trace。
 
 > 切换路线只改「并入哪几个 `-f` 文件」+ 对应 `*_BASE_URL` 端点，镜像与业务栈不变。
+
+---
+
+### 4.10 以 Docker Swarm stack 部署（推荐）
+
+部署形态已从 `docker compose up` 切换为 **Docker Swarm stack**（与 `flyctrl_deploy` 的 `base` 同源思路，但 stack 名用 `geesun` 以免同机互相覆盖）。`deploy/` 下三个脚本封装了完整发布链路：
+
+| 脚本 | 作用 |
+|---|---|
+| `start_stack.sh` | 前置检查（docker / swarm / `.env`）→ 默认跑 `build-push.sh` 打包推 Harbor → `docker stack deploy`（必带 `--with-registry-auth --resolve-image=always --prune`）；`--no-build` 跳过打包，`--with=phoenix,langfuse,mcp,web` 叠加附加 compose |
+| `stop_stack.sh` | `docker stack rm geesun`（移除服务/网络，**不删命名卷**）|
+| `service_stack.sh` | `docker stack services geesun` 看副本/镜像/端口 |
+
+**`docker stack deploy` 三个必带参数（漏了必踩坑）**：
+- `--with-registry-auth`：Harbor 是私有仓库，不带则节点拉不到镜像（依赖本机已 `docker login`）。
+- `--resolve-image=always`：固定 tag（如 `1.0.0`）重新发布时，Swarm 默认认为镜像未变而不更新；此参数强制每次拉新。
+- `--prune`：compose 里删掉的服务会被真正从 stack 清理（否则成为孤儿服务）。
+
+**与 `docker compose up` 的关键差异（已在本仓库 compose 文件改好，勿回退）**：
+- ⚠️ `restart:` 字段被 Swarm **忽略** → 全部改为 `deploy.restart_policy: { condition: any }`（异常退出自动拉起）。
+- ⚠️ `depends_on:` 被 Swarm **忽略**（不保证启动顺序）→ 启动顺序靠 `healthcheck` + `restart_policy` 自愈；各服务已配 healthcheck（agent 探 `/docs`、postgres `pg_isready`、alloy/prometheus/grafana 探 UI 等）。
+- ⚠️ 短端口 `127.0.0.1:host:container` 的 **host IP 绑定被忽略**（会变成 0.0.0.0 全网卡）→ 全部改为 long syntax `mode: host` + `host_ip: 127.0.0.1`（alloy 12345 / prometheus 9091 / grafana 3100 仍仅本机可达，不破安全边界）；caddy `80` 保留 ingress 全网卡（本就对外）。
+- ⚠️ `appnet` 网络去掉 `name:`（与 stack 前缀冲突），改 `driver: overlay`；stack 会加 `geesun_` 前缀 → 实际网络名 `geesun_appnet`。附加 compose 文件不再重复定义 `appnet`，只引用。
+- 命名卷自动加 `geesun_` 前缀（如 `geesun_agent_pg_data` / `geesun_loki_data`）；**生产尚未部署，无历史数据迁移问题**，直接切。
+- `env_file: [.env]` 仍生效（start_stack.sh 在 deploy/ 目录执行，`.env` 由 docker 在 deploy 时插值注入）。
+
+**发布 / 停止 / 状态**：
+```sh
+cd deploy
+./start_stack.sh --with=mcp,web          # 打包 + 发布主栈 + mcp + web
+./start_stack.sh --no-build              # 仅用已推送镜像重新部署（改配置后快速重启）
+./service_stack.sh                       # 看服务状态
+./stop_stack.sh                          # 停止（数据卷保留）
+```
+
+**生产验证（部署后）**：见 §7.8 校验 —— `./service_stack.sh` 全 `1/1 Running`；`http://10.10.10.67/` 前端、`127.0.0.1:3100` Grafana(看 Loki 有日志)、`127.0.0.1:9091` Prometheus(看 `geesun-agent`/`alloy` target up)、`127.0.0.1:12345` Alloy UI；agent 经 `alloy:4317` → Phoenix trace 链路通。
 
 ---
 
@@ -357,13 +390,14 @@ cron 示例（每天 03:07）：
    - **D. 可保持默认（通常无需改）：**
      - `LOG_LEVEL`/`LOG_FORMAT`、`AGENT_PG_*`、`AGENT_DATA_ROOT`、`REGISTRY_GEESUN/HUB`、`GEESUN_AGENT_TAG`、`LANGFUSE_TAG`、`POSTGRES_VERSION`、`PHOENIX_DB_*`(名称)、`OTEL_PROJECT_NAME`、`*_BASE_URL`(服务名)、网络类 `REDIS_HOST/PORT` 等。
 5. （可选但推荐）CubeSandbox 信任与 DNS：把 `geesun_agent/certs/`（含 `cube-root-ca.crt`）拷到生产机 deploy 上级目录（CA 挂载源），并 root 执行 `bash deploy/setup-cube-dns.sh`（dnsmasq 转发 `*.cube.app`，见 §4.8）。
-6. 合并拉取镜像：
+6. 一键发布（打包镜像 → 推 Harbor → stack deploy；`--no-build` 可跳过打包只重启）：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml pull
+   ./start_stack.sh --with=mcp,web
    ```
-7. 启动（依赖与 healthcheck 会控制顺序）：
+   > 前置：`docker swarm init`（单节点即可）、`docker login` 到 Harbor（start_stack.sh 的 `--with-registry-auth` 依赖本机凭证）。
+7. 查看状态：
    ```sh
-   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d
+   ./service_stack.sh
    ```
 8. 校验：
    - `docker compose ps` 全 healthy；
@@ -386,7 +420,7 @@ cron 示例（每天 03:07）：
 - **三个 Postgres**：agent_mem / phoenix / langfuse 各自独立，资源占用偏高；后续若想省可合并实例（按安全域权衡）。
 - **密钥**：`.env` 必须 `chmod 600` 且**绝不进 git**；生产可进一步改用 compose `secrets:` 挂载。
 - **DB 不暴露**：仅 `127.0.0.1` 供排障；对外只走 Caddy。
-- **资源限制**：各服务已加 `deploy.resources.limits`，防止 vLLM/agent 互相挤占（compose 非 swarm 下 `limits` 仅提示，真正限需用 `--compatibility` 或 cgroup v2 配置，按需确认）。
+- **资源限制**：各服务已加 `deploy.resources.limits` + `deploy.restart_policy`（Swarm 下 `limits` 真正生效做资源硬限、`restart_policy: any` 负责异常自愈；`docker compose` 非 swarm 下 `limits` 仅提示）。
 - **Langfuse 初始化**：官方 clickhouse migration 步骤务必在 `up` 前核对；首次启动 worker 会跑迁移，需等 healthy。
 - **不要 `-v` 删卷**：见 5.4。
 - **外部依赖可达性**：部署后先 `docker exec geesun-agent curl -s http://172.16.66.13:8003/v1/models` 验证 vLLM 连通，再验 CubeSandbox / MCP。

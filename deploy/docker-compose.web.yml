@@ -13,7 +13,6 @@
 services:
   geesun-agent-web:
     image: ${REGISTRY_GEESUN}/geesun-agent-web:${WEB_TAG:-1.0.0}
-    restart: unless-stopped
     environment:
       NODE_ENV: production
       PORT: "3000"
@@ -29,6 +28,8 @@ services:
       retries: 5
       start_period: 15s
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -39,7 +40,3 @@ services:
         max-size: "20m"
         max-file: "3"
 
-networks:
-  appnet:
-    name: appnet
-    driver: bridge

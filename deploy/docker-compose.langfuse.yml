@@ -13,7 +13,6 @@
 services:
   langfuse-worker:
     image: ${REGISTRY_HUB}/langfuse:${LANGFUSE_TAG:-3}
-    restart: always
     depends_on: &langfuse-depends-on
       postgres:
         condition: service_healthy
@@ -67,6 +66,8 @@ services:
       REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED}
     networks: [appnet]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -79,7 +80,6 @@ services:
 
   langfuse-web:
     image: ${REGISTRY_HUB}/langfuse:${LANGFUSE_TAG:-3}
-    restart: always
     depends_on: *langfuse-depends-on
     environment:
       <<: *langfuse-worker-env
@@ -95,6 +95,8 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
     networks: [appnet]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -107,7 +109,6 @@ services:
 
   clickhouse:
     image: ${REGISTRY_HUB}/clickhouse-server:25.12
-    restart: always
     user: "101:101"
     environment:
       CLICKHOUSE_DB: default
@@ -117,8 +118,14 @@ services:
       - langfuse_clickhouse_data:/var/lib/clickhouse
       - langfuse_clickhouse_logs:/var/log/clickhouse-server
     ports:
-      - 127.0.0.1:8123:8123
-      - 127.0.0.1:9000:9000
+      - target: 8123
+        published: 8123
+        mode: host
+        host_ip: 127.0.0.1
+      - target: 9000
+        published: 9000
+        mode: host
+        host_ip: 127.0.0.1
     networks: [appnet]
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
@@ -127,6 +134,8 @@ services:
       retries: 10
       start_period: 1s
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "2.0"
@@ -139,7 +148,6 @@ services:
 
   minio:
     image: ${REGISTRY_HUB}/minio:chainguard
-    restart: always
     entrypoint: sh
     command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
     environment:
@@ -147,7 +155,10 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
       - 9092:9000          # S3 API → 主机 9092（路线 B 自托管时即本机 minio；路线 A 共用栈已占此端口，故不并入）
-      - 127.0.0.1:9091:9001
+      - target: 9001
+        published: 9091
+        mode: host
+        host_ip: 127.0.0.1
     volumes:
       - langfuse_minio_data:/data
     networks: [appnet]
@@ -158,6 +169,8 @@ services:
       retries: 5
       start_period: 1s
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "0.5"
@@ -170,12 +183,14 @@ services:
 
   redis:
     image: ${REGISTRY_HUB}/redis:7
-    restart: always
     command: >
       --requirepass ${REDIS_AUTH}
       --maxmemory-policy noeviction
     ports:
-      - 127.0.0.1:6379:6379
+      - target: 6379
+        published: 6379
+        mode: host
+        host_ip: 127.0.0.1
     volumes:
       - langfuse_redis_data:/data
     networks: [appnet]
@@ -185,6 +200,8 @@ services:
       timeout: 10s
       retries: 10
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "0.5"
@@ -197,7 +214,6 @@ services:
 
   postgres:
     image: ${REGISTRY_HUB}/postgres:${POSTGRES_VERSION:-17}
-    restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -210,11 +226,16 @@ services:
       TZ: UTC
       PGTZ: UTC
     ports:
-      - 127.0.0.1:5432:5432
+      - target: 5432
+        published: 5432
+        mode: host
+        host_ip: 127.0.0.1
     volumes:
       - langfuse_postgres_data:/var/lib/postgresql/data
     networks: [appnet]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -225,9 +246,6 @@ services:
         max-size: "20m"
         max-file: "3"
 
-networks:
-  appnet:
-    name: appnet
 
 volumes:
   langfuse_postgres_data:

@@ -7,7 +7,6 @@
 services:
   phoenix:
     image: ${REGISTRY_HUB}/phoenix:19.1.0
-    restart: unless-stopped
     depends_on:
       - phoenix-db
     environment:
@@ -22,6 +21,8 @@ services:
       retries: 10
       start_period: 30s
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -34,7 +35,6 @@ services:
 
   phoenix-db:
     image: ${REGISTRY_HUB}/postgres:16.14
-    restart: unless-stopped
     environment:
       - POSTGRES_USER=${PHOENIX_DB_USER}
       - POSTGRES_PASSWORD=${PHOENIX_DB_PASSWORD}
@@ -50,6 +50,8 @@ services:
       timeout: 5s
       retries: 10
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -60,9 +62,6 @@ services:
         max-size: "20m"
         max-file: "3"
 
-networks:
-  appnet:
-    name: appnet
 
 volumes:
   phoenix_pg_data:

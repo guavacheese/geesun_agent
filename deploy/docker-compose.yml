@@ -2,13 +2,15 @@
 #
 # 合并启动（在 deploy/ 目录）：
 #   cp .env.example .env && vi .env        # 填全部密钥（含 REGISTRY_GEESUN / REGISTRY_HUB / Harbor 凭证）
-#   docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d
+#   ./start_stack.sh                          # 默认仅主栈（swarm）
+#   ./start_stack.sh --with=mcp,web           # 并入 MCP / 前端
+#   ./start_stack.sh --with=phoenix,langfuse  # 路线 B 自托管兜底
 #
 # 说明：
 #   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
 #     第三方通用镜像（pgvector/caddy/loki/alloy/prometheus/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
-#   - 多个 compose 用 -f 合并，共享默认网络 appnet（容器间用服务名互访）。
+#   - 多文件用 start_stack.sh --with= 合并 -c，共享 overlay 网络 appnet（容器间用服务名互访，stack 前缀 geesun_）。
 #   - 可观测性复用现网共享实例（路线 A，默认）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
 #     已发布在主机，本 compose 不再跑 phoenix/langfuse 服务；agent 经主机 LAN IP 连接（见 .env）。
 #   - 需要自托管兜底（无共享实例）时，把 docker-compose.langfuse.yml / docker-compose.phoenix.yml
@@ -22,7 +24,6 @@ services:
   geesun-agent:
     # 自有应用镜像来自 Harbor geesun_ai 项目；构建/推送见 deploy/build-push.sh
     image: ${REGISTRY_GEESUN}/geesun-agent:${GEESUN_AGENT_TAG:-1.0.0}
-    restart: unless-stopped
     # 注入 deploy/.env 全部变量（base_url / openai_api_key / model_name /
     # agent_workspace / mcp_token / upload_root / report_root / E2B_* 等必填项
     # 仅靠上面 environment: 块无法覆盖，缺失会导致 config.py 校验失败容器起不来）
@@ -64,6 +65,8 @@ services:
       retries: 10
       start_period: 30s
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "2.0"
@@ -76,7 +79,6 @@ services:
 
   agent-postgres:
     image: ${REGISTRY_HUB}/pgvector:0.8.0-pg17
-    restart: unless-stopped
     environment:
       POSTGRES_USER: ${AGENT_PG_USER:-geesun}
       POSTGRES_PASSWORD: ${AGENT_PG_PASSWORD}
@@ -92,6 +94,8 @@ services:
       timeout: 5s
       retries: 10
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -104,7 +108,6 @@ services:
 
   caddy:
     image: ${REGISTRY_HUB}/caddy:2.8-alpine
-    restart: unless-stopped
     ports:
       # 仅主入口 :80（前端 + /api/* 路由）；Phoenix(:6006)/Langfuse(:3000) 由现网共享容器直出，
       # 不经 Caddy 代理（避免与它们的已发布端口冲突）。
@@ -116,6 +119,8 @@ services:
     networks: [appnet]
     depends_on: [geesun-agent]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "0.5"
@@ -128,13 +133,14 @@ services:
 
   loki:
     image: ${REGISTRY_HUB}/loki:3.2.0
-    restart: unless-stopped
     command: -config.file=/etc/loki/loki-config.yaml
     volumes:
       - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
       - loki_data:/loki
     networks: [appnet]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "1.0"
@@ -148,7 +154,6 @@ services:
   # ── Grafana Alloy：统一采集 logs→Loki / metrics→Prometheus / traces→Phoenix（替代原 Promtail）──
   alloy:
     image: ${REGISTRY_HUB}/alloy:${ALLOY_TAG:-v1.19.2}
-    restart: unless-stopped
     command:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
@@ -162,10 +167,15 @@ services:
       - alloy_data:/var/lib/alloy/data
     # 仅发布 UI 到本机 127.0.0.1:12345 便于调试；OTLP 4317/4321 仅在 appnet 内由 agent 访问（不发布主机）
     ports:
-      - "127.0.0.1:12345:12345"
+      - target: 12345
+        published: 12345
+        mode: host
+        host_ip: 127.0.0.1
     networks: [appnet]
     depends_on: [loki, prometheus]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "0.5"
@@ -180,7 +190,6 @@ services:
   # 需 --web.enable-remote-write-receiver 才能接收 Alloy 的 prometheus.remote_write。
   prometheus:
     image: ${REGISTRY_HUB}/prometheus:${PROMETHEUS_TAG:-3.0}
-    restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -189,9 +198,14 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "127.0.0.1:9091:9090"
+      - target: 9090
+        published: 9091
+        mode: host
+        host_ip: 127.0.0.1
     networks: [appnet]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "0.5"
@@ -204,17 +218,21 @@ services:
 
   grafana:
     image: ${REGISTRY_HUB}/grafana:11.3.0
-    restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
     ports:
-      - "127.0.0.1:3100:3000"
+      - target: 3000
+        published: 3100
+        mode: host
+        host_ip: 127.0.0.1
     networks: [appnet]
     depends_on: [loki, prometheus]
     deploy:
+      restart_policy:
+        condition: any
       resources:
         limits:
           cpus: "0.5"
@@ -227,8 +245,7 @@ services:
 
 networks:
   appnet:
-    name: appnet
-    driver: bridge
+    driver: overlay
 
 volumes:
   agent_pg_data:
