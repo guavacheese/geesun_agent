@@ -22,6 +22,7 @@ skills/
 # 部署配置与文档（需纳入版本控制，覆盖上方的 *.md / *.json 通配）
 !logging.uvicorn.json
 !deploy/DEPLOYMENT.md
+!deploy/README.md
 !deploy/*.json
 !deploy/.env.example
 
