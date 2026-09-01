@@ -17,7 +17,7 @@
 | caddy | `dockerhub/caddy:2.8-alpine` | 80 | 80 | 是 | `caddy_data` `caddy_config` | geesun-agent / geesun-agent-web |
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
 | alloy | `dockerhub/alloy:v1.19.2` | 4317/4321(OTLP)、12345(UI,仅 127.0.0.1) | 不发布（OTLP 仅 appnet） | 否 | `alloy_data` | loki、prometheus（docker.sock 仅读） |
-| prometheus | `dockerhub/prometheus:3.0` | 9090 | 127.0.0.1:9091 | 否 | `prometheus_data` | —（需 `--web.enable-remote-write-receiver` 接收 Alloy remote_write） |
+| prometheus | `dockerhub/prometheus:3.0` | 9090 | 127.0.0.1:19091 | 否 | `prometheus_data` | —（需 `--web.enable-remote-write-receiver` 接收 Alloy remote_write） |
 | grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki、prometheus |
 | phoenix / langfuse（可观测栈） | **路线 A（默认，当前 67）**：复用现网共享实例（见 §10.3），agent OTLP 统一发往 Alloy（`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`，由 Alloy 转发到 Phoenix `10.10.10.67:4317`）；Langfuse 仍直发（`LANGFUSE_BASE_URL=http://10.10.10.67:3000`），**本 compose 不并入这两个文件**。**路线 B（自托管兜底，两文件始终保留不删）**：无共享实例时把 `docker-compose.phoenix.yml`+`docker-compose.langfuse.yml` 一并 `-f` 并入，agent OTLP 仍发往 Alloy、由 Alloy 经 `PHOENIX_OTLP_ENDPOINT=phoenix:4317` 转发到 phoenix 服务名；Langfuse 经 `langfuse-web:3000` 服务名直连（见 §4.9）。 | 路线 A：是（他人已发布）；路线 B：否（仅 appnet） | 路线 A：他人已发布；路线 B：Caddy 可选代理 | 路线 B：各 named volume | — |
 
@@ -288,7 +288,7 @@ cd deploy
 ./stop_stack.sh                          # 停止（数据卷保留）
 ```
 
-**生产验证（部署后）**：见 §7.8 校验 —— `./service_stack.sh` 全 `1/1 Running`；`http://10.10.10.67/` 前端、`127.0.0.1:3100` Grafana(看 Loki 有日志)、`127.0.0.1:9091` Prometheus(看 `geesun-agent`/`alloy` target up)、`127.0.0.1:12345` Alloy UI；agent 经 `alloy:4317` → Phoenix trace 链路通。
+**生产验证（部署后）**：见 §7.8 校验 —— `./service_stack.sh` 全 `1/1 Running`；`http://10.10.10.67/` 前端、`127.0.0.1:3100` Grafana(看 Loki 有日志)、`127.0.0.1:19091` Prometheus(看 `geesun-agent`/`alloy` target up)、`127.0.0.1:12345` Alloy UI；agent 经 `alloy:4317` → Phoenix trace 链路通。
 
 **⚠️ 行尾铁律（CRLF 坑，已踩两次）**：仓库文本已由 `.gitattributes` 强制 `eol=lf`，但**目标机手动拷贝的 deploy 目录**若来自 Windows 仍可能带 CRLF。症状链：脚本报 `pipefail invalid option` → yml 报 schema 错 → **`.env` 值尾带 `\r` 时 compose 展开 `${REGISTRY_HUB}` 得到 `...\r/pgvector:...` 报 `invalid reference format`**（`.env` 极易漏修）。目标机就地统一修复：
 ```sh
@@ -347,7 +347,7 @@ cron 示例（每天 03:07）：
 
 ### 6.2 采集链路
 `geesun-agent(stdout JSON)` → Docker `json-file`(本地轮转) → Alloy(`discovery.docker` 发现 appnet 容器、`loki.process` 提取 JSON 字段，并统一收 metrics→Prometheus / traces→Phoenix) → Loki(30d 留存) + Prometheus(metrics) → Grafana(检索/面板/告警)。
-- **验证**：进 alloy 容器看 UI `:12345`（本机 `127.0.0.1:12345`）；Prometheus `:9091` 查 `up`/`geesun-agent`/`alloy`；Phoenix（路线 A `10.10.10.67:6006`）确认 traces 到达。Alloy→Phoenix 转发经 `PHOENIX_OTLP_ENDPOINT` 控制（路线 B 改 `phoenix:4317`）。
+- **验证**：进 alloy 容器看 UI `:12345`（本机 `127.0.0.1:12345`）；Prometheus `:19091` 查 `up`/`geesun-agent`/`alloy`；Phoenix（路线 A `10.10.10.67:6006`）确认 traces 到达。Alloy→Phoenix 转发经 `PHOENIX_OTLP_ENDPOINT` 控制（路线 B 改 `phoenix:4317`）。
 
 ### 6.3 配置要点
 - `LOG_LEVEL`（默认 `INFO`）、`LOG_FORMAT=json|text` 由环境变量控制（`logging.py` 已实现）。

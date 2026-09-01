@@ -162,6 +162,7 @@ services:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
       - --storage.path=/var/lib/alloy/data
+      - --config.expand-env
       - /etc/alloy/config.alloy
     # env_file 注入 PHOENIX_OTLP_ENDPOINT（Alloy→Phoenix 转发目标；路线 A=LAN IP，路线 B=phoenix:4317）
     env_file: [.env]
@@ -203,7 +204,7 @@ services:
       - prometheus_data:/prometheus
     ports:
       - target: 9090
-        published: 9091
+        published: 19091
         mode: host
     networks: [appnet]
     deploy:

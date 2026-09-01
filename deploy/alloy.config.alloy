@@ -5,6 +5,7 @@
 //   traces : agent 经 OTLP 发来 → Phoenix（路线 A=现网共享实例 10.10.10.67:4317；路线 B=phoenix:4317，由 PHOENIX_OTLP_ENDPOINT 控制）
 // agent 侧：PHOENIX_COLLECTOR_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT 均指向 http://alloy:4317（appnet 内统一入口）
 // 镜像版本：见 build-push.sh 的 ALLOY_TAG（以 `docker pull grafana/alloy:latest` 实测 tag 固定，如 1.8.x）
+// 注意：配置含 ${PHOENIX_OTLP_ENDPOINT:-...} 环境变量展开，alloy 必须以 --config.expand-env 启动（见 docker-compose.yml command）
 
 logging {
   level  = "info"
@@ -12,13 +13,10 @@ logging {
 }
 
 // ───────────────────────── Logs ─────────────────────────
-// 发现宿主机上所有容器，仅保留 appnet 网络、并把容器名写入 container 标签
-discovery.docker "containers" {
-  host = "unix:///var/run/docker.sock"
-}
-
-discovery.relabel "appnet_only" {
-  targets = discovery.docker.containers.targets
+// loki.source.docker 自带 Docker API 容器发现（无需 discovery.docker）；
+// 网络过滤/标签注入用 relabel_rules 传入（v1.19 语法：loki.relabel 定义规则 + receiver 链路）
+loki.relabel "appnet_only" {
+  forward_to = [loki.process.stage.receiver]
 
   rule {
     source_labels = ["__meta_docker_container_name"]
@@ -34,30 +32,28 @@ discovery.relabel "appnet_only" {
 
 // 直接通过 Docker API 读容器日志（无需挂宿主机 /var/lib/docker/containers）
 loki.source.docker "logs" {
-  targets    = discovery.relabel.appnet_only.targets
-  forward_to = [loki.process.stage.receiver]
+  host          = "unix:///var/run/docker.sock"
+  forward_to    = [loki.relabel.appnet_only.receiver]
+  relabel_rules = loki.relabel.appnet_only.rules
 }
 
 // 提取应用 JSON 字段为索引标签（与原 Promtail pipeline_stages 对应）
+// v1.19 语法：stage 必须带类型后缀（stage.json / stage.labels），不再支持裸 stage {} 块
 loki.process "stage" {
   forward_to = [loki.write.default.receiver]
 
-  stage {
-    json {
-      expressions = {
-        level  = "level",
-        logger = "logger",
-        msg    = "msg",
-        ts     = "ts",
-      }
+  stage.json {
+    expressions = {
+      level  = "level",
+      logger = "logger",
+      msg    = "msg",
+      ts     = "ts",
     }
   }
-  stage {
-    labels {
-      values = {
-        level  = "",
-        logger = "",
-      }
+  stage.labels {
+    values = {
+      level  = "",
+      logger = "",
     }
   }
 }
