@@ -22,6 +22,8 @@ geesun_agent_web
 **/reports
 **/certs
 **/.env
+# 集成测试密钥配置（langchain-cubesandbox/.env.test，含内网 CUBE_API_KEY，不进镜像）
+**/.env.test*
 
 # 宿主机 Python 虚拟环境（不应进镜像；Dockerfile 用 uv sync 从 uv.lock 装依赖）
 **/.venv
