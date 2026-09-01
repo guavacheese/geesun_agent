@@ -4,8 +4,8 @@
 //   metrics: agent 经 OTLP 发来 → Prometheus（自建，remote_write）
 //   traces : agent 经 OTLP 发来 → Phoenix（路线 A=现网共享实例 10.10.10.67:4317；路线 B=phoenix:4317，由 PHOENIX_OTLP_ENDPOINT 控制）
 // agent 侧：PHOENIX_COLLECTOR_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT 均指向 http://alloy:4317（appnet 内统一入口）
-// 镜像版本：见 build-push.sh 的 ALLOY_TAG（以 `docker pull grafana/alloy:latest` 实测 tag 固定，如 1.8.x）
-// 注意：配置含 ${PHOENIX_OTLP_ENDPOINT:-...} 环境变量展开，alloy 必须以 --config.expand-env 启动（见 docker-compose.yml command）
+// 镜像版本：.env 的 ALLOY_TAG=v1.19.2（docker-compose.yml 默认值同步）
+// 注意：PHOENIX_OTLP_ENDPOINT 经 env() 函数读取（由 env_file 注入，v1.19 已移除 --config.expand-env）
 
 logging {
   level  = "info"
@@ -13,28 +13,32 @@ logging {
 }
 
 // ───────────────────────── Logs ─────────────────────────
-// loki.source.docker 自带 Docker API 容器发现（无需 discovery.docker）；
-// 网络过滤/标签注入用 relabel_rules 传入（Swarm 实际网络名带 stack 前缀 geesun_）（v1.19 语法：loki.relabel 定义规则 + receiver 链路）
-loki.relabel "appnet_only" {
-  forward_to = [loki.process.stage.receiver]
+// discovery.docker 发现容器 → discovery.relabel 过滤 appnet2 网络 + 提取容器名
+// → loki.source.docker 读日志（Swarm 实际网络名带 stack 前缀 geesun_appnet2）
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
 
-  rule {
-    source_labels = ["__meta_docker_container_name"]
-    regex         = "/(.*)"
-    target_label  = "container"
-  }
+discovery.relabel "appnet_only" {
+  targets = discovery.docker.containers.targets
+
   rule {
     source_labels = ["__meta_docker_network_name"]
     regex         = "geesun_appnet2"
     action        = "keep"
   }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
 }
 
 // 直接通过 Docker API 读容器日志（无需挂宿主机 /var/lib/docker/containers）
 loki.source.docker "logs" {
-  host          = "unix:///var/run/docker.sock"
-  forward_to    = [loki.relabel.appnet_only.receiver]
-  relabel_rules = loki.relabel.appnet_only.rules
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.appnet_only.output
+  forward_to = [loki.process.stage.receiver]
 }
 
 // 提取应用 JSON 字段为索引标签（与原 Promtail pipeline_stages 对应）
@@ -83,7 +87,7 @@ otelcol.receiver.otlp "default" {
 //   路线 B（自托管 phoenix compose）：在 .env 设 PHOENIX_OTLP_ENDPOINT=phoenix:4317
 otelcol.exporter.otlp "phoenix" {
   client {
-    endpoint = "${PHOENIX_OTLP_ENDPOINT:-10.10.10.67:4317}"
+    endpoint = env("PHOENIX_OTLP_ENDPOINT")
     tls {
       insecure = true
     }

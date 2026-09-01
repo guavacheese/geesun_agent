@@ -65,7 +65,6 @@ services:
       retries: 10
       start_period: 30s
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -95,7 +94,6 @@ services:
       timeout: 5s
       retries: 10
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -113,10 +111,7 @@ services:
     ports:
       # 仅主入口 :80（前端 + /api/* 路由）；Phoenix(:6006)/Langfuse(:3000) 由现网共享容器直出，
       # 不经 Caddy 代理（避免与它们的已发布端口冲突）。
-      # host 模式：单节点 swarm 与 ingress 等价，且 dnsrr 模式不允许 ingress 端口
-      - target: 80
-        published: 80
-        mode: host
+      - "80:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -124,7 +119,6 @@ services:
     networks: [appnet2]
     depends_on: [geesun-agent]
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -145,7 +139,6 @@ services:
       - loki_data:/loki
     networks: [appnet2]
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -165,7 +158,6 @@ services:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
       - --storage.path=/var/lib/alloy/data
-      - --config.expand-env
       - /etc/alloy/config.alloy
     # env_file 注入 PHOENIX_OTLP_ENDPOINT（Alloy→Phoenix 转发目标；路线 A=LAN IP，路线 B=phoenix:4317）
     env_file: [.env]
@@ -173,15 +165,12 @@ services:
       - ./alloy.config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - alloy_data:/var/lib/alloy/data
-    # 发布 UI 到主机 12345 便于调试（Swarm 不支持 host_ip，绑定所有接口）；OTLP 4317/4321 仅在 appnet 内由 agent 访问（不发布主机）
+    # 发布 UI 到主机 12345 便于调试；OTLP 4317/4321 仅在 appnet 内由 agent 访问（不发布主机）
     ports:
-      - target: 12345
-        published: 12345
-        mode: host
+      - "12345:12345"
     networks: [appnet2]
     depends_on: [loki, prometheus]
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -206,12 +195,9 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - target: 9090
-        published: 19091
-        mode: host
+      - "19091:9090"
     networks: [appnet2]
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -232,13 +218,10 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
     ports:
-      - target: 3000
-        published: 3100
-        mode: host
+      - "3100:3000"
     networks: [appnet2]
     depends_on: [loki, prometheus]
     deploy:
-      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
