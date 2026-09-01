@@ -65,6 +65,7 @@ services:
       retries: 10
       start_period: 30s
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -94,6 +95,7 @@ services:
       timeout: 5s
       retries: 10
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -119,6 +121,7 @@ services:
     networks: [appnet]
     depends_on: [geesun-agent]
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -139,6 +142,7 @@ services:
       - loki_data:/loki
     networks: [appnet]
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -173,6 +177,7 @@ services:
     networks: [appnet]
     depends_on: [loki, prometheus]
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -202,6 +207,7 @@ services:
         mode: host
     networks: [appnet]
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
@@ -228,6 +234,7 @@ services:
     networks: [appnet]
     depends_on: [loki, prometheus]
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:

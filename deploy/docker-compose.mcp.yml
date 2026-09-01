@@ -45,6 +45,7 @@ services:
       retries: 10
       start_period: 20s
     deploy:
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
       resources:
