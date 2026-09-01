@@ -106,7 +106,7 @@ build_push_web() {
     return 0
   fi
   local WEB_TAG="${WEB_TAG:-1.0.0}"
-  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67/}"
+  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67}"
   local WEB_IMAGE="$REGISTRY_GEESUN/geesun-agent-web:$WEB_TAG"
   echo "==> 构建 $WEB_IMAGE (context=$web_repo, NEXT_PUBLIC_API_BASE=$API_BASE)"
   docker build \
