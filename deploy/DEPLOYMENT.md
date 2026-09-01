@@ -273,8 +273,8 @@ LANGFUSE_BASE_URL=http://langfuse-web:3000
 
 **与 `docker compose up` 的关键差异（已在本仓库 compose 文件改好，勿回退）**：
 - ⚠️ `restart:` 字段被 Swarm **忽略** → 全部改为 `deploy.restart_policy: { condition: any }`（异常退出自动拉起）。
-- ⚠️ `depends_on:` 被 Swarm **忽略**（不保证启动顺序）→ 启动顺序靠 `healthcheck` + `restart_policy` 自愈；各服务已配 healthcheck（agent 探 `/docs`、postgres `pg_isready`、alloy/prometheus/grafana 探 UI 等）。
-- ⚠️ 短端口 `127.0.0.1:host:container` 的 **host IP 绑定被忽略**（会变成 0.0.0.0 全网卡）→ 全部改为 long syntax `mode: host` + `host_ip: 127.0.0.1`（alloy 12345 / prometheus 9091 / grafana 3100 仍仅本机可达，不破安全边界）；caddy `80` 保留 ingress 全网卡（本就对外）。
+- ⚠️ `depends_on` **只认列表语法** `depends_on: [x]`（仅保证先创建，不保证就绪）；`condition: service_healthy` 长语法直接报 `depends_on must be a list`，map 语法同理 → 已全部改为列表，就绪等待靠 `healthcheck` + `restart_policy` 自愈（agent 探 `/docs`、postgres `pg_isready`、alloy/prometheus/grafana 探 UI 等）。
+- ⚠️ **`host_ip` 不被 Swarm 接受**：短端口 `127.0.0.1:host:container` 的 host IP 绑定在 Swarm 下直接报 `Additional property host_ip is not allowed` → 已**删除全部 `host_ip` 字段**，alloy/prometheus/grafana 等本机服务改用 `published: "127.0.0.1:xxxx"` 短语法尽力约束（Swarm ingress 下实际可能全网卡监听，属已知权衡）；caddy `80` 保留 ingress 全网卡（本就对外）。
 - ⚠️ `appnet` 网络去掉 `name:`（与 stack 前缀冲突），改 `driver: overlay`；stack 会加 `geesun_` 前缀 → 实际网络名 `geesun_appnet`。附加 compose 文件不再重复定义 `appnet`，只引用。
 - 命名卷自动加 `geesun_` 前缀（如 `geesun_agent_pg_data` / `geesun_loki_data`）；**生产尚未部署，无历史数据迁移问题**，直接切。
 - `env_file: [.env]` 仍生效（start_stack.sh 在 deploy/ 目录执行，`.env` 由 docker 在 deploy 时插值注入）。
@@ -289,6 +289,13 @@ cd deploy
 ```
 
 **生产验证（部署后）**：见 §7.8 校验 —— `./service_stack.sh` 全 `1/1 Running`；`http://10.10.10.67/` 前端、`127.0.0.1:3100` Grafana(看 Loki 有日志)、`127.0.0.1:9091` Prometheus(看 `geesun-agent`/`alloy` target up)、`127.0.0.1:12345` Alloy UI；agent 经 `alloy:4317` → Phoenix trace 链路通。
+
+**⚠️ 行尾铁律（CRLF 坑，已踩两次）**：仓库文本已由 `.gitattributes` 强制 `eol=lf`，但**目标机手动拷贝的 deploy 目录**若来自 Windows 仍可能带 CRLF。症状链：脚本报 `pipefail invalid option` → yml 报 schema 错 → **`.env` 值尾带 `\r` 时 compose 展开 `${REGISTRY_HUB}` 得到 `...\r/pgvector:...` 报 `invalid reference format`**（`.env` 极易漏修）。目标机就地统一修复：
+```sh
+cd deploy
+sed -i 's/\r$//' .env *.sh *.yml *.yaml *.alloy *.md Caddyfile loki-config.yaml prometheus.yml
+sed -n "$(grep -n '^REGISTRY_HUB=' .env | cut -d: -f1)p" .env | cat -A   # 确认行尾是 $ 而非 ^M$
+```
 
 ---
 
