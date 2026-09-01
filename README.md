@@ -52,6 +52,70 @@ export SSL_CERT_FILE=/home/dhp/projects/cube-cert/cube-ca.pem
 
 ```
 
+## 各仓 .env 处理（本地开发）
+
+四个仓库的环境变量文件全部**不入库**（各自 `.gitignore` 已忽略，且 `.dockerignore` 保证不进镜像），仓库只保留脱敏模板 `.env.example`。新环境一律 `cp 模板 → 填真实值`。
+
+| 仓库 | 本地文件 | 模板 | 加载机制 | 用途 |
+| --- | --- | --- | --- | --- |
+| `geesun_agent` | `./.env`（根目录） | `./.env.example` | `src/core/config.py` 的 `Settings`（pydantic-settings，`env_file=[.env]`，大小写不敏感） | 后端本地开发 |
+| `geesun_mcp_server` | `./.env` | `./.env.example`（7 变量） | `main.py:14` `load_dotenv()` 自动加载 | MCP 服务本地开发 |
+| `geesun_agent_web` | `./.env.local` | `./.env.example`（`NEXT_PUBLIC_API_BASE`） | Next.js 原生（`next dev` 自动读 `.env.local`） | 前端本地开发 |
+| `langchain-cubesandbox` | `./.env.test` | `./.env.test.example` | `tests/integration_tests/test_sandbox.py:13-14` 显式 `load_dotenv(".env.test")` | 仅集成测试 |
+
+### 处理步骤
+
+**1. geesun_agent（后端）**
+
+```bash
+cd geesun_agent
+cp .env.example .env      # 模板字段对应 src/core/config.py 的 Settings（大小写不敏感）
+vi .env                   # 填 base_url / openai_api_key / model_name 等
+uv sync --frozen
+uv run uvicorn src.server:app --host 0.0.0.0 --port 8009
+```
+
+> 生产部署用 `deploy/.env.example → deploy/.env`（180 行全量模板，含密钥与镜像 tag），由 compose `env_file:[.env]` 注入容器——与根目录 `.env`（57 行，只管本地 `uv run`）是**两种运行模式**，互不替代。
+
+**2. geesun_mcp_server（MCP 服务，独立仓）**
+
+```bash
+cd geesun_mcp_server
+cp .env.example .env      # DECRYPT_API_URL / E2B_API_URL / E2B_API_KEY / SSL_CERT_FILE / AGENT_WORKSPACE / UPLOAD_ROOT / REPORT_ROOT
+vi .env
+uv sync --frozen
+uv run python main.py
+```
+
+`main.py:14` 的 `load_dotenv()` 自动加载仓库根 `.env`，无需 export；`override=False`，shell 已 export 的同名变量以 shell 为准（容器部署用 env 注入，本地用 `.env`）。
+
+**3. geesun_agent_web（前端，独立仓）**
+
+```bash
+cd geesun_agent_web
+cp .env.example .env.local   # NEXT_PUBLIC_API_BASE，本地默认 http://localhost:8009
+bun install
+bun run dev
+```
+
+> 生产部署**不走 `.env.local`**：`NEXT_PUBLIC_API_BASE` 是 build-time 变量，由 `deploy/build-push.sh` 以 `--build-arg` 注入镜像，改值必须重新构建（见 `geesun_agent_web/Dockerfile` 头注释）。
+
+**4. langchain-cubesandbox（沙箱库，仅集成测试）**
+
+```bash
+cd langchain-cubesandbox
+cp .env.test.example .env.test   # CUBE_TEMPLATE_ID(必填) / CUBE_API_URL / CUBE_API_KEY / CUBE_SSL_CERT
+vi .env.test
+uv run pytest tests/integration_tests/test_sandbox.py
+```
+
+### 安全规则（四仓一致）
+
+- 所有 `.env` 文件均已入各自 `.gitignore`（`.env*` 通配），`git add` 前确认不会误提交；
+- 模板 `.env.example` / `.env.test.example` 用白名单入库（`!.env.example` / `!.env.test.example`），只含键名与注释，不含真实值；
+- 各仓 `.dockerignore` 均已排除 `.env` 与虚拟环境（`**/.venv`、`**/.env.test*`），密钥不会烘焙进镜像；
+- 历史版本若误提交过密钥，**轮换密钥**即可（内网 key 轮换成本低，不建议重写 git 历史）。
+
 ## Deployment
 
 geesun_agent 生产部署目录位于 `deploy/`，采用 **Docker Swarm stack** 方式发布（与 `flyctrl_deploy` 同源思路，但补齐了 Swarm 必带参数与前置检查）。
