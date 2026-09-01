@@ -18,9 +18,9 @@ services:
       PORT: "3000"
       HOSTNAME: 0.0.0.0
     networks: [appnet]
-    depends_on:
-      geesun-agent:
-        condition: service_healthy
+    # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
+    # web 连不上 agent 时靠 restart 重试直至就绪
+    depends_on: [geesun-agent]
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

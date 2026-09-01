@@ -13,15 +13,12 @@
 services:
   langfuse-worker:
     image: ${REGISTRY_HUB}/langfuse:${LANGFUSE_TAG:-3}
+    # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）
     depends_on: &langfuse-depends-on
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
+      - postgres
+      - minio
+      - redis
+      - clickhouse
     environment: &langfuse-worker-env
       NEXTAUTH_URL: ${NEXTAUTH_URL}
       DATABASE_URL: ${DATABASE_URL}

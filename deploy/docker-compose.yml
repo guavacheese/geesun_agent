@@ -54,9 +54,9 @@ services:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
       # CubeSandbox CA（挂载源相对 deploy/ 目录，见 .env 的 CA_MOUNT_SRC）
       - ${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}:/etc/ssl/certs/cube-root-ca.crt:ro
-    depends_on:
-      agent-postgres:
-        condition: service_healthy
+    # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
+    # agent 连不上 postgres 时靠自身重试/重启直至就绪（等效等待 healthy）
+    depends_on: [agent-postgres]
     networks: [appnet]
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8009/docs').status==200 else 1)"]
