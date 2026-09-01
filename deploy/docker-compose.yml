@@ -165,12 +165,11 @@ services:
       - ./alloy.config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - alloy_data:/var/lib/alloy/data
-    # 仅发布 UI 到本机 127.0.0.1:12345 便于调试；OTLP 4317/4321 仅在 appnet 内由 agent 访问（不发布主机）
+    # 发布 UI 到主机 12345 便于调试（Swarm 不支持 host_ip，绑定所有接口）；OTLP 4317/4321 仅在 appnet 内由 agent 访问（不发布主机）
     ports:
       - target: 12345
         published: 12345
         mode: host
-        host_ip: 127.0.0.1
     networks: [appnet]
     depends_on: [loki, prometheus]
     deploy:
@@ -201,7 +200,6 @@ services:
       - target: 9090
         published: 9091
         mode: host
-        host_ip: 127.0.0.1
     networks: [appnet]
     deploy:
       restart_policy:
@@ -227,7 +225,6 @@ services:
       - target: 3000
         published: 3100
         mode: host
-        host_ip: 127.0.0.1
     networks: [appnet]
     depends_on: [loki, prometheus]
     deploy:
