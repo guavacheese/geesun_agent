@@ -13,8 +13,5 @@ scrape_configs:
     static_configs:
       - targets: ['alloy:12345']
 
-  # agent 若暴露 Prometheus /metrics 则直接抓取（未暴露时为空，无害）
-  - job_name: geesun-agent
-    metrics_path: /metrics
-    static_configs:
-      - targets: ['geesun-agent:8009']
+  # agent 指标已走 OTLP（agent → alloy:4317 → remote_write），
+  # 不暴露 /metrics 端点，无需直接抓取（此前每 10s 一条 404 噪音）
