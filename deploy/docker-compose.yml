@@ -10,7 +10,7 @@
 #   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
 #     第三方通用镜像（pgvector/caddy/loki/alloy/prometheus/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
-#   - 多文件用 start_stack.sh --with= 合并 -c，共享 overlay 网络 appnet（容器间用服务名互访，stack 前缀 geesun_）。
+#   - 多文件用 start_stack.sh --with= 合并 -c，共享 overlay 网络 appnet2（容器间用服务名互访，stack 前缀 geesun_）。
 #   - 可观测性复用现网共享实例（路线 A，默认）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
 #     已发布在主机，本 compose 不再跑 phoenix/langfuse 服务；agent 经主机 LAN IP 连接（见 .env）。
 #   - 需要自托管兜底（无共享实例）时，把 docker-compose.langfuse.yml / docker-compose.phoenix.yml
@@ -57,7 +57,7 @@ services:
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
     # agent 连不上 postgres 时靠自身重试/重启直至就绪（等效等待 healthy）
     depends_on: [agent-postgres]
-    networks: [appnet]
+    networks: [appnet2]
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8009/docs').status==200 else 1)"]
       interval: 15s
@@ -88,7 +88,7 @@ services:
       PGTZ: UTC
     volumes:
       - agent_pg_data:/var/lib/postgresql/data
-    networks: [appnet]
+    networks: [appnet2]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U geesun -d agent_mem"]
       interval: 5s
@@ -118,7 +118,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    networks: [appnet]
+    networks: [appnet2]
     depends_on: [geesun-agent]
     deploy:
       endpoint_mode: dnsrr
@@ -140,7 +140,7 @@ services:
     volumes:
       - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
       - loki_data:/loki
-    networks: [appnet]
+    networks: [appnet2]
     deploy:
       endpoint_mode: dnsrr
       restart_policy:
@@ -175,7 +175,7 @@ services:
       - target: 12345
         published: 12345
         mode: host
-    networks: [appnet]
+    networks: [appnet2]
     depends_on: [loki, prometheus]
     deploy:
       endpoint_mode: dnsrr
@@ -206,7 +206,7 @@ services:
       - target: 9090
         published: 19091
         mode: host
-    networks: [appnet]
+    networks: [appnet2]
     deploy:
       endpoint_mode: dnsrr
       restart_policy:
@@ -232,7 +232,7 @@ services:
       - target: 3000
         published: 3100
         mode: host
-    networks: [appnet]
+    networks: [appnet2]
     depends_on: [loki, prometheus]
     deploy:
       endpoint_mode: dnsrr
@@ -249,7 +249,7 @@ services:
         max-file: "3"
 
 networks:
-  appnet:
+  appnet2:
     driver: overlay
 
 volumes:

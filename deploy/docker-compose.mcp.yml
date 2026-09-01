@@ -5,7 +5,7 @@
 #                  -f docker-compose.phoenix.yml -f docker-compose.langfuse.yml up -d
 #
 # 设计要点：
-#   - 与 geesun-agent 同处 appnet；agent 用服务名 geesun-mcp:8000 访问
+#   - 与 geesun-agent 同处 appnet2；agent 用服务名 geesun-mcp:8000 访问
 #     （对应 .env 的 mcp_server_url=http://geesun-mcp:8000/mcp，覆盖默认的 localhost）。
 #   - 容器内部端口 8000 不映射到主机，仅 appnet 内互访，
 #     避免与 10.10.10.67 上现有 dev 的 :8000 冲突。
@@ -36,7 +36,7 @@ services:
       # CubeSandbox egress CA：宿主机证书路径由 CA_MOUNT_SRC 指定（默认仓库内 certs/）。
       # 必须指向真实存在的文件；若 sandbox 代理无 MITM 则删除本行 + SSL_CERT_FILE。
       - ${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}:/etc/ssl/certs/cube-root-ca.crt:ro
-    networks: [appnet]
+    networks: [appnet2]
     healthcheck:
       # 仅确认 8000 在监听（streamable-http 的 /mcp 对 GET 语义不定，用 TCP 探活更稳）
       test: ["CMD", "python3", "-c", "import socket,sys; s=socket.create_connection(('127.0.0.1',8000),3); s.close(); sys.exit(0)"]

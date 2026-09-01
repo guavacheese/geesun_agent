@@ -1,6 +1,6 @@
 // Alloy 统一采集配置（替代原 Promtail）
 // 信号路由：
-//   logs   : appnet 容器 stdout(JSON) → Loki（等价于原 Promtail 的 docker_sd + relabel + pipeline_stages）
+//   logs   : appnet2 容器 stdout(JSON) → Loki（等价于原 Promtail 的 docker_sd + relabel + pipeline_stages）
 //   metrics: agent 经 OTLP 发来 → Prometheus（自建，remote_write）
 //   traces : agent 经 OTLP 发来 → Phoenix（路线 A=现网共享实例 10.10.10.67:4317；路线 B=phoenix:4317，由 PHOENIX_OTLP_ENDPOINT 控制）
 // agent 侧：PHOENIX_COLLECTOR_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT 均指向 http://alloy:4317（appnet 内统一入口）
@@ -14,7 +14,7 @@ logging {
 
 // ───────────────────────── Logs ─────────────────────────
 // loki.source.docker 自带 Docker API 容器发现（无需 discovery.docker）；
-// 网络过滤/标签注入用 relabel_rules 传入（v1.19 语法：loki.relabel 定义规则 + receiver 链路）
+// 网络过滤/标签注入用 relabel_rules 传入（Swarm 实际网络名带 stack 前缀 geesun_）（v1.19 语法：loki.relabel 定义规则 + receiver 链路）
 loki.relabel "appnet_only" {
   forward_to = [loki.process.stage.receiver]
 
@@ -25,7 +25,7 @@ loki.relabel "appnet_only" {
   }
   rule {
     source_labels = ["__meta_docker_network_name"]
-    regex         = "appnet"
+    regex         = "geesun_appnet2"
     action        = "keep"
   }
 }

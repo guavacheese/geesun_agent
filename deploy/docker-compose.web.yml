@@ -2,7 +2,7 @@
 # geesun_agent_web（Next.js 前端）容器化 — 与主栈合并启动。
 #
 # 拓扑：
-#   geesun-agent-web 与 geesun-agent 同处 appnet，内部 3000 不发布主机；
+#   geesun-agent-web 与 geesun-agent 同处 appnet22，内部 3000 不发布主机；
 #   Caddy :80 按路径路由：/api/* → geesun-agent:8009（后端），其余 → geesun-agent-web:3000。
 #   前端与后端同域（http://10.10.10.67/），浏览器无 CORS 问题。
 #
@@ -17,7 +17,7 @@ services:
       NODE_ENV: production
       PORT: "3000"
       HOSTNAME: 0.0.0.0
-    networks: [appnet]
+    networks: [appnet2]
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
     # web 连不上 agent 时靠 restart 重试直至就绪
     depends_on: [geesun-agent]
