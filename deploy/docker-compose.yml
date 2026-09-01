@@ -113,7 +113,10 @@ services:
     ports:
       # 仅主入口 :80（前端 + /api/* 路由）；Phoenix(:6006)/Langfuse(:3000) 由现网共享容器直出，
       # 不经 Caddy 代理（避免与它们的已发布端口冲突）。
-      - "80:80"
+      # host 模式：单节点 swarm 与 ingress 等价，且 dnsrr 模式不允许 ingress 端口
+      - target: 80
+        published: 80
+        mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
