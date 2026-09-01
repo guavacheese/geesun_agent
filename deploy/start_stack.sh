@@ -39,6 +39,13 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 
+# ── 加载 .env 到 shell 环境 ────────────────────────────────
+# docker stack deploy 不像 docker compose 会自动读 .env 文件，
+# 它只从 shell 环境变量展开 ${VAR}。不加载则 ${REGISTRY_HUB}/${REGISTRY_GEESUN}
+# 全为空，image 展开成 /pgvector:0.8.0-pg17 → invalid reference format。
+# set -a 使 source 进来的变量自动 export，子进程（docker）才能继承。
+set -a; source "$ENV_FILE"; set +a
+
 # ── 解析参数 ───────────────────────────────────────────────
 EXTRA=()
 BUILD=1
