@@ -124,6 +124,32 @@ geesun_agent 生产部署目录位于 `deploy/`，采用 **Docker Swarm stack** 
 
 设计细节（网络/卷前缀、limits 生效、与 `docker compose up` 的差异、可观测栈路线 A/B 取舍）见 [`deploy/DEPLOYMENT.md`](./deploy/DEPLOYMENT.md)。
 
+### 本地开发 vs 生产：env 双模式（先读这个再往下）
+
+**生产只有一个配置入口：`deploy/.env`（180 行全量模板），同时服务「构建」与「运行」两个阶段；四个源码仓根目录的 `.env` / `.env.local` / `.env.test` 仅供本地开发，生产不参与**（各自 `.dockerignore` 已全部排除，镜像内不存在）。
+
+```
+deploy/.env.example ──cp──> deploy/.env（填全部密钥）
+        │
+        ├─ 构建阶段：build-push.sh:27-32 `set -a; . "$_DEPLOY_DIR/.env"; set +a` 读入
+        │    ├─ agent 镜像：uv sync --frozen 装依赖（构建期无需 env）
+        │    └─ web 镜像：--build-arg NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE:-http://10.10.10.67/}
+        │       （缺省 10.10.10.67；改前端地址见下方「场景 C」）
+        │
+        └─ 运行阶段：docker stack deploy 时 compose 原生读取 deploy/.env
+             ├─ geesun-agent：env_file:[.env] 全量透传 → config.py Settings 读取
+             ├─ geesun-mcp：env_file:[.env] → os.getenv（镜像内 load_dotenv 无 .env 文件 = no-op，兼容）
+             └─ geesun-agent-web：运行期无需 env（API 地址已内联进 JS 构建产物）
+```
+
+| 易混点 | 本地 | 生产 |
+| --- | --- | --- |
+| agent 配置 | 根 `.env`（57 行）→ `uv run uvicorn` | `deploy/.env`（180 行）→ compose `env_file:[.env]` 注入容器 |
+| web API 地址 | `.env.local` 的 `NEXT_PUBLIC_API_BASE`，`next dev` 每次启动生效 | 构建期 `--build-arg` 内联进 JS 产物，**运行期改 env 无效** |
+| mcp / cubesandbox | mcp 根 `.env`；cubesandbox `.env.test` 仅本地集成测试用 | 全部走 `deploy/.env`；cubesandbox 生产不参与 |
+
+> **场景 C（改前端 API 地址）**：`deploy/.env` 加一行 `NEXT_PUBLIC_API_BASE=http://新地址/` → 重跑 `bash build-push.sh`（重建 web 镜像，`WEB_TAG` 需同步递增或覆盖）→ 重新发布。仅改配置（非前端地址）则 `./start_stack.sh --no-build --with=mcp,web` 即可，无需重构建。
+
 ### 文件（deploy/）
 
 | 文件 | 说明 |
