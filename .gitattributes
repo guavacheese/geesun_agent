@@ -1,0 +1,29 @@
+# 统一行尾为 LF，防止 Windows 环境 CRLF 入库/检出
+# 背景：deploy 目录曾被 CRLF 直接提交，导致目标机拷贝后 .env 值尾带 \r，
+#       compose 展开 ${REGISTRY_HUB} 得非法 image 报 invalid reference format。
+* text=auto
+
+# 显式强制 LF（覆盖 text=auto 的猜测）
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.alloy text eol=lf
+*.env text eol=lf
+*.example text eol=lf
+Dockerfile text eol=lf
+Makefile text eol=lf
+Caddyfile text eol=lf
+.gitattributes text eol=lf
+
+# 二进制保持原样（不转换）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.pem binary
+*.woff2 binary
+*.zip binary
