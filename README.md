@@ -154,7 +154,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 
 | 文件 | 说明 |
 | --- | --- |
-| `docker-compose.yml` | **主栈**：`geesun-agent` + `agent-postgres`（pgvector）+ `caddy` + `loki` + `alloy` + `prometheus` + `grafana`；含 overlay 网络 `appnet` 与命名卷 |
+| `docker-compose.yml` | **主栈**：`geesun-agent` + `agent-postgres`（pgvector）+ `caddy` + `loki` + `alloy` + `prometheus` + `grafana`；含 overlay 网络 `appnet2` 与命名卷（端口占用见「端口一览」） |
 | `docker-compose.mcp.yml` | 附加：`geesun-mcp`（MCP 服务，路线 A 默认并入） |
 | `docker-compose.web.yml` | 附加：`geesun-agent-web`（Next.js 前端，并入后由 Caddy :80 同域服务） |
 | `docker-compose.phoenix.yml` | 附加（路线 B 自托管兜底）：`phoenix` + `phoenix-db` |
@@ -170,7 +170,83 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | `backup.sh` | 数据卷备份 |
 | `certs/` | CubeSandbox egress MITM CA（供 agent / mcp 容器信任 sandbox 出网 TLS 拦截）。**`combined-ca.pem` 由 `deploy/setup-combined-ca.sh` 生成**（自动合并你上传的 `rootCA.pem` 单证书 + 系统根 bundle），不要手动 cat；目录不入库 |
 
-> **多文件合并**：主栈默认只含 `docker-compose.yml`；MCP / 前端 / 可观测栈通过 `start_stack.sh --with=mcp,web` 以 `-c` 叠加，共享 overlay 网络 `appnet`（容器间用服务名互访，stack 前缀 `geesun_`）。
+> **多文件合并**：主栈默认只含 `docker-compose.yml`；MCP / 前端 / 可观测栈通过 `start_stack.sh --with=mcp,web` 以 `-c` 叠加，共享 overlay 网络 **`appnet2`**（容器间用服务名互访，stack 前缀 `geesun_`）。
+>
+> ⚠️ 网络名不一致（已知）：主栈 / mcp / web 用 `appnet2`，而 `docker-compose.phoenix.yml` 与 `docker-compose.langfuse.yml` 用的是 `appnet`。路线 A（默认，复用现网共享实例）不受影响；**走路线 B 自托管前，需把这两个文件里的 `networks: [appnet]` 统一改成 `appnet2`**，否则并入后跨网络不通。
+
+### 端口一览（部署前必读）
+
+端口分三类：**发布到宿主机**（部署前必须确认空闲，否则 `docker stack deploy` 冲突起不来）、**仅 overlay 网络内**（用服务名互访，不占宿主机端口）、**compose 之外的外部依赖**（需网络可达）。下表容器内端口 = 服务在容器里监听的端口，宿主机暴露 = 映射到主机的端口。
+
+#### A. 应用与网关
+
+| 服务（stack 名） | 容器内端口 | 宿主机暴露 | 作用 / 访问方式 |
+| --- | --- | --- | --- |
+| `geesun_caddy` | 80 | **80 → 80**（ingress，全网卡） | 唯一主入口：`/api/*`、`/docs`、`/openapi.json` → `geesun-agent:8009`；其余 → `geesun-agent-web:3000` |
+| `geesun_geesun-agent` | 8009 | 不发布 | FastAPI（`/docs` 健康检查用）；仅经 Caddy 或 appnet2 内访问 |
+| `geesun_geesun-mcp` | 8000 | 不发布 | MCP（streamable-http）；agent 经 `.env` 的 `mcp_server_url=http://geesun-mcp:8000/mcp` 访问。**刻意不发布**：现网已有 dev 占用 :8000 |
+| `geesun_geesun-agent-web` | 3000 | 不发布 | Next.js 前端；经 Caddy :80 同域（无 CORS）。**必须保持不发布**：现网 :3000 已被共享 Langfuse 占用 |
+
+#### B. 数据库与缓存
+
+| 服务 | 容器内端口 | 宿主机暴露 | 说明 |
+| --- | --- | --- | --- |
+| `geesun_agent-postgres`（pgvector 0.8.0-pg17） | 5432 | 不发布 | agent 库 `agent_mem`；appnet2 内 `agent-postgres:5432` |
+| `phoenix-db`（路线 B） | 5432 | 不发布 | Phoenix 元数据库 |
+| `postgres`（路线 B Langfuse） | 5432 | **5432**（mode: host） | ⚠️ 现网已被 `opt-db-1` / `langfuse-postgres-1` 占用 → 路线 B 并入必冲突 |
+| `redis`（路线 B） | 6379 | **6379**（mode: host） | ⚠️ 现网已被共享 redis 占用（127.0.0.1） |
+| `clickhouse`（路线 B） | 8123（HTTP）/ 9000（native） | **8123 / 9000**（mode: host） | ⚠️ 现网已被共享 clickhouse 占用 |
+
+#### C. 可观测（日志 / 指标 / 追踪）
+
+| 服务 | 容器内端口 | 宿主机暴露 | 说明 |
+| --- | --- | --- | --- |
+| `geesun_loki` | 3100 | 不发布 | 仅 Alloy 在 appnet2 内写 `http://loki:3100` |
+| `geesun_alloy` | 12345（UI/自监控）· 4317（OTLP gRPC）· 4321（OTLP HTTP） | **12345 → 12345** | agent 追踪入口 `http://alloy:4317`（`.env` 的 `PHOENIX_COLLECTOR_ENDPOINT`）；4317/4321 仅内网不发布 |
+| `geesun_prometheus` | 9090 | **19091 → 9090** | 开 `--web.enable-remote-write-receiver` 收 Alloy remote_write；Grafana 数据源走 `prometheus:9090` |
+| `geesun_grafana` | 3000 | **3100 → 3000** | 日志检索 UI（admin / `.env` 的 `GRAFANA_PASSWORD`）。⚠️ compose 现为全网卡发布，而 `.env` 注释称 `127.0.0.1:3100`——**两者不一致**；若只允本机访问，把 compose 改成 `127.0.0.1:3100:3000` |
+| `phoenix`（路线 B） | 6006（HTTP UI）· 4317（OTLP gRPC） | 不发布 | 路线 A（默认）连现网共享实例 `10.10.10.67:6006` / `:4317` |
+| `langfuse-web`（路线 B） | 3000 | 不发布 | 路线 A（默认）连现网共享实例 `http://10.10.10.67:3000`。⚠️ 路线 B 下 UI **仅 overlay 内网可达**：`Caddyfile` 未给 Langfuse 配代理块（其文件头注释称"由 caddy 代理 :3000"，与实际不一致），需外部访问请自行在 `Caddyfile` 加 `:3000` 块（前提该主机端口空闲） |
+| `langfuse-worker`（路线 B） | 3030 | 不发布 | 仅容器间通信 |
+
+#### D. 对象存储（路线 B）
+
+| 服务 | 容器内端口 | 宿主机暴露 | 说明 |
+| --- | --- | --- | --- |
+| `minio` | 9000（S3 API）· 9001（Console） | **9092 → 9000** · **9091 → 9001** | 媒体外部端点 `.env` 的 `LANGFUSE_S3_*_EXTERNAL_ENDPOINT=http://10.10.10.67:9092`；⚠️ 现网 9092 已被共享 minio 占用 |
+
+#### E. compose 之外的外部依赖（需网络可达，不在本 stack 内）
+
+| 依赖 | 地址:端口 | 用途 | 配置位置 |
+| --- | --- | --- | --- |
+| vLLM（OpenAI 兼容） | `172.16.66.13:8003` | 模型推理 `/v1/*` | `.env` 的 `base_url` |
+| CubeSandbox cube-api（E2B 控制面） | `172.16.66.13:6000` | 沙箱 create / connect / kill | `.env` 的 `E2B_API_URL`、`cube_api_url` |
+| LDAP / AD | `192.168.1.241:389` | 登录认证 | `.env` 的 `ldap_server` |
+| Harbor 镜像仓库（HTTP） | `172.16.220.74:8333` | 拉取镜像，需配 insecure-registries | `.env` 的 `REGISTRY_GEESUN` / `REGISTRY_HUB` |
+| dnsmasq（`*.cube.app` 直答） | 本机 `127.0.0.1:53` + `172.17.0.1:53` | 容器解析沙箱域名 → 172.16.66.13 | `deploy/setup-cube-dns.sh` |
+| DLP 解密网关 | `.env` 的 `DECRYPT_API_URL`（占位待替换） | MCP 解密加密文件 | `.env` |
+
+> **8003 vs 6000 别搞混**：两者同在 172.16.66.13，但 8003 是 vLLM（OpenAI `/v1/*`），**6000 才是 CubeSandbox E2B 控制面**。`E2B_API_URL` 误写成 8003 → `E2BSandbox.connect` 打 vLLM 拿 404 → e2b 解析报 `KeyError: 'code'`（2026-09-02 实锤）。验证：`curl http://172.16.66.13:6000/sandboxes` 应返回沙箱列表。
+
+#### F. 部署前端口自检
+
+```bash
+# 1) 主栈会占用的宿主机端口（含 --with=mcp,web）——必须全部空闲
+for p in 80 3100 12345 19091; do
+  printf "%-6s %s\n" "$p" "$(ss -lntupH 2>/dev/null | grep -q ":$p " && echo 'OCCUPIED' || echo 'free')"
+done
+
+# 2) 路线 B 额外占用（并入 phoenix/langfuse 时才检查）：5432 6379 8123 9000 9091 9092
+
+# 3) 外部依赖连通性
+curl -s -o /dev/null -w "vLLM  :%{http_code}\n" http://172.16.66.13:8003/v1/models
+curl -s -o /dev/null -w "cube  :%{http_code}\n" http://172.16.66.13:6000/sandboxes
+curl -s -o /dev/null -w "harbor:%{http_code}\n" http://172.16.220.74:8333/v2/
+```
+
+**现网 10.10.10.67 实测占用快照（2026-09-02）**：`22`(sshd) · `53`(dnsmasq) · `80`(caddy) · `323`(chronyd) · `631`(cupsd) · `2377`/`7946`/`4789`(swarm) · `3000`(共享 Langfuse) · `3030`(langfuse-worker, 127.0.0.1) · `3100`(grafana) · `5432`(opt-db + langfuse-postgres) · `6379`(共享 redis, 127.0.0.1) · `8123`/`9000`(共享 clickhouse, 127.0.0.1) · `9091`/`9092`(共享 minio) · `12345`(alloy) · `19091`(prometheus)。
+
+> ⚠️ **由此得出的冲突结论**：主栈 4 个端口（80/3100/12345/19091）在现网不冲突，可直接部署；**路线 B 的 langfuse compose 不可并入现网**（5432/6379/8123/9000/9091/9092 全被共享栈占满），仅适用于全新机器。
 
 ### 部署步骤
 

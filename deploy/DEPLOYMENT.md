@@ -10,21 +10,21 @@
 
 | 组件 | 镜像（Harbor） | 容器端口 | 主机发布端口 | 对外 | 数据持久化 | 关键依赖 |
 |---|---|---|---|---|---|---|
-| geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 不发布（仅 appnet） | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun-mcp :8000、Phoenix/Langfuse |
-| geesun-mcp | `geesun_ai/geesun-mcp-server:<tag>` | 8000 | 不发布（仅 appnet） | 否 | 共享 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`（与 agent 同挂） | agent（经服务名）、DLP 解密 API、CubeSandbox(E2B) |
-| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet） | 经 Caddy :80 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
+| geesun-agent | `geesun_ai/geesun-agent:<tag>` | 8009 | 不发布（仅 appnet2） | 经 Caddy | `/data/agent` `/data/uploads` `/data/reports`（host 绑定） | vLLM :8003、CubeSandbox、geesun-mcp :8000、Phoenix/Langfuse |
+| geesun-mcp | `geesun_ai/geesun-mcp-server:<tag>` | 8000 | 不发布（仅 appnet2） | 否 | 共享 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`（与 agent 同挂） | agent（经服务名）、DLP 解密 API、CubeSandbox(E2B) |
+| geesun-agent-web | `geesun_ai/geesun-agent-web:<tag>` | 3000 | 不发布（仅 appnet2） | 经 Caddy :80 | 无（无状态） | geesun-agent（healthcheck 门控）；NEXT_PUBLIC_API_BASE 构建期内联 |
 | agent-postgres | `dockerhub/pgvector:0.8.0-pg17` | 5432 | 不发布 | 否 | named volume `agent_pg_data` | — |
 | caddy | `dockerhub/caddy:2.8-alpine` | 80 | 80 | 是 | `caddy_data` `caddy_config` | geesun-agent / geesun-agent-web |
 | loki | `dockerhub/loki:3.2.0` | 3100 | 不发布 | 否（Grafana 接） | `loki_data` | — |
-| alloy | `dockerhub/alloy:v1.19.2` | 4317/4321(OTLP)、12345(UI,仅 127.0.0.1) | 不发布（OTLP 仅 appnet） | 否 | `alloy_data` | loki、prometheus（docker.sock 仅读） |
-| prometheus | `dockerhub/prometheus:3.0` | 9090 | 127.0.0.1:19091 | 否 | `prometheus_data` | —（需 `--web.enable-remote-write-receiver` 接收 Alloy remote_write） |
-| grafana | `dockerhub/grafana:11.3.0` | 3000 | 127.0.0.1:3100 | 127.0.0.1:3100 | `grafana_data` | loki、prometheus |
-| phoenix / langfuse（可观测栈） | **路线 A（默认，当前 67）**：复用现网共享实例（见 §10.3），agent OTLP 统一发往 Alloy（`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`，由 Alloy 转发到 Phoenix `10.10.10.67:4317`）；Langfuse 仍直发（`LANGFUSE_BASE_URL=http://10.10.10.67:3000`），**本 compose 不并入这两个文件**。**路线 B（自托管兜底，两文件始终保留不删）**：无共享实例时把 `docker-compose.phoenix.yml`+`docker-compose.langfuse.yml` 一并 `-f` 并入，agent OTLP 仍发往 Alloy、由 Alloy 经 `PHOENIX_OTLP_ENDPOINT=phoenix:4317` 转发到 phoenix 服务名；Langfuse 经 `langfuse-web:3000` 服务名直连（见 §4.9）。 | 路线 A：是（他人已发布）；路线 B：否（仅 appnet） | 路线 A：他人已发布；路线 B：Caddy 可选代理 | 路线 B：各 named volume | — |
+| alloy | `dockerhub/alloy:v1.19.2` | 4317/4321(OTLP)、12345(UI) | 12345（ingress 全网卡）；OTLP 4317/4321 不发布（仅 appnet2） | 是（12345） | `alloy_data` | loki、prometheus（docker.sock 仅读） |
+| prometheus | `dockerhub/prometheus:3.0` | 9090 | 19091（ingress 全网卡，非 127.0.0.1） | 是（19091） | `prometheus_data` | —（需 `--web.enable-remote-write-receiver` 接收 Alloy remote_write） |
+| grafana | `dockerhub/grafana:11.3.0` | 3000 | 3100（ingress 全网卡，非 127.0.0.1） | 是（3100，需防火墙收敛） | `grafana_data` | loki、prometheus |
+| phoenix / langfuse（可观测栈） | 路线 A（默认）：复用现网共享实例，不并入本 compose（见 §10.3）；路线 B（兜底）：`dockerhub/phoenix:19.1.0` + `dockerhub/langfuse:3.224.3` | 路线 A：6006/4317(Phoenix)、3000(Langfuse) 均为他人实例；路线 B：phoenix 6006/4317、langfuse-web 3000、langfuse-worker 3030 | 路线 A：是（他人已发布）；路线 B：不发布（仅 `appnet`，并入前建议统一为 `appnet2`） | 路线 A：他人已发布；路线 B：Caddy 可选代理（当前 `Caddyfile` 未配 langfuse 块） | 路线 B：`phoenix_pg_data` / `langfuse_*` 各 named volume | 路线 A：agent OTLP 统一发 Alloy（`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`）再转发 `10.10.10.67:4317`（⚠️ 实测该实例已停，见 §4.5），Langfuse 直发 `10.10.10.67:3000`；路线 B：`PHOENIX_OTLP_ENDPOINT=phoenix:4317`，Langfuse 走 `langfuse-web:3000`（见 §4.9） |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
 - **CubeSandbox**：`172.16.66.13`（cube-api 控制面 :6000；cube-egress MITM；sandbox 域名 `*.cube.app` 经 dnsmasq `address=` 直答指向 172.16.66.13，见 §4.8。⚠️ 8003 是 vLLM 不是 E2B，`E2B_API_URL` 必须指 :6000）
-- **geesun_mcp_server**：现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），与 agent 同处 `appnet`，agent 经服务名 `geesun-mcp:8000` 访问；容器内部端口 8000 **不发布到主机**（避免与 dev 的 :8000 冲突），仅 appnet 内互访。DLP 解密 API 仍在 compose 外，由 `.env` 的 `DECRYPT_API_URL` 提供。
+- **geesun_mcp_server**：现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），与 agent 同处 `appnet2`，agent 经服务名 `geesun-mcp:8000` 访问；容器内部端口 8000 **不发布到主机**（避免与 dev 的 :8000 冲突），仅 appnet2 内互访。DLP 解密 API 仍在 compose 外，由 `.env` 的 `DECRYPT_API_URL` 提供。
 - **Harbor**：`172.16.220.74:8333`（HTTP，项目 `geesun_ai`（自有应用 geesun-agent）+ `dockerhub`（第三方通用镜像中央仓库 redis/minio/postgres/loki/grafana/phoenix/langfuse 等））
 
 ---
@@ -120,13 +120,14 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 ## 4. 网络规划
 
 ### 4.1 Docker 内部网络
-- 所有服务加入自定义 bridge 网络 **`appnet`**，容器间用**服务名**互访（如 agent 配 `mcp_server_url=http://geesun-mcp:8000/mcp`）。
-- 多个 compose 用 `-f` 合并时，各自的 `networks: [appnet]` 会加入同一网络（名称固定为 `appnet`）。
-- ⚠️ **可观测性不在 appnet 内**：Phoenix/Langfuse 为现网共享实例（另一 compose），agent 经主机 LAN IP 已发布端口连接（`http://10.10.10.67:4317` / `http://10.10.10.67:3000`）。
+- 所有服务加入 overlay 网络（Swarm）**`appnet2`**，容器间用**服务名**互访（如 agent 配 `mcp_server_url=http://geesun-mcp:8000/mcp`）。
+- 多个 compose 用 `-f` 合并时，**只有声明了同名网络的服务才互通**：主栈 / mcp / web 均为 `appnet2`；`docker-compose.phoenix.yml` 与 `docker-compose.langfuse.yml` 仍写 `appnet`——走**路线 B 前必须把这两处的 `networks: [appnet]` 统一改成 `appnet2`**，否则这两组服务与主栈不在同一网络、服务名互不可达（路线 A 复用共享实例、不并入这两个文件，不受影响）。
+- ⚠️ **可观测性不在 appnet2 内**：Phoenix/Langfuse 为现网共享实例（另一 compose），agent 经主机 LAN IP 已发布端口连接（`http://10.10.10.67:4317` / `http://10.10.10.67:3000`）。
 
 ### 4.2 对外暴露（最小化）
-- 只暴露 **Caddy**：`:80`（前端主入口，`/api/*` 路由到 agent）。Phoenix(`:6006`)、Langfuse(`:3000`)、Minio S3(`:9092`) 由现网共享容器直出，**不经 Caddy**（避免与其已发布端口冲突）。
-- 数据库 / Loki / Grafana(127.0.0.1:3100) **不映射主机端口**，仅经 `appnet` 内部访问。
+- 对外主入口只暴露 **Caddy `:80`**（前端主入口，`/api/*` 路由到 agent）。Phoenix(`:6006`)、Langfuse(`:3000`)、Minio S3(`:9092`) 由现网共享容器直出，**不经 Caddy**（避免与其已发布端口冲突）。
+- ⚠️ 除 80 外，本 stack 还发布 3 个运维端口（实测均为 ingress 全网卡，非回环）：`3100`(Grafana) / `12345`(Alloy UI) / `19091`(Prometheus)。若按最小化暴露要求，需在主机防火墙收敛这 3 个端口——Swarm ingress 下无法用 compose 的 `127.0.0.1:` 前缀约束（§5 有实测说明）。
+- 数据库 / Loki **不映射主机端口**，仅经 `appnet2` 内部访问；Grafana 映射到主机 `3100`（compose 为 `"3100:3000"` ingress 全网卡，非早期注释所说的 127.0.0.1，见 §4.5）。
 
 ### 4.3 访问外部物理机（vLLM / CubeSandbox / MCP）与 CA 信任
 - 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP（`172.16.66.13` vLLM :8003 与 CubeSandbox :6000），agent 内 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
@@ -142,22 +143,35 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 - Caddy 做 TLS 终止，使用内部 CA（mkcert 链）签发 `10.10.10.67` 证书；内网服务之间明文。证书存于 `caddy_data` volume。
 
 ### 4.5 端口冲突速查（含部署前预检）
-容器**内部端口**（appnet 服务名互访）与**主机发布端口**（`ports:` 映射）是两回事：仅在 `ports:` 里声明的才占主机端口；容器间互访走服务名，不占主机端口。
+
+> **完整端口矩阵（容器内端口 / 宿主机暴露 / 网络 / 外部依赖）见 README `### 端口一览`**，本节只做现网冲突速查。
+
+容器**内部端口**（appnet2 服务名互访）与**主机发布端口**（`ports:` 映射）是两回事：仅在 `ports:` 里声明的才占主机端口；容器间互访走服务名，不占主机端口。
 
 **部署前在 10.10.10.67 上预检我方端口是否空闲**（该机已跑共享可观测栈，见下表"复用"行，勿占用其端口）：
 ```sh
-ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
+# 主栈实际发布到主机的端口只有这 4 个（agent 8009 / mcp 8000 不发布，无需预检）
+for p in 80 3100 12345 19091; do
+  printf "%-6s %s\n" "$p" "$(ss -lntupH 2>/dev/null | grep -q ":$p " && echo OCCUPIED || echo free)"
+done
 ```
-- 预期：`80 / 8009 / 8000 / 3100` **全部空闲**（这是我方要用的主机端口）。
+- 预期：`80 / 3100 / 12345 / 19091` 全部 `free`（这是我方**真正**发布到主机的端口）。
 - 若 80 被占用 → 换 Caddy 映射：改 `docker-compose.yml` 的 caddy `ports:` + `.env` 的 `CORS_ALLOW_ORIGINS` + 前端镜像 `NEXT_PUBLIC_API_BASE`（构建期）后重新部署。
+- 若走路线 B（并入 phoenix/langfuse）→ 额外预检 `5432 6379 8123 9000 9091 9092`，现网这些端口**已被共享栈占满，不可并入**。
 
-| 端口 | 用途 | 主机发布? | 处理 |
-|---|---|---|---|
-| 80 | Caddy 入口（前端 + `/api/*` → agent） | 是 | 我方唯一主机端口 |
-| 8009 | geesun-agent | 否（仅 appnet） | 不冲突 |
-| 8000 | geesun-mcp | 否（仅 appnet） | 不发布，不冲突 |
-| 3100 | Grafana | 127.0.0.1:3100 | 仅本机排障 |
-| 3000 / 6006 / 4317 / 9090 / 9092 / 5432 | **共享可观测栈**（现网 langfuse-web / opt-phoenix / langfuse-minio / opt-db） | 是（他人已发布） | **复用，勿占用、勿下线**；agent 经主机 IP 连接 |
+| 端口（主机） | 容器内端口 | 服务 | 主机发布? | 处理 |
+|---|---|---|---|---|
+| 80 | 80 | Caddy 入口（前端 + `/api/*` → agent） | 是（ingress 全网卡） | 我方对外唯一入口 |
+| 8009 | 8009 | geesun-agent（FastAPI `/docs`） | 否（仅 appnet2） | 不发布，不冲突 |
+| 8000 | 8000 | geesun-mcp（MCP streamable-http） | 否（仅 appnet2） | 不发布（现网 dev 已占 :8000） |
+| 3100 | 3000 | Grafana | 是（ingress 全网卡） | ⚠️ compose 现为 `"3100:3000"` 全网卡，与早期"127.0.0.1:3100"注释不符；Swarm ingress 下无法只绑回环，需靠防火墙收敛 |
+| 12345 | 12345 | Alloy UI / 自监控 | 是（ingress 全网卡） | OTLP 4317/4321 仅 appnet2 内，不发布 |
+| 19091 | 9090 | Prometheus | 是（ingress 全网卡） | 收 Alloy remote_write |
+| 3000 / 6006 / 4317 / 9090 / 9092 / 5432 / 6379 / 8123 / 9000 / 9091 | — | **共享可观测栈**（现网 langfuse-web / langfuse-minio / opt-db / langfuse-clickhouse / langfuse-redis；Phoenix 已停止见下） | 是（他人已发布） | **复用，勿占用、勿下线**；agent 经主机 IP 连接 |
+
+**现网 10.10.10.67 实测占用快照（2026-09-02）**：`22`(sshd) · `53`(dnsmasq) · `80`(caddy) · `323`(chronyd) · `631`(cupsd) · `2377`/`7946`/`4789`(swarm) · `3000`(共享 Langfuse) · `3030`(langfuse-worker, 127.0.0.1) · `3100`(grafana) · `5432`(opt-db + langfuse-postgres) · `6379`(共享 redis, 127.0.0.1) · `8123`/`9000`(共享 clickhouse, 127.0.0.1) · `9091`/`9092`(共享 minio) · `12345`(alloy) · `19091`(prometheus)。
+
+> ⚠️ **实测发现：现网 Phoenix 未在运行**——`opt-phoenix-1` 容器 `Exited (0)` 20 小时，6006/4317 **无监听**，导致 Alloy 转发 traces 持续报 `dial tcp 10.10.10.67:4317: connect: connection refused` 并 `Dropping data`。即 `.env` 的 `PHOENIX_OTLP_ENDPOINT=10.10.10.67:4317` 当前指向死端口，追踪链实际只落 Loki/Prometheus，**Phoenix 侧无 trace**。恢复办法：`docker start opt-phoenix-1`（或改走路线 B 自托管 Phoenix，并把 `PHOENIX_OTLP_ENDPOINT` 改成 `phoenix:4317`）。
 
 ---
 
@@ -166,7 +180,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 1. **agent 容器内 `localhost` 指向自身**：`mcp.json` 默认 `http://localhost:8000/mcp`，在容器内 localhost 是 agent 自己而非 mcp → 连不到。修复：`config.py` 新增 `mcp_server_url`（默认 dev 用 localhost，prod 由 `.env` 覆为 `http://geesun-mcp:8000/mcp`）；`mcp.py` 默认服务改读该值。
 2. **mcp 服务绑回环**：原 `main.py` 绑 `127.0.0.1:8000`，仅听本机回环，容器内 agent 经服务名访问不到。修复：`main.py` 改绑 `0.0.0.0:8000`（dev 同机裸跑仍兼容 127.0.0.1）。
 
-**拓扑**：`geesun-mcp` 服务与 `geesun-agent` 同处 `appnet`，agent 用服务名 `geesun-mcp:8000` 访问；mcp 容器内部端口 8000 **不发布到主机**（避免与 dev 裸跑的 :8000 冲突），仅 appnet 内互访。
+**拓扑**：`geesun-mcp` 服务与 `geesun-agent` 同处 `appnet2`，agent 用服务名 `geesun-mcp:8000` 访问；mcp 容器内部端口 8000 **不发布到主机**（避免与 dev 裸跑的 :8000 冲突），仅 appnet2 内互访。
 
 **共享挂载**：mcp 复用 agent 的 `${AGENT_DATA_ROOT}/{agent,uploads,reports}`，因为 mcp 需：
 - 读 skills（`AGENT_WORKSPACE` 下的 `skills/`）；
@@ -189,7 +203,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 
 **排障 runbook**：
 - mcp 工具加载失败（agent 日志 `MCP server [decrypt-file] 加载工具失败`）：
-  1. `docker exec geesun-agent curl -s http://geesun-mcp:8000/mcp` 确认 appnet 内可达；
+  1. `docker exec geesun-agent curl -s http://geesun-mcp:8000/mcp` 确认 appnet2 内可达；
   2. `docker logs geesun-mcp` 看是否 `ValidationError`（env 缺失）或 E2B/解密报错；
   3. 确认 `mcp.json` 的 url 已是 `geesun-mcp:8000/mcp`（见上方残留坑）。
 - E2B 调用报错 `KeyError: 'code'`（工具级 `ToolException: 'code'`）：根因是 `E2B_API_URL` 指向 vLLM(8003) 而非 cube-api(6000)，`E2BSandbox.connect` 打 404 响应体无 `code` 字段致 e2b 解析崩。修复：`.env` 的 `E2B_API_URL=http://172.16.66.13:6000` 后 redeploy mcp 服务。
@@ -198,7 +212,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 ---
 
 ### 4.7 前端（geesun_agent_web）容器化部署
-前端 Next.js 16 已容器化为 `geesun-agent-web` 服务（`docker-compose.web.yml`），与 agent 同处 `appnet`，内部 3000 不发布主机，由 Caddy :80 对外。
+前端 Next.js 16 已容器化为 `geesun-agent-web` 服务（`docker-compose.web.yml`），与 agent 同处 `appnet2`，内部 3000 不发布主机，由 Caddy :80 对外。
 
 **⚠️ 构建期注入（最容易踩的坑）**：`NEXT_PUBLIC_API_BASE` 是 Next.js **公共变量，浏览器直接读构建产物**——属于 build-time 内联，运行时改 `.env` **无效**。生产镜像默认内联 `http://10.10.10.67/`（Caddy :80 同域）；换环境必须用 `NEXT_PUBLIC_API_BASE=xxx bash deploy/build-push.sh` 重新构建镜像，不能靠改 `.env`。
 
@@ -220,7 +234,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 ### 4.8 CubeSandbox 域名（`*.cube.app`）与 DNS（docker 化）
 sandbox 访问域名形如 `49983-78083c0f5b044a3084a891a2c1f35b50.cube.app`，e2b SDK 用该域名连沙箱运行时（`connection_config.get_sandbox_url`）；**生产容器里必须能解析到 `172.16.66.13`**（cube-egress 所在裸金属，dev 机 WSL 的 dnsmasq 也是 `address=/cube.app/172.16.66.13`）。
 
-**Docker 的 DNS 链**：容器 → `127.0.0.11`（docker 内嵌 DNS，只解 appnet 服务名）→ 转发其它域名给上游 resolver（daemon.json `dns` / resolv.conf）。
+**Docker 的 DNS 链**：容器 → `127.0.0.11`（docker 内嵌 DNS，只解 appnet2 服务名）→ 转发其它域名给上游 resolver（daemon.json `dns` / resolv.conf）。
 
 **正确做法（已在 `deploy/setup-cube-dns.sh` 落地，root 执行一次）**：
 1. 宿主机装 dnsmasq，写入 `/etc/dnsmasq.d/cube.conf`：**`address=/cube.app/172.16.66.13`（address= 本地直答模式）** + `server=<resolv.conf 上游>`（保持外网解析）+ `listen-address=<docker0 网关>,127.0.0.1`；
@@ -245,7 +259,7 @@ Phoenix + Langfuse 有两条部署路线。**两个 compose 文件（`docker-com
 - 共享实例的 3000/6006/9092/5432 端口**勿占用、勿下线**（§4.5 预检表）。
 
 **路线 B — 自托管兜底（无共享实例时）**
-- 把两个可观测 compose 文件一并并入（与 yml/mcp/web 合并到同一 `appnet`）：
+- 把两个可观测 compose 文件一并并入（**并入前先把这两个文件的 `networks: [appnet]` 改成 `appnet2`**，才能与 yml/mcp/web 处于同一网络、用服务名互通）：
 ```sh
 ./start_stack.sh --with=phoenix,langfuse,mcp,web
 ```
@@ -254,8 +268,9 @@ Phoenix + Langfuse 有两条部署路线。**两个 compose 文件（`docker-com
 PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
 LANGFUSE_BASE_URL=http://langfuse-web:3000
 ```
-- 端口：phoenix(6006/4317)、langfuse-web(3000)、minio(9092) 在 `appnet` 内可达；langfuse 的 minio 映射到主机 9092、clickhouse/redis/postgres 仅绑 127.0.0.1（排障用）。只要同机无其它进程占 9092/8123/9000/6379/5432，路线 B 与主栈不冲突（主栈只映射 80 与 127.0.0.1:3100）。
-- 若想在路线 B 也从外部看 UI，可在 `Caddyfile` 加 `:6006`/`:3000` 代理块（前提：这些主机端口空闲、未被任何共享实例占用）；否则 UI 仅 appnet 内可达，不影响 agent 上报 trace。
+- 端口：phoenix(6006/4317)、langfuse-web(3000)、langfuse-worker(3030)、minio(9000/9001) 在 overlay 网络内以服务名可达；langfuse 的 minio 映射到主机 **9092(S3 API) / 9091(Console)**，clickhouse 映射 **8123 / 9000**、redis **6379**、postgres **5432**（`mode: host`，非仅回环）。
+- ⚠️ **路线 B 与现网 10.10.10.67 端口冲突（2026-09-02 实测）**：该机 5432 / 6379 / 8123 / 9000 / 9091 / 9092 已被共享 Langfuse 栈（langfuse-postgres / langfuse-redis / langfuse-clickhouse / langfuse-minio）+ `opt-db` 占满 → **路线 B 不可并入现网**，仅适用于全新机器。主栈本身只映射 80 / 3100 / 12345 / 19091（实测均为 dockerd 全网卡 ingress 监听，非 127.0.0.1），与共享栈不冲突。
+- 若想在路线 B 也从外部看 UI，可在 `Caddyfile` 加 `:6006`/`:3000` 代理块（前提：这些主机端口空闲、未被任何共享实例占用）；否则 UI 仅 overlay 网络内可达，不影响 agent 上报 trace（另：路线 B 并入前需把这两个文件的 `networks: [appnet]` 改成 `appnet2`，否则与主栈跨网络不通）。
 
 > 切换路线只改「并入哪几个 `-f` 文件」+ 对应 `*_BASE_URL` 端点，镜像与业务栈不变。
 
@@ -279,8 +294,9 @@ LANGFUSE_BASE_URL=http://langfuse-web:3000
 **与 `docker compose up` 的关键差异（已在本仓库 compose 文件改好，勿回退）**：
 - ⚠️ `restart:` 字段被 Swarm **忽略** → 全部改为 `deploy.restart_policy: { condition: any }`（异常退出自动拉起）。
 - ⚠️ `depends_on` **只认列表语法** `depends_on: [x]`（仅保证先创建，不保证就绪）；`condition: service_healthy` 长语法直接报 `depends_on must be a list`，map 语法同理 → 已全部改为列表，就绪等待靠 `healthcheck` + `restart_policy` 自愈（agent 探 `/docs`、postgres `pg_isready`、alloy/prometheus/grafana 探 UI 等）。
-- ⚠️ **`host_ip` 不被 Swarm 接受**：短端口 `127.0.0.1:host:container` 的 host IP 绑定在 Swarm 下直接报 `Additional property host_ip is not allowed` → 已**删除全部 `host_ip` 字段**，alloy/prometheus/grafana 等本机服务改用 `published: "127.0.0.1:xxxx"` 短语法尽力约束（Swarm ingress 下实际可能全网卡监听，属已知权衡）；caddy `80` 保留 ingress 全网卡（本就对外）。
-- ⚠️ `appnet` 网络去掉 `name:`（与 stack 前缀冲突），改 `driver: overlay`；stack 会加 `geesun_` 前缀 → 实际网络名 `geesun_appnet`。附加 compose 文件不再重复定义 `appnet`，只引用。
+- ⚠️ **`host_ip` 不被 Swarm 接受**：短端口 `127.0.0.1:host:container` 的 host IP 绑定在 Swarm 下直接报 `Additional property host_ip is not allowed` → 已**删除全部 `host_ip` 字段**，alloy/prometheus/grafana 也退回 `"host:container"` 短语法（如 `3100:3000` / `19091:9090` / `12345:12345`）。
+- ⚠️ **实测结论（2026-09-02）**：Swarm ingress 下这 4 个端口 `80 / 3100 / 12345 / 19091` **全部由 dockerd 监听在 `*:`（全网卡）**，本机回环约束在 ingress 模式下无效。若 Grafana / Prometheus / Alloy UI 不应对外，只能在**主机防火墙**收敛（或改用 `mode: host` + 非 ingress 部署），不要在 compose 里写 `127.0.0.1:` 指望生效。
+- ⚠️ 主栈网络去掉 `name:`（与 stack 前缀冲突），改 `driver: overlay`；stack 会加 `geesun_` 前缀 → 实际网络名 `geesun_appnet2`。附加 compose 文件（mcp / web）不再重复定义该网络，只引用；`docker-compose.phoenix.yml` / `docker-compose.langfuse.yml` 仍声明 `appnet`，走路线 B 前需统一为 `appnet2`。
 - 命名卷自动加 `geesun_` 前缀（如 `geesun_agent_pg_data` / `geesun_loki_data`）；**生产尚未部署，无历史数据迁移问题**，直接切。
 - `env_file: [.env]` 仍生效（start_stack.sh 在 deploy/ 目录执行，`.env` 由 docker 在 deploy 时插值注入）。
 
@@ -351,7 +367,7 @@ cron 示例（每天 03:07）：
 - **日期留存 + 检索 + 告警** = Loki `retention_period: 720h`（30 天）+ Grafana。这正是 log4j 日期滚动的平台等价物，且带查询能力。
 
 ### 6.2 采集链路
-`geesun-agent(stdout JSON)` → Docker `json-file`(本地轮转) → Alloy(`discovery.docker` 发现 appnet 容器、`loki.process` 提取 JSON 字段，并统一收 metrics→Prometheus / traces→Phoenix) → Loki(30d 留存) + Prometheus(metrics) → Grafana(检索/面板/告警)。
+`geesun-agent(stdout JSON)` → Docker `json-file`(本地轮转) → Alloy(`discovery.docker` 发现 appnet2 容器、`loki.process` 提取 JSON 字段，并统一收 metrics→Prometheus / traces→Phoenix) → Loki(30d 留存) + Prometheus(metrics) → Grafana(检索/面板/告警)。
 - **验证**：进 alloy 容器看 UI `:12345`（本机 `127.0.0.1:12345`）；Prometheus `:19091` 查 `up`/`geesun-agent`/`alloy`；Phoenix（路线 A `10.10.10.67:6006`）确认 traces 到达。Alloy→Phoenix 转发经 `PHOENIX_OTLP_ENDPOINT` 控制（路线 B 改 `phoenix:4317`）。
 
 ### 6.3 配置要点
@@ -438,7 +454,7 @@ cron 示例（每天 03:07）：
 - **外部依赖可达性**：部署后先 `docker exec geesun-agent curl -s http://172.16.66.13:8003/v1/models` 验证 vLLM 连通，再验 CubeSandbox / MCP。
 - **MCP 容器化**：geesun_mcp_server 现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），合并 `up` 时加 `-f docker-compose.mcp.yml`；agent 经服务名 `geesun-mcp:8000` 访问，勿再手跑裸进程。部署拓扑与排障见 §4.6。
 - **前端容器化**：geesun_agent_web 已容器化为 `geesun-agent-web`（见 `docker-compose.web.yml`），合并 `up` 时加 `-f docker-compose.web.yml`；`NEXT_PUBLIC_API_BASE` 为构建期内联（运行时改 `.env` 无效）、Caddy 按路径分流防 rewrite 回环，详见 §4.7。
-- **部署前端口预检**：务必先跑 §4.5 的 `ss -tlnp` 确认**我方端口**（80/8009/8000/3100）空闲；3000/6006/9092/5432 为现网共享可观测栈，**复用勿动**。
+- **部署前端口预检**：务必先跑 §4.5 的预检确认**我方真正发布到主机的端口**（`80` / `3100` / `12345` / `19091`）空闲——agent 8009 与 mcp 8000 **不发布**，无需预检；3000/6006/9092/5432/6379/8123/9000/9091 为现网共享可观测栈，**复用勿动**（完整端口矩阵见 README「端口一览」）。
 - **CubeSandbox DNS**：容器内 `*.cube.app` 解析必须配 dnsmasq + daemon `dns`（§4.8），**不要**用 compose `dns:`（会顶掉 127.0.0.11 导致服务名解析失效）。
 
 ---
@@ -492,7 +508,7 @@ LANGFUSE_SECRET_KEY=sk-lf-prod-xxxx
 PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317
 ```
 
-- **路线 B（自托管兜底）** 的端点不同：把 `LANGFUSE_BASE_URL` / `PHOENIX_COLLECTOR_ENDPOINT` 改走服务名（同 `appnet` 内可达），其余 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_*）在 `.env` 填全（`.env.example` 已含）：
+- **路线 B（自托管兜底）** 的端点不同：把 `LANGFUSE_BASE_URL` / `PHOENIX_COLLECTOR_ENDPOINT` 改走服务名（同 `appnet2` 内可达），其余 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_*）在 `.env` 填全（`.env.example` 已含）：
 ```sh
 LANGFUSE_BASE_URL=http://langfuse-web:3000
 PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
