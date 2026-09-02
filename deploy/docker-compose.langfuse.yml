@@ -79,7 +79,7 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1g
+          memory: 2g
     logging:
       driver: json-file
       options:
@@ -101,19 +101,27 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+      # 关键：绑定 0.0.0.0。Next.js 默认只绑 overlay 网络 IP(10.0.1.x)，而 swarm
+      # mode: host 发布经 docker-proxy 转发到容器 gwbridge IP(172.21.0.15)，该地址
+      # 无监听 → 主机/agent 访问 10.10.10.67:3000 被 RST。绑 0.0.0.0 后两网段皆监听。
+      HOSTNAME: "0.0.0.0"
     networks: [appnet2]
-    # UI + OTLP ingest 发布主机 3000（ingress 全网卡）：
+    # UI + OTLP ingest 发布主机 3000（mode: host 直绑，绕过 ingress mesh）：
     #   - 用户浏览器访问 http://10.10.10.67:3000
     #   - agent 经 .env 的 LANGFUSE_BASE_URL=http://10.10.10.67:3000 上报 trace
+    #   - 注：默认 ingress 发布在崩溃循环期间 IPVS 残留失效后端导致主机不可达，
+    #     故改用 mode: host（单节点 swarm 下稳定可靠）。
     ports:
-      - "3000:3000"
+      - target: 3000
+        published: 3000
+        mode: host
     deploy:
       restart_policy:
         condition: any
       resources:
         limits:
           cpus: "1.0"
-          memory: 1g
+          memory: 2g
     logging:
       driver: json-file
       options:
