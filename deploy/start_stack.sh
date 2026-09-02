@@ -14,7 +14,7 @@
 #   ./start_stack.sh                          # 默认仅主栈（先打包再发布）
 #   ./start_stack.sh --no-build               # 跳过打包，仅用已推送镜像重新部署
 #   ./start_stack.sh --with=mcp,web           # 并入 MCP / 前端
-#   ./start_stack.sh --with=phoenix,langfuse  # 路线 B 自托管可观测栈兜底
+#   ./start_stack.sh --with=phoenix,langfuse  # 可观测栈随栈自托管（与 agent/mcp/web 统一启动）
 #   STACK_NAME=geesun ./start_stack.sh         # 显式指定 stack 名（默认 geesun）
 #
 set -euo pipefail

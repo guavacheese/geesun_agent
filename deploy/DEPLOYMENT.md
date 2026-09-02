@@ -20,7 +20,7 @@
 | prometheus | `dockerhub/prometheus:3.0` | 9090 | 19091（ingress 全网卡，非 127.0.0.1） | 是（19091） | `prometheus_data` | —（需 `--web.enable-remote-write-receiver` 接收 Alloy remote_write） |
 | grafana | `dockerhub/grafana:11.3.0` | 3000 | 3100（ingress 全网卡，非 127.0.0.1） | 是（3100，需防火墙收敛） | `grafana_data` | loki、prometheus |
 | phoenix（追踪 UI，默认并入） | `docker-compose.phoenix.yml`（`start_stack.sh --with=phoenix`，**默认即并入**）；镜像 `geesun_ai/phoenix:19.1.0` + `geesun_ai/postgres:16.14`（已推 Harbor `geesun_ai`，非 `dockerhub`） | 6006(UI) / 4317(OTLP gRPC) / 9090(metrics 默认未启用) | **6006**（ingress 全网卡）；4317/9090 仅 appnet2 内（Alloy 经 `phoenix:4317` 转发，不发布主机） | 是（6006，`http://10.10.10.67:6006`） | named volume `phoenix_pg_data`（全新库，未迁历史数据） | agent OTLP 统一发 Alloy（`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`）→ 由 Alloy 经 `PHOENIX_OTLP_ENDPOINT=phoenix:4317` 转发（见 README「端口一览 C」）。⚠️ 2026-09-02 前原方案是复用现网共享实例 `opt-phoenix-1`，但该实例 `RestartPolicy=no`、9-01 停止后 traces 全丢，故改为栈内自托管自愈 |
-| langfuse（LLM 观测，复用现网共享实例） | 路线 A（当前默认）：复用现网 `10.10.10.67:3000`，**不并入本 compose**；路线 B（兜底文件 `docker-compose.langfuse.yml`，仅全新机器可用） | 路线 A：3000(web) 为现网他人实例；路线 B：langfuse-web 3000、langfuse-worker 3030、minio 9000/9001、clickhouse 8123/9000、redis 6379、postgres 5432 | 路线 A：是（他人已发布 `10.10.10.67:3000`）；路线 B：`9092→9000`(minio S3) / `9091→9001`(console)，其余 `mode: host` | 路线 A：他人已发布；路线 B：Caddy 可选代理（当前 `Caddyfile` 未配 langfuse 块） | 路线 B：`langfuse_*` 各 named volume | 路线 A：agent 直发 `LANGFUSE_BASE_URL=http://10.10.10.67:3000`（见 §4.9）；路线 B：走 `langfuse-web:3000` |
+| langfuse（LLM 观测，默认并入） | `docker-compose.langfuse.yml`（`start_stack.sh --with=langfuse`，**默认即并入**）；镜像来自 Harbor `dockerhub` 项目（langfuse-web / langfuse-worker / clickhouse / minio / redis / postgres） | 3000(web/UI) / 3030(worker) / 9000·9001(minio) / 8123·9000(clickhouse) / 6379(redis) / 5432(postgres) | **3000**(UI, ingress 全网卡) · **9092→9000**(minio S3, ingress 全网卡)；其余端口仅 appnet2 内（不发布主机） | 是（3000 / 9092） | named volume `langfuse_*` 各卷 | agent 经 `LANGFUSE_BASE_URL=http://langfuse-web:3000`（appnet2 内）；`LANGFUSE_PUBLIC_KEY/SECRET_KEY` 须对应本实例项目（用 `LANGFUSE_INIT_*` 自动建项目）。⚠️ 旧共享实例（占用 3000/3030/5432/6379/8123/9000/9091/9092）须停用释放，否则抢端口（见 §4.5） |
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
@@ -122,10 +122,10 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 
 ### 4.1 Docker 内部网络
 - 所有服务加入 overlay 网络（Swarm）**`appnet2`**，容器间用**服务名**互访（如 agent 配 `mcp_server_url=http://geesun-mcp:8000/mcp`）。
-- 多个 compose 用 `-f` 合并时，**只有声明了同名网络的服务才互通**：主栈 / mcp / web / **phoenix（`docker-compose.phoenix.yml` 已改为 `appnet2`）** 均为 `appnet2`；仅 `docker-compose.langfuse.yml`（路线 B 兜底）仍写 `appnet`——走**路线 B 前必须把该文件的 `networks: [appnet]` 统一改成 `appnet2`**，否则 Langfuse 服务与主栈不在同一网络、服务名互不可达（路线 A 复用现网共享实例、不并入该文件，不受影响）。
+- 多个 compose 用 `-f` 合并时，**只有声明了同名网络的服务才互通**：主栈 / mcp / web / **phoenix** / **langfuse** 全部统一为 `appnet2`（各附加 compose 文件已改为引用 `appnet2`，无需再手动改网络名），容器间用服务名互访。
 
 ### 4.2 对外暴露（最小化）
-- 对外主入口只暴露 **Caddy `:80`**（前端主入口，`/api/*` 路由到 agent）。Phoenix UI(`:6006`) 由本 stack 经 ingress 直出（自托管）；Langfuse(`:3000`)、Minio S3(`:9092`) 由现网共享容器直出，**不经 Caddy**（避免与其已发布端口冲突）。
+- 对外主入口只暴露 **Caddy `:80`**（前端主入口，`/api/*` 路由到 agent）。Phoenix UI(`:6006`)、Langfuse UI(`:3000`)、Minio S3(`:9092`) 均由本 stack 经 ingress 直出（栈内自托管），**不经 Caddy**（Caddy 只代理 :80 前端主入口，避免与可观测栈已发布端口冲突）。
 - ⚠️ 除 80 外，本 stack 还发布 3 个运维端口（实测均为 ingress 全网卡，非回环）：`3100`(Grafana) / `12345`(Alloy UI) / `19091`(Prometheus)。若按最小化暴露要求，需在主机防火墙收敛这 3 个端口——Swarm ingress 下无法用 compose 的 `127.0.0.1:` 前缀约束（§5 有实测说明）。
 - 数据库 / Loki **不映射主机端口**，仅经 `appnet2` 内部访问；Grafana 映射到主机 `3100`（compose 为 `"3100:3000"` ingress 全网卡，非早期注释所说的 127.0.0.1，见 §4.5）。
 
@@ -156,24 +156,28 @@ for p in 80 3100 6006 12345 19091; do
   printf "%-6s %s\n" "$p" "$(ss -lntupH 2>/dev/null | grep -q ":$p " && echo OCCUPIED || echo free)"
 done
 ```
-- 预期：`80 / 3100 / 6006 / 12345 / 19091` 全部 `free`（这是我方**真正**发布到主机的端口）。
+- 预期：`80 / 3100 / 6006 / 12345 / 19091 / 3000 / 9092` 全部 `free`（这是我方**真正**发布到主机的端口；3000/9092 随 `--with=langfuse` 并入）。
 - 若 80 被占用 → 换 Caddy 映射：改 `docker-compose.yml` 的 caddy `ports:` + `.env` 的 `CORS_ALLOW_ORIGINS` + 前端镜像 `NEXT_PUBLIC_API_BASE`（构建期）后重新部署。
-- 若走路线 B（并入 langfuse，全新机器）→ 额外预检 `5432 6379 8123 9000 9091 9092`，现网这些端口**已被共享 Langfuse 栈占满，不可并入**。
+- 若 3000 / 9092 被占用 → 多半是旧共享 Langfuse 实例仍在跑；启用自托管前须先 `docker rm -f` / `docker stack rm` 停用它释放这两个端口，否则 `docker stack deploy` 冲突起不来。
 
 | 端口（主机） | 容器内端口 | 服务 | 主机发布? | 处理 |
 |---|---|---|---|---|
 | 80 | 80 | Caddy 入口（前端 + `/api/*` → agent） | 是（ingress 全网卡） | 我方对外唯一入口 |
 | 8009 | 8009 | geesun-agent（FastAPI `/docs`） | 否（仅 appnet2） | 不发布，不冲突 |
 | 8000 | 8000 | geesun-mcp（MCP streamable-http） | 否（仅 appnet2） | 不发布（现网 dev 已占 :8000） |
-| 6006 | 6006 | **geesun_phoenix（UI，默认 `--with=phoenix` 并入）** | 是（ingress 全网卡） | 我方栈内自托管；Alloy 经 `phoenix:4317`（仅 appnet2）转发 traces |
+| 6006 | 6006 | **geesun_phoenix（UI，`--with=phoenix` 并入）** | 是（ingress 全网卡） | 我方栈内自托管；Alloy 经 `phoenix:4317`（仅 appnet2）转发 traces |
+| 3000 | 3000 | **geesun_langfuse-web（UI + OTLP，`--with=langfuse` 并入）** | 是（ingress 全网卡） | 我方栈内自托管；agent 经 `LANGFUSE_BASE_URL=http://10.10.10.67:3000` 上报 |
+| 9092 | 9000 | **geesun_minio（S3 媒体，`--with=langfuse` 并入）** | 是（ingress 全网卡） | 浏览器经 `LANGFUSE_S3_*_EXTERNAL_ENDPOINT` 取媒体 |
 | 3100 | 3000 | Grafana | 是（ingress 全网卡） | ⚠️ compose 现为 `"3100:3000"` 全网卡，与早期"127.0.0.1:3100"注释不符；Swarm ingress 下无法只绑回环，需靠防火墙收敛 |
 | 12345 | 12345 | Alloy UI / 自监控 | 是（ingress 全网卡） | OTLP 4317/4321 仅 appnet2 内，不发布 |
 | 19091 | 9090 | Prometheus | 是（ingress 全网卡） | 收 Alloy remote_write |
-| 3000 / 3030 / 5432 / 6379 / 8123 / 9000 / 9091 / 9092 | — | **共享 Langfuse 栈**（现网 langfuse-web / langfuse-worker / langfuse-postgres / langfuse-redis / langfuse-clickhouse / langfuse-minio + opt-db） | 是（他人已发布） | **复用，勿占用、勿下线**；Langfuse agent 经 `10.10.10.67:3000` 连接 |
+| 5432 / 6379 / 8123 / 9000（共享实例残留） | — | **旧共享 Langfuse 栈**（langfuse-postgres / langfuse-redis / langfuse-clickhouse + opt-db） | 是（他人已发布） | ⚠️ **迁移须停用**：启用自托管前 `docker rm -f` / `docker stack rm` 释放，否则与我方栈抢端口（Langfuse 后端现仅 appnet2 内、不发布主机） |
 
-**现网 10.10.10.67 实测占用快照（2026-09-02，Phoenix 纳入 stack 后）**：`22`(sshd) · `53`(dnsmasq) · `80`(caddy) · `323`(chronyd) · `631`(cupsd) · `2377`/`7946`/`4789`(swarm) · `3000`(共享 Langfuse) · `3030`(langfuse-worker, 127.0.0.1) · `3100`(grafana) · `5432`(opt-db + langfuse-postgres) · **`6006`(Phoenix UI，本栈自托管)** · `6379`(共享 redis, 127.0.0.1) · `8123`/`9000`(共享 clickhouse, 127.0.0.1) · `9091`/`9092`(共享 minio) · `12345`(alloy) · `19091`(prometheus)。
+**现网 10.10.10.67 实测占用快照（2026-09-02，Phoenix 已纳入 stack、Langfuse 尚未自托管前的迁移基准）**：`22`(sshd) · `53`(dnsmasq) · `80`(caddy) · `323`(chronyd) · `631`(cupsd) · `2377`/`7946`/`4789`(swarm) · `3000`(共享 Langfuse) · `3030`(langfuse-worker, 127.0.0.1) · `3100`(grafana) · `5432`(opt-db + langfuse-postgres) · **`6006`(Phoenix UI，本栈自托管)** · `6379`(共享 redis, 127.0.0.1) · `8123`/`9000`(共享 clickhouse, 127.0.0.1) · `9091`/`9092`(共享 minio) · `12345`(alloy) · `19091`(prometheus)。部署 Langfuse 自托管后：`3000`/`9092` 仍由我方 stack 占用（端口不变），`5432`/`6379`/`8123`/`9000` 随旧共享实例停用而释放。
 
 > 📌 **Phoenix 部署方式变更（2026-09-02）**：原方案复用现网共享实例 `opt-phoenix-1`（`RestartPolicy=no`），该实例 9-01 停止后 traces 全丢。现已改为 **`docker-compose.phoenix.yml` 随 `--with=phoenix` 并入本 swarm stack**（镜像 `geesun_ai/phoenix:19.1.0` + `geesun_ai/postgres:16.14`，已推 Harbor），由 `deploy.restart_policy: any` 自愈，UI 发布 `6006`，traces 经 `phoenix:4317`（appnet2）由 Alloy 转发。旧 `opt-phoenix-1` 不再使用。
+
+> 📌 **Langfuse 部署方式变更（2026-09-02）**：原方案复用现网共享 Langfuse 实例（占用 3000/3030/5432/6379/8123/9000/9091/9092、无人自愈）。现已改为 **`docker-compose.langfuse.yml` 随 `--with=langfuse` 并入本 swarm stack**（镜像来自 Harbor `dockerhub` 项目），`langfuse-web` 发布 `3000`、minio 发布 `9092`、postgres/redis/clickhouse 仅 appnet2 内；旧共享实例须停用释放 3000/9092。agent 的 `LANGFUSE_PUBLIC_KEY/SECRET_KEY` 须对应本实例项目（用 `LANGFUSE_INIT_*` 自动建项目）。
 
 ---
 
@@ -194,11 +198,12 @@ done
 
 **⚠️ mcp.json 残留坑**：agent 首次启动会按 `mcp_server_url` 生成 `{AGENT_WORKSPACE}/mcp.json`。若你**之前**手动改过 `mcp.json`（或旧部署遗留），里面的 url 可能是 `localhost`，改 `.env` 的 `mcp_server_url` **不会自动覆盖**已存在的 `mcp.json`。修复：`rm {AGENT_DATA_ROOT}/agent/mcp.json` 让它用新默认值重新生成，或手动把里面 `decrypt-file.url` 改成 `http://geesun-mcp:8000/mcp`。
 
-**合并启动**（路线 A：prod 仅 3 个文件，复用现网共享实例；需自托管见 §4.9 路线 B）：
+**合并启动**（可观测栈随栈自托管，统一命令）：
 ```sh
-./start_stack.sh --with=mcp,web            # 默认先 build-push 打包再 stack deploy
+./start_stack.sh --with=phoenix,langfuse,mcp,web   # 默认先 build-push 打包再 stack deploy
 # 等价展开：docker stack deploy -c docker-compose.yml -c docker-compose.mcp.yml \
-#          -c docker-compose.web.yml --with-registry-auth --resolve-image=always --prune geesun
+#          -c docker-compose.web.yml -c docker-compose.phoenix.yml -c docker-compose.langfuse.yml \
+#          --with-registry-auth --resolve-image=always --prune geesun
 ```
 
 **镜像构建**：`build-push.sh` 已加 `build_push_mcp()`（旧名 `sync_mcp`），会把 `geesun_mcp_server` 仓库（上下文=其根）构建并推到 `geesun_ai/geesun-mcp-server:<MCP_TAG>`。基镜像已从 `python:3.11` 改 `python:3.13-slim-bookworm`，与 `pyproject.toml` 的 `requires-python>=3.13` 及 dev 运行时一致，避免 dev/prod 漂移。
@@ -222,9 +227,9 @@ done
 
 **前端本地 dev 不受影响**：dev 仍是 `bun run dev`（读 `.env.local`，默认 `http://localhost:8009`），`next.config.ts` 的 `output: "standalone"` 仅对 `next build` 生效，`next dev` 忽略；容器与 dev 是两套独立运行方式。
 
-**合并启动**（路线 A：prod 仅 3 个文件，复用现网共享实例；需自托管见 §4.9 路线 B）：
+**合并启动**（可观测栈随栈自托管，统一命令）：
 ```sh
-./start_stack.sh --with=mcp,web
+./start_stack.sh --with=phoenix,langfuse,mcp,web
 ```
 
 **排障**：
@@ -261,21 +266,13 @@ sandbox 访问域名形如 `49983-78083c0f5b044a3084a891a2c1f35b50.cube.app`，e
 - agent 配置：`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`（agent→Alloy），`PHOENIX_OTLP_ENDPOINT=phoenix:4317`（Alloy→Phoenix，见 README「端口一览 C」）。
 - ⚠️ 旧方案"复用现网 `opt-phoenix-1` 共享实例"已废弃：该实例 `RestartPolicy=no`，9-01 停止后 traces 全丢，故改为栈内自托管。
 
-**Langfuse（LLM 观测）—— 路线 A 复用现网共享实例（当前默认）/ 路线 B 自托管兜底**
-- **路线 A（默认）**：prod 主栈不并 `docker-compose.langfuse.yml`，agent 直发现网共享实例 `LANGFUSE_BASE_URL=http://10.10.10.67:3000`（见 §10.3）。共享栈的 3000/3030/5432/6379/8123/9000/9091/9092 端口**勿占用、勿下线**（§4.5 预检表）。
-- **路线 B（兜底，仅全新机器）**：无共享实例时把 `docker-compose.langfuse.yml` 一并并入（**并入前先把该文件的 `networks: [appnet]` 改成 `appnet2`**，才能与 yml/mcp/web/phoenix 处于同一网络、用服务名互通）：
-```sh
-./start_stack.sh --with=phoenix,langfuse,mcp,web
-```
-  - `.env` 须填全 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_* 等，`.env.example` 已含），并把端点改走服务名：
-```sh
-LANGFUSE_BASE_URL=http://langfuse-web:3000
-```
-  - 端口：langfuse-web(3000)、langfuse-worker(3030)、minio(9000/9001) 在 overlay 网络内以服务名可达；langfuse 的 minio 映射到主机 **9092(S3 API) / 9091(Console)**，clickhouse 映射 **8123 / 9000**、redis **6379**、postgres **5432**（`mode: host`，非仅回环）。
-  - ⚠️ **路线 B 与现网 10.10.10.67 端口冲突（2026-09-02 实测）**：该机 5432 / 6379 / 8123 / 9000 / 9091 / 9092 已被共享 Langfuse 栈（langfuse-postgres / langfuse-redis / langfuse-clickhouse / langfuse-minio）+ `opt-db` 占满 → **路线 B 不可并入现网**，仅适用于全新机器。我方 stack 发布端口为 80 / 3100 / **6006(Phoenix)** / 12345 / 19091（实测均为 dockerd 全网卡 ingress 监听，非 127.0.0.1），与共享栈不冲突。
-  - 若想在路线 B 也从外部看 UI，可在 `Caddyfile` 加 `:3000` 代理块（前提该主机端口空闲）；否则 UI 仅 overlay 网络内可达，不影响 agent 上报 trace。
+**Langfuse（LLM 观测）—— 随 `--with=langfuse` 并入本 stack 自托管（2026-09-02 起，与 Phoenix 同形态）**
+- `docker-compose.langfuse.yml` 随 `start_stack.sh --with=langfuse`（完整启动为 `--with=phoenix,langfuse,mcp,web`）一并部署，镜像均来自 Harbor `dockerhub` 项目（`langfuse:3.224.3` / `clickhouse-server:25.12` / `minio:chainguard` / `redis:7` / `postgres:17`，已由 `build-push.sh` 同步）。
+- `deploy.restart_policy: any` 自愈，不再依赖现网共享 Langfuse 实例（旧共享实例占用 3000/3030/5432/6379/8123/9000/9091/9092、无人自愈，须停用）。
+- 端口形态（与 Phoenix 一致）：`langfuse-web` 发布主机 **3000**（UI + OTLP ingest，agent 经 `LANGFUSE_BASE_URL=http://10.10.10.67:3000` 上报）；`minio` 发布 **9092**（S3 媒体外部端点）；`postgres` / `redis` / `clickhouse` 仅 appnet2 内、不占主机端口（旧共享栈的 5432/6379/8123/9000 冲突已消除）。
+- agent 配置：`.env` 的 `LANGFUSE_BASE_URL=http://10.10.10.67:3000`（主机 LAN IP，与 Phoenix 同形态直发）；`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` 必须对应本实例项目——自托管为全新空库，最简易做法是用 `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `LANGFUSE_INIT_PROJECT_SECRET_KEY` 填一组自选值，并把 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` 设成完全相同的值，首次启动 Langfuse 自动建项目（详见 `.env.example`）。
 
-> 切换只看「并入哪几个 `-f` 文件」+ 对应 `*_BASE_URL` 端点，镜像与业务栈不变。Phoenix 现已固定为栈内自托管，不再有路线切换。
+> 可观测栈（Phoenix + Langfuse）现已固定为栈内自托管，统一用 `start_stack.sh --with=phoenix,langfuse,mcp,web` 启动，不再有「复用共享实例 / 自托管兜底」的路线切换。
 
 ---
 
@@ -299,7 +296,7 @@ LANGFUSE_BASE_URL=http://langfuse-web:3000
 - ⚠️ `depends_on` **只认列表语法** `depends_on: [x]`（仅保证先创建，不保证就绪）；`condition: service_healthy` 长语法直接报 `depends_on must be a list`，map 语法同理 → 已全部改为列表，就绪等待靠 `healthcheck` + `restart_policy` 自愈（agent 探 `/docs`、postgres `pg_isready`、alloy/prometheus/grafana 探 UI 等）。
 - ⚠️ **`host_ip` 不被 Swarm 接受**：短端口 `127.0.0.1:host:container` 的 host IP 绑定在 Swarm 下直接报 `Additional property host_ip is not allowed` → 已**删除全部 `host_ip` 字段**，alloy/prometheus/grafana 也退回 `"host:container"` 短语法（如 `3100:3000` / `19091:9090` / `12345:12345`）。
 - ⚠️ **实测结论（2026-09-02）**：Swarm ingress 下这 4 个端口 `80 / 3100 / 12345 / 19091` **全部由 dockerd 监听在 `*:`（全网卡）**，本机回环约束在 ingress 模式下无效。若 Grafana / Prometheus / Alloy UI 不应对外，只能在**主机防火墙**收敛（或改用 `mode: host` + 非 ingress 部署），不要在 compose 里写 `127.0.0.1:` 指望生效。
-- ⚠️ 主栈网络去掉 `name:`（与 stack 前缀冲突），改 `driver: overlay`；stack 会加 `geesun_` 前缀 → 实际网络名 `geesun_appnet2`。附加 compose 文件（mcp / web）不再重复定义该网络，只引用；`docker-compose.phoenix.yml` / `docker-compose.langfuse.yml` 仍声明 `appnet`，走路线 B 前需统一为 `appnet2`。
+- ⚠️ 主栈网络去掉 `name:`（与 stack 前缀冲突），改 `driver: overlay`；stack 会加 `geesun_` 前缀 → 实际网络名 `geesun_appnet2`。附加 compose 文件（mcp / web / phoenix / langfuse）统一引用该网络、不再重复定义；`docker-compose.langfuse.yml` 现已从旧 `appnet` 改为 `appnet2`，可直接 `--with=langfuse` 并入（旧版 `appnet` 在合并配置里未定义，并入会报 network not found）。
 - 命名卷自动加 `geesun_` 前缀（如 `geesun_agent_pg_data` / `geesun_loki_data`）；**生产尚未部署，无历史数据迁移问题**，直接切。
 - `env_file: [.env]` 仍生效（start_stack.sh 在 deploy/ 目录执行，`.env` 由 docker 在 deploy 时插值注入）。
 
@@ -371,7 +368,7 @@ cron 示例（每天 03:07）：
 
 ### 6.2 采集链路
 `geesun-agent(stdout JSON)` → Docker `json-file`(本地轮转) → Alloy(`discovery.docker` 发现 appnet2 容器、`loki.process` 提取 JSON 字段，并统一收 metrics→Prometheus / traces→Phoenix) → Loki(30d 留存) + Prometheus(metrics) → Grafana(检索/面板/告警)。
-- **验证**：进 alloy 容器看 UI `:12345`（本机 `127.0.0.1:12345`）；Prometheus `:19091` 查 `up`/`geesun-agent`/`alloy`；Phoenix（路线 A `10.10.10.67:6006`）确认 traces 到达。Alloy→Phoenix 转发经 `PHOENIX_OTLP_ENDPOINT` 控制（路线 B 改 `phoenix:4317`）。
+- **验证**：进 alloy 容器看 UI `:12345`（本机 `127.0.0.1:12345`）；Prometheus `:19091` 查 `up`/`geesun-agent`/`alloy`；Phoenix（`http://10.10.10.67:6006`，随 `--with=phoenix` 自托管）确认 traces 到达。Alloy→Phoenix 转发经 `.env` 的 `PHOENIX_OTLP_ENDPOINT=phoenix:4317` 控制。
 
 ### 6.3 配置要点
 - `LOG_LEVEL`（默认 `INFO`）、`LOG_FORMAT=json|text` 由环境变量控制（`logging.py` 已实现）。
@@ -433,8 +430,8 @@ cron 示例（每天 03:07）：
 8. 校验：
    - `docker compose ps` 全 healthy；
    - `http://10.10.10.67/` → 前端页面（Caddy → geesun-agent-web）；API 文档 `http://10.10.10.67/docs`（Caddy → geesun-agent:8009）；
-   - `http://10.10.10.67:6006` → Phoenix（现网共享实例）；
-   - `http://10.10.10.67:3000` → Langfuse（现网共享实例），注册/使用 prod project 的 API key；
+   - `http://10.10.10.67:6006` → Phoenix（栈内自托管）；
+   - `http://10.10.10.67:3000` → Langfuse（栈内自托管，首次访问用 `LANGFUSE_INIT_*` 引导的 admin 登录，prod project 的 API key 回填 `.env`），S3 媒体走 `http://10.10.10.67:9092`；
    - `127.0.0.1:3100` → Grafana，看 Loki 数据源有日志。
 
 **阶段 C — 接线**
@@ -447,7 +444,7 @@ cron 示例（每天 03:07）：
 
 - **Harbor HTTP**：务必配 `insecure-registries`，否则 login/pull 失败。
 - **构建上下文**：`geesun-agent` 必须在 `/d/workspace` 下构建，否则 `langchain-cubesandbox` 解析失败。
-- **9090 端口冲突**：Phoenix 的 9090 由现网共享实例发布，prod 不再自建 Phoenix/Langfuse，无冲突。
+- **9090 端口冲突**：Phoenix 的 9090（metrics）默认未启用、`docker-compose.phoenix.yml` 未发布该端口；我方已自建 Phoenix/Langfuse（随 `--with` 并入），与旧共享实例（若未停用）仅在 `3000`/`9092` 重叠，须先停用旧共享实例（见 §4.5）。
 - **三个 Postgres**：agent_mem / phoenix / langfuse 各自独立，资源占用偏高；后续若想省可合并实例（按安全域权衡）。
 - **密钥**：`.env` 必须 `chmod 600` 且**绝不进 git**；生产可进一步改用 compose `secrets:` 挂载。
 - **DB 不暴露**：仅 `127.0.0.1` 供排障；对外只走 Caddy。
@@ -475,16 +472,16 @@ cron 示例（每天 03:07）：
 | 7 | 三项目配置全收口到 `.env`（Phoenix 入 `.env` + compose 去硬编码；Langfuse 补齐所有变量且去除不安全默认值，改为 `${VAR}` 强契约） | `.env.example` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh build_push_mcp（旧名 sync_mcp）+ requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
 | 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh build_push_web（旧名 sync_web）+ Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
-| 10 | 复用现网共享可观测栈（路线 A）：prod compose 仅 yml+mcp+web 三文件，Caddy 只留 :80，agent 经 10.10.10.67:4317/:3000 连共享 Phoenix/Langfuse；phoenix/langfuse 两个 compose 文件保留作路线 B 兜底（见 §4.9） | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
+| 10 | 可观测栈随主栈自托管（Phoenix/Langfuse 一并 `--with=phoenix,langfuse` 并入 swarm stack）：统一启动命令 `start_stack.sh --with=phoenix,langfuse,mcp,web`；Caddy 只留 :80，agent 经 `alloy:4317`（Alloy 转 Phoenix）与 `10.10.10.67:3000`（Langfuse）连接；phoenix/langfuse 两个 compose 文件随主栈并入，不再作独立兜底 | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
 | 11 | CubeSandbox 信任与 DNS docker 化：agent/mcp CA 挂载 + REQUESTS_CA_BUNDLE/SSL_CERT_FILE；`setup-combined-ca.sh`（生成 mkcert+系统根 bundle）；`setup-cube-dns.sh`（dnsmasq 直答 *.cube.app + daemon dns） | `docker-compose.yml` + `docker-compose.mcp.yml` + 新增 `setup-combined-ca.sh` + `setup-cube-dns.sh` + §4.3/§4.8 | ✅ 已落地 |
 
 > 实现项 #1–#5、#7–#11 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 
 ---
 
-## 10. 环境策略：dev / prod 区分（路线 A 默认；langfuse/phoenix 文件保留为路线 B 兜底）
+## 10. 环境策略：dev / prod 区分（可观测栈随主栈自托管，统一部署）
 
-**决策：路线 A** —— 单宿主机 `10.10.10.67`，只跑**一套** Phoenix + 一套 Langfuse，dev/prod 用「项目名 / 项目 key」区分；prod 的 geesun_agent 也部署在同一台。理由：Phoenix/Langfuse 是「可观测性」不是「业务数据」，共享后端可接受；业务数据（agent_mem）与 agent 应用本身已是独立容器/卷，隔离到位。
+**决策：统一自托管** —— 单宿主机 `10.10.10.67` 上，Phoenix/Langfuse 随主栈 `--with=phoenix,langfuse` 一并部署（不再复用现网独立共享实例），dev/prod 用「项目名 / 项目 key」区分；prod 的 geesun_agent 也部署在同一台。理由：Phoenix/Langfuse 是「可观测性」不是「业务数据」，单实例后端可接受；业务数据（agent_mem）与 agent 应用本身已是独立容器/卷，隔离到位；可观测栈由 swarm `restart_policy` 自愈，比旧共享实例更稳。
 
 ### 10.1 Phoenix：靠 `openinference.project.name` 分项目
 - 已做成可配项（`config.py` 的 `otel_project_name`，`.env` 的 `OTEL_PROJECT_NAME`）。
@@ -497,25 +494,21 @@ cron 示例（每天 03:07）：
 - dev agent `.env` 填 dev project 的 key；prod agent `.env` 填 prod project 的 key；二者的 `LANGFUSE_BASE_URL` 指向同一实例。
 - 注：后端 PG/Clickhouse/Minio 共享，逻辑隔离靠 key。
 
-### 10.3 端口现状与处理（已按"复用共享可观测栈"落地）
-- **现状（2026-08-27 实测）**：10.10.10.67 上运行 **dev/共享可观测栈**（已 3 周）：`langfuse-langfuse-web-1`(:3000)、`langfuse-worker`(:3030 lo)、`opt-phoenix-1`(:6006/:4317/:9090)、`opt-db-1`(:5432)、`langfuse-minio-1`(:9092/:9091 lo)、langfuse postgres/redis/clickhouse（内部/lo）。**主机 80 空闲**。
-- **决策**：遵循路线 A——**复用**这套 Phoenix/Langfuse 作为 dev/prod 共享后端（project key 区分）；prod compose **只并 3 个文件**（yml+mcp+web），不并 phoenix/langfuse 文件；Caddy 只用 :80（前端主入口）；agent 经 `http://10.10.10.67:4317` / `http://10.10.10.67:3000` 连接共享实例。共享实例的 3000/6006/9092/5432 等端口**勿占用、勿下线**。两个可观测 compose 文件（`docker-compose.phoenix.yml`/`docker-compose.langfuse.yml`）**保留在仓库作路线 B 兜底，不删除**——换环境无共享实例时按 §4.9 并入即可。
+### 10.3 可观测栈现状与处理（已按"随主栈自托管"落地）
+- **现状（2026-09-02 起）**：10.10.10.67 上 Phoenix/Langfuse 由本 swarm stack 自托管——`geesun_phoenix`(:6006 UI / `phoenix:4317` 经 Alloy)、`geesun_langfuse-web`(:3000 UI+OTLP)、`geesun_minio`(:9092 S3)，postgres/redis/clickhouse 仅 appnet2 内；agent 经 `alloy:4317`（Alloy→Phoenix）与 `http://10.10.10.67:3000`（Langfuse）上报。**主机 80 空闲**。旧独立共享可观测栈（opt-phoenix / langfuse-*）已停用迁移（2026-09-02）。
+- **决策**：统一部署——`start_stack.sh --with=phoenix,langfuse,mcp,web` 一并拉起可观测栈；Caddy 只用 :80（前端主入口）；dev/prod 共用同一套 Phoenix/Langfuse 后端，靠 `OTEL_PROJECT_NAME`(Phoenix) 与 `LANGFUSE_*_KEY`(Langfuse) 的项目 key 区分（见 §10.1/§10.2）。旧共享实例的 3000/9092 端口须释放给我方栈。
 
 ### 10.4 agent 环境变量按环境切换
 prod 的 `geesun_agent/deploy/.env` 至少区分：
 ```sh
 OTEL_PROJECT_NAME=Geesun-Agent-prod
 LANGFUSE_BASE_URL=http://10.10.10.67:3000
-LANGFUSE_PUBLIC_KEY=pk-lf-prod-xxxx
-LANGFUSE_SECRET_KEY=sk-lf-prod-xxxx
-PHOENIX_COLLECTOR_ENDPOINT=http://10.10.10.67:4317
+LANGFUSE_PUBLIC_KEY=pk-lf-<本实例项目key>
+LANGFUSE_SECRET_KEY=sk-lf-<本实例项目key>
+PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317
 ```
 
-- **路线 B（自托管兜底）** 的端点不同：把 `LANGFUSE_BASE_URL` / `PHOENIX_COLLECTOR_ENDPOINT` 改走服务名（同 `appnet2` 内可达），其余 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_*）在 `.env` 填全（`.env.example` 已含）：
-```sh
-LANGFUSE_BASE_URL=http://langfuse-web:3000
-PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:4317
-```
+- **随栈自托管（默认）**：`LANGFUSE_BASE_URL=http://10.10.10.67:3000`（langfuse-web 已发布 :3000，与 Phoenix 同形态直发），`PHOENIX_COLLECTOR_ENDPOINT=http://alloy:4317`（agent→Alloy）。其余 Langfuse 自托管变量（DATABASE_URL / SALT / ENCRYPTION_KEY / CLICKHOUSE_* / REDIS_* / MINIO_* / LANGFUSE_S3_* / LANGFUSE_INIT_*）在 `.env` 填全（`.env.example` 已含）；`LANGFUSE_PUBLIC_KEY/SECRET_KEY` 须与 `LANGFUSE_INIT_PROJECT_*_KEY` 一致（全新空库）。
 
 ---
 

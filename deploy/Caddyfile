@@ -1,7 +1,7 @@
 # 反向代理 — 内网 LAN 用，plain HTTP（如需 TLS 在此加 `tls internal` 并改监听 443）。
 # 各后端均经 appnet 内网互访，仅 caddy 暴露主机端口。
-# 可观测性复用现网共享实例（路线 A）：Phoenix http://10.10.10.67:6006 、
-# Langfuse http://10.10.10.67:3000 由各自容器直出，不经 Caddy；本文件只代理前端主入口 :80。
+# Phoenix(:6006) / Langfuse(:3000) 现已随栈自托管、由各自容器直出主机（ingress 全网卡），不经 Caddy 代理
+# （避免与已发布端口冲突）；本文件只代理前端主入口 :80。
 
 {
   admin off

@@ -1,14 +1,25 @@
-# Langfuse 自托管可观测栈 — 作为「路线 B 兜底」始终保留在仓库，不删除。
-# 适用：现网没有共享 Phoenix/Langfuse 实例时（换机器 / 换环境 / 共用栈下线），
-#       把本文件与 docker-compose.phoenix.yml 一并 -f 并入主栈启动（见 DEPLOYMENT.md §4.9）。
-# 基于官方 docker-compose.yml 精简 / 硬化：
-#   - web/worker 不映射主机端口，由 caddy 经 appnet 代理 :3000（路线 A 共用栈在跑时本文件不并入）。
-#   - minio S3 API 映射到主机 9092，EXTERNAL 端点指向主机 LAN IP（路线 B 自托管时即本机 minio）。
-#   - postgres/redis/clickhouse 仅绑定 127.0.0.1 供排障，不对外。
-#   - 所有第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub），
-#     需先由 build-push.sh 同步进 Harbor。
-#   - 全部环境变量来自 deploy/.env（单一可信源），无默认值；.env 漏填任一变量会在 up 时直接报错。
-# 部署前请与 git clone 的官方 docker-compose.yml 逐行核对（尤其 clickhouse / migration 步骤）。
+# Langfuse（LLM 观测）可观测栈 — 纳入 geesun swarm stack（start_stack.sh --with=langfuse 并入）。
+#
+# 自 2026-09-02 起与 Phoenix 一样「随栈自托管」，不再复用现网共享 Langfuse 实例：
+#   原共享实例（langfuse-web / langfuse-worker / langfuse-postgres / langfuse-redis /
+#   langfuse-clickhouse / langfuse-minio）占用主机 3000/3030/5432/6379/8123/9000/9091/9092，
+#   与本栈抢端口且无人自愈。纳入 swarm stack 后由 deploy.restart_policy 自愈，
+#   旧共享实例须停用（见下方「迁移注意」）。
+#
+# 拓扑：agent（appnet2）→ Langfuse OTLP ingest（langfuse-web:3000）落 trace；
+#       langfuse-web/worker 经 appnet2 服务名访问 postgres / clickhouse / redis / minio。
+#       仅 langfuse-web:3000（UI + OTLP）与 minio:9092（S3 媒体外部端点）发布主机，
+#       其余后端（postgres / redis / clickhouse）仅 appnet2 内、不占主机端口。
+#
+# 镜像：langfuse / clickhouse-server / minio / redis / postgres 均来自 Harbor dockerhub 项目
+#       （REGISTRY_HUB），由 deploy/build-push.sh 同步进 Harbor（标准第三方镜像）。
+#
+# ⚠️ 迁移注意：启用本文件前，必须先停用现网共享 Langfuse 实例，释放主机
+#   3000 / 9092（其余 3030/5432/6379/8123/9000/9091 共享实例占用但本栈不再发布，
+#   仅 3000/9092 与本栈发布端口冲突）。否则 docker stack deploy 端口冲突起不来。
+#   自托管 Langfuse 为全新空库，LANGFUSE_PUBLIC_KEY/SECRET_KEY 必须对应本实例项目
+#   （最简易：用 LANGFUSE_INIT_PROJECT_PUBLIC_KEY/SECRET_KEY 填一组自选值，并把
+#   LANGFUSE_PUBLIC_KEY/SECRET_KEY 设成完全相同的值，首次启动自动建项目）。
 
 services:
   langfuse-worker:
@@ -61,7 +72,7 @@ services:
       REDIS_AUTH: ${REDIS_AUTH}
       LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: ${LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK}
       REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED}
-    networks: [appnet]
+    networks: [appnet2]
     deploy:
       restart_policy:
         condition: any
@@ -90,7 +101,12 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
-    networks: [appnet]
+    networks: [appnet2]
+    # UI + OTLP ingest 发布主机 3000（ingress 全网卡）：
+    #   - 用户浏览器访问 http://10.10.10.67:3000
+    #   - agent 经 .env 的 LANGFUSE_BASE_URL=http://10.10.10.67:3000 上报 trace
+    ports:
+      - "3000:3000"
     deploy:
       restart_policy:
         condition: any
@@ -114,14 +130,8 @@ services:
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
       - langfuse_clickhouse_logs:/var/log/clickhouse-server
-    ports:
-      - target: 8123
-        published: 8123
-        mode: host
-      - target: 9000
-        published: 9000
-        mode: host
-    networks: [appnet]
+    # 仅 appnet2 内（CLICKHOUSE_URL=http://clickhouse:8123 经服务名互访）；不发布主机端口
+    networks: [appnet2]
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
       interval: 5s
@@ -148,14 +158,13 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    # S3 API 发布主机 9092（浏览器经 LANGFUSE_S3_*_EXTERNAL_ENDPOINT=http://10.10.10.67:9092 取媒体）。
+    # Console :9001 不发布（仅排障用，容器内可访问）。
     ports:
-      - 9092:9000          # S3 API → 主机 9092（路线 B 自托管时即本机 minio；路线 A 共用栈已占此端口，故不并入）
-      - target: 9001
-        published: 9091
-        mode: host
+      - "9092:9000"
     volumes:
       - langfuse_minio_data:/data
-    networks: [appnet]
+    networks: [appnet2]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 1s
@@ -180,13 +189,10 @@ services:
     command: >
       --requirepass ${REDIS_AUTH}
       --maxmemory-policy noeviction
-    ports:
-      - target: 6379
-        published: 6379
-        mode: host
+    # 仅 appnet2 内（REDIS_HOST=redis 经服务名互访）；不发布主机端口
     volumes:
       - langfuse_redis_data:/data
-    networks: [appnet]
+    networks: [appnet2]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -218,13 +224,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       TZ: UTC
       PGTZ: UTC
-    ports:
-      - target: 5432
-        published: 5432
-        mode: host
+    # 仅 appnet2 内（DATABASE_URL=postgresql://postgres:...@postgres:5432/... 经服务名互访）；不发布主机端口
     volumes:
       - langfuse_postgres_data:/var/lib/postgresql/data
-    networks: [appnet]
+    networks: [appnet2]
     deploy:
       restart_policy:
         condition: any

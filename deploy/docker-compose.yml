@@ -4,17 +4,17 @@
 #   cp .env.example .env && vi .env        # 填全部密钥（含 REGISTRY_GEESUN / REGISTRY_HUB / Harbor 凭证）
 #   ./start_stack.sh                          # 默认仅主栈（swarm）
 #   ./start_stack.sh --with=mcp,web           # 并入 MCP / 前端
-#   ./start_stack.sh --with=phoenix,langfuse  # 路线 B 自托管兜底
+#   ./start_stack.sh --with=phoenix,langfuse  # 可观测栈随栈自托管（与 agent/mcp/web 统一启动）
 #
 # 说明：
 #   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
 #     第三方通用镜像（pgvector/caddy/loki/alloy/prometheus/grafana）在 dockerhub 项目（REGISTRY_HUB），
 #     由 deploy/build-push.sh 构建 / 同步。
 #   - 多文件用 start_stack.sh --with= 合并 -c，共享 overlay 网络 appnet2（容器间用服务名互访，stack 前缀 geesun_）。
-#   - 可观测性复用现网共享实例（路线 A，默认）：Phoenix(:6006/:4317)、Langfuse(:3000) 由各自容器
-#     已发布在主机，本 compose 不再跑 phoenix/langfuse 服务；agent 经主机 LAN IP 连接（见 .env）。
-#   - 需要自托管兜底（无共享实例）时，把 docker-compose.langfuse.yml / docker-compose.phoenix.yml
-#     一并 -f 并入（路线 B，见 DEPLOYMENT.md §4.9）；两文件始终保留在仓库，不删除。
+#   - 可观测性 Phoenix/Langfuse 均自托管、随栈启动：--with=phoenix 并入 docker-compose.phoenix.yml、
+#     --with=langfuse 并入 docker-compose.langfuse.yml；二者都用 appnet2、由 deploy.restart_policy 自愈，
+#     不再依赖现网共享实例。agent 经主机 LAN IP 连 Phoenix(:6006 UI，Alloy 转 :4317) 与
+#     Langfuse(:3000 UI+OTLP)，见 .env 的 PHOENIX_COLLECTOR_ENDPOINT / LANGFUSE_BASE_URL。
 #   - 对外只暴露 caddy 的 80（前端主入口）；数据库 / loki / grafana(127.0.0.1:3100) 不暴露到主机。
 #   - 日志/指标/追踪：各服务 json-file 驱动做大小轮转（max-size/max-file），Alloy 统一采集（logs→Loki / metrics→Prometheus / traces→Phoenix，替代原 Promtail），Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
