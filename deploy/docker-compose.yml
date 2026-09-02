@@ -52,6 +52,9 @@ services:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/uploads:/data/uploads
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
+      # skills 三层目录（__system__/__agent__/__user_*__）——backend 路由 root_dir 依赖
+      # /data/agent/skills 存在，缺失会 path_not_found（2026-09-02 实测）；挂宿主机侧持久化
+      - ${AGENT_DATA_ROOT:-/opt/geesun/data}/skills:/data/agent/skills
       # CubeSandbox CA（挂载源相对 deploy/ 目录，见 .env 的 CA_MOUNT_SRC；combined-ca.pem = mkcert+系统根）
       - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；

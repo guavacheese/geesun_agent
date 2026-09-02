@@ -33,6 +33,8 @@ services:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/uploads:/data/uploads
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
+      # skills 三层目录——mcp 的 run_script_from_skill 也走 /data/agent/skills
+      - ${AGENT_DATA_ROOT:-/opt/geesun/data}/skills:/data/agent/skills
       # CubeSandbox egress CA：宿主机证书路径由 CA_MOUNT_SRC 指定（默认仓库内 certs/）。
       # 必须指向真实存在的文件；若 sandbox 代理无 MITM 则删除本行 + SSL_CERT_FILE。
       - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
