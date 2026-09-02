@@ -45,15 +45,15 @@ services:
       otel_project_name: "${OTEL_PROJECT_NAME:-Geesun-Agent-prod}"
       cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67}"
       # CubeSandbox egress MITM CA（sandbox 出网 TLS 拦截证书，无 MITM 可删挂载+这两行）
-      REQUESTS_CA_BUNDLE: /etc/ssl/certs/cube-root-ca.crt
-      SSL_CERT_FILE: /etc/ssl/certs/cube-root-ca.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/combined-ca.pem
+      SSL_CERT_FILE: /etc/ssl/certs/combined-ca.pem
     # 宿主机挂载：报告/上传/工作目录防容器重建丢失（AGENT_DATA_ROOT 见 .env）
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/uploads:/data/uploads
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
-      # CubeSandbox CA（挂载源相对 deploy/ 目录，见 .env 的 CA_MOUNT_SRC）
-      - ${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}:/etc/ssl/certs/cube-root-ca.crt:ro
+      # CubeSandbox CA（挂载源相对 deploy/ 目录，见 .env 的 CA_MOUNT_SRC；combined-ca.pem = mkcert+系统根）
+      - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
     # agent 连不上 postgres 时靠自身重试/重启直至就绪（等效等待 healthy）
     depends_on: [agent-postgres]

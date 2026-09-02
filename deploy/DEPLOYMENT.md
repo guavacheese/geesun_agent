@@ -23,7 +23,7 @@
 
 **外部物理机（不在 compose 内，由 geesun-agent 跨网络访问）：**
 - **vLLM**：`172.16.66.13:8003`（MoE 35B，`base_url=http://172.16.66.13:8003/v1`）
-- **CubeSandbox**：`192.168.10.136`（cube-proxy / cube-egress MITM；dev/prod 共用；sandbox 域名 `*.cube.app` 经 DNS 指向 136，见 §4.8）
+- **CubeSandbox**：`172.16.66.13`（cube-api 控制面 :6000；cube-egress MITM；sandbox 域名 `*.cube.app` 经 dnsmasq `address=` 直答指向 172.16.66.13，见 §4.8。⚠️ 8003 是 vLLM 不是 E2B，`E2B_API_URL` 必须指 :6000）
 - **geesun_mcp_server**：现已容器化为 `geesun-mcp` 服务（见 `docker-compose.mcp.yml`），与 agent 同处 `appnet`，agent 经服务名 `geesun-mcp:8000` 访问；容器内部端口 8000 **不发布到主机**（避免与 dev 的 :8000 冲突），仅 appnet 内互访。DLP 解密 API 仍在 compose 外，由 `.env` 的 `DECRYPT_API_URL` 提供。
 - **Harbor**：`172.16.220.74:8333`（HTTP，项目 `geesun_ai`（自有应用 geesun-agent）+ `dockerhub`（第三方通用镜像中央仓库 redis/minio/postgres/loki/grafana/phoenix/langfuse 等））
 
@@ -129,10 +129,11 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 - 数据库 / Loki / Grafana(127.0.0.1:3100) **不映射主机端口**，仅经 `appnet` 内部访问。
 
 ### 4.3 访问外部物理机（vLLM / CubeSandbox / MCP）与 CA 信任
-- 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP（`172.16.66.13` vLLM、`192.168.10.136` CubeSandbox），agent 内 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
+- 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP（`172.16.66.13` vLLM :8003 与 CubeSandbox :6000），agent 内 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
 - **CubeSandbox egress MITM CA（docker 化，已落地）**：CubeSandbox 走 `cube-egress` 做 TLS 拦截，提供 `rootCA.pem`。**agent 与 geesun-mcp 两个容器都已配好**（`docker-compose.yml` 与 `docker-compose.mcp.yml`）：
-  - bind mount：`${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}` → `/etc/ssl/certs/cube-root-ca.crt:ro`（相对 `deploy/` 目录；生产机把 `geesun_agent/certs/` 拷到 deploy 上级即可）；
-  - 环境变量：agent 设 `REQUESTS_CA_BUNDLE` + `SSL_CERT_FILE`；mcp 设 `SSL_CERT_FILE`；
+  - bind mount：`${CA_MOUNT_SRC:-../certs/combined-ca.pem}` → `/etc/ssl/certs/combined-ca.pem:ro`（相对 `deploy/` 目录；生产机把 `combined-ca.pem` 拷到 deploy 上级 certs/ 即可）；
+  - **必须用 `combined-ca.pem`（mkcert CA + 147 系统根 bundle，227KB）**：仅挂 `rootCA.pem` 单证书（1688B）会导致容器内 pip/uv 拉 pypi.org（GlobalSign 签发）`UnknownIssuer`，agent 启动即崩（2026-09-01 实测）。宿主机 `combined-ca.crt` 改名 `combined-ca.pem` 即可（内容相同）。
+  - 环境变量：agent 设 `REQUESTS_CA_BUNDLE` + `SSL_CERT_FILE`；mcp 设 `SSL_CERT_FILE`；`CUBE_CA_PATH` 同指容器内 `combined-ca.pem`（sandbox.py 读取）；
   - 若 sandbox 代理无 MITM，可删挂载与该变量。
 - 连接外网组件走 LAN IP 时，容器→主机→目标 NAT 自动完成，无需 `host.docker.internal`。
 
@@ -172,7 +173,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 
 **外部依赖**：
 - DLP 解密网关 `DECRYPT_API_URL`（compose 外，由 `.env` 提供）；
-- CubeSandbox(E2B) `E2B_API_URL` / `E2B_API_KEY`（MCP 内 `e2b_code_interpreter` 用，需信任 egress CA，见 §4.3）。
+- CubeSandbox(E2B) `E2B_API_URL` / `E2B_API_KEY`（MCP 内 `e2b_code_interpreter` / `upload_to_sandbox` 用，需信任 egress CA，见 §4.3）。**`E2B_API_URL` 必须指向 cube-api 控制面 `http://172.16.66.13:6000`**——8003 是 vLLM，指向它会 404 且 e2b 报 `KeyError: 'code'`（2026-09-02 实测）。
 
 **⚠️ mcp.json 残留坑**：agent 首次启动会按 `mcp_server_url` 生成 `{AGENT_WORKSPACE}/mcp.json`。若你**之前**手动改过 `mcp.json`（或旧部署遗留），里面的 url 可能是 `localhost`，改 `.env` 的 `mcp_server_url` **不会自动覆盖**已存在的 `mcp.json`。修复：`rm {AGENT_DATA_ROOT}/agent/mcp.json` 让它用新默认值重新生成，或手动把里面 `decrypt-file.url` 改成 `http://geesun-mcp:8000/mcp`。
 
@@ -190,6 +191,7 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
   1. `docker exec geesun-agent curl -s http://geesun-mcp:8000/mcp` 确认 appnet 内可达；
   2. `docker logs geesun-mcp` 看是否 `ValidationError`（env 缺失）或 E2B/解密报错；
   3. 确认 `mcp.json` 的 url 已是 `geesun-mcp:8000/mcp`（见上方残留坑）。
+- E2B 调用报错 `KeyError: 'code'`（工具级 `ToolException: 'code'`）：根因是 `E2B_API_URL` 指向 vLLM(8003) 而非 cube-api(6000)，`E2BSandbox.connect` 打 404 响应体无 `code` 字段致 e2b 解析崩。修复：`.env` 的 `E2B_API_URL=http://172.16.66.13:6000` 后 redeploy mcp 服务。
 - E2B 调用 TLS 报错：确认 `CA_MOUNT_SRC` 指向真实 CA 文件且 `SSL_CERT_FILE` 已注入（无 MITM 则删挂载+变量）。
 
 ---
@@ -215,18 +217,20 @@ ss -tlnp | grep -E ':(80|8009|8000|3100)\b'
 ---
 
 ### 4.8 CubeSandbox 域名（`*.cube.app`）与 DNS（docker 化）
-sandbox 访问域名形如 `49983-78083c0f5b044a3084a891a2c1f35b50.cube.app`，dev 在 WSL 里用 dnsmasq 转发（`server=/cube.app/192.168.10.136`）；**生产容器里同样要能解析**。
+sandbox 访问域名形如 `49983-78083c0f5b044a3084a891a2c1f35b50.cube.app`，e2b SDK 用该域名连沙箱运行时（`connection_config.get_sandbox_url`）；**生产容器里必须能解析到 `172.16.66.13`**（cube-egress 所在裸金属，dev 机 WSL 的 dnsmasq 也是 `address=/cube.app/172.16.66.13`）。
 
 **Docker 的 DNS 链**：容器 → `127.0.0.11`（docker 内嵌 DNS，只解 appnet 服务名）→ 转发其它域名给上游 resolver（daemon.json `dns` / resolv.conf）。
 
 **正确做法（已在 `deploy/setup-cube-dns.sh` 落地，root 执行一次）**：
-1. 宿主机装 dnsmasq，写入 `/etc/dnsmasq.d/cube.conf`：`server=/cube.app/192.168.10.136`（与 dev 一致；136 提供 `*.cube.app` 解析）；
+1. 宿主机装 dnsmasq，写入 `/etc/dnsmasq.d/cube.conf`：**`address=/cube.app/172.16.66.13`（address= 本地直答模式）** + `server=<resolv.conf 上游>`（保持外网解析）+ `listen-address=<docker0 网关>,127.0.0.1`；
 2. `/etc/docker/daemon.json` 加 `"dns": ["<dnsmasq 监听 IP>"]`（如 docker0 网关 `172.17.0.1`），重启 docker；
-3. 验证：`docker run --rm busybox nslookup xxx.cube.app`。
+3. 验证：`docker run --rm busybox nslookup xxx.cube.app` → 应返回 `172.16.66.13`。
+
+**⚠️ 必须 `address=` 直答，不要 `server=/cube.app/<IP>` 转发**：`server=` 会把查询转发给 `<IP>:53` 的 DNS 服务，而 172.16.66.13 上并无 DNS 服务（实测 53 端口不通），转发必 NXDOMAIN。此前脚本默认 `server=/cube.app/192.168.10.136` 是旧 QEMU dev 环境的写法（136 上确有 dnsmasq），裸金属环境已不适用（2026-09-02 实测修正）。
 
 **为什么不用 compose 的 `dns:` 字段**：它会顶掉 `127.0.0.11`，导致 agent/mcp 容器**无法用服务名**（`geesun-mcp`/`agent-postgres`/`geesun-agent-web`）互访——内嵌 DNS 是服务名解析的唯一通道。daemon 级 `dns` 则保留内嵌 DNS，仅把外部域名转发给 dnsmasq。
 
-**前提**：67 到 `192.168.10.136` 网络可达（与 dev 同内网段）。
+**前提**：67 到 `172.16.66.13` 网络可达（:6000/:8003 实测通）。
 
 ---
 
@@ -396,7 +400,7 @@ cron 示例（每天 03:07）：
      - `CORS_ALLOW_ORIGINS`：按需改成 Web 实际域名/IP。
    - **D. 可保持默认（通常无需改）：**
      - `LOG_LEVEL`/`LOG_FORMAT`、`AGENT_PG_*`、`AGENT_DATA_ROOT`、`REGISTRY_GEESUN/HUB`、`GEESUN_AGENT_TAG`、`LANGFUSE_TAG`、`POSTGRES_VERSION`、`PHOENIX_DB_*`(名称)、`OTEL_PROJECT_NAME`、`*_BASE_URL`(服务名)、网络类 `REDIS_HOST/PORT` 等。
-5. （可选但推荐）CubeSandbox 信任与 DNS：把 `geesun_agent/certs/`（含 `cube-root-ca.crt`）拷到生产机 deploy 上级目录（CA 挂载源），并 root 执行 `bash deploy/setup-cube-dns.sh`（dnsmasq 转发 `*.cube.app`，见 §4.8）。
+5. （可选但推荐）CubeSandbox 信任与 DNS：把 `combined-ca.pem`（或 certs 目录内 `combined-ca.crt` 改名）拷到生产机 deploy 上级目录 certs/（CA 挂载源），并 root 执行 `bash deploy/setup-cube-dns.sh`（dnsmasq `address=` 直答 `*.cube.app` → 172.16.66.13，见 §4.8）。
 6. 一键发布（打包镜像 → 推 Harbor → stack deploy；`--no-build` 可跳过打包只重启）：
    ```sh
    ./start_stack.sh --with=mcp,web

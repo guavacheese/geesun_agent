@@ -28,14 +28,14 @@ services:
       UPLOAD_ROOT: /data/uploads
       REPORT_ROOT: /data/reports
       # CubeSandbox egress CA（容器内挂载路径，源见下方 CA_MOUNT_SRC 卷）
-      SSL_CERT_FILE: /etc/ssl/certs/cube-root-ca.crt
+      SSL_CERT_FILE: /etc/ssl/certs/combined-ca.pem
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/uploads:/data/uploads
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
       # CubeSandbox egress CA：宿主机证书路径由 CA_MOUNT_SRC 指定（默认仓库内 certs/）。
       # 必须指向真实存在的文件；若 sandbox 代理无 MITM 则删除本行 + SSL_CERT_FILE。
-      - ${CA_MOUNT_SRC:-../certs/cube-root-ca.crt}:/etc/ssl/certs/cube-root-ca.crt:ro
+      - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
     networks: [appnet2]
     healthcheck:
       # 仅确认 8000 在监听（streamable-http 的 /mcp 对 GET 语义不定，用 TCP 探活更稳）
