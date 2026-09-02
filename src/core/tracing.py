@@ -50,6 +50,10 @@ def setup_tracing() -> bool:
 
         tracer_provider = trace_sdk.TracerProvider(
             resource=Resource.create({
+                # Phoenix 19.x 按标准 OTel `project.name` 资源属性分组项目；
+                # 旧版 OpenInference 用 `openinference.project.name`，现代 Phoenix 已忽略，
+                # 缺失 `project.name` 时所有 trace 落入内置 "default" 项目（2026-09-02 实测）。
+                "project.name": settings.otel_project_name,
                 "openinference.project.name": settings.otel_project_name,
             })
         )
