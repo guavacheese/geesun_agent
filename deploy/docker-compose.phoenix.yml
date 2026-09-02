@@ -1,19 +1,38 @@
-# Phoenix（Arize）自托管可观测栈 — 作为「路线 B 兜底」始终保留在仓库，不删除。
-# 适用：现网没有共享 Phoenix 实例时，把本文件与 docker-compose.langfuse.yml 一并 -f 并入主栈启动（见 DEPLOYMENT.md §4.9）。
-# 注意：web/grpc 端口不映射到主机，由 caddy 经 appnet 内网代理（:6006 / :4317 内部可达）；
-#       路线 A（现网共用栈在跑）下本文件不并入，agent 经主机 LAN IP 连接共享实例。
-# 第三方镜像来自 Harbor dockerhub 项目（REGISTRY_HUB=172.16.220.74:8333/dockerhub）。
+# Phoenix（Arize）可观测栈 — 纳入 geesun swarm stack（start_stack.sh --with=phoenix 并入）。
+#
+# 为什么从「路线 A 复用现网共享实例」改为自托管：
+#   原共享实例是 compose 项目 opt 的 opt-phoenix-1 容器，RestartPolicy=no；它于
+#   2026-09-01 14:58（北京时间）被优雅停止（日志 Shutting down，ExitCode=0）后未再启动，
+#   /opt/docker-compose.yml 也已不在原位（mv 到 /opt/phoenix/，project 名随之变化）。
+#   结果 6006/4317 无监听 → Alloy 转发 traces 持续
+#   `dial tcp 10.10.10.67:4317: connect: connection refused` 并 Dropping data（2026-09-02 实测）。
+#   纳入 swarm stack 后由 deploy.restart_policy 自愈，不再依赖外部共享实例。
+#
+# 拓扑：agent/Alloy（appnet2）→ Alloy 经 PHOENIX_OTLP_ENDPOINT=phoenix:4317 转发 traces
+#       → phoenix:4317（OTLP gRPC，仅 overlay 内，不发布主机）。
+#       UI 发布到主机 6006；metrics 9090 不发布。
+#
+# 镜像：phoenix:19.1.0 / postgres:16.14 已推送至 Harbor **geesun_ai** 项目（REGISTRY_GEESUN），
+#       不走 dockerhub 项目（该项目的 phoenix/postgres 标签为空）。
+#
+# 数据：使用全新卷 phoenix_pg_data。原共享实例历史数据仍在 opt_database_data 卷
+#       （spans 约 1.1 万行 / traces 218 行，1.7GB），未迁移；需要时再 pg_dump 导入。
 
 services:
   phoenix:
-    image: ${REGISTRY_HUB}/phoenix:19.1.0
+    image: ${REGISTRY_GEESUN}/phoenix:19.1.0
+    # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）
     depends_on:
       - phoenix-db
     environment:
       - PHOENIX_SQL_DATABASE_URL=${PHOENIX_SQL_DATABASE_URL}
       - PHOENIX_PORT=6006
       - PHOENIX_GRPC_PORT=4317
-    networks: [appnet]
+    ports:
+      # UI 发布到主机 6006（ingress）。OTLP gRPC 4317 与 metrics 9090 仅在 appnet2 内可达，
+      # Alloy 用服务名 phoenix:4317 访问，无需发布主机（也避免与现网共享栈争端口）。
+      - "6006:6006"
+    networks: [appnet2]
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:6006/').status==200 else 1)"]
       interval: 15s
@@ -34,7 +53,7 @@ services:
         max-file: "3"
 
   phoenix-db:
-    image: ${REGISTRY_HUB}/postgres:16.14
+    image: ${REGISTRY_GEESUN}/postgres:16.14
     environment:
       - POSTGRES_USER=${PHOENIX_DB_USER}
       - POSTGRES_PASSWORD=${PHOENIX_DB_PASSWORD}
@@ -43,7 +62,7 @@ services:
       - PGTZ=UTC
     volumes:
       - phoenix_pg_data:/var/lib/postgresql/data
-    networks: [appnet]
+    networks: [appnet2]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U phoenix"]
       interval: 5s

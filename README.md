@@ -157,7 +157,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | `docker-compose.yml` | **主栈**：`geesun-agent` + `agent-postgres`（pgvector）+ `caddy` + `loki` + `alloy` + `prometheus` + `grafana`；含 overlay 网络 `appnet2` 与命名卷（端口占用见「端口一览」） |
 | `docker-compose.mcp.yml` | 附加：`geesun-mcp`（MCP 服务，路线 A 默认并入） |
 | `docker-compose.web.yml` | 附加：`geesun-agent-web`（Next.js 前端，并入后由 Caddy :80 同域服务） |
-| `docker-compose.phoenix.yml` | 附加（路线 B 自托管兜底）：`phoenix` + `phoenix-db` |
+| `docker-compose.phoenix.yml` | 附加（**默认并入**）：`phoenix` + `phoenix-db`；Alloy 经服务名 `phoenix:4317` 转发 traces，UI 发布 `6006`。原「复用现网共享实例」方案已废弃——该实例无 restart 策略、停止后 traces 全丢（2026-09-02） |
 | `docker-compose.langfuse.yml` | 附加（路线 B 自托管兜底）：`langfuse-web` / `langfuse-worker` + `clickhouse` / `minio` / `redis` / `postgres` |
 | `start_stack.sh` | **部署入口**：前置检查（docker/swarm/`.env`）→ 调 `build-push.sh` 打包推送 → `docker stack deploy`（带 `--with-registry-auth --resolve-image=always --prune`） |
 | `stop_stack.sh` | 停止并移除 stack（`docker stack rm geesun`，**保留命名卷**） |
@@ -172,7 +172,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 
 > **多文件合并**：主栈默认只含 `docker-compose.yml`；MCP / 前端 / 可观测栈通过 `start_stack.sh --with=mcp,web` 以 `-c` 叠加，共享 overlay 网络 **`appnet2`**（容器间用服务名互访，stack 前缀 `geesun_`）。
 >
-> ⚠️ 网络名不一致（已知）：主栈 / mcp / web 用 `appnet2`，而 `docker-compose.phoenix.yml` 与 `docker-compose.langfuse.yml` 用的是 `appnet`。路线 A（默认，复用现网共享实例）不受影响；**走路线 B 自托管前，需把这两个文件里的 `networks: [appnet]` 统一改成 `appnet2`**，否则并入后跨网络不通。
+> ⚠️ 网络名不一致（已知）：主栈 / mcp / web / **phoenix** 均用 `appnet2`；只有 `docker-compose.langfuse.yml`（路线 B 兜底）仍用 `appnet`。**走路线 B 自托管 Langfuse 前，需把该文件的 `networks: [appnet]` 改成 `appnet2`**，否则并入后跨网络不通。
 
 ### 端口一览（部署前必读）
 
@@ -192,7 +192,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | 服务 | 容器内端口 | 宿主机暴露 | 说明 |
 | --- | --- | --- | --- |
 | `geesun_agent-postgres`（pgvector 0.8.0-pg17） | 5432 | 不发布 | agent 库 `agent_mem`；appnet2 内 `agent-postgres:5432` |
-| `phoenix-db`（路线 B） | 5432 | 不发布 | Phoenix 元数据库 |
+| `geesun_phoenix-db`（`--with=phoenix` 并入） | 5432 | 不发布 | Phoenix 元数据库，卷 `phoenix_pg_data` |
 | `postgres`（路线 B Langfuse） | 5432 | **5432**（mode: host） | ⚠️ 现网已被 `opt-db-1` / `langfuse-postgres-1` 占用 → 路线 B 并入必冲突 |
 | `redis`（路线 B） | 6379 | **6379**（mode: host） | ⚠️ 现网已被共享 redis 占用（127.0.0.1） |
 | `clickhouse`（路线 B） | 8123（HTTP）/ 9000（native） | **8123 / 9000**（mode: host） | ⚠️ 现网已被共享 clickhouse 占用 |
@@ -205,7 +205,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | `geesun_alloy` | 12345（UI/自监控）· 4317（OTLP gRPC）· 4321（OTLP HTTP） | **12345 → 12345** | agent 追踪入口 `http://alloy:4317`（`.env` 的 `PHOENIX_COLLECTOR_ENDPOINT`）；4317/4321 仅内网不发布 |
 | `geesun_prometheus` | 9090 | **19091 → 9090** | 开 `--web.enable-remote-write-receiver` 收 Alloy remote_write；Grafana 数据源走 `prometheus:9090` |
 | `geesun_grafana` | 3000 | **3100 → 3000** | 日志检索 UI（admin / `.env` 的 `GRAFANA_PASSWORD`）。⚠️ compose 现为全网卡发布，而 `.env` 注释称 `127.0.0.1:3100`——**两者不一致**；若只允本机访问，把 compose 改成 `127.0.0.1:3100:3000` |
-| `phoenix`（路线 B） | 6006（HTTP UI）· 4317（OTLP gRPC） | 不发布 | 路线 A（默认）连现网共享实例 `10.10.10.67:6006` / `:4317` |
+| `geesun_phoenix`（默认 `--with=phoenix` 并入） | 6006（HTTP UI）· 4317（OTLP gRPC）· 9090（metrics，默认未启用） | **6006 → 6006** | UI：`http://10.10.10.67:6006`；Alloy 经服务名 `phoenix:4317` 转发 traces（4317/9090 不发布主机）。**已不依赖现网共享实例**（原 `opt-phoenix-1` 无 restart 策略、2026-09-01 停止后 traces 全丢，2026-09-02 改为栈内自托管） |
 | `langfuse-web`（路线 B） | 3000 | 不发布 | 路线 A（默认）连现网共享实例 `http://10.10.10.67:3000`。⚠️ 路线 B 下 UI **仅 overlay 内网可达**：`Caddyfile` 未给 Langfuse 配代理块（其文件头注释称"由 caddy 代理 :3000"，与实际不一致），需外部访问请自行在 `Caddyfile` 加 `:3000` 块（前提该主机端口空闲） |
 | `langfuse-worker`（路线 B） | 3030 | 不发布 | 仅容器间通信 |
 
@@ -231,8 +231,9 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 #### F. 部署前端口自检
 
 ```bash
-# 1) 主栈会占用的宿主机端口（含 --with=mcp,web）——必须全部空闲
-for p in 80 3100 12345 19091; do
+# 1) 主栈会占用的宿主机端口（默认 --with=phoenix,mcp,web）——除 6006 外必须空闲，
+#    6006 为 Phoenix UI（2026-09-02 起随 --with=phoenix 并入）
+for p in 80 3100 6006 12345 19091; do
   printf "%-6s %s\n" "$p" "$(ss -lntupH 2>/dev/null | grep -q ":$p " && echo 'OCCUPIED' || echo 'free')"
 done
 
@@ -244,9 +245,9 @@ curl -s -o /dev/null -w "cube  :%{http_code}\n" http://172.16.66.13:6000/sandbox
 curl -s -o /dev/null -w "harbor:%{http_code}\n" http://172.16.220.74:8333/v2/
 ```
 
-**现网 10.10.10.67 实测占用快照（2026-09-02）**：`22`(sshd) · `53`(dnsmasq) · `80`(caddy) · `323`(chronyd) · `631`(cupsd) · `2377`/`7946`/`4789`(swarm) · `3000`(共享 Langfuse) · `3030`(langfuse-worker, 127.0.0.1) · `3100`(grafana) · `5432`(opt-db + langfuse-postgres) · `6379`(共享 redis, 127.0.0.1) · `8123`/`9000`(共享 clickhouse, 127.0.0.1) · `9091`/`9092`(共享 minio) · `12345`(alloy) · `19091`(prometheus)。
+**现网 10.10.10.67 实测占用快照（2026-09-02，Phoenix 纳入 stack 后）**：`22`(sshd) · `53`(dnsmasq) · `80`(caddy) · `323`(chronyd) · `631`(cupsd) · `2377`/`7946`/`4789`(swarm) · `3000`(共享 Langfuse) · `3030`(langfuse-worker, 127.0.0.1) · `3100`(grafana) · `5432`(opt-db + langfuse-postgres) · `6006`(**Phoenix UI，栈内**) · `6379`(共享 redis, 127.0.0.1) · `8123`/`9000`(共享 clickhouse, 127.0.0.1) · `9091`/`9092`(共享 minio) · `12345`(alloy) · `19091`(prometheus)。
 
-> ⚠️ **由此得出的冲突结论**：主栈 4 个端口（80/3100/12345/19091）在现网不冲突，可直接部署；**路线 B 的 langfuse compose 不可并入现网**（5432/6379/8123/9000/9091/9092 全被共享栈占满），仅适用于全新机器。
+> ⚠️ **由此得出的冲突结论**：主栈 5 个端口（80/3100/6006/12345/19091）在现网不冲突（`--with=phoenix,mcp,web` 可直接部署）；**langfuse compose 不可并入现网**（5432/6379/8123/9000/9091/9092 全被共享栈占满），仅适用于全新机器。Phoenix 已改为栈内自托管，Langfuse 仍复用现网共享实例 `10.10.10.67:3000`。
 
 ### 部署步骤
 
