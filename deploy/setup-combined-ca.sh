@@ -119,4 +119,5 @@ echo "    大小: $(du -h "$CA_OUTPUT" | cut -f1)  md5: $(md5sum "$CA_OUTPUT" | 
 echo
 echo "完成。compose 的 CA_MOUNT_SRC 默认指向 certs/combined-ca.pem；"
 echo "生产机请确认 deploy 上级 certs/ 存在该文件（或把 CA_MOUNT_SRC 指向实际路径）。"
-echo "验证容器内：docker exec <agent容器> sh -c 'md5sum /etc/ssl/certs/combined-ca.pem' 应与上方 md5 一致。"
+echo "验证容器内：docker exec <agent容器> sh -c 'grep -c BEGIN\\ CERTIFICATE /etc/ssl/certs/combined-ca.pem' 应等于上方证书数；"
+echo "（同一脚本生成的副本才可用 md5 比对；与手工 cat 的旧文件比 md5 会因分隔格式不同而误判）"
