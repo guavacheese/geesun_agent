@@ -132,7 +132,8 @@ HARBOR_USER=<你的Harbor账号> HARBOR_PASSWORD=<密码> \
 - 容器通过宿主机的 NAT（MASQUERADE）访问外部 IP（`172.16.66.13` vLLM :8003 与 CubeSandbox :6000），agent 内 `base_url=http://172.16.66.13:8003/v1` 可直接连通（前提是宿主机能路由到该网段）。
 - **CubeSandbox egress MITM CA（docker 化，已落地）**：CubeSandbox 走 `cube-egress` 做 TLS 拦截，提供 `rootCA.pem`。**agent 与 geesun-mcp 两个容器都已配好**（`docker-compose.yml` 与 `docker-compose.mcp.yml`）：
   - bind mount：`${CA_MOUNT_SRC:-../certs/combined-ca.pem}` → `/etc/ssl/certs/combined-ca.pem:ro`（相对 `deploy/` 目录；生产机把 `combined-ca.pem` 拷到 deploy 上级 certs/ 即可）；
-  - **必须用 `combined-ca.pem`（mkcert CA + 147 系统根 bundle，227KB）**：仅挂 `rootCA.pem` 单证书（1688B）会导致容器内 pip/uv 拉 pypi.org（GlobalSign 签发）`UnknownIssuer`，agent 启动即崩（2026-09-01 实测）。宿主机 `combined-ca.crt` 改名 `combined-ca.pem` 即可（内容相同）。
+  - **必须用 `combined-ca.pem`（mkcert CA + 147 系统根 bundle，约 148 证书/227KB）**：仅挂 `rootCA.pem` 单证书（1688B）会把容器内 Python/pip/uv 的默认信任库整体替换成这一个 CA、系统根被全部排除 → 拉 pypi.org（GlobalSign 签发）报 `UnknownIssuer`，agent 启动即崩（2026-09-01 实测反证）。bundle 同时含 mkcert CA（信任内网 cube-egress 拦截）+ 系统根（信任外网），两者缺一不可。
+  - **生成方式（处理流程，脚本化）**：宿主机执行 `bash deploy/setup-combined-ca.sh`——脚本自动①定位本机 mkcert 单证书（`certs/rootCA.pem` 或 `cube-root-ca.pem`/`cube-ca.pem`，可用 `CA_INPUT=` 覆盖）→ ②探测系统根 bundle（Rocky/OpenCloudOS `/etc/pki/tls/certs/ca-bundle.crt`；Debian/Ubuntu `/etc/ssl/certs/ca-certificates.crt`）→ ③python3 按证书块 sha256 合并去重 → ④输出 `combined-ca.pem` 到 `CA_MOUNT_SRC` 默认路径 `certs/combined-ca.pem`，并打印证书数/大小/md5 供与容器内比对。**不要再手动 `cat rootCA.pem ca-bundle.crt > combined-ca.pem`**（旧流程不可复现、易漏去重）。
   - 环境变量：agent 设 `REQUESTS_CA_BUNDLE` + `SSL_CERT_FILE`；mcp 设 `SSL_CERT_FILE`；`CUBE_CA_PATH` 同指容器内 `combined-ca.pem`（sandbox.py 读取）；
   - 若 sandbox 代理无 MITM，可删挂载与该变量。
 - 连接外网组件走 LAN IP 时，容器→主机→目标 NAT 自动完成，无需 `host.docker.internal`。
@@ -400,7 +401,7 @@ cron 示例（每天 03:07）：
      - `CORS_ALLOW_ORIGINS`：按需改成 Web 实际域名/IP。
    - **D. 可保持默认（通常无需改）：**
      - `LOG_LEVEL`/`LOG_FORMAT`、`AGENT_PG_*`、`AGENT_DATA_ROOT`、`REGISTRY_GEESUN/HUB`、`GEESUN_AGENT_TAG`、`LANGFUSE_TAG`、`POSTGRES_VERSION`、`PHOENIX_DB_*`(名称)、`OTEL_PROJECT_NAME`、`*_BASE_URL`(服务名)、网络类 `REDIS_HOST/PORT` 等。
-5. （可选但推荐）CubeSandbox 信任与 DNS：把 `combined-ca.pem`（或 certs 目录内 `combined-ca.crt` 改名）拷到生产机 deploy 上级目录 certs/（CA 挂载源），并 root 执行 `bash deploy/setup-cube-dns.sh`（dnsmasq `address=` 直答 `*.cube.app` → 172.16.66.13，见 §4.8）。
+5. （可选但推荐）CubeSandbox 信任与 DNS：在宿主机跑 `bash deploy/setup-combined-ca.sh` 生成 `combined-ca.pem`（自动合并本机 `rootCA.pem` + 系统根，输出到 deploy 上级 certs/，见 §4.3），并 root 执行 `bash deploy/setup-cube-dns.sh`（dnsmasq `address=` 直答 `*.cube.app` → 172.16.66.13，见 §4.8）。
 6. 一键发布（打包镜像 → 推 Harbor → stack deploy；`--no-build` 可跳过打包只重启）：
    ```sh
    ./start_stack.sh --with=mcp,web
@@ -456,7 +457,7 @@ cron 示例（每天 03:07）：
 | 8 | geesun_mcp_server 容器化进 compose（docker-compose.mcp.yml + build-push.sh build_push_mcp（旧名 sync_mcp）+ requirements.txt + Dockerfile 基镜像 3.13） | `docker-compose.mcp.yml` + `build-push.sh` + `geesun_mcp_server/requirements.txt` + `geesun_mcp_server/Dockerfile` | ✅ 已落地 |
 | 9 | geesun_agent_web 容器化进 compose（docker-compose.web.yml + build-push.sh build_push_web（旧名 sync_web）+ Caddy 路径路由防回环 + next.config standalone） | `docker-compose.web.yml` + `build-push.sh` + `geesun_agent_web/Dockerfile` + `geesun_agent_web/.dockerignore` + `Caddyfile` + `next.config.ts` | ✅ 已落地 |
 | 10 | 复用现网共享可观测栈（路线 A）：prod compose 仅 yml+mcp+web 三文件，Caddy 只留 :80，agent 经 10.10.10.67:4317/:3000 连共享 Phoenix/Langfuse；phoenix/langfuse 两个 compose 文件保留作路线 B 兜底（见 §4.9） | `docker-compose.yml` + `Caddyfile` + `.env.example` + 前端镜像 `NEXT_PUBLIC_API_BASE` + `docker-compose.phoenix.yml` + `docker-compose.langfuse.yml` | ✅ 已落地 |
-| 11 | CubeSandbox 信任与 DNS docker 化：agent/mcp CA 挂载 + REQUESTS_CA_BUNDLE/SSL_CERT_FILE；`setup-cube-dns.sh`（dnsmasq 转发 *.cube.app + daemon dns） | `docker-compose.yml` + `docker-compose.mcp.yml` + 新增 `setup-cube-dns.sh` + §4.3/§4.8 | ✅ 已落地 |
+| 11 | CubeSandbox 信任与 DNS docker 化：agent/mcp CA 挂载 + REQUESTS_CA_BUNDLE/SSL_CERT_FILE；`setup-combined-ca.sh`（生成 mkcert+系统根 bundle）；`setup-cube-dns.sh`（dnsmasq 直答 *.cube.app + daemon dns） | `docker-compose.yml` + `docker-compose.mcp.yml` + 新增 `setup-combined-ca.sh` + `setup-cube-dns.sh` + §4.3/§4.8 | ✅ 已落地 |
 
 > 实现项 #1–#5、#7–#11 已落地；仅 #6（Harbor Retention）需在控制台人工配置，步骤见 §11。
 

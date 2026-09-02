@@ -44,7 +44,10 @@ services:
       langfuse_secret_key: "${LANGFUSE_SECRET_KEY}"
       otel_project_name: "${OTEL_PROJECT_NAME:-Geesun-Agent-prod}"
       cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67}"
-      # CubeSandbox egress MITM CA（sandbox 出网 TLS 拦截证书，无 MITM 可删挂载+这两行）
+      # CubeSandbox egress MITM CA：必须用 combined-ca.pem（mkcert+系统根 bundle），
+      # 仅挂 rootCA.pem 单证书会整体替换信任库、排除系统根 → uv 拉 pypi UnknownIssuer
+      # 启动即崩（2026-09-01 实测）。生成：宿主机 bash deploy/setup-combined-ca.sh。
+      # 无 MITM 可删挂载+这两行。
       REQUESTS_CA_BUNDLE: /etc/ssl/certs/combined-ca.pem
       SSL_CERT_FILE: /etc/ssl/certs/combined-ca.pem
     # 宿主机挂载：报告/上传/工作目录防容器重建丢失（AGENT_DATA_ROOT 见 .env）
@@ -55,7 +58,8 @@ services:
       # skills 三层目录（__system__/__agent__/__user_*__）——backend 路由 root_dir 依赖
       # /data/agent/skills 存在，缺失会 path_not_found（2026-09-02 实测）；挂宿主机侧持久化
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/skills:/data/agent/skills
-      # CubeSandbox CA（挂载源相对 deploy/ 目录，见 .env 的 CA_MOUNT_SRC；combined-ca.pem = mkcert+系统根）
+      # CubeSandbox CA：挂载源见 .env 的 CA_MOUNT_SRC，由 deploy/setup-combined-ca.sh 生成
+      # （mkcert+系统根 bundle，约 148 证书——不能只挂 rootCA.pem 单证书，原因见 .env.example 注释）
       - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
     # agent 连不上 postgres 时靠自身重试/重启直至就绪（等效等待 healthy）

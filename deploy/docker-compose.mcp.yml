@@ -27,7 +27,9 @@ services:
       AGENT_WORKSPACE: /data/agent
       UPLOAD_ROOT: /data/uploads
       REPORT_ROOT: /data/reports
-      # CubeSandbox egress CA（容器内挂载路径，源见下方 CA_MOUNT_SRC 卷）
+      # CubeSandbox egress CA（容器内挂载路径，源见下方 CA_MOUNT_SRC 卷）。
+      # 必须用 combined-ca.pem（mkcert+系统根 bundle）；只挂 rootCA.pem 单证书会排除
+      # 系统根 → pip/uv 拉 pypi UnknownIssuer。生成：bash deploy/setup-combined-ca.sh
       SSL_CERT_FILE: /etc/ssl/certs/combined-ca.pem
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
@@ -35,7 +37,8 @@ services:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/reports:/data/reports
       # skills 三层目录——mcp 的 run_script_from_skill 也走 /data/agent/skills
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/skills:/data/agent/skills
-      # CubeSandbox egress CA：宿主机证书路径由 CA_MOUNT_SRC 指定（默认仓库内 certs/）。
+      # CubeSandbox egress CA：宿主机证书路径由 CA_MOUNT_SRC 指定（默认仓库内 certs/，
+      # 由 deploy/setup-combined-ca.sh 生成，mkcert+系统根 bundle——不能只挂 rootCA.pem）。
       # 必须指向真实存在的文件；若 sandbox 代理无 MITM 则删除本行 + SSL_CERT_FILE。
       - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
     networks: [appnet2]

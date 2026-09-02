@@ -166,9 +166,9 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | `.env.example` | **全部环境变量安全模板**（可入库）；复制为 `.env` 后填密钥 |
 | `.env` | 真实连接配置（**不入库**，务必 `chmod 600`） |
 | `Caddyfile` / `alloy.config.alloy` / `loki-config.yaml` / `prometheus.yml` / `grafana/` | 各服务运行时配置（bind mount 进容器） |
-| `setup-cube-dns.sh` / `init-host.sh` | 主机侧辅助：`*.cube.app` DNS 解析、主机初始化 |
+| `setup-cube-dns.sh` / `setup-combined-ca.sh` / `init-host.sh` | 主机侧辅助：`*.cube.app` DNS 解析、生成 combined-ca.pem（mkcert+系统根 bundle）、主机初始化 |
 | `backup.sh` | 数据卷备份 |
-| `certs/` | CubeSandbox egress MITM CA（供 agent / mcp 容器信任 sandbox 出网 TLS 拦截） |
+| `certs/` | CubeSandbox egress MITM CA（供 agent / mcp 容器信任 sandbox 出网 TLS 拦截）。**`combined-ca.pem` 由 `deploy/setup-combined-ca.sh` 生成**（自动合并你上传的 `rootCA.pem` 单证书 + 系统根 bundle），不要手动 cat；目录不入库 |
 
 > **多文件合并**：主栈默认只含 `docker-compose.yml`；MCP / 前端 / 可观测栈通过 `start_stack.sh --with=mcp,web` 以 `-c` 叠加，共享 overlay 网络 `appnet`（容器间用服务名互访，stack 前缀 `geesun_`）。
 
@@ -182,6 +182,19 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
   - Docker Desktop：Settings → Docker Engine → 加入上述 JSON → Apply & Restart
 - 目标机登录 Harbor（私有仓库拉取镜像必需）：`docker login 172.16.220.74:8333`
 - 预建 agent 工作目录（防容器重建丢数据）：`mkdir -p /opt/geesun/data/{agent,uploads,reports}`（路径对应 `.env` 的 `AGENT_DATA_ROOT`）
+- **生成 CA 合并 bundle（为什么不是直接用上传的 `rootCA.pem`，见下方说明）**：
+  ```bash
+  # 把上传的 rootCA.pem 放到仓库 certs/（或任一路径），然后在宿主机执行：
+  bash deploy/setup-combined-ca.sh          # 输出 certs/combined-ca.pem（mkcert+系统根，约 148 证书/227KB）
+  # 生产机如需自定义路径：CA_INPUT=/opt/x/rootCA.pem CA_OUTPUT=/opt/x/combined-ca.pem bash deploy/setup-combined-ca.sh
+  ```
+  > **为什么 .env.example 里挂的是 `combined-ca.pem` 而不是你上传的 `rootCA.pem`**：`rootCA.pem` 只是 CubeSandbox egress MITM 的 mkcert 单证书（约 1.7KB）。容器内 `SSL_CERT_FILE` 指向它后，Python/pip/uv 的默认信任库被**整体替换**成这一个 CA → 系统根被全部排除 → agent 启动 `uv sync` 拉 pypi.org（GlobalSign 签发）报 `UnknownIssuer` 直接崩。`combined-ca.pem` = mkcert CA（信任内网拦截证书）+ 系统根（信任外网 pypi 等），两者缺一不可（2026-09-01 实测反证）。
+- **配置 `*.cube.app` 域名解析（sandbox 运行时访问依赖，见 DEPLOYMENT §4.8）**：e2b SDK 用 `<port>-<sandbox_id>.cube.app` 域名连沙箱，容器内必须解析到 `172.16.66.13`（cube-egress 所在裸金属）：
+  ```bash
+  sudo bash deploy/setup-cube-dns.sh   # 宿主机 root 执行一次：dnsmasq address= 直答 + daemon.json dns 指向 dnsmasq
+  # 验证：docker run --rm busybox nslookup xxx.cube.app 应返回 172.16.66.13
+  ```
+  > 必须 `address=` 本地直答模式；不要用 `server=/cube.app/<IP>` 转发——172.16.66.13:53 无 DNS 服务，转发必 NXDOMAIN（2026-09-02 实测修正）。
 - Harbor 提前建好两个项目：`geesun_ai`（自有应用）、`dockerhub`（第三方中央仓库）
 
 #### 1. 构建并推送镜像（在有源码的构建机执行）
@@ -283,8 +296,8 @@ cd deploy
 | `DECRYPT_API_URL` | DLP 解密网关地址（compose 外，MCP 内部 httpx POST 加密文件） |
 | `E2B_API_URL` | CubeSandbox(E2B) 代理地址（实测与 vLLM 同主机同端口，按路径区分服务，非笔误） |
 | `E2B_API_KEY` | CubeSandbox API Key |
-| `SSL_CERT_FILE` | 容器内信任的 CubeSandbox egress CA 路径（无 MITM 可删） |
-| `CA_MOUNT_SRC` | CA 证书在宿主机的路径（相对 `deploy/`，bind mount 进容器） |
+| `SSL_CERT_FILE` | 容器内信任的 CubeSandbox egress CA 路径（必须 `combined-ca.pem` bundle，不能只挂 rootCA.pem 单证书——会排除系统根致 pypi UnknownIssuer；无 MITM 可删） |
+| `CA_MOUNT_SRC` | CA 证书在宿主机的路径（相对 `deploy/`，bind mount 进容器；文件由 `setup-combined-ca.sh` 生成） |
 
 #### 日志 / 数据库 / 数据根
 
