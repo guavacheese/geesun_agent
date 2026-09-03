@@ -306,9 +306,20 @@ cd deploy
 STACK_NAME=geesun ./start_stack.sh         # 显式指定 stack 名（默认 geesun）
 ```
 
+按场景选命令（参数/变量语义、影响范围与推演详见 [`deploy/DEPLOYMENT.md`](./deploy/DEPLOYMENT.md) §1.6）：
+
+| 场景 | 操作 | 影响范围 |
+| --- | --- | --- |
+| **首次部署**（从零拉起） | 目标机先 `docker swarm init` + `docker login <Harbor>`；构建机 `./build-push.sh` 全量打包推送；目标机 `./start_stack.sh`（默认只发主栈；要带子栈就补全 `--with=...`） | 全新拉起 |
+| **加挂子栈**（首次引入 mcp/web/phoenix/langfuse） | `./start_stack.sh --with=<完整复刻>`——`--with` 每次必须与上次完全一致，漏项会触发 `--prune` 清掉对应服务 | 新增服务 |
+| **只改了 `.env`**（如 langfuse PK/SK、DB 密码） | `./start_stack.sh --no-build --with=<与上次完全一致>`（几十秒完成）。`.env` 是 deploy 那一刻固化的快照，`docker service update --force` 不会重读 `.env`，重跑 deploy 是唯一生效入口 | 仅引用了变更 env 的服务滚动重启，其余零中断 |
+| **改了源码**（agent/mcp/web 任一） | 回构建机 `./build-push.sh`（**先递增 `*_TAG`**，否则同 tag 拉到的还是旧镜像）→ 目标机 `.env` 改对应 tag → `./start_stack.sh --no-build --with=<复刻>` | 单服务滚动重启 |
+| **停掉某服务**（如不用 langfuse） | 从 compose 集合移除：`./start_stack.sh --no-build --with=<剩余项>`——`--prune` 删该服务 task；命名卷/数据保留，将来要恢复把该项传回 `--with` 重新拉起即可 | 对应服务被清理 |
+
 - `--with-registry-auth`：依赖本机已 `docker login` Harbor，否则私有镜像拉取失败
 - `--resolve-image=always`：固定 tag 重新发布时强制拉新镜像
-- `--prune`：compose 中删掉的服务会被真正清理
+- `--prune`：compose 中删掉的服务会被真正清理（**只删服务，命名卷保留**）
+- `STACK_NAME` 默认 `geesun`，**一旦定了别改**——改名等于另起一套 stack，旧服务全部孤立
 
 #### 4. 校验
 
