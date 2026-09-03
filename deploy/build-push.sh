@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ⚠️ 行尾禁区：本文件（及 deploy/ 下所有 .sh/.yml/.yaml/.env）必须以 LF 行尾保存！
+#    Windows 记事本/某些编辑器会写成 CRLF，传到目标机(67)后执行会报：
+#        /usr/bin/env bash^M: bad interpreter: No such file or directory
+#    根因：bash 把 \r 当成解释器名的一部分。仓库根 .gitattributes 已强制 eol=lf 归一，
+#    但凡改动本文件请用 LF 保存（IDE 设 "Line Separator: LF"），别用记事本。
+#    自检：grep -c $'\r' build-push.sh  → 必须输出 0。
 # ───────────────────────────────────────────────────────────────────────────
 # 构建自有应用镜像（推送至 REGISTRY_GEESUN 所指项目，默认 geesun_ai），并把所有第三方
 # 镜像同步进 REGISTRY_HUB 所指项目——生产单仓（2026-09-02 起）：REGISTRY_HUB 与
@@ -51,6 +57,14 @@ PROMETHEUS_TAG="${PROMETHEUS_TAG:-3.0}"
 # 监控采集器（主机/容器指标 → Grafana 四张看板的数据源，见 deploy/grafana/dashboards/）
 NODE_EXPORTER_TAG="${NODE_EXPORTER_TAG:-v1.8.2}"
 CADVISOR_TAG="${CADVISOR_TAG:-v0.49.1}"
+# cadvisor 上游仓库可覆盖：官方只在 gcr.io 发布，内网构建机（含本机）通常无法直连 gcr.io。
+# 若本轮同步报 cadvisor 失败，请在能出网的机器上执行（tag 后 push 进 Harbor 即可，无需重跑本脚本）：
+#   CADVISOR_SRC=172.16.220.74:8333/geesun_ai/cadvisor   # 出网机推上去后再回本机验证
+# 或在出网机上直接：
+#   docker pull gcr.io/cadvisor/cadvisor:${CADVISOR_TAG}
+#   docker tag  gcr.io/cadvisor/cadvisor:${CADVISOR_TAG} 172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG}
+#   docker push 172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG}
+CADVISOR_SRC="${CADVISOR_SRC:-gcr.io/cadvisor/cadvisor}"
 
 echo "==> REGISTRY_GEESUN = $REGISTRY_GEESUN"
 echo "==> REGISTRY_HUB     = $REGISTRY_HUB"
@@ -124,19 +138,23 @@ build_push_web
 # 用法: sync <公网镜像> <harbor内短名:tag>
 # 注意：sync() 是「同步第三方镜像」（公网 pull → tag → push 进 REGISTRY_HUB 所指项目），
 # 与上面 build_push_mcp / build_push_web（构建自有代码镜像推 geesun_ai 项目）语义不同。
+# 失败清单：单个第三方镜像拉不到（例如内网机访问不到 gcr.io）不应中断整轮同步，
+# 否则后面的镜像全部推不进 Harbor。改为收集失败项，末尾统一汇总并以非零退出码暴露。
+SYNC_FAILED=()
 sync() {
   local src="$1" dst="$REGISTRY_HUB/$2"
   echo "==> 同步 $src -> $dst"
-  if docker pull "$src" 2>/dev/null; then
-    :
-  elif docker image inspect "$src" >/dev/null 2>&1; then
-    echo "    (公网拉取失败，使用本地已存在的 $src)"
-  else
-    echo "    [错误] 无法拉取且本地无 $src，跳过" >&2
-    return 1
+  if ! docker pull "$src" 2>/dev/null; then
+    if docker image inspect "$src" >/dev/null 2>&1; then
+      echo "    (公网拉取失败，使用本地已存在的 $src)"
+    else
+      echo "    [错误] 无法拉取且本地无 $src，记入失败清单，继续同步其余镜像" >&2
+      SYNC_FAILED+=("$src")
+      return 0
+    fi
   fi
-  docker tag "$src" "$dst"
-  docker push "$dst"
+  docker tag "$src" "$dst"  || { echo "    [错误] tag 失败" >&2; SYNC_FAILED+=("$src (tag)"); return 0; }
+  docker push "$dst"        || { echo "    [错误] push 失败" >&2; SYNC_FAILED+=("$src (push)"); return 0; }
 }
 
 # 主栈依赖（→ REGISTRY_HUB=geesun_ai 单仓）
@@ -149,7 +167,8 @@ sync "grafana/grafana:11.3.0"                  "grafana:11.3.0"
 sync "prometheus:${PROMETHEUS_TAG:-3.0}"        "prometheus:${PROMETHEUS_TAG:-3.0}"
 # 监控采集器（主机/容器指标；Grafana 看板数据源，缺此二者「主机/容器概览」全空）
 sync "prom/node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}"   "node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}"
-sync "gcr.io/cadvisor/cadvisor:${CADVISOR_TAG:-v0.49.1}" "cadvisor:${CADVISOR_TAG:-v0.49.1}"
+# 上游默认 gcr.io（内网常见不可达，失败不中断，见 SYNC_FAILED 汇总与 CADVISOR_SRC 说明）
+sync "${CADVISOR_SRC:-gcr.io/cadvisor/cadvisor}:${CADVISOR_TAG:-v0.49.1}" "cadvisor:${CADVISOR_TAG:-v0.49.1}"
 # Phoenix（→ REGISTRY_HUB=geesun_ai 单仓）
 sync "arizephoenix/phoenix:19.1.0"            "phoenix:19.1.0"
 sync "postgres:16.14"                          "postgres:16.14"
@@ -159,6 +178,25 @@ sync "clickhouse/clickhouse-server:25.12"      "clickhouse-server:25.12"
 sync "cgr.dev/chainguard/minio"                "minio:chainguard"
 sync "redis:7"                                 "redis:7"
 sync "postgres:17"                             "postgres:17"
+
+# ── 4. 失败汇总（不静默：任一镜像未同步进 Harbor，都以非零退出码暴露）──
+if [ "${#SYNC_FAILED[@]}" -gt 0 ]; then
+  echo "" >&2
+  echo "==> ⚠️ 有 ${#SYNC_FAILED[@]} 个第三方镜像未同步进 Harbor：" >&2
+  printf '      - %s\n' "${SYNC_FAILED[@]}" >&2
+  echo "" >&2
+  echo "    影响：目标机 docker stack deploy 时对应服务会停在 preparing / No such image。" >&2
+  echo "    处理：在能出网的机器上手工拉取后推入 Harbor，例如：" >&2
+  for f in "${SYNC_FAILED[@]}"; do
+    short="${f##*/}"                       # gcr.io/cadvisor/cadvisor:v0.49.1 -> cadvisor:v0.49.1
+    echo "      docker pull $f" >&2
+    echo "      docker tag  $f $REGISTRY_HUB/$short" >&2
+    echo "      docker push $REGISTRY_HUB/$short" >&2
+  done
+  echo "" >&2
+  echo "==> 其余镜像同步完成（geesun-agent / geesun-mcp-server / geesun-agent-web 已推送至 $REGISTRY_GEESUN）" >&2
+  exit 1
+fi
 
 echo "==> 完成。geesun-agent / geesun-mcp-server / geesun-agent-web 已推送至 $REGISTRY_GEESUN；第三方镜像已推送至 $REGISTRY_HUB"
 echo "    后续在目标机（镜像已在 Harbor）执行："

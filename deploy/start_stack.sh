@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 #
+# ⚠️ 行尾禁区：本文件（及 deploy/ 下所有 .sh/.yml/.yaml/.env）必须以 LF 行尾保存！
+#    Windows 记事本/某些编辑器会写成 CRLF，传到目标机(67)后执行会报：
+#        /usr/bin/env bash^M: bad interpreter: No such file or directory
+#    根因：bash 把 \r 当成解释器名的一部分。仓库根 .gitattributes 已强制 eol=lf 归一，
+#    但凡改动本文件请用 LF 保存（IDE 设 "Line Separator: LF"），别用记事本。
+#    自检：grep -c $'\r' start_stack.sh  → 必须输出 0。
+#
 # start_stack.sh — 以 Docker Swarm stack 方式部署 geesun_agent 主栈（含可选附加 compose）。
 #
 # 与 flyctrl_deploy 的 start_stack.sh 同源思路，但补齐了 Swarm 必带参数与前置检查：

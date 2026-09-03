@@ -1,7 +1,9 @@
 # 统一行尾为 LF，防止 Windows 环境 CRLF 入库/检出
 # 背景：deploy 目录曾被 CRLF 直接提交，导致目标机拷贝后 .env 值尾带 \r，
 #       compose 展开 ${REGISTRY_HUB} 得非法 image 报 invalid reference format。
-* text=auto
+# 关键：text=auto 仅“归一入库”，但 Windows checkout 会还原成本机 CRLF —— 这正是行尾坑反复复发之源。
+# 必须显式 eol=lf，强制所有文本文件“检出也为 LF”，从根上消除 Windows 编辑器/checkout 引入的 CRLF。
+* text=auto eol=lf
 
 # 显式强制 LF（覆盖 text=auto 的猜测）
 *.sh text eol=lf

@@ -242,6 +242,24 @@ Grafana：`http://10.10.10.67:3100`（admin + `.env` 的 `GRAFANA_PASSWORD`）�
 - **agent 业务指标未落 Prometheus**：实测 `genai_*` / `http_server_*` / token 类指标 0 个，traces 正常 → 疑似 agent 侧只注册了 tracer provider、未注册 meter provider（OTLP metrics 断链）。「tokens/延迟/会话数」类看板待该链路修好后补
 - **未配告警规则**（Grafana Alerting）：待看板用顺后再加，建议起步三条——根分区 >80%、容器重启、`ERROR` 日志 5 分钟突增；通知渠道内网 webhook 或邮件
 
+### 1.7.5 行尾约定（CRLF 禁区，防复发）
+
+`deploy/` 下所有文本文件（`.sh` / `.yml` / `.yaml` / `.env` / `.example` / `Caddyfile` 等）**必须以 LF 行尾保存**，严禁 CRLF。这是反复踩过的坑：
+
+- **症状**：本机（Windows）用记事本/默认编辑器保存成 CRLF 后，scp/sftp 传到目标机（67, Linux）执行 `start_stack.sh` / `build-push.sh` 会直接报：
+  ```
+  /usr/bin/env bash^M: bad interpreter: No such file or directory
+  ```
+  更早的变体：CRLF 的 `.env` 值尾带 `\r`，compose 展开 `${REGISTRY_HUB}` 得非法 image 名 → `invalid reference format`。
+- **根因**：`\r`（CR）被 bash / compose 当成值/解释器名的一部分，Linux 不认。
+- **机制兜底（已在仓库根 `.gitattributes` 落实）**：`* text=auto` + 各类型显式 `eol=lf`，提交时自动归一为 LF、检出也强制 LF。**任何人拉下来都不会再带回 CRLF**，从源头消除该问题。
+- **编辑纪律**：改这些文件时，IDE 设 `Line Separator: LF`（不要 `CRLF`），**不要用 Windows 记事本**直接存 deploy 文件。
+- **自检命令**（改动后跑一下，必须输出 `0`）：
+  ```bash
+  grep -c $'\r' deploy/start_stack.sh deploy/build-push.sh
+  ```
+- 两个 shell 脚本顶部也已内嵌同样的警告注释，编辑时一眼可见。
+
 ---
 
 ## 2. 完整环境变量清单（`deploy/.env`，对照 `.env.example`）

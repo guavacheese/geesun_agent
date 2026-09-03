@@ -247,41 +247,14 @@ services:
         max-size: "20m"
         max-file: "3"
 
-  # ── cAdvisor：容器级指标（每容器 CPU / 内存 / 网络 / 文件系统）──
-  # Grafana「容器概览」看板的数据源，用于定位"哪个服务吃 CPU/内存/在重启"。
-  # 注意（2026-09-03 实测本机要点）：Docker 29 启用 containerd snapshotter
-  # （Storage Driver=overlayfs / io.containerd.snapshotter.v1，镜像层在 /var/lib/containerd，
-  #  不是传统的 /var/lib/docker/overlay2）——故除 /var/lib/docker 外必须挂
-  # /var/lib/containerd + containerd.sock，否则容器名映射不上、指标全空。
-  cadvisor:
-    image: ${REGISTRY_HUB}/cadvisor:${CADVISOR_TAG:-v0.49.1}
-    command:
-      - --docker_only=true
-      - --housekeeping_interval=15s
-      - --store_container_labels=false
-    privileged: true   # 需读 cgroup/procfs；监控采集器惯例，仅限本服务
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker:/var/lib/docker:ro
-      - /var/lib/containerd:/var/lib/containerd:ro
-      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
-      - /dev/disk:/dev/disk:ro
-    networks: [appnet2]
-    deploy:
-      mode: global
-      restart_policy:
-        condition: any
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256m
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+  # ── cAdvisor（容器级指标：每容器 CPU / 内存 / 网络 / 文件系统）已拆出主栈 ──
+  # 拆出原因（2026-09-03 实测）：官方镜像仅发布于 gcr.io，内网构建机不可达；
+  #   留在本文件会导致 stack deploy 时该服务长期停在 preparing / No such image，
+  #   而 Swarm 不会因为单个服务缺镜像而失败——表现为"部署成功但一直起不来"，排查成本高。
+  # 镜像同步进 Harbor 后（在能出网的机器上 pull → tag → push，见 build-push.sh 失败汇总提示），
+  #   叠加部署即可，主栈其余服务不受影响：
+  #     ./start_stack.sh --no-build --with=cadvisor
+  # 服务定义见 docker-compose.cadvisor.yml；Grafana「容器概览」看板待其上线后才有数据。
 
   grafana:
     image: ${REGISTRY_HUB}/grafana:11.3.0

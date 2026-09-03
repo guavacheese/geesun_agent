@@ -1,0 +1,56 @@
+# ── cAdvisor：容器级指标采集（可选附加栈，--with=cadvisor 叠加）──
+#
+# 为何独立成文件而不是放进主栈 docker-compose.yml：
+#   官方镜像（gcr.io/cadvisor/cadvisor）在内网构建机不可达（2026-09-03 实测：
+#   gcr.io 超时、Docker Hub 的 google/cadvisor 已废弃、阿里云/华为云/daocloud 均拒绝或需登录）。
+#   留在主栈会让 stack deploy 长期停在 preparing / No such image，却又不报错，排查成本高。
+#   拆出后：主栈（含 node-exporter）可先正常上线，cadvisor 镜像到位再叠加。
+#
+# 前置：镜像需先进 Harbor（在能出网的机器上执行，build-push.sh 同步失败时会打印同样提示）：
+#   docker pull gcr.io/cadvisor/cadvisor:${CADVISOR_TAG:-v0.49.1}
+#   docker tag  gcr.io/cadvisor/cadvisor:${CADVISOR_TAG:-v0.49.1} 172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG:-v0.49.1}
+#   docker push 172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG:-v0.49.1}
+#
+# 部署（在 deploy/ 目录，与主栈合并发布；变量由 start_stack.sh 从 .env 注入并展开）：
+#   ./start_stack.sh --no-build --with=cadvisor
+# 验证：
+#   docker service ps geesun_cadvisor --no-trunc | head
+#   docker service logs geesun_cadvisor | tail -20
+#
+# Grafana「容器概览」看板（geesun-containers）的数据源即本服务；
+# 未部署时该看板面板为空属预期，主机/日志/服务健康三张看板不受影响。
+
+services:
+  cadvisor:
+    image: ${REGISTRY_HUB}/cadvisor:${CADVISOR_TAG:-v0.49.1}
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --store_container_labels=false
+    privileged: true   # 需读 cgroup/procfs；监控采集器惯例，仅限本服务
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      # 2026-09-03 实测要点：Docker 29 默认启用 containerd snapshotter
+      # （Storage Driver=overlayfs / io.containerd.snapshotter.v1），镜像层位于
+      # /var/lib/containerd 而非传统 /var/lib/docker/overlay2。缺下面两行挂载，
+      # cAdvisor 无法把容器 ID 映射成容器名，指标里 container=="" 导致看板全空。
+      - /var/lib/containerd:/var/lib/containerd:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - /dev/disk:/dev/disk:ro
+    networks: [appnet2]
+    deploy:
+      mode: global
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
