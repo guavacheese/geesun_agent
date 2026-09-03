@@ -72,6 +72,11 @@ services:
       REDIS_AUTH: ${REDIS_AUTH}
       LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: ${LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK}
       REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED}
+      # V8 heap 上限锁 3 GB（默认 ~1.5 GB 会让 init/迁移在 4 GB 容器内仍先撞 V8 上限 OOM）。
+      # 必须与 deploy.resources.limits.memory=4g 配套：单加此项则容器限 2g 时进程被内核 OOM-kill；
+      # 单加 limit 不设此项则 V8 仍在 ~1.5 GB 崩溃（2026-09-03 实测：init scripts 跑一半 heap OOM，
+      # organization 从未建成，UI 一直要求 New Organization）。
+      NODE_OPTIONS: "--max-old-space-size=3072"
     networks: [appnet2]
     deploy:
       restart_policy:
@@ -79,7 +84,9 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 2g
+          # 4 GB：web/worker 均运行 Prisma 迁移 + Next.js 服务（Node V8 heap 锁 3 GB 见上），
+          # 2 GB 实测不足（2026-09-03 init 阶段 heap OOM，org 从未建成）。
+          memory: 4g
     logging:
       driver: json-file
       options:
@@ -121,7 +128,7 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 2g
+          memory: 4g
     logging:
       driver: json-file
       options:
