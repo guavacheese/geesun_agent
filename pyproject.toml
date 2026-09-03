@@ -19,6 +19,10 @@ dependencies = [
     "ldap3>=2.9.1",
     "openai>=2.32.0",
     "openinference-instrumentation-langchain>=0.1.0",
+    # FastAPI HTTP server metrics（http_server_*）+ HTTP server span：与 langchain
+    # OpenInference instrumentor 无冲突（不同层）；0.50b0 以下无 http.server.request.duration，
+    # 需 0.50b0+ 才有新版 HTTP server metric（2026-09-03 OTLP metrics 补链路）
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
     "opentelemetry-exporter-otlp-proto-http>=1.30.0",
     "openpyxl>=3.1.5",
     "pandas>=3.0.2",

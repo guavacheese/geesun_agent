@@ -19,7 +19,18 @@ class Settings(BaseSettings):
     mcp_server_url: str = "http://localhost:8000/mcp"
 
     # Arize Phoenix 追踪（从 .env 或环境变量读取）
+    # 注意（2026-09-03）：生产 compose 默认注入 http://alloy:4317——alloy 是
+    # trace/metrics 统一 OTLP 入口（grpc 同端口按 OTLP service path 分流），
+    # 不再直连 Phoenix；本字段名保留 phoenix 但实际承担"OTLP gRPC 统一端点"。
     phoenix_collector_endpoint: str = ""
+
+    # ─── OTel metrics（2026-09-03 新增，修复 genai_*/http_server_* 全 0）───
+    # 此前 setup_tracing() 只注册 TracerProvider、从未创建 MeterProvider → metrics API
+    # 走 no-op，进程不发任何 OTLP metrics 请求（alloy/Prometheus 空等）。此处补管道：
+    # otel_metrics_enabled=False 可整体关闭（回归纯 trace）；
+    # otel_metrics_endpoint 留空 = 复用 phoenix_collector_endpoint（推荐，同一 alloy 入口）。
+    otel_metrics_enabled: bool = True
+    otel_metrics_endpoint: str = ""
 
     # Langfuse 追踪（OpenTelemetry HTTP ingest）
     langfuse_secret_key: str = ""

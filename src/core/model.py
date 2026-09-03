@@ -3,6 +3,7 @@ from typing import Callable
 import asyncio
 import logging
 import re
+import time
 
 from langchain_openai import ChatOpenAI
 from langchain.agents.middleware import (
@@ -62,6 +63,76 @@ def _capture_usage(resp, request) -> None:
     if len(_session_prompt_tokens) > 2000:
         _session_prompt_tokens.clear()
     logger.warning("[DIAG] 引擎真实 prompt_tokens=%d (session=%s)", real_in, sid)
+
+
+# ─── GenAI OTLP metrics 打点（2026-09-03 新增，标准 semconv 命名）───
+# 背景：官方 opentelemetry-instrumentation-openai 会为 LLM 调用叠加第二层 gen_ai span
+#（langchain OpenInference instrumentor 已包一层 → Phoenix LLM 面板可能计数双算），
+# 故采用「标准指标名 + 自研打点」路线（经确认）：
+#   gen_ai.client.token.usage        Histogram（无 unit）—— input/output 由属性
+#                                    gen_ai.token.type 区分（引擎真实 usage，非估算）
+#   gen_ai.client.operation.duration Histogram（unit=s）—— 每次 LLM 调用墙钟耗时
+# 属性：gen_ai.system="openai"（全链路 OpenAI 兼容协议：vLLM/Kimi/GLM 同）、
+#       gen_ai.request.model、error.type（失败路径）。
+# 安全：若 setup_tracing() 未注册 MeterProvider（otel_metrics_enabled=False / endpoint
+# 缺失），metrics_api.get_meter 返回 no-op meter → 全部 record 静默丢弃，零成本零风险，
+# 绝不影响主链路（与 token 缓存同层旁路，不抛异常）。
+_genai_instruments: dict | None = None
+
+
+def _get_genai_instruments() -> dict:
+    """懒取 meter + instrument（并发下重复创建亦无害；opentelemetry-api 缺失时静默返回空）。"""
+    global _genai_instruments
+    if _genai_instruments is None:
+        try:
+            from opentelemetry import metrics as metrics_api
+
+            meter = metrics_api.get_meter("geesun.agent", "0.1.0")
+            _genai_instruments = {
+                "token_usage": meter.create_histogram(
+                    name="gen_ai.client.token.usage",
+                    description="GenAI 每次调用的 token 消耗（引擎真实 usage）",
+                ),
+                "duration": meter.create_histogram(
+                    name="gen_ai.client.operation.duration",
+                    description="GenAI 每次调用的墙钟耗时",
+                    unit="s",
+                ),
+            }
+        except Exception:
+            _genai_instruments = {}
+    return _genai_instruments
+
+
+def _record_genai_metrics(
+    *,
+    model_name: str | None,
+    duration_s: float | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    error_type: str | None = None,
+) -> None:
+    """记录一次 LLM 调用的 gen_ai 指标。成功：token + duration；失败：duration + error.type。"""
+    inst = _get_genai_instruments()
+    if not inst:
+        return
+    base = {
+        "gen_ai.system": "openai",
+        "gen_ai.request.model": model_name or settings.model_name or "unknown",
+    }
+    if duration_s is not None:
+        attrs = dict(base)
+        if error_type:
+            attrs["error.type"] = error_type
+        inst["duration"].record(duration_s, attributes=attrs)
+    if input_tokens is not None:
+        inst["token_usage"].record(
+            input_tokens, attributes={**base, "gen_ai.token.type": "input"}
+        )
+    if output_tokens is not None:
+        inst["token_usage"].record(
+            output_tokens, attributes={**base, "gen_ai.token.type": "output"}
+        )
 
 
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
@@ -410,11 +481,17 @@ async def model_call_guard(
     _MAX_CTX_RETRIES = 2
     attempt = 0
     while True:
+        t0 = time.perf_counter()  # GenAI 指标：仅统计本次尝试的墙钟耗时（重试间不计）
         try:
             resp = await asyncio.wait_for(
                 handler(request), timeout=settings.model_call_timeout_sec
             )
         except asyncio.TimeoutError:
+            _record_genai_metrics(
+                model_name=getattr(request.model, "model_name", None),
+                duration_s=time.perf_counter() - t0,
+                error_type="timeout",
+            )
             raise TimeoutError(
                 f"model 调用超过 {settings.model_call_timeout_sec}s 灾难性总时长兜底（"
                 f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
@@ -422,6 +499,13 @@ async def model_call_guard(
         except Exception as e:
             parsed = _parse_context_error(str(e))
             if parsed is None or attempt >= _MAX_CTX_RETRIES:
+                # 非上下文超限错误，或重试耗尽 → 原样上抛（由 chat.py/M3 处理）；
+                # 失败也记 duration（带 error.type），避免"只统计成功"高估耗时均值
+                _record_genai_metrics(
+                    model_name=getattr(request.model, "model_name", None),
+                    duration_s=time.perf_counter() - t0,
+                    error_type=type(e).__name__,
+                )
                 raise  # 非上下文超限错误，或重试耗尽 → 原样上抛（由 chat.py/M3 处理）
             real_limit, real_input = parsed
             # 用 API 真实上限修正 settings（后续所有调用永久受益）
@@ -457,4 +541,14 @@ async def model_call_guard(
             continue
         # 成功路径（未抛异常）：捕获引擎真实 prompt_tokens 回写每会话缓存，再返回
         _capture_usage(resp, request)
+        # GenAI 指标打点（标准 semconv 名；metrics 未启用时 no-op 静默，零风险）
+        _um = getattr(resp, "usage_metadata", None)
+        if not isinstance(_um, dict):
+            _um = {}  # usage_metadata 缺失/漂移 → 仅记 duration，token 维度不记
+        _record_genai_metrics(
+            model_name=getattr(request.model, "model_name", None),
+            duration_s=time.perf_counter() - t0,
+            input_tokens=_um.get("input_tokens") or _um.get("prompt_tokens"),
+            output_tokens=_um.get("output_tokens") or _um.get("completion_tokens"),
+        )
         return resp

@@ -46,17 +46,36 @@ def setup_tracing() -> bool:
             SimpleSpanProcessor,
             BatchSpanProcessor,
         )
+        # ── Metrics SDK（2026-09-03 补链路：此前只注册 trace → genai_*/http_server_* 全 0）──
+        from opentelemetry import metrics as metrics_api
+        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+            OTLPMetricExporter,
+        )
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import (
+            PeriodicExportingMetricReader,
+        )
         from openinference.instrumentation.langchain import LangChainInstrumentor
 
-        tracer_provider = trace_sdk.TracerProvider(
-            resource=Resource.create({
-                # Phoenix 19.x 按标准 OTel `project.name` 资源属性分组项目；
-                # 旧版 OpenInference 用 `openinference.project.name`，现代 Phoenix 已忽略，
-                # 缺失 `project.name` 时所有 trace 落入内置 "default" 项目（2026-09-02 实测）。
-                "project.name": settings.otel_project_name,
-                "openinference.project.name": settings.otel_project_name,
-            })
-        )
+        # FastAPI instrumentor 是新增依赖（pyproject ≥0.50b0），缺包时仅 http_server
+        # 指标缺席、其余 trace/metrics 不受影响 → 单独降级，不拖垮整个 setup_tracing()
+        try:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        except ImportError:
+            FastAPIInstrumentor = None
+            logger.warning(
+                "[TRACING] opentelemetry-instrumentation-fastapi 未安装 — "
+                "http_server_* 指标缺席（缺依赖可后续 uv sync 补齐）"
+            )
+
+        resource = Resource.create({
+            # Phoenix 19.x 按标准 OTel `project.name` 资源属性分组项目；
+            # 旧版 OpenInference 用 `openinference.project.name`，现代 Phoenix 已忽略，
+            # 缺失 `project.name` 时所有 trace 落入内置 "default" 项目（2026-09-02 实测）。
+            "project.name": settings.otel_project_name,
+            "openinference.project.name": settings.otel_project_name,
+        })
+        tracer_provider = trace_sdk.TracerProvider(resource=resource)
 
         # ── 1. Phoenix gRPC exporter ──
         phoenix_endpoint = settings.phoenix_collector_endpoint
@@ -101,9 +120,57 @@ def setup_tracing() -> bool:
                 "[TRACING] LANGFUSE 配置不完整 — Langfuse exporter 跳过"
             )
 
-        # ── 3. 激活 ──
+        # ── 3. Metrics：MeterProvider + OTLP gRPC exporter（2026-09-03 补链路）──
+        # 根因：此前只注册了 TracerProvider → metrics API 走 no-op，进程从未发出任何
+        # OTLP metrics 请求（Prometheus 中 genai_*/http_server_* 全 0 且无 series）。
+        # metrics 与 trace 共用同一 OTLP gRPC 端点（生产 = alloy:4317 统一入口，
+        # grpc 同端口按 OTLP service path 分流 trace/metrics，alloy 侧零改动）；
+        # 15s 周期导出（PeriodicExportingMetricReader），兼顾观察时效与开销。
+        metrics_registered = False
+        if settings.otel_metrics_enabled:
+            metrics_endpoint = settings.otel_metrics_endpoint or phoenix_endpoint
+            if metrics_endpoint:
+                try:
+                    metric_reader = PeriodicExportingMetricReader(
+                        OTLPMetricExporter(
+                            endpoint=metrics_endpoint,
+                            timeout=5,
+                        ),
+                        export_interval_millis=15000,
+                    )
+                    meter_provider = MeterProvider(
+                        metric_readers=[metric_reader],
+                        resource=resource,
+                    )
+                    metrics_api.set_meter_provider(meter_provider)
+                    metrics_registered = True
+                    logger.info(
+                        "[METRICS] MeterProvider 已注册 — OTLP gRPC endpoint=%s, 导出周期=15s",
+                        metrics_endpoint,
+                    )
+                except Exception as e:
+                    logger.warning("[METRICS] MeterProvider 初始化异常: %s", e)
+            else:
+                logger.warning(
+                    "[METRICS] otel_metrics_enabled=True 但无 endpoint "
+                    "（phoenix_collector_endpoint 为空）— metrics 跳过"
+                )
+
+        # ── 4. 激活 ──
         trace_api.set_tracer_provider(tracer_provider)
         LangChainInstrumentor().instrument()
+
+        # HTTP server instrument（http_server_* metrics + HTTP server span）。
+        # 须在 FastAPI app 实例化前 instrument——setup_tracing() 位于 server.py 顶部、
+        # import api.router 之前（模块 docstring 已声明），顺序安全。
+        if FastAPIInstrumentor is not None:
+            try:
+                FastAPIInstrumentor().instrument()
+                logger.info(
+                    "[TRACING] FastAPIInstrumentor 已注册（http_server_* metrics + HTTP span）"
+                )
+            except Exception as e:
+                logger.warning("[TRACING] FastAPIInstrumentor 注册失败: %s", e)
 
         was_setup = bool(
             phoenix_endpoint
@@ -113,9 +180,10 @@ def setup_tracing() -> bool:
         logger.info(
             "[TRACING] OpenInference 初始化完成 — "
             "auto_instrument=langchain, "
-            "Phoenix=%s, Langfuse=%s",
+            "Phoenix=%s, Langfuse=%s, Metrics=%s",
             bool(phoenix_endpoint),
             bool(settings.langfuse_secret_key and settings.langfuse_base_url),
+            metrics_registered,
         )
         return was_setup
 
