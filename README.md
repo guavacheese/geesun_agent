@@ -316,6 +316,8 @@ STACK_NAME=geesun ./start_stack.sh         # 显式指定 stack 名（默认 gee
 | **改了源码**（agent/mcp/web 任一） | 回构建机 `./build-push.sh`（**先递增 `*_TAG`**，否则同 tag 拉到的还是旧镜像）→ 目标机 `.env` 改对应 tag → `./start_stack.sh --no-build --with=<复刻>` | 单服务滚动重启 |
 | **停掉某服务**（如不用 langfuse） | 从 compose 集合移除：`./start_stack.sh --no-build --with=<剩余项>`——`--prune` 删该服务 task；命名卷/数据保留，将来要恢复把该项传回 `--with` 重新拉起即可 | 对应服务被清理 |
 
+> **改源码（场景④）实操**：三仓 ↔ `*_TAG` 变量映射、「构建机/目标机 `.env` 必须同值」提醒与五步流程见 [`DEPLOYMENT.md`](./deploy/DEPLOYMENT.md) §1.6.2 场景④ 展开；只想热更单个服务、不重跑 `start_stack.sh` 时用 `docker service update --image <镜像:新tag> geesun_<服务名>`——**必须显式 `--image`，只 `--force` 换不掉代码**（Swarm 固化 digest），详见 DEPLOYMENT §1.6.4。
+
 - `--with-registry-auth`：依赖本机已 `docker login` Harbor，否则私有镜像拉取失败
 - `--resolve-image=always`：固定 tag 重新发布时强制拉新镜像
 - `--prune`：compose 中删掉的服务会被真正清理（**只删服务，命名卷保留**）

@@ -119,11 +119,57 @@
 | **④ 改了源码**（agent/mcp/web 任一） | 回构建机 `build-push.sh`（**递增 `*_TAG`**）→ 生产机 `.env` 改对应 tag → `./start_stack.sh --no-build --with=<复刻>` | 单服务滚动重启 |
 | **⑤ 停掉某服务**（如不用 langfuse） | 从 compose 集合移除：不传 `langfuse` → `./start_stack.sh --no-build --with=<剩余项>` | `--prune` 删该服务 task；命名卷/数据保留，将来要恢复直接传回 `--with` 重新拉起即可 |
 
+##### 场景④ 展开：递增 `*_TAG` 与重发镜像的完整步骤
+
+> 核心原则：**每次改源码都给受影响仓递增 tag，且构建机与目标机的 `deploy/.env` 必须改成同一个新值**。tag 是镜像内容的身份证——同 tag 被覆盖后，Swarm 节点仍可能拉到旧的（spec 固化 digest，见 §1.6.4 铁律①），这正是"改了源码同 tag 拉到的还是旧镜像"的根因。
+
+**改了哪个仓 → 只递增哪个变量**（`build-push.sh` 与 compose 都从 `deploy/.env` 取值）：
+
+| 改了哪个仓源码 | 递增的变量 | 默认值（`.env.example`） | compose 引用 |
+| --- | --- | --- | --- |
+| `geesun_agent` | `GEESUN_AGENT_TAG` | `1.0.0`（L136） | `docker-compose.yml:27` |
+| `geesun_mcp_server` | `MCP_TAG` | `1.0.0`（L27） | `docker-compose.mcp.yml:22` |
+| `geesun_agent_web` | `WEB_TAG` | `1.0.0`（L142） | `docker-compose.web.yml:15` |
+
+**五步流程**（以改 mcp 源码为例；agent/mcp/web 同理换变量名）：
+
+1. **构建机**编辑 `deploy/.env`（⚠️ 不是 `.env.example` 模板）：`MCP_TAG=1.0.0` → `MCP_TAG=1.0.1`。tag 只求唯一，patch 位 +1 即可，不必语义化版本。
+2. **构建机** `cd deploy && HARBOR_USER=xxx HARBOR_PASSWORD=yyy bash build-push.sh`——脚本自动 source `deploy/.env`（build-push.sh:29-33），把 `geesun_ai/geesun-mcp-server:1.0.1` 推到 Harbor。geesun-agent 另支持位置参数 `bash build-push.sh 1.0.1`（优先级高于 `.env`，见 build-push.sh:47）。
+3. **把同一个新值同步到目标机 `deploy/.env`**（SFTP 或 vi）。⚠️ 两机不一致 = 构建推了 1.0.1、目标机 spec 仍指向 1.0.0 → 拉到旧镜像。这是"递增没生效"最常见的翻车点。
+4. **目标机** `./start_stack.sh --no-build --with=<与上次完全一致>`——stack deploy 幂等 diff，只有 image 从 1.0.0 → 1.0.1 的那一个服务滚动重启，其余服务零操作。
+5. **验证**：`./service_stack.sh`；或 `docker service inspect geesun_geesun-mcp --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'` 确认 digest 已变化；`docker service logs -f geesun_geesun-mcp` 看新进程日志。
+
+> 若只想热更单服务、不想重跑 start_stack.sh 或动目标机 `.env`，见 §1.6.4。
+
 #### 1.6.3 镜像 tag 与拉取策略
 
 - **镜像统一来自 Harbor `geesun_ai` 单仓（2026-09-02 查证生产 10.10.10.67 即如此）**：`REGISTRY_GEESUN` 与 `REGISTRY_HUB` 同值 `172.16.220.74:8333/geesun_ai`，自有应用（geesun-agent / geesun-mcp-server / geesun-agent-web）与第三方通用镜像（pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres）均由 `build-push.sh` 构建/同步进该单仓，17 个服务全部自 `geesun_ai` 拉取。`REGISTRY_HUB` 变量名与 compose 引用保留，将来若恢复 dockerhub proxy 拆分只改 `.env` 一个值；`dockerhub` proxy 项目仅作工作站手动拉 `library/*` 官方镜像的加速通道（回源 daocloud）。`*_TAG` 变量见 §2.6。
 - 镜像 tag 只认正斜杠 `/`，反斜杠 `\` 报 `invalid reference format`。
 - `depends_on` 在 swarm 仅支持**列表**写法（无 `condition: service_healthy`）；agent/mcp/web 连不上依赖时靠自身重试 + `restart_policy: any` 自愈，compose 文件里已有相应 `healthcheck` 供人工排查。
+
+#### 1.6.4 单服务热更：`docker service update`（不重跑 start_stack.sh）
+
+> 适用：只换**某一个服务**的镜像（已递增 tag 并 push Harbor 后），不想让 `start_stack.sh` 全量重算 spec，也不想动目标机 `.env`。若你已把新 tag 同步进 `.env`，走场景④ 的 `./start_stack.sh --no-build --with=<复刻>` 更省事——两条路效果一样（都是该服务滚动重启），`start_stack.sh` 是"全栈对齐 `.env` 快照"入口，`service update` 是"只动点名的一个服务"入口。
+
+**语法**（新镜像须已 push 到 Harbor）：
+
+```sh
+docker service update --image <registry>/<镜像名>:<新tag> geesun_<compose服务名>
+# 例：把 mcp 热更到 1.0.1
+docker service update --image 172.16.220.74:8333/geesun_ai/geesun-mcp-server:1.0.1 geesun_geesun-mcp
+```
+
+**两条铁律**（2026-09-01 双斜杠 404 / 09-03 langfuse-worker 热更实测沉淀）：
+
+1. **必须显式 `--image <新 tag/digest>`，只加 `--force` 无效**。Swarm 在服务创建/更新时把镜像 tag 解析成 digest 固化进 spec——`docker service inspect <服务> --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'` 会看到 `1.0.0@sha256:…`；`--force` 只是用 spec 里**固化的旧 digest** 重启 task，不会重新解析 tag → 容器跑的还是旧代码（此前"pull + --force 全做了仍旧码"的真根因）。
+2. **服务名带 stack 前缀 `geesun_`**：agent 是 `geesun_geesun-agent`、mcp 是 `geesun_geesun-mcp`、web 是 `geesun_geesun-agent-web`（`./service_stack.sh` 可列出全部实际名字）。
+
+**验证**：`docker service inspect geesun_geesun-mcp --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'` 应显示新 tag 的 digest；`docker service logs -f geesun_geesun-mcp` 看新进程。
+
+**与 `start_stack.sh` 的边界**：
+
+- `.env` 是 deploy 那一刻固化的快照——`service update` **不会重读 `.env`**（§1.5 / §1.6.1）。只改 env（密钥/密码等）必须重跑 `./start_stack.sh --no-build`，`service update` 只能换镜像/强制重启进程（场景③）。
+- `service update` 只动点名服务，不存在 `--prune` 误清其他服务的风险；代价是不重算其他服务 spec——若同时改了 compose 文件（端口/副本数/挂载等），仍应走 `start_stack.sh`。
 
 ---
 
