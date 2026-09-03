@@ -1,0 +1,106 @@
+{
+  "uid": "geesun-logs",
+  "title": "Geesun · 日志与错误",
+  "tags": ["geesun", "logs"],
+  "description": "栈内全部服务日志（数据源：Loki）。日常排障首选入口：先看错误速率曲线，再下拉看明细。注意：caddy / agent-web / geesun-mcp / clickhouse / minio 无请求时静默无日志属正常。",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "日志产生速率（按容器，条/秒）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (container) (count_over_time({container=~\"geesun_.*\"}[5m])) / 300", "legendFormat": "{{container}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "错误日志速率（按容器，含 error/traceback/exception）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 60, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (container) (count_over_time({container=~\"geesun_.*\"} |~ \"(?i)error|traceback|exception\" [5m]))", "legendFormat": "{{container}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "logs",
+      "title": "错误日志明细（全栈）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        { "refId": "A", "expr": "{container=~\"geesun_.*\"} |~ \"(?i)error|traceback|exception\"", "queryType": "range" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "WARNING 日志（agent 的 JSON 日志走 level 标签）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        { "refId": "A", "expr": "{container=~\"geesun_.*\", level=\"WARNING\"}", "queryType": "range" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "agent 后端异常栈（Traceback）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        { "refId": "A", "expr": "{container=~\"geesun_geesun-agent.*\"} |= \"Traceback\"", "queryType": "range" }
+      ]
+    }
+  ]
+}

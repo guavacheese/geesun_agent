@@ -154,7 +154,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 
 | 文件 | 说明 |
 | --- | --- |
-| `docker-compose.yml` | **主栈**：`geesun-agent` + `agent-postgres`（pgvector）+ `caddy` + `loki` + `alloy` + `prometheus` + `grafana`；含 overlay 网络 `appnet2` 与命名卷（端口占用见「端口一览」） |
+| `docker-compose.yml` | **主栈**：`geesun-agent` + `agent-postgres`（pgvector）+ `caddy` + `loki` + `alloy` + `prometheus` + `grafana` + `node-exporter` + `cadvisor`（后两者为监控采集器，`mode: global` 不发布主机端口，见 `deploy/DEPLOYMENT.md` §1.7）；含 overlay 网络 `appnet2` 与命名卷（端口占用见「端口一览」） |
 | `docker-compose.mcp.yml` | 附加：`geesun-mcp`（MCP 服务，默认并入） |
 | `docker-compose.web.yml` | 附加：`geesun-agent-web`（Next.js 前端，并入后由 Caddy :80 同域服务） |
 | `docker-compose.phoenix.yml` | 附加（`--with=phoenix` 并入）：`phoenix` + `phoenix-db`；Alloy 经服务名 `phoenix:4317` 转发 traces，UI 发布 `6006`。原「复用现网共享实例」方案已废弃——该实例无 restart 策略、停止后 traces 全丢（2026-09-02） |
@@ -204,10 +204,18 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | `geesun_loki` | 3100 | 不发布 | 仅 Alloy 在 appnet2 内写 `http://loki:3100` |
 | `geesun_alloy` | 12345（UI/自监控）· 4317（OTLP gRPC）· 4321（OTLP HTTP） | **12345 → 12345** | agent 追踪入口 `http://alloy:4317`（`.env` 的 `PHOENIX_COLLECTOR_ENDPOINT`）；4317/4321 仅内网不发布 |
 | `geesun_prometheus` | 9090 | **19091 → 9090** | 开 `--web.enable-remote-write-receiver` 收 Alloy remote_write；Grafana 数据源走 `prometheus:9090` |
-| `geesun_grafana` | 3000 | **3100 → 3000** | 日志检索 UI（admin / `.env` 的 `GRAFANA_PASSWORD`）。⚠️ compose 现为全网卡发布，而 `.env` 注释称 `127.0.0.1:3100`——**两者不一致**；若只允本机访问，把 compose 改成 `127.0.0.1:3100:3000` |
+| `geesun_node-exporter` | 9100 | 不发布 | 主机指标（CPU/内存/磁盘/网络/负载）→ Prometheus；看板「Geesun · 主机概览」数据源 |
+| `geesun_cadvisor` | 8080 | 不发布 | 容器级指标（每容器 CPU/内存/网络/可写层）→ Prometheus；看板「Geesun · 容器概览」数据源。⚠️ 本机 Docker 用 containerd snapshotter，必须挂 `/var/lib/containerd` + `containerd.sock`（见 compose 注释） |
+| `geesun_grafana` | 3000 | **3100 → 3000** | 日志检索 + 监控看板 UI（admin / `.env` 的 `GRAFANA_PASSWORD`）；4 张看板随栈 provisioning（改看板请改 `deploy/grafana/dashboards/*.json`，**勿在 UI 里改**）。⚠️ compose 现为全网卡发布，而 `.env` 注释称 `127.0.0.1:3100`——**两者不一致**；若只允本机访问，把 compose 改成 `127.0.0.1:3100:3000` |
 | `geesun_phoenix`（默认 `--with=phoenix` 并入） | 6006（HTTP UI）· 4317（OTLP gRPC）· 9090（metrics，默认未启用） | **6006 → 6006** | UI：`http://10.10.10.67:6006`；Alloy 经服务名 `phoenix:4317` 转发 traces（4317/9090 不发布主机）。**已不依赖现网共享实例**（原 `opt-phoenix-1` 无 restart 策略、2026-09-01 停止后 traces 全丢，2026-09-02 改为栈内自托管） |
 | `geesun_langfuse-web`（`--with=langfuse` 并入） | 3000 | **3000 → 3000** | UI + OTLP ingest：`http://10.10.10.67:3000`；agent 经 `.env` 的 `LANGFUSE_BASE_URL` 上报 trace。**已不依赖现网共享实例**（旧共享 Langfuse 须停用释放 :3000，否则端口冲突） |
 | `geesun_langfuse-worker`（`--with=langfuse` 并入） | 3030 | 不发布 | 仅容器间消费队列 |
+
+**监控看板（Grafana `http://10.10.10.67:3100`）**：4 张看板随栈 provisioning 进 `Geesun` 文件夹——主机概览（CPU/内存/**根分区**/负载/网络/磁盘 IO）、容器概览（17 服务 CPU/内存排行与趋势）、日志与错误（错误速率 + 全栈 error/WARNING/Traceback）、服务健康（targets 存活 + 各容器日志活跃度）。
+
+**查日志（Explore → Loki）**：`{container=~"geesun_geesun-agent.*"}`（agent 后端）· `{container=~"geesun_geesun-agent-web.*"}`（前端）· `{container=~"geesun_geesun-mcp.*"}`（MCP）——**运算符必须用 `=~` 正则**：label 值是 `geesun_<服务>.1.<taskid>` 全名，容器重启换 taskid 后精确匹配查不到。Loki 只有 Alloy 启用后的增量，更早历史用 `docker service logs geesun_<服务>`。
+
+改看板请改 `deploy/grafana/dashboards/*.json`（`allowUiUpdates=false`，**UI 里改会在下次重部署被覆盖**）。完整说明见 `deploy/DEPLOYMENT.md` §1.7。
 
 #### D. 对象存储（`--with=langfuse` 并入）
 
@@ -283,7 +291,7 @@ cd deploy
 HARBOR_USER=xxx HARBOR_PASSWORD=yyy bash build-push.sh
 ```
 
-脚本会把 `geesun-agent` / `geesun-mcp-server` / `geesun-agent-web` 推送至 `geesun_ai`（`REGISTRY_GEESUN`），并把 pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres 等同步进 `REGISTRY_HUB` 所指项目——**生产单仓：与 `geesun_ai` 同值**（第三方镜像不再进 `dockerhub` proxy 项目）。
+脚本会把 `geesun-agent` / `geesun-mcp-server` / `geesun-agent-web` 推送至 `geesun_ai`（`REGISTRY_GEESUN`），并把 pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres / **node-exporter** / **cadvisor** 等同步进 `REGISTRY_HUB` 所指项目——**生产单仓：与 `geesun_ai` 同值**（第三方镜像不再进 `dockerhub` proxy 项目）。
 
 > 生产内网机若无法直连公网拉取第三方镜像，请在能出网的机器跑本脚本后，再到内网机 `docker pull`。
 
@@ -419,6 +427,8 @@ cd deploy
 | `GEESUN_AGENT_TAG` | geesun-agent 镜像 tag（默认 `1.0.0`） |
 | `ALLOY_TAG` | Alloy 镜像 tag（默认 `v1.19.2`） |
 | `PROMETHEUS_TAG` | Prometheus 镜像 tag（默认 `3.0`，需 2.48+ 支持 remote-write-receiver） |
+| `NODE_EXPORTER_TAG` | node-exporter 镜像 tag（默认 `v1.8.2`，主机指标采集器） |
+| `CADVISOR_TAG` | cAdvisor 镜像 tag（默认 `v0.49.1`，容器指标采集器；v0.49+ 支持 containerd snapshotter） |
 | `WEB_TAG` | 前端镜像 tag（默认 `1.0.0`；`NEXT_PUBLIC_API_BASE` 为 build-time 注入，运行时改无效） |
 | `LANGFUSE_TAG` | Langfuse 镜像 tag（pin `3.224.3`；4.0.0 暂无可拉取镜像） |
 | `POSTGRES_VERSION` | pgvector 基础 Postgres 大版本（默认 `17`） |

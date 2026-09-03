@@ -1,0 +1,115 @@
+{
+  "uid": "geesun-containers",
+  "title": "Geesun · 容器概览",
+  "tags": ["geesun", "containers"],
+  "description": "栈内 17 个服务的容器级资源（数据源：cAdvisor）。用于回答「哪个服务吃 CPU / 内存、文件系统涨了没」。仅统计名称以 geesun_ 开头的栈内容器。",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "容器 CPU 用量排行（核，当前值）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "cellOptions": { "type": "gauge" } } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"/?geesun_.*\"}[5m]))", "legendFormat": "{{name}}", "format": "table", "instant": true }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "容器内存用量排行（working set，当前值）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "cellOptions": { "type": "gauge" } } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (container_memory_working_set_bytes{name=~\"/?geesun_.*\"})", "legendFormat": "{{name}}", "format": "table", "instant": true }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "容器 CPU 趋势（核）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"/?geesun_.*\"}[5m]))", "legendFormat": "{{name}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "容器内存趋势（working set）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (container_memory_working_set_bytes{name=~\"/?geesun_.*\"})", "legendFormat": "{{name}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "容器网络吞吐（收/发）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"/?geesun_.*\"}[5m]))", "legendFormat": "收 {{name}}" },
+        { "refId": "B", "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"/?geesun_.*\"}[5m]))", "legendFormat": "发 {{name}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "容器文件系统用量（可写层，排查日志/缓存暴涨）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (container_fs_usage_bytes{name=~\"/?geesun_.*\"})", "legendFormat": "{{name}}" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "uid": "geesun-health",
+  "title": "Geesun · 服务健康与采集链路",
+  "tags": ["geesun", "health"],
+  "description": "采集链路自监控（Prometheus targets / Loki 各容器日志活跃度）。用于回答「监控本身是不是还活着、哪个服务静默了」。agent 业务指标（tokens/延迟）当前 OTLP metrics 未落库，故本看板不含业务面板。",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "采集目标存活（1=正常）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "min(up{job=~\"prometheus|alloy|node-exporter|cadvisor\"})" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "采集目标数量",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "count(up)" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "近 1h 有日志的容器数",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "count(count_over_time({container=~\"geesun_.*\"}[1h]))" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Prometheus 写入速率（样本/秒）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(prometheus_tsdb_head_samples_appended_total[5m])" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "采集目标明细（up / 抓取耗时）",
+      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "up", "legendFormat": "up", "format": "table", "instant": true },
+        { "refId": "B", "expr": "scrape_duration_seconds", "legendFormat": "耗时", "format": "table", "instant": true }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "各容器近 1h 日志条数（0 = 静默，结合服务性质判断是否异常）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (container) (count_over_time({container=~\"geesun_.*\"}[1h]))", "format": "table", "instant": true }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "logs",
+      "title": "全栈最新日志（tail）",
+      "datasource": { "type": "loki", "uid": "geesun-loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        { "refId": "A", "expr": "{container=~\"geesun_.*\"}", "queryType": "range" }
+      ]
+    }
+  ]
+}

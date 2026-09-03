@@ -173,6 +173,77 @@ docker service update --image 172.16.220.74:8333/geesun_ai/geesun-mcp-server:1.0
 
 ---
 
+## 1.7 监控看板与日常查日志（Grafana / Prometheus / Loki）
+
+> 2026-09-03 补齐：此前 Prometheus 里 418 个指标名**全是采集器自监控**（prometheus/alloy/loki/go…），
+> `node_*` / `container_*` 为 0 个 → 主机 CPU/内存/磁盘**没有任何数据源**，Grafana 也无任何看板
+> （只剩 Explore 手查 Loki）。本节记录补齐后的组成与查日志操作。
+
+### 1.7.1 组成与数据流
+
+```
+node-exporter(:9100) ─┐
+cadvisor(:8080)      ─┼→ prometheus:9090 ← remote_write ← alloy:4317（agent OTLP）
+prometheus / alloy    ─┘                        │
+容器 stdout ──docker.sock 服务发现── alloy ──────┼→ loki:3100
+                                                ↓
+                                          grafana:3000（主机 :3100）
+```
+
+新增两个采集器（均 `mode: global`、**不发布主机端口**，仅 overlay 内可达）：
+
+| 服务 | 作用 | 关键点 |
+|---|---|---|
+| `node-exporter` | 主机 CPU / 内存 / 磁盘 / 网络 / 负载 | 挂 `/` 为 `/host:ro,rslave`，排除容器伪文件系统 |
+| `cadvisor` | 每容器 CPU / 内存 / 网络 / 可写层 | 本机 Docker 29 用 **containerd snapshotter**（镜像层在 `/var/lib/containerd`），故除 `/var/lib/docker` 外必须挂 `/var/lib/containerd` + `containerd.sock`，否则容器名映射不上、指标全空；需 `privileged: true` 读 cgroup |
+
+镜像由 `build-push.sh` 的 `sync()` 同步进 Harbor（`prom/node-exporter` / `gcr.io/cadvisor/cadvisor`，tag 见 `.env.example` 的 `NODE_EXPORTER_TAG` / `CADVISOR_TAG`）——**新机器上未同步会起不来**。
+
+### 1.7.2 看板（dashboard as code）
+
+JSON 在 `deploy/grafana/dashboards/`，由 `grafana/provisioning/dashboards/geesun.yaml` 加载进 Grafana 的 `Geesun` 文件夹：
+
+| 看板 | uid | 数据源 | 用途 |
+|---|---|---|---|
+| Geesun · 主机概览 | `geesun-host` | Prometheus | CPU/内存/**根分区使用率**/负载/网络/磁盘 IO |
+| Geesun · 容器概览 | `geesun-containers` | Prometheus | 哪个服务吃 CPU/内存、可写层暴涨（17 服务排行 + 趋势） |
+| Geesun · 日志与错误 | `geesun-logs` | Loki | 错误速率曲线 + 全栈 error/WARNING/Traceback 明细 |
+| Geesun · 服务健康与采集链路 | `geesun-health` | 两者 | targets 存活、各容器近 1h 日志条数（0=静默）、全栈 tail |
+
+**铁律**：`allowUiUpdates=false`——**不要在 UI 里改看板**（下次重部署会被 JSON 覆盖）。改看板流程：改 JSON → commit/push → 目标机同步 `deploy/` → `./start_stack.sh --no-build`（grafana 重发配置）。
+
+数据源 uid 已固定为 `geesun-prometheus` / `geesun-loki`（见 `provisioning/datasources/*.yaml`）；旧的无 uid 条目由 `deleteDatasources` 先删后建，幂等。
+
+### 1.7.3 日常查日志（Grafana Explore）
+
+Grafana：`http://10.10.10.67:3100`（admin + `.env` 的 `GRAFANA_PASSWORD`）；Prometheus 原生 UI：`http://10.10.10.67:19091`。
+
+1. 左侧 **Explore** → 顶部数据源选 **Loki**
+2. Label filters：`container` **运算符改成 `=~`（正则）**，值填下表左侧列——**必须用正则**：label 值是 `geesun_<服务>.1.<taskid>` 全名，容器重启换 taskid 后精确匹配就查不到东西了
+3. 可选：Line contains 填 `ERROR` / `Traceback`
+4. 右上角 Run query；要实时跟踪点 **Live**（等价 `tail -f`）
+5. 切 **Code** 模式可直接写 LogQL（更快）
+
+| 服务 | LogQL |
+|---|---|
+| agent 后端 | `{container=~"geesun_geesun-agent.*"}` |
+| 前端 web | `{container=~"geesun_geesun-agent-web.*"}` |
+| MCP | `{container=~"geesun_geesun-mcp.*"}` |
+| agent 的 PG | `{container=~"geesun_agent-postgres.*"}` |
+| 只看错误 | 上式后加 ` \|= "ERROR"` 或 ` \|~ "(?i)error\|traceback"` |
+
+**两个实况（2026-09-03 实测，别当故障查）**：
+
+- Loki 只有 Alloy 启用后（9-02 起）的**增量**日志，更早的用 `docker service logs geesun_<服务> --tail 200` 兜底
+- **caddy / agent-web / mcp / clickhouse / minio 近期无日志属正常**：caddy 默认不打访问日志、next-server 不打印请求日志、mcp 只在被调用时输出、clickhouse/minio 日志写文件不进 stdout
+
+### 1.7.4 已知缺口（TODO，不是故障）
+
+- **agent 业务指标未落 Prometheus**：实测 `genai_*` / `http_server_*` / token 类指标 0 个，traces 正常 → 疑似 agent 侧只注册了 tracer provider、未注册 meter provider（OTLP metrics 断链）。「tokens/延迟/会话数」类看板待该链路修好后补
+- **未配告警规则**（Grafana Alerting）：待看板用顺后再加，建议起步三条——根分区 >80%、容器重启、`ERROR` 日志 5 分钟突增；通知渠道内网 webhook 或邮件
+
+---
+
 ## 2. 完整环境变量清单（`deploy/.env`，对照 `.env.example`）
 
 > 全部变量集中在 `deploy/.env`（单一可信源），各 compose 经 `env_file` / `environment` 引用。`.env.example` 内联注释含每项**取舍与生成命令**（如 `openssl rand -hex 32`），本表只列变量、默认值/示例与消费方。带 `REPLACE_ME` / `CHANGE_ME` 的必须替换；留空项按需填（如 `LANGFUSE_INIT_*` 留空则 UI 手动建）。
@@ -269,6 +340,8 @@ docker service update --image 172.16.220.74:8333/geesun_ai/geesun-mcp-server:1.0
 | `GEESUN_AGENT_TAG` | `1.0.0` | docker-compose.yml | agent 镜像 tag |
 | `ALLOY_TAG` | `v1.19.2` | docker-compose.yml | Alloy 镜像 tag |
 | `PROMETHEUS_TAG` | `3.0` | docker-compose.yml | Prometheus 镜像 tag |
+| `NODE_EXPORTER_TAG` | `v1.8.2` | docker-compose.yml | node-exporter tag（主机指标，见 §1.7） |
+| `CADVISOR_TAG` | `v0.49.1` | docker-compose.yml | cAdvisor tag（容器指标；v0.49+ 才支持 containerd snapshotter，见 §1.7） |
 | `WEB_TAG` | `1.0.0` | docker-compose.web.yml | 前端镜像 tag |
 | `NEXT_PUBLIC_API_BASE` | `http://10.10.10.67/` | build-push.sh（build-time） | 前端 API 地址（内联进 JS，**运行期改无效**） |
 | `LANGFUSE_TAG` | `3.224.3` | docker-compose.langfuse.yml | Langfuse 镜像 tag（pin 具体补丁版，禁浮动 `:3`） |

@@ -13,5 +13,18 @@ scrape_configs:
     static_configs:
       - targets: ['alloy:12345']
 
+  # 主机指标（node-exporter，overlay 内 :9100，不发布主机端口）
+  - job_name: node-exporter
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # 容器指标（cadvisor，overlay 内 :8080，不发布主机端口）
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+
   # agent 指标已走 OTLP（agent → alloy:4317 → remote_write），
   # 不暴露 /metrics 端点，无需直接抓取（此前每 10s 一条 404 噪音）
+  # 注意（2026-09-03 实测）：Prometheus 中 genai_*/http_server_*/token 类指标当前为 0，
+  # 即 agent 的 OTLP metrics 未落库（traces 正常），故「agent 业务」看板暂缺数据源——
+  # 排查方向：agent 侧 OTLP exporter 是否只注册了 tracer provider 未注册 meter provider。

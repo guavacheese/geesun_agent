@@ -218,12 +218,80 @@ services:
         max-size: "20m"
         max-file: "3"
 
+  # ── node-exporter：主机指标（CPU / 内存 / 磁盘 / 网络 / 负载）──
+  # Grafana「主机概览」看板的数据源；此前 Prometheus 里 node_* 指标为 0（2026-09-03 实测），
+  # 主机 CPU/内存/磁盘压根没有采集源，只能命令行 df/top 看，故补此服务。
+  # global 模式：每节点一份（当前单节点，将来加节点自动覆盖），不发布主机端口。
+  node-exporter:
+    image: ${REGISTRY_HUB}/node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      # 排除容器/虚拟文件系统，否则 docker/overlay、kubelet 等伪盘刷屏
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/.+|rootfs/var/lib/containerd/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    networks: [appnet2]
+    deploy:
+      mode: global
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ── cAdvisor：容器级指标（每容器 CPU / 内存 / 网络 / 文件系统）──
+  # Grafana「容器概览」看板的数据源，用于定位"哪个服务吃 CPU/内存/在重启"。
+  # 注意（2026-09-03 实测本机要点）：Docker 29 启用 containerd snapshotter
+  # （Storage Driver=overlayfs / io.containerd.snapshotter.v1，镜像层在 /var/lib/containerd，
+  #  不是传统的 /var/lib/docker/overlay2）——故除 /var/lib/docker 外必须挂
+  # /var/lib/containerd + containerd.sock，否则容器名映射不上、指标全空。
+  cadvisor:
+    image: ${REGISTRY_HUB}/cadvisor:${CADVISOR_TAG:-v0.49.1}
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --store_container_labels=false
+    privileged: true   # 需读 cgroup/procfs；监控采集器惯例，仅限本服务
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /var/lib/containerd:/var/lib/containerd:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - /dev/disk:/dev/disk:ro
+    networks: [appnet2]
+    deploy:
+      mode: global
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
   grafana:
     image: ${REGISTRY_HUB}/grafana:11.3.0
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # 看板 JSON 随代码进 git（dashboard as code），由 provisioning/dashboards/geesun.yaml 加载；
+      # 禁止在 UI 里手改（allowUiUpdates=false），改了下次重部署会被覆盖。
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     ports:
       - "3100:3000"

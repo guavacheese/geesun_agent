@@ -1,7 +1,15 @@
 apiVersion: 1
+
+# 旧条目清理：此前未显式声明 uid，Grafana 按名称自动生成（uid=prometheus）。
+# 现在改用固定 uid 供看板 JSON 引用；每次 stack deploy 先删后建，幂等无残留。
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
 datasources:
   - name: Prometheus
     type: prometheus
+    uid: geesun-prometheus   # 看板 JSON 以此 uid 引用，勿随意改
     access: proxy
     url: http://prometheus:9090
     isDefault: false

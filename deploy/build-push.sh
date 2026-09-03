@@ -48,6 +48,9 @@ AGENT_TAG="${1:-${GEESUN_AGENT_TAG:-1.0.0}}"
 # 第三方镜像 tag（与 .env.example 对应；可被环境变量覆盖）
 ALLOY_TAG="${ALLOY_TAG:-v1.19.2}"
 PROMETHEUS_TAG="${PROMETHEUS_TAG:-3.0}"
+# 监控采集器（主机/容器指标 → Grafana 四张看板的数据源，见 deploy/grafana/dashboards/）
+NODE_EXPORTER_TAG="${NODE_EXPORTER_TAG:-v1.8.2}"
+CADVISOR_TAG="${CADVISOR_TAG:-v0.49.1}"
 
 echo "==> REGISTRY_GEESUN = $REGISTRY_GEESUN"
 echo "==> REGISTRY_HUB     = $REGISTRY_HUB"
@@ -144,6 +147,9 @@ sync "grafana/alloy:${ALLOY_TAG:-v1.19.2}"                  "alloy:${ALLOY_TAG:-
 sync "grafana/grafana:11.3.0"                  "grafana:11.3.0"
 # Alloy（统一采集，替代 Promtail；ALLOY_TAG 与 .env.example 一致）
 sync "prometheus:${PROMETHEUS_TAG:-3.0}"        "prometheus:${PROMETHEUS_TAG:-3.0}"
+# 监控采集器（主机/容器指标；Grafana 看板数据源，缺此二者「主机/容器概览」全空）
+sync "prom/node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}"   "node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}"
+sync "gcr.io/cadvisor/cadvisor:${CADVISOR_TAG:-v0.49.1}" "cadvisor:${CADVISOR_TAG:-v0.49.1}"
 # Phoenix（→ REGISTRY_HUB=geesun_ai 单仓）
 sync "arizephoenix/phoenix:19.1.0"            "phoenix:19.1.0"
 sync "postgres:16.14"                          "postgres:16.14"
