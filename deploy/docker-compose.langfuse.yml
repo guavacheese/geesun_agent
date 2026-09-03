@@ -11,8 +11,8 @@
 #       仅 langfuse-web:3000（UI + OTLP）与 minio:9092（S3 媒体外部端点）发布主机，
 #       其余后端（postgres / redis / clickhouse）仅 appnet2 内、不占主机端口。
 #
-# 镜像：langfuse / clickhouse-server / minio / redis / postgres 均来自 Harbor dockerhub 项目
-#       （REGISTRY_HUB），由 deploy/build-push.sh 同步进 Harbor（标准第三方镜像）。
+# 镜像：langfuse / clickhouse-server / minio / redis / postgres 均来自 REGISTRY_HUB 所指项目
+#       （生产单仓=geesun_ai；dockerhub proxy 模板示例不再使用），由 deploy/build-push.sh 同步进 Harbor。
 #
 # ⚠️ 迁移注意：启用本文件前，必须先停用现网共享 Langfuse 实例，释放主机
 #   3000 / 9092（其余 3030/5432/6379/8123/9000/9091 共享实例占用但本栈不再发布，

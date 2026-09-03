@@ -267,13 +267,13 @@ curl -s -o /dev/null -w "harbor:%{http_code}\n" http://172.16.220.74:8333/v2/
   # 生产机如需自定义路径：CA_INPUT=/opt/x/rootCA.pem CA_OUTPUT=/opt/x/combined-ca.pem bash deploy/setup-combined-ca.sh
   ```
   > **为什么 .env.example 里挂的是 `combined-ca.pem` 而不是你上传的 `rootCA.pem`**：`rootCA.pem` 只是 CubeSandbox egress MITM 的 mkcert 单证书（约 1.7KB）。容器内 `SSL_CERT_FILE` 指向它后，Python/pip/uv 的默认信任库被**整体替换**成这一个 CA → 系统根被全部排除 → agent 启动 `uv sync` 拉 pypi.org（GlobalSign 签发）报 `UnknownIssuer` 直接崩。`combined-ca.pem` = mkcert CA（信任内网拦截证书）+ 系统根（信任外网 pypi 等），两者缺一不可（2026-09-01 实测反证）。
-- **配置 `*.cube.app` 域名解析（sandbox 运行时访问依赖，见 DEPLOYMENT §4.8）**：e2b SDK 用 `<port>-<sandbox_id>.cube.app` 域名连沙箱，容器内必须解析到 `172.16.66.13`（cube-egress 所在裸金属）：
+- **配置 `*.cube.app` 域名解析（sandbox 运行时访问依赖）**：e2b SDK 用 `<port>-<sandbox_id>.cube.app` 域名连沙箱，容器内必须解析到 `172.16.66.13`（cube-egress 所在裸金属）：
   ```bash
   sudo bash deploy/setup-cube-dns.sh   # 宿主机 root 执行一次：dnsmasq address= 直答 + daemon.json dns 指向 dnsmasq
   # 验证：docker run --rm busybox nslookup xxx.cube.app 应返回 172.16.66.13
   ```
   > 必须 `address=` 本地直答模式；不要用 `server=/cube.app/<IP>` 转发——172.16.66.13:53 无 DNS 服务，转发必 NXDOMAIN（2026-09-02 实测修正）。
-- Harbor 提前建好两个项目：`geesun_ai`（自有应用）、`dockerhub`（第三方中央仓库）
+- Harbor 建好 `geesun_ai` 项目（**生产镜像统一仓库**：自有应用与第三方镜像同仓，`REGISTRY_GEESUN` / `REGISTRY_HUB` 同值，2026-09-02 起）；`dockerhub` proxy 项目可选，仅作工作站手动拉 `library/*` 官方镜像的加速通道
 
 #### 1. 构建并推送镜像（在有源码的构建机执行）
 
@@ -283,7 +283,7 @@ cd deploy
 HARBOR_USER=xxx HARBOR_PASSWORD=yyy bash build-push.sh
 ```
 
-脚本会把 `geesun-agent` / `geesun-mcp-server` / `geesun-agent-web` 推送至 `geesun_ai`，并把 pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres 等同步进 `dockerhub`。
+脚本会把 `geesun-agent` / `geesun-mcp-server` / `geesun-agent-web` 推送至 `geesun_ai`（`REGISTRY_GEESUN`），并把 pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres 等同步进 `REGISTRY_HUB` 所指项目——**生产单仓：与 `geesun_ai` 同值**（第三方镜像不再进 `dockerhub` proxy 项目）。
 
 > 生产内网机若无法直连公网拉取第三方镜像，请在能出网的机器跑本脚本后，再到内网机 `docker pull`。
 
@@ -412,8 +412,8 @@ cd deploy
 
 | 变量 | 说明 |
 | --- | --- |
-| `REGISTRY_GEESUN` | 自有应用仓库，如 `172.16.220.74:8333/geesun_ai` |
-| `REGISTRY_HUB` | 第三方中央仓库，如 `172.16.220.74:8333/dockerhub` |
+| `REGISTRY_GEESUN` | 自有应用仓库，`172.16.220.74:8333/geesun_ai` |
+| `REGISTRY_HUB` | 第三方镜像仓库——**生产单仓：与 `REGISTRY_GEESUN` 同值 `geesun_ai`**（第三方镜像也放 geesun_ai；变量名保留，将来拆分只改此值） |
 | `GEESUN_AGENT_TAG` | geesun-agent 镜像 tag（默认 `1.0.0`） |
 | `ALLOY_TAG` | Alloy 镜像 tag（默认 `v1.19.2`） |
 | `PROMETHEUS_TAG` | Prometheus 镜像 tag（默认 `3.0`，需 2.48+ 支持 remote-write-receiver） |

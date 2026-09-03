@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ───────────────────────────────────────────────────────────────────────────
-# 构建 geesun-agent 镜像（推送至 Harbor geesun_ai 项目），并把所有第三方镜像
-# 同步进 Harbor dockerhub 项目（第三方通用镜像中央仓库）。
+# 构建自有应用镜像（推送至 REGISTRY_GEESUN 所指项目，默认 geesun_ai），并把所有第三方
+# 镜像同步进 REGISTRY_HUB 所指项目——生产单仓（2026-09-02 起）：REGISTRY_HUB 与
+# REGISTRY_GEESUN 同值 geesun_ai，第三方镜像不再进 dockerhub proxy 项目；变量名保留便于将来拆分。
 #
 # 前置条件（目标机 / 构建机一次性配置）：
 #   1) Harbor 为 HTTP（172.16.220.74:8333），需把该地址加入 Docker「不安全仓库」：
@@ -9,9 +10,9 @@
 #        { "insecure-registries": ["172.16.220.74:8333"] }
 #      然后 systemctl restart docker
 #      Docker Desktop: Settings → Docker Engine → 加入上述 JSON → Apply & Restart
-#   2) 当前机器需能拉取公网镜像（用于把第三方镜像同步进 Harbor dockerhub 项目）；
+#   2) 当前机器需能拉取公网镜像（用于把第三方镜像同步进 Harbor，默认 geesun_ai 单仓）；
 #      生产内网机若无法直连公网，请在能出网的机器跑本脚本后，再到内网机 docker compose pull。
-#   3) 目标 Harbor 需提前建好两个项目：geesun_ai（自有）、dockerhub（第三方中央仓库）。
+#   3) 目标 Harbor 需建好 geesun_ai 项目（单仓）；dockerhub proxy 项目可选（仅工作站手动拉官方镜像加速）。
 #   4) 生产机需预创建 agent 工作目录（防容器重建丢数据）：
 #      mkdir -p /opt/geesun/data/{agent,uploads,reports}   # 路径对应 .env 的 AGENT_DATA_ROOT
 #
@@ -33,7 +34,7 @@ if [[ -f "$_DEPLOY_DIR/.env" ]]; then
 fi
 
 REGISTRY_GEESUN="${REGISTRY_GEESUN:-172.16.220.74:8333/geesun_ai}"
-REGISTRY_HUB="${REGISTRY_HUB:-172.16.220.74:8333/dockerhub}"
+REGISTRY_HUB="${REGISTRY_HUB:-172.16.220.74:8333/geesun_ai}"   # 单仓默认与 GEESUN 同值；拆分时改回 dockerhub
 HARBOR_HOST="172.16.220.74:8333"
 HARBOR_USER="${HARBOR_USER:-}"
 HARBOR_PASSWORD="${HARBOR_PASSWORD:-}"
@@ -75,7 +76,7 @@ docker push "$AGENT_IMAGE"
 
 # ── 2.5 构建并推送自有应用：geesun-mcp-server（→ geesun_ai 项目）──
 # 命名说明：本函数是「构建自家代码镜像 + push 进 Harbor geesun_ai 项目」（build + push），
-# 与下方 sync() 的「同步第三方镜像」（公网 pull → tag → push 进 dockerhub 项目）语义不同；
+# 与下方 sync() 的「同步第三方镜像」（公网 pull → tag → push 进 REGISTRY_HUB 所指项目，单仓=geesun_ai）语义不同；
 # 旧名 sync_mcp 沿用 sync_ 前缀易误导，现按行为命名为 build_push_mcp。
 # 构建上下文为 geesun_mcp_server 仓库根（与 geesun_agent 同级 /d/workspace/geesun_mcp_server）。
 # 该仓库自带 Dockerfile（非 root UID 1001 mcpuser，与 agent 同 UID，便于共享挂载目录属主）。
@@ -116,9 +117,9 @@ build_push_web() {
 }
 build_push_web
 
-# ── 3. 同步第三方镜像进 Harbor dockerhub 项目 ──
+# ── 3. 同步第三方镜像进 Harbor（REGISTRY_HUB 所指项目，生产单仓=geesun_ai）──
 # 用法: sync <公网镜像> <harbor内短名:tag>
-# 注意：sync() 是「同步第三方镜像」（公网 pull → tag → push 进 Harbor dockerhub 项目），
+# 注意：sync() 是「同步第三方镜像」（公网 pull → tag → push 进 REGISTRY_HUB 所指项目），
 # 与上面 build_push_mcp / build_push_web（构建自有代码镜像推 geesun_ai 项目）语义不同。
 sync() {
   local src="$1" dst="$REGISTRY_HUB/$2"
@@ -135,7 +136,7 @@ sync() {
   docker push "$dst"
 }
 
-# 主栈依赖（dockerhub 项目）
+# 主栈依赖（→ REGISTRY_HUB=geesun_ai 单仓）
 sync "pgvector/pgvector:0.8.0-pg17"            "pgvector:0.8.0-pg17"
 sync "caddy:2.8-alpine"                        "caddy:2.8-alpine"
 sync "grafana/loki:3.2.0"                      "loki:3.2.0"
@@ -143,7 +144,7 @@ sync "grafana/alloy:${ALLOY_TAG:-v1.19.2}"                  "alloy:${ALLOY_TAG:-
 sync "grafana/grafana:11.3.0"                  "grafana:11.3.0"
 # Alloy（统一采集，替代 Promtail；ALLOY_TAG 与 .env.example 一致）
 sync "prometheus:${PROMETHEUS_TAG:-3.0}"        "prometheus:${PROMETHEUS_TAG:-3.0}"
-# Phoenix（dockerhub 项目）
+# Phoenix（→ REGISTRY_HUB=geesun_ai 单仓）
 sync "arizephoenix/phoenix:19.1.0"            "phoenix:19.1.0"
 sync "postgres:16.14"                          "postgres:16.14"
 # Langfuse（pin 3.224.3，与 .env 的 LANGFUSE_TAG 一致；4.0.0 非可拉取镜像 tag）
@@ -159,7 +160,7 @@ echo "      mkdir -p /opt/geesun/data/{agent,uploads,reports}   # 路径对应 .
 echo "      cd $REPO_ROOT/deploy"
 echo "      cp .env.example .env && vi .env   # 填全部密钥（REGISTRY_GEESUN / REGISTRY_HUB / Harbor 凭证 / 各 *PASSWORD）"
 echo "      docker login 172.16.220.74:8333   # 私有仓库拉取镜像必需（--with-registry-auth 依赖本机登录态）"
-echo "      ./setup-cube-dns.sh               # 可选但推荐：*.cube.app DNS（见 DEPLOYMENT.md §4.8）"
+echo "      ./setup-cube-dns.sh               # 可选但推荐：*.cube.app DNS（dnsmasq 直答，见 README Deployment §0）"
 echo "      ./start_stack.sh --no-build --with=mcp,web   # 用已推送镜像发布到 Swarm（--no-build 跳过打包）"
 echo "      ./service_stack.sh               # 校验服务状态（docker stack services geesun）"
 echo "    （构建机若已在本目录，可直接 ./start_stack.sh --with=mcp,web，它会先 build-push 再发布）"

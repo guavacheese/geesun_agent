@@ -7,9 +7,9 @@
 #   ./start_stack.sh --with=phoenix,langfuse  # 可观测栈随栈自托管（与 agent/mcp/web 统一启动）
 #
 # 说明：
-#   - 镜像来自 Harbor：自有应用 geesun-agent 在 geesun_ai 项目（REGISTRY_GEESUN），
-#     第三方通用镜像（pgvector/caddy/loki/alloy/prometheus/grafana）在 dockerhub 项目（REGISTRY_HUB），
-#     由 deploy/build-push.sh 构建 / 同步。
+#   - 镜像来自 Harbor：自有应用用 REGISTRY_GEESUN，第三方通用镜像用 REGISTRY_HUB；
+#     生产单仓（2026-09-02 起）：两者同值 geesun_ai，全部服务同仓拉取，
+#     由 deploy/build-push.sh 构建 / 同步（dockerhub proxy 仅作工作站手动拉官方镜像加速）。
 #   - 多文件用 start_stack.sh --with= 合并 -c，共享 overlay 网络 appnet2（容器间用服务名互访，stack 前缀 geesun_）。
 #   - 可观测性 Phoenix/Langfuse 均自托管、随栈启动：--with=phoenix 并入 docker-compose.phoenix.yml、
 #     --with=langfuse 并入 docker-compose.langfuse.yml；二者都用 appnet2、由 deploy.restart_policy 自愈，
@@ -18,7 +18,8 @@
 #   - 对外只暴露 caddy 的 80（前端主入口）；数据库 / loki / grafana(127.0.0.1:3100) 不暴露到主机。
 #   - 日志/指标/追踪：各服务 json-file 驱动做大小轮转（max-size/max-file），Alloy 统一采集（logs→Loki / metrics→Prometheus / traces→Phoenix，替代原 Promtail），Grafana 检索。
 #   - geesun-agent 镜像需先由 build-push.sh 构建并推送（构建上下文必须为 /d/workspace）。
-#   - CubeSandbox 证书与 *.cube.app DNS：见 DEPLOYMENT.md §4.3 / §4.8 与 deploy/setup-cube-dns.sh。
+#   - CubeSandbox 证书（combined-ca）与 *.cube.app DNS：见 README `## Deployment` §0
+#     与 deploy/setup-combined-ca.sh / deploy/setup-cube-dns.sh。
 
 services:
   geesun-agent:

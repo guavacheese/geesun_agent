@@ -43,7 +43,7 @@ else
 fi
 
 echo "完成。可继续："
-echo "  sudo bash deploy/setup-cube-dns.sh    # 可选但推荐：容器内解析 *.cube.app（§4.8）"
+echo "  sudo bash deploy/setup-cube-dns.sh    # 可选但推荐：容器内解析 *.cube.app（见 README Deployment §0）"
 echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml pull"
 echo "  docker compose -f docker-compose.yml -f docker-compose.mcp.yml -f docker-compose.web.yml up -d"
 echo "(若主机无 UID 1001 账户属正常；chown 按数字 UID 生效即可)"

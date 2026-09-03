@@ -12,8 +12,8 @@
 #       → phoenix:4317（OTLP gRPC，仅 overlay 内，不发布主机）。
 #       UI 发布到主机 6006；metrics 9090 不发布。
 #
-# 镜像：phoenix:19.1.0 / postgres:16.14 已推送至 Harbor **geesun_ai** 项目（REGISTRY_GEESUN），
-#       不走 dockerhub 项目（该项目的 phoenix/postgres 标签为空）。
+# 镜像：phoenix:19.1.0 / postgres:16.14 经 compose 用 REGISTRY_GEESUN 取（单仓=geesun_ai，
+#       与 REGISTRY_HUB 同值；build-push.sh 亦同步这两镜像入仓）。
 #
 # 数据：使用全新卷 phoenix_pg_data。原共享实例历史数据仍在 opt_database_data 卷
 #       （spans 约 1.1 万行 / traces 218 行，1.7GB），未迁移；需要时再 pg_dump 导入。

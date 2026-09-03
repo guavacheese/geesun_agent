@@ -11,7 +11,7 @@
 #     避免与 10.10.10.67 上现有 dev 的 :8000 冲突。
 #   - 共享 agent 的 ${AGENT_DATA_ROOT}/{agent,uploads,reports} 挂载：
 #     mcp 需读 skills（AGENT_WORKSPACE）、解析 /uploads / /reports 虚拟路径。
-#   - E2B / CubeSandbox 访问需信任 egress CA（SSL_CERT_FILE），与 agent 同理（DEPLOYMENT §4.3）。
+#   - E2B / CubeSandbox 访问需信任 egress CA（SSL_CERT_FILE），与 agent 同理（见 README Deployment §0 与 setup-combined-ca.sh）。
 #   - DLP 解密网关（DECRYPT_API_URL）在 compose 外，由 .env 提供。
 #   - 镜像需先由 build-push.sh 的 build_push_mcp()（旧名 sync_mcp）构建并推送（上下文 = geesun_mcp_server 仓库根）。
 #
