@@ -23,7 +23,10 @@
 
 services:
   langfuse-worker:
-    image: ${REGISTRY_HUB}/langfuse:${LANGFUSE_TAG:-3}
+    # ⚠️ 必须用独立 worker 镜像 langfuse-worker（官方 v3 起分镜像）：若复用 langfuse(web) 镜像，
+    #    容器会跑成 next-server web 进程，BullMQ 消费器不启动 → otel-ingestion-queue 堆积、
+    #    ClickHouse 0 trace（2026-09-03 实测根因）。
+    image: ${REGISTRY_HUB}/langfuse-worker:${LANGFUSE_TAG:-3}
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）
     depends_on: &langfuse-depends-on
       - postgres
