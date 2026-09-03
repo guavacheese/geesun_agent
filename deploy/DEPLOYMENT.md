@@ -2,7 +2,7 @@
 
 > 本文件是 `deploy/` 目录的部署参考，配合根 `README.md` 的 `## Deployment` 使用：
 > - **端口矩阵、部署步骤、外部依赖**见 `README.md` 的 `## Deployment`（本文件不重复）；
-> - 本文件额外收录：①设计细节（网络 / 卷前缀 / `limits` 生效差异，README 已交叉引用）②完整环境变量清单 ③实锤过的部署坑与修复（防复发）。
+> - 本文件额外收录：①设计细节（网络 / 卷前缀 / `limits` 生效差异，README 已交叉引用）与**按场景部署操作手册（§1.6）** ②完整环境变量清单 ③实锤过的部署坑与修复（防复发）。
 >
 > 职责分离：**`AGENTS.md`（仓库根）= agent 沙箱运行时 obey 规则**（文件系统 / MCP 工具 / Skill 优先 / write_file 路径）；**本文件 = 部署 / 排障诊断参考**。两者不混。
 
@@ -48,7 +48,7 @@
 ### 1.3 `limits` 生效差异（与 `docker compose up` 的关键区别）
 
 - 本仓库所有 compose 用 **`deploy.resources.limits.{cpus,memory}`** 设限额（swarm 专用键）。**仅 `docker stack deploy`（swarm）会生效**；`docker compose up`（非 swarm）**完全忽略 `deploy.resources.limits`**，且这些 compose 没有配套写非 swarm 的 `mem_limit` / `cpus` 键，于是：
-  - 若误用 `docker compose up` 拉起，**所有服务无 CPU/内存上限** → 失控容器可能撑爆节点内存（尤其 `langfuse-web`/`langfuse-worker` 需 2g、`clickhouse` 需 4g 的场景）。
+  - 若误用 `docker compose up` 拉起，**所有服务无 CPU/内存上限** → 失控容器可能撑爆节点内存（尤其 `langfuse-web`/`langfuse-worker` 需 4g、`clickhouse` 需 4g 的场景）。
   - **生产只走 `start_stack.sh`（`docker stack deploy`）**，不用 `docker compose up`。这是硬性约束。
 - swarm 下 `memory` 限额是硬上限：容器超用会被 cgroup 杀（表现为 OOMKill 或进程 V8 `SIGABRT` exit 134，见 §3 的 Langfuse 内存坑）。`cpus` 是 CFS 配额硬上限。
 - 当前各服务限额（核对自各 compose，2026-09-02）：
@@ -66,8 +66,8 @@
   | geesun-agent-web | 1.0 | 512m | docker-compose.web.yml |
   | phoenix | 1.0 | 1g | docker-compose.phoenix.yml |
   | phoenix-db | 1.0 | 1g | docker-compose.phoenix.yml |
-  | langfuse-web | 1.0 | **2g** | docker-compose.langfuse.yml |
-  | langfuse-worker | 1.0 | **2g** | docker-compose.langfuse.yml |
+  | langfuse-web | 1.0 | **4g** + `NODE_OPTIONS=--max-old-space-size=3072` | docker-compose.langfuse.yml |
+  | langfuse-worker | 1.0 | **4g** + `NODE_OPTIONS=--max-old-space-size=3072` | docker-compose.langfuse.yml |
   | clickhouse | 2.0 | 4g | docker-compose.langfuse.yml |
   | minio | 0.5 | 512m | docker-compose.langfuse.yml |
   | redis | 0.5 | 512m | docker-compose.langfuse.yml |
@@ -86,10 +86,44 @@
 - compose 内服务侧用 `env_file: [.env]`（geesun-agent / geesun-mcp / alloy）把全部变量透传给容器；其余服务在 `environment:` 块逐个 `${VAR}` 引用。`.env` 含密钥，**不入库**（`chmod 600`）。
 - `NEXT_PUBLIC_API_BASE` 是 **build-time** 变量：经 `build-push.sh` 的 `--build-arg` 内联进 web 镜像 JS 产物，运行时改 `.env` 无效（改前端地址须重建 web 镜像并递增 `WEB_TAG`）。
 
-### 1.6 镜像 tag 与拉取策略
+### 1.6 部署操作手册（按场景）
 
-- 自有应用（geesun-agent / geesun-mcp-server / geesun-agent-web）来自 Harbor `geesun_ai`（`REGISTRY_GEESUN`），第三方通用镜像（pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres）来自 `dockerhub`（`REGISTRY_HUB`），均由 `build-push.sh` 构建/同步。
-- `start_stack.sh` 带 `--resolve-image=always`（固定 tag 重新发布时强制拉新镜像）+ `--with-registry-auth`（私有 Harbor 必需，依赖本机已 `docker login`）。改了源码须回构建机 `build-push.sh` 重推并**递增 tag**，否则 `--resolve-image=always` 拉到旧镜像。镜像 tag 只认正斜杠 `/`，反斜杠 `\` 报 `invalid reference format`。
+> 部署唯一入口是 `deploy/start_stack.sh`（头部注释是速查，本节是完整语义）。它最终汇成一条 `docker stack deploy`：
+> `docker stack deploy -c docker-compose.yml [-c docker-compose.<附加>.yml…] --with-registry-auth --resolve-image=always --prune <STACK_NAME>`
+> **核心机制：swarm stack deploy 是声明式幂等 diff**——重跑时只滚动** spec 真正变化**的服务，其余服务零操作（容器不重启、连接不断）。不存在"全部重启一遍"，也**不需要**为单服务写专用重启脚本。
+
+#### 1.6.1 参数 / 变量语义速查
+
+| 参数 | 作用 | 何时用 / 注意 |
+| --- | --- | --- |
+| （无参数） | 先跑 `build-push.sh` 打包推 Harbor，再 deploy | **首次部署、改了源码**（想只发镜像见 `--no-build`） |
+| `--no-build` | 跳过打包推送，仅用已推送镜像重发 spec | **只改了 `.env` / compose** 时用，几十秒完成；镜像没变就不要省它 |
+| `--with=mcp,web,phoenix,langfuse` | 叠加 `docker-compose.<name>.yml`（逗号分隔，名称必须对应存在的附加 compose 文件） | 加挂子栈；**每次都必须完整复刻上次的参数组合**——漏项会触发 `--prune` 清掉对应服务（见 1.6.3 场景⑤） |
+| `STACK_NAME=geesun ./start_stack.sh` | **环境变量前缀**（不是参数）指定 stack 名 | 默认 `geesun`，**一旦定了别改**——改名 = 另起一套 stack，旧服务全部孤立（见 §1.2 卷前缀语义） |
+| `--with-registry-auth` | deploy 时把本机 Harbor 登录凭证传给 swarm 节点 | 私有 Harbor 必需；依赖本机已 `docker login ${REGISTRY_HUB%/*}`，未登录则节点拉镜像 401/失败 |
+| `--resolve-image=always` | 固定 tag（如 `:3.224.3`）也强制重新拉镜像 | 保证同 tag 重发布拉到新镜像；但**改了源码必须递增 tag**，否则拉到的还是旧 tag 内容 |
+| `--prune` | 清理"compose 集合中已删除"的服务 | 双刃剑：少带了 `--with` 项 = 该服务在集合里消失 = 被 prune 清掉；**只删服务，不删命名卷**（数据保留，见 §1.2） |
+
+- 脚本只认 `--with=` 与 `--no-build` 两个参数，其余直接报错退出；`STACK_NAME` 是前缀 env 不是参数。
+- 前置检查（不过则退出）：docker 存在、swarm active（否则先 `docker swarm init`）、`deploy/.env` 存在。
+- `.env` 由脚本 `set -a; source` 注入 shell 再 deploy——`docker stack deploy` 自己不读 `.env`（见 §1.5），这也是"改 .env 后唯一入口是重跑 deploy"的原因：服务 spec 里的 env 是 deploy 那一刻固化的快照，`docker service update --force` 不会重读 .env，只适合"卷内代码改了想强重启进程"的场景。
+- 发布后查状态：`./service_stack.sh`；看日志：`docker service logs -f geesun_<服务名>`；停整栈：`./stop_stack.sh`（等价 `docker stack rm geesun`，命名卷保留）。
+
+#### 1.6.2 五场景操作速查
+
+| 场景 | 操作 | 影响范围 |
+| --- | --- | --- |
+| **① 首次部署**（构建机 + 生产机均从零） | 生产机先 `docker swarm init` + `docker login ${REGISTRY_HUB%/*}`；构建机 `deploy/build-push.sh` 全量打包推送；生产机 `deploy/start_stack.sh`（默认参数 = 只发主栈；要带子栈就带全 `--with=...`） | 全新拉起 |
+| **② 加挂可观测栈**（首次引入 phoenix/langfuse） | `./start_stack.sh --with=phoenix,langfuse,mcp,web`（**完整复刻**，勿只写新增项） | 新增服务；端口矩阵见 §1.4 / README `## Deployment` |
+| **③ 只改了 `.env`**（如 langfuse PK/SK、DB 密码） | `./start_stack.sh --no-build --with=<与上次完全一致>` | 仅引用变更 env 的服务滚动重启（其余零中断）——例：改 `LANGFUSE_PUBLIC/SECRET_KEY` 只滚 `geesun_geesun-agent`，langfuse 服务端不碰 |
+| **④ 改了源码**（agent/mcp/web 任一） | 回构建机 `build-push.sh`（**递增 `*_TAG`**）→ 生产机 `.env` 改对应 tag → `./start_stack.sh --no-build --with=<复刻>` | 单服务滚动重启 |
+| **⑤ 停掉某服务**（如不用 langfuse） | 从 compose 集合移除：不传 `langfuse` → `./start_stack.sh --no-build --with=<剩余项>` | `--prune` 删该服务 task；命名卷/数据保留，将来要恢复直接传回 `--with` 重新拉起即可 |
+
+#### 1.6.3 镜像 tag 与拉取策略
+
+- 自有应用（geesun-agent / geesun-mcp-server / geesun-agent-web）来自 Harbor `geesun_ai`（`REGISTRY_GEESUN`），第三方通用镜像（pgvector / caddy / loki / alloy / prometheus / grafana / phoenix / langfuse / clickhouse / minio / redis / postgres）来自 `dockerhub`（`REGISTRY_HUB`），均由 `build-push.sh` 构建/同步。`*_TAG` 变量见 §2.6。
+- 镜像 tag 只认正斜杠 `/`，反斜杠 `\` 报 `invalid reference format`。
+- ⚠️ **生产实际与上段"拆分表述"不一致（2026-09-02 查证，待对齐）**：生产机 `10.10.10.67` 的 `/opt/geesun/deploy/.env` 第 119 行实测 `REGISTRY_HUB=172.16.220.74:8333/geesun_ai`（与 `REGISTRY_GEESUN` 同值、单仓模式），故 17 个服务全部自 `geesun_ai` 拉取、无一个 `dockerhub` 前缀；`dockerhub` proxy 项目实际只作工作站手动拉 `library/*` 官方镜像的加速通道（回源 daocloud）。文档与 `.env.example` 仍写"拆分目标态"，是否对齐为单仓待拍板。
 - `depends_on` 在 swarm 仅支持**列表**写法（无 `condition: service_healthy`）；agent/mcp/web 连不上依赖时靠自身重试 + `restart_policy: any` 自愈，compose 文件里已有相应 `healthcheck` 供人工排查。
 
 ---
@@ -263,6 +297,10 @@
 - **swarm 镜像部署：源码改动必须回构建机 rebuild+push 才生效**：geesun-agent / geesun-mcp / geesun-agent-web 均跑预构建镜像（Harbor `geesun_ai`，tag 由 `.env` 的 `GEESUN_AGENT_TAG` 等控制），生产机只 `start_stack.sh --no-build` 拉镜像刷新。改了 `src/` 后若仅在生产机改文件**不会生效**——必须在构建机跑 `deploy/build-push.sh`（或 `docker build -t 172.16.220.74:8333/geesun_ai/geesun-agent:<新tag>` 后 `docker push`），再上生产机改 tag + `--no-build --with=phoenix,langfuse,mcp,web` 重启。镜像 tag 只认正斜杠 `/`，反斜杠 `\` 会报 `invalid reference format`。
 - **可观测栈统一随主栈自托管（2026-09-02 起）**：Phoenix（`--with=phoenix`）与 Langfuse（`--with=langfuse`）均已并入本 swarm stack，网络统一 `appnet2`，UI 分别发布 `6006` / `3000`、Minio S3 发布 `9092`，后端 postgres/redis/clickhouse 仅 appnet2 内不占主机端口。旧「复用现网共享实例」方案已废弃。**迁移前须先停用旧共享 Langfuse 栈**（占 3000/3030/5432/6379/8123/9000/9091/9092，无人自愈），否则与我方栈抢 3000/9092。Langfuse 自托管后 `LANGFUSE_PUBLIC_KEY/SECRET_KEY` 须对应**本实例**项目（用 `LANGFUSE_INIT_*` 环境变量首次启动时自动建项目并产出 key），不能填旧共享实例的 key。
 - **附加 compose 网络名铁律**：所有 `docker-compose.*.yml` 附加文件（mcp / web / phoenix / langfuse）均引用主栈同名的 overlay 网络 `appnet2`，**不得**写 `appnet`（历史上 langfuse 文件曾写 `appnet` 导致并入后与主栈不通）。合并只看 `start_stack.sh --with=` 传哪些文件 + 对应 `*_BASE_URL` 端点。
-- **Langfuse-web / langfuse-worker 内存 limits.memory 必须 ≥ 2g（2026-09-02 实测）**：1g 限额下 Next.js 16 在 prisma + clickhouse migration + `next-server` 启动阶段 V8 堆超 1g 触发 `SIGABRT`（exit 134）崩溃循环，swarm `restart_policy: any` 反复拉起永不停（容器内仅占 ~44% 内存、无 heap OOM 文本、宿主机有大量空闲，故非宿主机 OOM，而是 cgroup 限额截断）。**修复**：worker 与 web 的 `deploy.resources.limits.memory` 提到 `2g`（当前 compose 已设）。若再遇 langfuse-web 崩溃循环且日志无 OOM 字样，先调内存限额而非去看应用代码。
+- **Langfuse-web / langfuse-worker 内存：`limits.memory` 必须 4g 且配套 `NODE_OPTIONS`（2026-09-03 实测，commit f73c6fb）**：两级实测教训——① 1g 限额下 Next.js 16 启动阶段 V8 堆超限触发 `SIGABRT`（exit 134）崩溃循环（2026-09-02 曾修到 2g）；② **2g 仍不够**：首启 init 阶段（Prisma 424 个 migration 后建 org/project/keys/user 的事务）V8 堆涨到 ~1.5g 撞 `--max-old-space-size` 默认上限，进程被 SIGKILL（日志只有 `FATAL ERROR: Ineffective mark-compacts near heap limit / JavaScript heap out of memory`），事务回滚 → organization 0 行 → UI 永远要求 New Organization，而 swarm 随后拉起的新 task 表面正常（UI 能开、health 200），极具迷惑性。**修复必须两项配套**：容器 `limits.memory: 4g`（否则 cgroup 先杀进程）+ 环境变量 `NODE_OPTIONS: "--max-old-space-size=3072"`（锁 V8 heap 3g，否则 V8 仍撞老默认上限）——只改其一都治不好。当前 compose 已按此设置（经 `<<: *langfuse-worker-env` anchor 同时作用于 web/worker）。诊断顺序：崩溃循环且日志无 OOM 字样 → 先查内存限额；日志有 heap OOM → 直接查这两个变量是否配套。
 - **swarm 发布端口须让进程绑 0.0.0.0（Next.js 只绑 overlay IP 的特例，2026-09-02 实测）**：`langfuse-web:3000` 默认 `mode: host` 发布后，主机 `10.10.10.67:3000` / `127.0.0.1:3000` 仍 `Connection reset by peer`（000）；但容器内 `curl localhost:3000` 与同 overlay 内 agent 访问 `langfuse-web:3000` 均 200。根因：Next.js 16 进程只监听 overlay IP（`10.0.1.x:3000`），而 swarm `mode: host` 经 docker-proxy 把主机 3000 转发到容器 gwbridge IP（`172.21.0.15`），该地址无监听 → RST（`iptables DNAT dpt:3000 to:172.21.0.15` + `/proc/net/tcp` 仅 `10.0.1.x:0BB8` 实锤）。**修复**：langfuse-web 加环境变量 `HOSTNAME: "0.0.0.0"` 使其绑全网卡（容器 `/proc/net/tcp` 变 `00000000:0BB8`），主机端口即 200。注意：`minio:9092` 用默认 ingress 发布即正常（403 响应），无需此处理——仅 Next.js 这类「只绑首个网卡 IP」的进程需要。
 - **三个 Postgres 实例独立、不合并（2026-09-02 确认现状）**：本栈有 **三个独立 PG 服务、三个不同镜像/版本**，不是「一个实例三库」：①`geesun_postgres`（langfuse 后端，`postgres:17`）；②`geesun_phoenix-db`（Phoenix，`postgres:16.14`，来自 `REGISTRY_GEESUN` 而非 dockerhub）；③`geesun_agent-postgres`（agent，`pgvector:0.8.0-pg17`）。**不合并的理由**：版本/扩展诉求不同（phoenix 钉 16.14、agent 需 pgvector-on-pg17、langfuse 用 17），合并需先把 phoenix 升 17 且放弃爆炸半径隔离，且 `backup.sh` 本就三库分别 pg_dump。历史历来如此，未做过单实例合并。**`agent-postgres` 名不副实**：镜像是 pgvector 但全量搜 `src/` 的 `embedding|vector|similarity|cosine|knn|CREATE EXTENSION|pgvector` 零命中——当前仅作 LangGraph checkpointer + 长期记忆 store（普通关系表），向量扩展未消费；选 pgvector 是为将来 RAG/语义记忆预置，勿当向量检索库排查相似度查询。
+- **Langfuse v3 权限数据诊断：表名单数陷阱 + 双层 membership + "UI 要 New Organization"≠库空（2026-09-03 实测沉淀）**：
+  - **表名全是复数**：`organizations` / `projects` / `api_keys` / `organization_memberships` / `project_memberships`。用单数（`SELECT * FROM organization`）查会报 `relation does not exist`，极易误判"库空 / init 从未成功"（本次就因此把已建好的数据误判成 init 失败，白查一轮）。验证 init 成功与否必须查**数据行**，而不是只核对 env 注入或表存在性。
+  - **UI 空态看的是"当前登录用户"而非"库里有没有 org"**：v3 登录后按当前用户的 org membership 决定渲染（无 → New Organization 引导页）。`LANGFUSE_INIT_*` 自动建的 org 挂在 `LANGFUSE_INIT_USER_EMAIL` 名下；另注册的新账号（如 UI 上自行 signup 的 dan）默认不属于任何 org → 即使 Geesun org / 项目 / trace 都在库里，dan 登录照样看到 New Organization。**排障先查 `SELECT u.email, om.role FROM users u LEFT JOIN organization_memberships om ON om.user_id=u.id`**，而不是去怀疑 init。
+  - **v3 是双层 membership，挂 org 不够**：要让某用户看到项目 trace，须同时插 `organization_memberships`（org 层）+ `project_memberships`（项目层，行内 `org_membership_id` 引用前者的 id，复合主键 `(project_id, user_id)`、无独立 id 列）；`project_memberships` 无 id 列，`SELECT ... pm.id` 会报 column does not exist。role 枚举：`{OWNER,ADMIN,MEMBER,VIEWER,NONE}`。给普通使用 MEMBER 即可（可见/可上报 trace），要管成员再提 ADMIN。
