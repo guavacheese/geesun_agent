@@ -56,15 +56,14 @@ ALLOY_TAG="${ALLOY_TAG:-v1.19.2}"
 PROMETHEUS_TAG="${PROMETHEUS_TAG:-3.0}"
 # 监控采集器（主机/容器指标 → Grafana 四张看板的数据源，见 deploy/grafana/dashboards/）
 NODE_EXPORTER_TAG="${NODE_EXPORTER_TAG:-v1.8.2}"
-CADVISOR_TAG="${CADVISOR_TAG:-v0.49.1}"
-# cadvisor 上游仓库可覆盖：官方只在 gcr.io 发布，内网构建机（含本机）通常无法直连 gcr.io。
-# 若本轮同步报 cadvisor 失败，请在能出网的机器上执行（tag 后 push 进 Harbor 即可，无需重跑本脚本）：
-#   CADVISOR_SRC=172.16.220.74:8333/geesun_ai/cadvisor   # 出网机推上去后再回本机验证
-# 或在出网机上直接：
-#   docker pull gcr.io/cadvisor/cadvisor:${CADVISOR_TAG}
-#   docker tag  gcr.io/cadvisor/cadvisor:${CADVISOR_TAG} 172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG}
-#   docker push 172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG}
-CADVISOR_SRC="${CADVISOR_SRC:-gcr.io/cadvisor/cadvisor}"
+CADVISOR_TAG="${CADVISOR_TAG:-v0.57.0}"
+# cadvisor 上游仓库可覆盖（2026-09-03 实测修正）：官方新版在 gcr.io/cadvisor/cadvisor 与
+#   ghcr.io/google/cadvisor；docker.io 无此仓库（cadvisor/cadvisor 不存在），旧 google/cadvisor:latest
+#   仅支持 cgroups v1 且冻结 7 年，禁用。构建机 ghcr.io 直连可达（备选：gcr.m.daocloud.io 的 gcr 镜像站），
+#   故默认取 ghcr.io/google/cadvisor。CADVISOR_SRC 是「完整源镜像引用」，sync 时不再追加 TAG。
+# 若已在出网机把正确镜像推好 Harbor，可跳过本脚本同步直接复用：
+#   CADVISOR_SRC=172.16.220.74:8333/geesun_ai/cadvisor:${CADVISOR_TAG}  ./build-push.sh
+CADVISOR_SRC="${CADVISOR_SRC:-ghcr.io/google/cadvisor:${CADVISOR_TAG:-v0.57.0}}"
 
 echo "==> REGISTRY_GEESUN = $REGISTRY_GEESUN"
 echo "==> REGISTRY_HUB     = $REGISTRY_HUB"
@@ -167,8 +166,9 @@ sync "grafana/grafana:11.3.0"                  "grafana:11.3.0"
 sync "prometheus:${PROMETHEUS_TAG:-3.0}"        "prometheus:${PROMETHEUS_TAG:-3.0}"
 # 监控采集器（主机/容器指标；Grafana 看板数据源，缺此二者「主机/容器概览」全空）
 sync "prom/node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}"   "node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}"
-# 上游默认 gcr.io（内网常见不可达，失败不中断，见 SYNC_FAILED 汇总与 CADVISOR_SRC 说明）
-sync "${CADVISOR_SRC:-gcr.io/cadvisor/cadvisor}:${CADVISOR_TAG:-v0.49.1}" "cadvisor:${CADVISOR_TAG:-v0.49.1}"
+# 上游默认 ghcr.io/google/cadvisor:v0.57.0（官方发布、cgroups v2 兼容；docker.io 无此仓库，旧版禁用）。
+# 拉不到时记入 SYNC_FAILED 不中断整轮，见 CADVISOR_SRC 说明与末尾失败汇总。
+sync "${CADVISOR_SRC:-ghcr.io/google/cadvisor:${CADVISOR_TAG:-v0.57.0}}" "cadvisor:${CADVISOR_TAG:-v0.57.0}"
 # Phoenix（→ REGISTRY_HUB=geesun_ai 单仓）
 sync "arizephoenix/phoenix:19.1.0"            "phoenix:19.1.0"
 sync "postgres:16.14"                          "postgres:16.14"
@@ -188,7 +188,7 @@ if [ "${#SYNC_FAILED[@]}" -gt 0 ]; then
   echo "    影响：目标机 docker stack deploy 时对应服务会停在 preparing / No such image。" >&2
   echo "    处理：在能出网的机器上手工拉取后推入 Harbor，例如：" >&2
   for f in "${SYNC_FAILED[@]}"; do
-    short="${f##*/}"                       # gcr.io/cadvisor/cadvisor:v0.49.1 -> cadvisor:v0.49.1
+    short="${f##*/}"                       # google/cadvisor:latest -> cadvisor:v0.49.1
     echo "      docker pull $f" >&2
     echo "      docker tag  $f $REGISTRY_HUB/$short" >&2
     echo "      docker push $REGISTRY_HUB/$short" >&2
