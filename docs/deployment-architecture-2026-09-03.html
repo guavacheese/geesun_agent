@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>geesun_ai 生产部署架构 — 网络/服务/端口与数据流（2026-09-03 实况）</title>
+<style>
+  :root{
+    --fg:#1f2328; --muted:#57606a; --line:#d8dee4; --bg:#ffffff;
+    --accent:#0969da; --accent-soft:#ddf4ff; --code-bg:#f6f8fa;
+    --th-bg:#f0f3f6; --th-fg:#1f2328;
+    --blue:#0969da; --purple:#8250df; --green:#1a7f37; --orange:#bc4c00; --teal:#0e7490; --red:#cf222e;
+    --blue-soft:#ddf4ff; --purple-soft:#fbefff; --green-soft:#dafbe1; --orange-soft:#fff1e5; --teal-soft:#e6f6fb; --red-soft:#ffebe9;
+  }
+  *{box-sizing:border-box;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    color:var(--fg); background:#f6f8fa; margin:0; padding:24px 16px; line-height:1.6;
+  }
+  .wrap{max-width:1080px;margin:0 auto;}
+  header.doc{border:1px solid var(--line);border-radius:10px;padding:20px 24px;background:#fff;margin-bottom:20px;}
+  header.doc h1{margin:0 0 6px;font-size:24px;}
+  .meta{color:var(--muted);font-size:13px;margin-bottom:10px;}
+  .badges{margin-top:8px;}
+  .badge{display:inline-block;background:var(--accent-soft);color:var(--accent);border:1px solid #b6d7f7;border-radius:20px;padding:2px 10px;font-size:12px;margin:2px 4px 2px 0;font-weight:600;}
+  .badge.warn{background:var(--red-soft);color:var(--red);border-color:#ffc1c7;}
+  .badge.purple{background:var(--purple-soft);color:var(--purple);border-color:#e4d5fb;}
+  .badge.green{background:var(--green-soft);color:var(--green);border-color:#b7e3c0;}
+  .badge.orange{background:var(--orange-soft);color:var(--orange);border-color:#f6cba6;}
+  section{background:#fff;border:1px solid var(--line);border-radius:10px;padding:18px 24px;margin-bottom:20px;}
+  section h2{font-size:19px;margin:0 0 4px;border-bottom:2px solid var(--accent);padding-bottom:6px;}
+  section h3{font-size:15px;margin:18px 0 6px;}
+  .sub{color:var(--muted);font-size:13px;margin:2px 0 12px;}
+  .figcap{font-size:13px;color:var(--muted);margin:6px 0 2px;text-align:center;}
+  svg{width:100%;height:auto;display:block;background:#fff;}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0 4px;}
+  th,td{border:1px solid var(--line);padding:5px 9px;text-align:left;vertical-align:top;}
+  th{background:var(--th-bg);font-weight:600;white-space:nowrap;}
+  td code,li code,p code{background:var(--code-bg);border-radius:4px;padding:1px 5px;font-size:12px;font-family:Consolas,Menlo,monospace;}
+  code{background:var(--code-bg);border-radius:4px;padding:1px 5px;font-size:12.5px;font-family:Consolas,Menlo,monospace;}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:10px 14px;overflow:auto;font-size:12.5px;line-height:1.5;}
+  pre code{background:none;padding:0;}
+  ul,ol{padding-left:22px;}
+  li{margin:3px 0;}
+  .kbd{font-family:Consolas,Menlo,monospace;background:#fff;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;font-size:12px;}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:10px 0;}
+  .card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#fff;}
+  .card .n{font-size:22px;font-weight:700;color:var(--accent);}
+  .card .t{font-size:12px;color:var(--muted);}
+  .note{border-left:4px solid var(--orange);background:var(--orange-soft);padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;margin:10px 0;}
+  .danger{border-left:4px solid var(--red);background:var(--red-soft);padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;margin:10px 0;}
+  .ok{border-left:4px solid var(--green);background:var(--green-soft);padding:8px 12px;border-radius:0 6px 6px 0;font-size:13px;margin:10px 0;}
+  .pill{display:inline-block;border-radius:4px;padding:0 6px;font-size:11.5px;font-weight:600;}
+  .pill.g{background:var(--green-soft);color:var(--green);border:1px solid #b7e3c0;}
+  .pill.r{background:var(--red-soft);color:var(--red);border:1px solid #ffc1c7;}
+  .pill.o{background:var(--orange-soft);color:var(--orange);border:1px solid #f6cba6;}
+  .pill.b{background:var(--blue-soft);color:var(--blue);border:1px solid #b6d7f7;}
+  .pill.p{background:var(--purple-soft);color:var(--purple);border:1px solid #e4d5fb;}
+  a{color:var(--accent);}
+  footer{color:var(--muted);font-size:12px;text-align:center;padding:8px;}
+  .flow{display:flex;align-items:flex-start;gap:10px;margin:4px 0;}
+  .flow .step{flex:0 0 26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;margin-top:2px;}
+  .flow .body{flex:1;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <h1>geesun_ai 生产部署架构 — 网络 / 服务 / 端口 / 数据流</h1>
+  <div class="meta">
+    数据基准：<b>2026-09-03（今日实况核对，SSH 10.10.10.67 只读采集 + deploy/ 声明文件比对）</b> ·
+    生产机 <code>10.10.10.67</code> · Swarm 单节点（Leader）· Docker Engine 29.6.2 · 8 vCPU / 31 GB RAM · / 35%（09-03 两轮清理回收 ~26G 后）
+  </div>
+  <div class="badges">
+    <span class="badge">17 services · 1/1 Running</span>
+    <span class="badge">镜像单仓 geesun_ai（2026-09-02 起）</span>
+    <span class="badge">overlay: geesun_appnet2 · 10.0.1.0/24</span>
+    <span class="badge purple">agent:1.0.1 · mcp:1.0.0 · web:1.0.0</span>
+    <span class="badge green">已清理（09-03）: 残留容器/悬空卷/旧镜像全清 · :5432 无监听</span>
+  </div>
+  <div class="sub" style="margin-top:6px;">
+    图/表全部基于 compose 声明 + 生产实况交叉验证；引用统一指向 <code>deploy/</code> 下的真实文件与行号。
+  </div>
+</header>
+
+<section>
+  <h2>0 · 一分钟快览</h2>
+  <div class="cards">
+    <div class="card"><div class="n">17</div><div class="t">swarm 服务（含子栈 mcp/web/phoenix/langfuse），全部 Running 1/1</div></div>
+    <div class="card"><div class="n">1</div><div class="t">overlay 网络 <code>geesun_appnet2</code>（10.0.1.0/24），服务名互访</div></div>
+    <div class="card"><div class="n">7</div><div class="t">主机发布端口：80/3000/6006/3100/19091/12345/9092</div></div>
+    <div class="card"><div class="n">3</div><div class="t">独立 Postgres：agent-mem(pgvector17) / langfuse(pg17) / phoenix(pg16.14)</div></div>
+  </div>
+  <div class="cards">
+    <div class="card"><div class="n">3</div><div class="t">自有应用镜像：geesun-agent / geesun-mcp-server / geesun-agent-web（build-push.sh 构建推 Harbor）</div></div>
+    <div class="card"><div class="n">2</div><div class="t">外部计算依赖：vLLM :8003（LLM）与 cube-api :6000（沙箱控制面），同在 172.16.66.13</div></div>
+    <div class="card"><div class="n">1</div><div class="t">PyPI 本地中转：devpi @ 192.168.10.136:3141（沙箱 pip 现场装包）</div></div>
+    <div class="card"><div class="n">0</div><div class="t">残留（09-03 已清）：原 opt-db-1 占 :5432 → 已删，终态 17 容器 / 13 卷 / 29 镜像全在用</div></div>
+  </div>
+  <div class="sub" style="margin-top:8px;">
+    关键背景：可观测（Phoenix/Langfuse）与 MCP/Web 均已<b>随本 swarm stack 自托管</b>（<code>--with=mcp,web,phoenix,langfuse</code>），不再复用现网共享实例；镜像从双项目（dockerhub proxy 拆分）收敛为 <b>Harbor 单仓 <code>geesun_ai</code></b>。
+  </div>
+</section>
+
+<section>
+  <h2>1 · 物理拓扑与镜像供应链（机器级）</h2>
+  <div class="sub">四类机器：构建机 / Harbor / 生产机(67) / 计算节点(66.13) + 136(devpi) 与 LDAP、DLP 外部依赖。镜像只进 Harbor 一个口，运行时全部从 Harbor 拉。</div>
+  <svg viewBox="0 0 1000 760" xmlns="http://www.w3.org/2000/svg" font-family="'Microsoft YaHei','PingFang SC',sans-serif">
+    <defs>
+      <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#57606a"/></marker>
+      <marker id="arrB" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0969da"/></marker>
+      <marker id="arrP" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8250df"/></marker>
+      <marker id="arrO" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#bc4c00"/></marker>
+    </defs>
+    <rect x="0" y="0" width="1000" height="760" fill="#fff"/>
+    <text x="10" y="20" font-size="12" fill="#57606a">图例：<tspan font-weight="700" fill="#0969da">──▶ 镜像/构建流</tspan>　<tspan font-weight="700" fill="#8250df">──▶ 运行时调用（67→外部）</tspan>　<tspan font-weight="700" fill="#bc4c00">──▶ 浏览器/用户入口</tspan></text>
+
+    <!-- 浏览器 -->
+    <rect x="40" y="60" width="185" height="82" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.6"/>
+    <text x="132" y="86" text-anchor="middle" font-size="14" font-weight="700" fill="#0969da">浏览器 / 内网用户</text>
+    <text x="132" y="106" text-anchor="middle" font-size="12" fill="#1f2328">http://10.10.10.67/</text>
+    <text x="132" y="124" text-anchor="middle" font-size="11" fill="#57606a">UI: :80 / :3000(langfuse) / :6006(phoenix)</text>
+
+    <!-- Harbor -->
+    <rect x="405" y="52" width="240" height="150" rx="10" fill="#fff1e5" stroke="#bc4c00" stroke-width="1.8"/>
+    <text x="525" y="76" text-anchor="middle" font-size="14" font-weight="700" fill="#bc4c00">Harbor 172.16.220.74:8333</text>
+    <text x="525" y="94" text-anchor="middle" font-size="11" fill="#57606a">HTTP（insecure-registries）· 生产单仓</text>
+    <rect x="420" y="104" width="210" height="36" rx="6" fill="#fff" stroke="#d8dee4"/>
+    <text x="525" y="118" text-anchor="middle" font-size="11.5" font-weight="600" fill="#0969da">geesun_ai ×17 镜像</text>
+    <text x="525" y="133" text-anchor="middle" font-size="10.5" fill="#57606a">自研3 + pgvector/caddy/loki/alloy/prom/grafana/…</text>
+    <rect x="420" y="146" width="210" height="40" rx="6" fill="#fff" stroke="#d8dee4"/>
+    <text x="525" y="161" text-anchor="middle" font-size="11.5" font-weight="600" fill="#8250df">cubesandbox 项目</text>
+    <text x="525" y="177" text-anchor="middle" font-size="10.5" fill="#57606a">sandbox-code 模板（沙箱 rootfs）</text>
+
+    <!-- 外网 -->
+    <rect x="868" y="60" width="112" height="64" rx="10" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="924" y="86" text-anchor="middle" font-size="12" font-weight="600" fill="#57606a">外网</text>
+    <text x="924" y="105" text-anchor="middle" font-size="10.5" fill="#57606a">mirrors.aliyun.com/pypi（回源）</text>
+
+    <!-- 构建机 -->
+    <rect x="40" y="252" width="185" height="122" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.6"/>
+    <text x="132" y="276" text-anchor="middle" font-size="14" font-weight="700" fill="#0969da">构建机（工作站 Windows）</text>
+    <text x="132" y="296" text-anchor="middle" font-size="11" fill="#1f2328">/d/workspace 三源码仓</text>
+    <text x="132" y="312" text-anchor="middle" font-size="11" fill="#1f2328">geesun_agent / _mcp_server / _agent_web</text>
+    <text x="132" y="332" text-anchor="middle" font-size="11" fill="#1f2328">deploy/build-push.sh</text>
+    <text x="132" y="350" text-anchor="middle" font-size="10.5" fill="#57606a">需能出公网拉第三方镜像 + 登录 Harbor</text>
+    <text x="132" y="366" text-anchor="middle" font-size="10.5" fill="#57606a">构建上下文含 langchain-cubesandbox（同级）</text>
+
+    <!-- 136 -->
+    <rect x="40" y="460" width="185" height="160" rx="10" fill="#fbefff" stroke="#8250df" stroke-width="1.8"/>
+    <text x="132" y="484" text-anchor="middle" font-size="14" font-weight="700" fill="#8250df">192.168.10.136</text>
+    <text x="132" y="502" text-anchor="middle" font-size="11" fill="#1f2328">PyPI 本地中转 / 模板构建机</text>
+    <rect x="52" y="512" width="161" height="52" rx="6" fill="#fff" stroke="#d8dee4"/>
+    <text x="132" y="529" text-anchor="middle" font-size="11.5" font-weight="600" fill="#8250df">devpi-server :3141</text>
+    <text x="132" y="546" text-anchor="middle" font-size="10" fill="#57606a">Python venv + systemd（非 docker）</text>
+    <text x="132" y="559" text-anchor="middle" font-size="10" fill="#57606a">index=/root/pypi/+simple/</text>
+    <text x="132" y="578" text-anchor="middle" font-size="11" fill="#1f2328">Docker 29.4.1：构建沙箱模板</text>
+    <text x="132" y="596" text-anchor="middle" font-size="10.5" fill="#57606a">出口干净（不经 AC 网关）· firewalld 放行 3141</text>
+
+    <!-- 生产机 67 -->
+    <rect x="300" y="252" width="428" height="330" rx="14" fill="#ffffff" stroke="#1f2328" stroke-width="2"/>
+    <rect x="300" y="252" width="428" height="40" rx="14" fill="#1f2328"/>
+    <rect x="300" y="276" width="428" height="16" fill="#1f2328"/>
+    <text x="514" y="277" text-anchor="middle" font-size="14.5" font-weight="700" fill="#fff">生产机 10.10.10.67 · Docker Swarm（单节点 Leader）</text>
+    <text x="320" y="312" font-size="12" fill="#1f2328">stack <b>geesun</b> · 17 services 全部 1/1 Running</text>
+    <text x="320" y="332" font-size="12" fill="#1f2328">overlay <b>geesun_appnet2</b> = 10.0.1.0/24（容器服务名互访）</text>
+    <text x="320" y="352" font-size="12" fill="#1f2328">镜像全来自 Harbor geesun_ai（--with-registry-auth 拉取）</text>
+    <text x="320" y="376" font-size="12" font-weight="700" fill="#0969da">主机发布端口（对外暴露面）</text>
+    <text x="332" y="396" font-size="11.5" fill="#1f2328">:80  caddy 前端主入口（ingress）</text>
+    <text x="332" y="414" font-size="11.5" fill="#1f2328">:3000 langfuse-web UI+OTLP（host 直绑）</text>
+    <text x="332" y="432" font-size="11.5" fill="#1f2328">:6006 phoenix UI · :3100 grafana · :19091 prometheus</text>
+    <text x="332" y="450" font-size="11.5" fill="#1f2328">:12345 alloy UI · :9092 minio S3（媒体外链）</text>
+    <text x="320" y="476" font-size="12" font-weight="700" fill="#8250df">数据/系统附设</text>
+    <text x="332" y="496" font-size="11.5" fill="#1f2328">/opt/geesun/data/{agent,uploads,reports,skills}（bind 共享）</text>
+    <text x="332" y="514" font-size="11.5" fill="#1f2328">dnsmasq :53 · *.cube.app（setup-cube-dns.sh）</text>
+    <text x="332" y="532" font-size="11.5" fill="#1f2328">certs/combined-ca.pem（egress MITM CA，setup-combined-ca.sh）</text>
+    <text x="320" y="556" font-size="12" font-weight="700" fill="#1a7f37">✓ 已清理（09-03 原残留区）</text>
+    <text x="332" y="574" font-size="11.5" fill="#1f2328">opt-db-1（旧共享栈 PG，曾占 :5432）已删 + 卷同删</text>
+    <text x="332" y="590" font-size="11.5" fill="#57606a">opt-phoenix-1 / cube-egress / 14 个旧 task 与悬空卷、旧镜像一并清除</text>
+    <text x="320" y="612" font-size="11" fill="#57606a">容器网络与 17 服务细节 → 架构图 2</text>
+
+    <!-- 计算节点 66.13 -->
+    <rect x="770" y="252" width="210" height="330" rx="12" fill="#fbefff" stroke="#8250df" stroke-width="1.8"/>
+    <text x="875" y="278" text-anchor="middle" font-size="13.5" font-weight="700" fill="#8250df">172.16.66.13（Rocky9）</text>
+    <text x="875" y="296" text-anchor="middle" font-size="11" fill="#1f2328">LLM + 沙箱计算节点</text>
+    <rect x="782" y="306" width="186" height="56" rx="6" fill="#fff" stroke="#d8dee4"/>
+    <text x="875" y="324" text-anchor="middle" font-size="11.5" font-weight="600" fill="#8250df">vLLM :8003（OpenAI /v1）</text>
+    <text x="875" y="340" text-anchor="middle" font-size="10" fill="#57606a">Qwen3.6-35B-A3B-FP8 · TP4 · 4×GPU</text>
+    <text x="875" y="354" text-anchor="middle" font-size="10" fill="#57606a">systemd: vllm-qwen3.5.service（非 docker）</text>
+    <rect x="782" y="368" width="186" height="34" rx="6" fill="#fff" stroke="#d8dee4"/>
+    <text x="875" y="386" text-anchor="middle" font-size="11" fill="#1f2328">bge-m3 reranker :8002</text>
+    <text x="875" y="400" text-anchor="middle" font-size="10" fill="#57606a">vllm-bge-m3.service（同机共享 4 卡）</text>
+    <rect x="782" y="408" width="186" height="40" rx="6" fill="#fff" stroke="#d8dee4"/>
+    <text x="875" y="426" text-anchor="middle" font-size="11.5" font-weight="600" fill="#8250df">cube-api / CubeMaster :6000</text>
+    <text x="875" y="441" text-anchor="middle" font-size="10" fill="#57606a">E2B 控制面（GET /sandboxes 验证）</text>
+    <text x="875" y="460" text-anchor="middle" font-size="11" fill="#1f2328">Sandbox VM 池（MicroVM）</text>
+    <text x="875" y="476" text-anchor="middle" font-size="10.5" fill="#57606a">模板 dev-pipfix（allow-out-cidr 136/32）</text>
+    <text x="875" y="492" text-anchor="middle" font-size="10.5" fill="#57606a">出网 egress MITM（VeriSign 伪 CA 拦截）</text>
+    <text x="875" y="510" text-anchor="middle" font-size="10.5" fill="#57606a">沙箱内 pip 已配 devpi（sandbox.py）</text>
+    <text x="875" y="546" text-anchor="middle" font-size="10.5" fill="#57606a">Harbor 模板拉取：cubemastercli tpl</text>
+    <text x="875" y="562" text-anchor="middle" font-size="10.5" fill="#57606a">create-from-image</text>
+
+    <!-- LDAP / DLP -->
+    <rect x="320" y="640" width="190" height="62" rx="10" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="415" y="662" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1f2328">LDAP/AD 192.168.1.241:389</text>
+    <text x="415" y="680" text-anchor="middle" font-size="10.5" fill="#57606a">DC=geesun,DC=li · agent 登录鉴权</text>
+    <text x="415" y="694" text-anchor="middle" font-size="10.5" fill="#57606a">bind: geesunai · admin 组 geesun-admins</text>
+    <rect x="530" y="640" width="200" height="62" rx="10" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="630" y="662" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1f2328">DLP 解密网关</text>
+    <text x="630" y="680" text-anchor="middle" font-size="10.5" fill="#57606a">DECRYPT_API_URL（.env，内网 HTTP）</text>
+    <text x="630" y="694" text-anchor="middle" font-size="10.5" fill="#57606a">mcp 侧 POST /decrypt 处理加密文件</text>
+
+    <!-- 箭头：浏览器→67 -->
+    <path d="M 225 118 C 255 118 255 210 300 210" fill="none" stroke="#bc4c00" stroke-width="2" marker-end="url(#arrO)"/>
+    <text x="248" y="110" font-size="11" fill="#bc4c00" font-weight="600">HTTP :80 / :3000 / :6006</text>
+    <!-- 构建机→Harbor -->
+    <path d="M 225 310 C 300 310 300 130 405 130" fill="none" stroke="#0969da" stroke-width="2" marker-end="url(#arrB)"/>
+    <text x="252" y="180" font-size="11" fill="#0969da" font-weight="600">docker build+push 自研3</text>
+    <text x="252" y="196" font-size="11" fill="#0969da">+ 同步第三方镜像(geesun_ai)</text>
+    <!-- 136→Harbor (push sandbox template) -->
+    <path d="M 225 540 C 320 540 320 360 405 360" fill="none" stroke="#8250df" stroke-width="2" marker-end="url(#arrP)"/>
+    <text x="240" y="470" font-size="11" fill="#8250df" font-weight="600">push cubesandbox/</text>
+    <text x="240" y="486" font-size="11" fill="#8250df">sandbox-code:agent-pipfix</text>
+    <!-- Harbor→67 (pull) -->
+    <path d="M 525 202 C 525 220 514 220 514 252" fill="none" stroke="#0969da" stroke-width="2" marker-end="url(#arrB)"/>
+    <text x="545" y="224" font-size="11" fill="#0969da">docker pull（--with-registry-auth / --resolve-image=always）</text>
+    <!-- Harbor→66.13 (template pull) -->
+    <path d="M 645 160 C 760 160 875 200 875 252" fill="none" stroke="#8250df" stroke-width="1.6" stroke-dasharray="5,4" marker-end="url(#arrP)"/>
+    <text x="782" y="196" font-size="10.5" fill="#8250df">cubemaster 拉模板 rootfs</text>
+    <!-- 外网回源 -->
+    <path d="M 924 124 C 924 150 924 160 924 180" fill="none" stroke="#57606a" stroke-width="1.6" stroke-dasharray="5,4" marker-end="url(#arr)"/>
+    <!-- 67→66.13 LLM/E2B -->
+    <path d="M 728 430 C 755 430 755 440 770 440" fill="none" stroke="#8250df" stroke-width="2" marker-end="url(#arrP)"/>
+    <text x="678" y="420" font-size="11" fill="#8250df" font-weight="600">agent → :8003/v1 ChatOpenAI</text>
+    <text x="678" y="436" font-size="11" fill="#8250df">(Qwen3.6-35B-A3B)</text>
+    <text x="686" y="474" font-size="11" fill="#8250df" font-weight="600">agent/mcp → :6000</text>
+    <text x="686" y="490" font-size="11" fill="#8250df">E2B connect（沙箱创建/执行）</text>
+    <!-- 66.13 sandbox→136 devpi -->
+    <path d="M 770 476 C 560 476 400 560 230 576" fill="none" stroke="#8250df" stroke-width="1.8" stroke-dasharray="6,4" marker-end="url(#arrP)"/>
+    <text x="500" y="548" font-size="11" fill="#8250df" font-weight="600">沙箱内 pip install → 136:3141 devpi（allow-out-cidr 192.168.10.136/32 放行）</text>
+    <!-- 136→外网回源 -->
+    <path d="M 225 600 C 400 620 700 620 924 130" fill="none" stroke="#57606a" stroke-width="1.6" stroke-dasharray="5,4" marker-end="url(#arr)"/>
+    <text x="640" y="610" font-size="10.5" fill="#57606a">devpi 回源缓存（首拉后零外网流量）</text>
+    <!-- 67→LDAP -->
+    <path d="M 420 582 C 420 610 415 620 415 640" fill="none" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrP)"/>
+    <!-- 67→DLP -->
+    <path d="M 640 582 C 640 610 630 620 630 640" fill="none" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrP)"/>
+  </svg>
+  <div class="figcap">图 1 · 物理拓扑：四条链路 —— ①镜像供应链（构建机/136 → Harbor → 67/66.13）；②用户入口（浏览器 → 67 各端口）；③运行时外部调用（67 → 66.13 vLLM/cube、LDAP、DLP）；④沙箱 pip → 136 devpi</div>
+
+  <div class="note"><b>重点解释「为什么这么绕」：</b>沙箱（66.13 上）不是不能出网，而是出口被上网认证网关 AC Portal 管控（HTTP 302 认证页 / 443 重签伪证书）。因此 <b>pip 装包改走内网 devpi（136）</b>——136 出口干净，能回源阿里云 PyPI；沙箱侧用 <code>allow-out-cidr 192.168.10.136/32</code> 只放行这一个内网目标，其它出网流量仍被 egress MITM（VeriSign 伪 CA）拦截，容器/agent 侧用 <code>combined-ca.pem</code>（mkcert + 系统根 bundle，约 148 证书）信任该 MITM，二者配合才是「能装包又可控出网」的完整方案（根因与 CA 细节见 <code>.env.example:36-50</code> 注释）。</div>
+</section>
+
+<section>
+  <h2>2 · Swarm 容器网络拓扑（栈内 17 服务）</h2>
+  <div class="sub">整栈（stack=geesun）挂同一张 overlay <code>geesun_appnet2</code>（实况 subnet 10.0.1.0/24，gw 10.0.1.1），容器间用 <b>compose 短服务名</b> DNS 互访（不可用 stack 前缀名）。右侧为主机发布面：仅 7 个端口对外。</div>
+  <svg viewBox="0 0 1000 910" xmlns="http://www.w3.org/2000/svg" font-family="'Microsoft YaHei','PingFang SC',sans-serif">
+    <defs>
+      <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#57606a"/></marker>
+    </defs>
+    <rect x="0" y="0" width="1000" height="910" fill="#fff"/>
+
+    <!-- 主机虚线外框 -->
+    <rect x="16" y="16" width="676" height="878" rx="14" fill="none" stroke="#1f2328" stroke-width="1.8" stroke-dasharray="8,5"/>
+    <rect x="24" y="6" width="210" height="22" rx="6" fill="#1f2328"/>
+    <text x="129" y="21" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">主机 10.10.10.67 · swarm 单节点</text>
+
+    <!-- overlay 框 -->
+    <rect x="32" y="34" width="644" height="850" rx="10" fill="#f6f8fa" stroke="#0969da" stroke-width="1.6"/>
+    <text x="354" y="56" text-anchor="middle" font-size="13" font-weight="700" fill="#0969da">overlay 网络 geesun_appnet2 · 10.0.1.0/24 · 容器服务名互访</text>
+
+    <!-- 分区标签 -->
+    <text x="44" y="78" font-size="11.5" font-weight="700" fill="#0969da">▎入口与应用层（自有镜像，来自 Harbor geesun_ai）</text>
+    <text x="44" y="248" font-size="11.5" font-weight="700" fill="#8250df">▎agent 状态后端</text>
+    <text x="44" y="338" font-size="11.5" font-weight="700" fill="#1a7f37">▎可观测主栈（logs→Loki / metrics→Prom / traces→Alloy→Phoenix）</text>
+    <text x="44" y="528" font-size="11.5" font-weight="700" fill="#0e7490">▎Phoenix（随 --with=phoenix 自托管）</text>
+    <text x="44" y="668" font-size="11.5" font-weight="700" fill="#bc4c00">▎Langfuse（随 --with=langfuse 自托管）</text>
+
+    <!-- ══ 应用层 4 卡 y=88..240 ══ -->
+    <!-- caddy -->
+    <rect x="44" y="90" width="150" height="146" rx="9" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+    <text x="119" y="112" text-anchor="middle" font-size="13.5" font-weight="700" fill="#0969da">caddy</text>
+    <text x="119" y="130" text-anchor="middle" font-size="10" fill="#57606a">caddy:2.8-alpine</text>
+    <text x="119" y="152" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:80</text>
+    <text x="119" y="172" text-anchor="middle" font-size="9.5" fill="#57606a">主机发布(ingress)</text>
+    <text x="119" y="194" text-anchor="middle" font-size="9.5" fill="#1f2328">/api/*,/docs→agent</text>
+    <text x="119" y="208" text-anchor="middle" font-size="9.5" fill="#1f2328">其余→agent-web</text>
+    <text x="119" y="226" text-anchor="middle" font-size="9.5" fill="#57606a">(Caddyfile:14-27)</text>
+    <!-- web -->
+    <rect x="204" y="90" width="150" height="146" rx="9" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+    <text x="279" y="112" text-anchor="middle" font-size="13.5" font-weight="700" fill="#0969da">geesun-agent-web</text>
+    <text x="279" y="130" text-anchor="middle" font-size="10" fill="#57606a">:1.0.0 · Next.js 16</text>
+    <text x="279" y="152" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:3000（栈内）</text>
+    <text x="279" y="172" text-anchor="middle" font-size="9.5" fill="#57606a">不发布主机</text>
+    <text x="279" y="194" text-anchor="middle" font-size="9.5" fill="#1f2328">NEXT_PUBLIC_API_BASE=</text>
+    <text x="279" y="208" text-anchor="middle" font-size="9.5" fill="#1f2328">http://10.10.10.67/</text>
+    <text x="279" y="226" text-anchor="middle" font-size="9.5" fill="#57606a">build-time 变量(web.yml)</text>
+    <!-- agent -->
+    <rect x="364" y="90" width="150" height="146" rx="9" fill="#ddf4ff" stroke="#0969da" stroke-width="1.6"/>
+    <text x="439" y="112" text-anchor="middle" font-size="13.5" font-weight="700" fill="#0969da">geesun-agent ★</text>
+    <text x="439" y="130" text-anchor="middle" font-size="10" fill="#57606a">:1.0.1 · FastAPI</text>
+    <text x="439" y="152" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:8009（栈内）</text>
+    <text x="439" y="172" text-anchor="middle" font-size="9.5" fill="#57606a">不发布主机</text>
+    <text x="439" y="194" text-anchor="middle" font-size="9.5" fill="#1f2328">LangGraph/DeepAgents</text>
+    <text x="439" y="208" text-anchor="middle" font-size="9.5" fill="#1f2328">编排核心（见架构图 3）</text>
+    <text x="439" y="226" text-anchor="middle" font-size="9.5" fill="#57606a">2c/2g (compose:75-81)</text>
+    <!-- mcp -->
+    <rect x="524" y="90" width="150" height="146" rx="9" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+    <text x="599" y="112" text-anchor="middle" font-size="13.5" font-weight="700" fill="#0969da">geesun-mcp</text>
+    <text x="599" y="130" text-anchor="middle" font-size="10" fill="#57606a">:1.0.0</text>
+    <text x="599" y="152" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:8000（栈内）</text>
+    <text x="599" y="172" text-anchor="middle" font-size="9.5" fill="#57606a">/mcp streamable-http</text>
+    <text x="599" y="194" text-anchor="middle" font-size="9.5" fill="#1f2328">DLP 解密 / 沙箱 / skills</text>
+    <text x="599" y="208" text-anchor="middle" font-size="9.5" fill="#1f2328">解密网关在外（见 .env）</text>
+    <text x="599" y="226" text-anchor="middle" font-size="9.5" fill="#57606a">UID 1001 共享卷</text>
+
+    <!-- agent-postgres -->
+    <rect x="44" y="262" width="630" height="66" rx="9" fill="#fbefff" stroke="#8250df" stroke-width="1.4"/>
+    <text x="60" y="286" font-size="13" font-weight="700" fill="#8250df">agent-postgres</text>
+    <text x="170" y="286" font-size="11" fill="#1f2328">pgvector:0.8.0-pg17 · :5432 · DB=agent_mem（LangGraph checkpointer + store）</text>
+    <text x="60" y="310" font-size="10" fill="#57606a">卷 geesun_agent_pg_data · 实为普通关系表后端；pgvector 扩展当前未被代码消费（为将来 RAG/语义记忆预置）· 健康检查 pg_isready</text>
+
+    <!-- ══ 可观测 4 卡 y=352..510 ══ -->
+    <!-- alloy -->
+    <rect x="44" y="352" width="150" height="160" rx="9" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.6"/>
+    <text x="119" y="374" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1a7f37">alloy ★</text>
+    <text x="119" y="392" text-anchor="middle" font-size="10" fill="#57606a">alloy:v1.19.2</text>
+    <text x="119" y="414" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:4317/4321 OTLP</text>
+    <text x="119" y="434" text-anchor="middle" font-size="9.5" fill="#57606a">主机 :12345 UI(ingress)</text>
+    <text x="119" y="456" text-anchor="middle" font-size="9.5" fill="#1f2328">统一采集（logs/metrics/</text>
+    <text x="119" y="470" text-anchor="middle" font-size="9.5" fill="#1f2328">traces 三合一收口）</text>
+    <text x="119" y="488" text-anchor="middle" font-size="9.5" fill="#57606a">挂 docker.sock 发现容器</text>
+    <text x="119" y="502" text-anchor="middle" font-size="9.5" fill="#57606a">(alloy.config.alloy)</text>
+    <!-- loki -->
+    <rect x="204" y="352" width="150" height="160" rx="9" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+    <text x="279" y="374" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1a7f37">loki</text>
+    <text x="279" y="392" text-anchor="middle" font-size="10" fill="#57606a">loki:3.2.0</text>
+    <text x="279" y="414" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:3100</text>
+    <text x="279" y="434" text-anchor="middle" font-size="9.5" fill="#57606a">日志后端（不发布主机）</text>
+    <text x="279" y="456" text-anchor="middle" font-size="9.5" fill="#1f2328">Alloy docker_sd 采集</text>
+    <text x="279" y="470" text-anchor="middle" font-size="9.5" fill="#1f2328">→ loki.api/v1/push</text>
+    <text x="279" y="488" text-anchor="middle" font-size="9.5" fill="#57606a">卷 geesun_loki_data</text>
+    <!-- prometheus -->
+    <rect x="364" y="352" width="150" height="160" rx="9" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+    <text x="439" y="374" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1a7f37">prometheus</text>
+    <text x="439" y="392" text-anchor="middle" font-size="10" fill="#57606a">prometheus:3.0</text>
+    <text x="439" y="414" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:9090</text>
+    <text x="439" y="434" text-anchor="middle" font-size="9.5" fill="#57606a">主机 :19091(ingress)</text>
+    <text x="439" y="456" text-anchor="middle" font-size="9.5" fill="#1f2328">--web.enable-remote-</text>
+    <text x="439" y="470" text-anchor="middle" font-size="9.5" fill="#1f2328">write-receiver</text>
+    <text x="439" y="488" text-anchor="middle" font-size="9.5" fill="#57606a">(compose:196-219)</text>
+    <!-- grafana -->
+    <rect x="524" y="352" width="150" height="160" rx="9" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+    <text x="599" y="374" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1a7f37">grafana</text>
+    <text x="599" y="392" text-anchor="middle" font-size="10" fill="#57606a">grafana:11.3.0</text>
+    <text x="599" y="414" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">:3000</text>
+    <text x="599" y="434" text-anchor="middle" font-size="9.5" fill="#57606a">主机 :3100(ingress)</text>
+    <text x="599" y="456" text-anchor="middle" font-size="9.5" fill="#1f2328">查 Loki/Prom 数据源</text>
+    <text x="599" y="470" text-anchor="middle" font-size="9.5" fill="#1f2328">(provisioning 预配置)</text>
+    <text x="599" y="488" text-anchor="middle" font-size="9.5" fill="#57606a">⚠ 实况全网卡非 127.0.0.1</text>
+    <text x="599" y="502" text-anchor="middle" font-size="9.5" fill="#cf222e">.env.example:247 注释已不符</text>
+
+    <!-- ══ Phoenix ══ -->
+    <rect x="44" y="542" width="310" height="112" rx="9" fill="#e6f6fb" stroke="#0e7490" stroke-width="1.4"/>
+    <text x="60" y="566" font-size="13" font-weight="700" fill="#0e7490">phoenix（Arize）</text>
+    <text x="199" y="566" font-size="10.5" fill="#57606a">phoenix:19.1.0 · 1c/1g</text>
+    <text x="60" y="588" font-size="11.5" fill="#1f2328">:6006 UI（主机发布 ingress）· :4317 OTLP gRPC（仅栈内）· :9090 metrics</text>
+    <text x="60" y="610" font-size="10.5" fill="#57606a">Alloy 经 PHOENIX_OTLP_ENDPOINT=phoenix:4317 转发 traces（OpenInference）</text>
+    <text x="60" y="630" font-size="10" fill="#57606a">2026-09-01 起随栈自托管；原共享实例与其 opt_database_data 卷已于 09-03 清理</text>
+    <text x="60" y="645" font-size="10" fill="#57606a">（旧试运行 trace 未迁移、随卷删除——如需追溯已不可得）</text>
+    <!-- phoenix-db -->
+    <rect x="364" y="542" width="310" height="112" rx="9" fill="#e6f6fb" stroke="#0e7490" stroke-width="1.4"/>
+    <text x="380" y="566" font-size="13" font-weight="700" fill="#0e7490">phoenix-db</text>
+    <text x="490" y="566" font-size="10.5" fill="#57606a">postgres:16.14 · 1c/1g</text>
+    <text x="380" y="588" font-size="11.5" fill="#1f2328">:5432 · DB=phoenix（PHOENIX_SQL_DATABASE_URL）</text>
+    <text x="380" y="610" font-size="10.5" fill="#57606a">卷 geesun_phoenix_pg_data · 健康检查 pg_isready -U phoenix</text>
+    <text x="380" y="630" font-size="10" fill="#57606a">仅 phoenix 服务访问；不发布主机</text>
+
+    <!-- ══ Langfuse ══ -->
+    <!-- web -->
+    <rect x="44" y="682" width="310" height="80" rx="9" fill="#fff1e5" stroke="#bc4c00" stroke-width="1.6"/>
+    <text x="60" y="706" font-size="13" font-weight="700" fill="#bc4c00">langfuse-web</text>
+    <text x="199" y="706" font-size="10.5" fill="#57606a">langfuse:3.224.3 · 1c/4g</text>
+    <text x="60" y="728" font-size="11.5" fill="#1f2328">:3000 UI + OTLP ingest · <b>主机发布 3000（mode: host）</b></text>
+    <text x="60" y="748" font-size="10" fill="#57606a">HOSTNAME=0.0.0.0（否则 overlay IP 无监听被 RST）· NODE_OPTIONS=3072m</text>
+    <!-- worker -->
+    <rect x="364" y="682" width="310" height="80" rx="9" fill="#fff1e5" stroke="#bc4c00" stroke-width="1.6"/>
+    <text x="380" y="706" font-size="13" font-weight="700" fill="#bc4c00">langfuse-worker</text>
+    <text x="519" y="706" font-size="10.5" fill="#57606a">langfuse-worker:3.224.3 · 1c/4g</text>
+    <text x="380" y="728" font-size="11.5" fill="#1f2328">:3030（仅栈内）· BullMQ 消费</text>
+    <text x="380" y="748" font-size="10" fill="#57606a">⚠ 必须独立 worker 镜像：复用 web 镜像则队列无人消费 → ClickHouse 0 trace</text>
+    <!-- 存储 2x2 -->
+    <rect x="44" y="776" width="150" height="92" rx="9" fill="#fff7ed" stroke="#bc4c00" stroke-width="1.2"/>
+    <text x="119" y="798" text-anchor="middle" font-size="12" font-weight="700" fill="#bc4c00">postgres</text>
+    <text x="119" y="816" text-anchor="middle" font-size="10.5" fill="#1f2328">postgres:17 :5432</text>
+    <text x="119" y="832" text-anchor="middle" font-size="9.5" fill="#57606a">Langfuse 元数据主库</text>
+    <text x="119" y="846" text-anchor="middle" font-size="9.5" fill="#57606a">(DATABASE_URL)</text>
+    <text x="119" y="860" text-anchor="middle" font-size="9.5" fill="#57606a">卷 …_postgres_data</text>
+    <rect x="204" y="776" width="150" height="92" rx="9" fill="#fff7ed" stroke="#bc4c00" stroke-width="1.2"/>
+    <text x="279" y="798" text-anchor="middle" font-size="12" font-weight="700" fill="#bc4c00">clickhouse</text>
+    <text x="279" y="816" text-anchor="middle" font-size="10.5" fill="#1f2328">:8123 HTTP/:9000 TCP</text>
+    <text x="279" y="832" text-anchor="middle" font-size="9.5" fill="#57606a">trace/observation 存储</text>
+    <text x="279" y="846" text-anchor="middle" font-size="9.5" fill="#57606a">2c/4g · user 101:101</text>
+    <text x="279" y="860" text-anchor="middle" font-size="9.5" fill="#57606a">卷 …_clickhouse_data</text>
+    <rect x="364" y="776" width="150" height="92" rx="9" fill="#fff7ed" stroke="#bc4c00" stroke-width="1.2"/>
+    <text x="439" y="798" text-anchor="middle" font-size="12" font-weight="700" fill="#bc4c00">redis</text>
+    <text x="439" y="816" text-anchor="middle" font-size="10.5" fill="#1f2328">redis:7 :6379</text>
+    <text x="439" y="832" text-anchor="middle" font-size="9.5" fill="#57606a">BullMQ 队列（otel-ingestion）</text>
+    <text x="439" y="846" text-anchor="middle" font-size="9.5" fill="#57606a">requirepass REDIS_AUTH</text>
+    <text x="439" y="860" text-anchor="middle" font-size="9.5" fill="#57606a">noeviction</text>
+    <rect x="524" y="776" width="150" height="92" rx="9" fill="#fff7ed" stroke="#bc4c00" stroke-width="1.2"/>
+    <text x="599" y="798" text-anchor="middle" font-size="12" font-weight="700" fill="#bc4c00">minio</text>
+    <text x="599" y="816" text-anchor="middle" font-size="10.5" fill="#1f2328">:9000 S3 / :9001 console</text>
+    <text x="599" y="832" text-anchor="middle" font-size="9.5" fill="#57606a">events/media/exports 桶</text>
+    <text x="599" y="846" text-anchor="middle" font-size="9.5" fill="#57606a">主机 :9092(ingress) 媒体</text>
+    <text x="599" y="860" text-anchor="middle" font-size="9.5" fill="#57606a">EXTERNAL_ENDPOINT 取图</text>
+
+    <!-- 内部箭头（少量关键线） -->
+    <!-- caddy -> web -->
+    <path d="M 130 236 L 130 250 Q 130 256 136 256 L 265 256 Q 272 256 272 262 L 272 286" fill="none" stroke="#57606a" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <!-- caddy -> agent 路由注释 -->
+    <path d="M 166 236 L 176 250 Q 180 256 188 256 L 420 256 Q 430 256 430 264 L 430 284" fill="none" stroke="#57606a" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="196" y="250" font-size="10" fill="#1f2328">/api/* /docs → agent；其余 → web（Caddyfile:15-26）</text>
+    <!-- agent -> mcp -->
+    <path d="M 514 236 L 514 250 L 580 250 L 580 278" fill="none" stroke="#57606a" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="520" y="248" font-size="10" fill="#1f2328">:8000/mcp（mcp_server_url）</text>
+    <!-- agent -> agent-pg -->
+    <path d="M 439 236 L 439 250 L 439 262" fill="none" stroke="#57606a" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <!-- agent -> alloy OTLP -->
+    <path d="M 500 236 C 520 300 560 320 590 346" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr2)"/>
+    <text x="515" y="292" font-size="10.5" fill="#1a7f37" font-weight="600">agent OTLP :4317（PHOENIX_COLLECTOR_ENDPOINT）</text>
+    <!-- alloy -> phoenix -->
+    <path d="M 119 512 L 119 542" fill="none" stroke="#0e7490" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="128" y="532" font-size="10" fill="#0e7490">traces → phoenix:4317</text>
+    <!-- alloy -> loki / prom -->
+    <path d="M 148 512 Q 180 530 230 530" fill="none" stroke="#1a7f37" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="196" y="526" font-size="9.5" fill="#1a7f37">loki:3100 push</text>
+    <path d="M 210 500 Q 300 520 370 512 L 400 500" fill="none" stroke="#1a7f37" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="288" y="522" font-size="9.5" fill="#1a7f37">prometheus:9090 remote_write</text>
+    <!-- phoenix -> phoenix-db -->
+    <path d="M 354 600 L 364 600" fill="none" stroke="#0e7490" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="326" y="592" font-size="9.5" fill="#0e7490">:5432</text>
+    <!-- langfuse-web -> worker 队列说明 + 存储总线 -->
+    <path d="M 250 762 C 280 772 330 772 360 762" fill="none" stroke="#bc4c00" stroke-width="1.4" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+    <text x="268" y="776" font-size="9.5" fill="#bc4c00">BullMQ(redis) 队列 → worker 消费</text>
+    <!-- web/worker -> 存储 -->
+    <path d="M 130 762 L 130 776" fill="none" stroke="#bc4c00" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <path d="M 270 762 L 270 776" fill="none" stroke="#bc4c00" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <path d="M 439 762 L 439 776" fill="none" stroke="#bc4c00" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <path d="M 599 762 L 599 776" fill="none" stroke="#bc4c00" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <!-- agent -> langfuse host 3000（从 agent 右侧出到主机发布？标注文本即可） -->
+    <text x="608" y="272" font-size="10.5" fill="#bc4c00" font-weight="600">agent → 主机 :3000 langfuse</text>
+    <text x="608" y="288" font-size="10" fill="#57606a">(LANGFUSE_BASE_URL，走 host 发布)</text>
+
+    <!-- ══ 右侧主机端口发布面 ══ -->
+    <rect x="708" y="34" width="276" height="856" rx="10" fill="#fff" stroke="#d8dee4" stroke-width="1.4"/>
+    <text x="846" y="58" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2328">主机端口发布面（ss -tlnp 实况）</text>
+    <line x1="720" y1="70" x2="972" y2="70" stroke="#d8dee4"/>
+
+    <g font-size="11.5">
+      <text x="726" y="94" font-weight="700" fill="#0969da">:80</text>
+      <text x="790" y="94" fill="#1f2328">caddy（ingress）</text>
+      <text x="790" y="108" fill="#57606a" font-size="10">前端主入口（仅此对外）</text>
+      <text x="726" y="130" font-weight="700" fill="#bc4c00">:3000</text>
+      <text x="790" y="130" fill="#1f2328">langfuse-web（mode: host）</text>
+      <text x="790" y="144" fill="#57606a" font-size="10">docker-proxy 直绑 · UI+OTLP</text>
+      <text x="726" y="170" font-weight="700" fill="#0e7490">:6006</text>
+      <text x="790" y="170" fill="#1f2328">phoenix UI（ingress）</text>
+      <text x="726" y="196" font-weight="700" fill="#1a7f37">:3100</text>
+      <text x="790" y="196" fill="#1f2328">grafana UI（ingress）</text>
+      <text x="790" y="210" fill="#57606a" font-size="10">查 Loki/Prometheus</text>
+      <text x="726" y="236" font-weight="700" fill="#1a7f37">:19091</text>
+      <text x="790" y="236" fill="#1f2328">prometheus UI（ingress）</text>
+      <text x="726" y="262" font-weight="700" fill="#1a7f37">:12345</text>
+      <text x="790" y="262" fill="#1f2328">alloy UI（ingress）</text>
+      <text x="726" y="288" font-weight="700" fill="#bc4c00">:9092</text>
+      <text x="790" y="288" fill="#1f2328">minio S3（ingress, 容器9000）</text>
+      <text x="790" y="302" fill="#57606a" font-size="10">浏览器取 langfuse 媒体文件</text>
+      <text x="726" y="328" font-weight="700" fill="#57606a">:5432</text>
+      <text x="790" y="328" fill="#57606a">无监听（opt-db-1 09-03 已清）</text>
+      <text x="790" y="342" fill="#57606a" font-size="10">栈内 3×PG 仅 overlay 内互访，不发布主机</text>
+      <text x="726" y="368" font-weight="700" fill="#57606a">:53</text>
+      <text x="790" y="368" fill="#1f2328">dnsmasq *.cube.app</text>
+      <text x="726" y="394" font-weight="700" fill="#57606a">:22/2377/7946</text>
+      <text x="790" y="394" fill="#1f2328">sshd / swarm 管理面</text>
+    </g>
+    <line x1="720" y1="410" x2="972" y2="410" stroke="#d8dee4"/>
+    <text x="726" y="432" font-size="11.5" font-weight="700" fill="#1f2328">不发布主机（仅 overlay 内）：</text>
+    <text x="726" y="450" font-size="10.5" fill="#57606a">agent :8009 · mcp :8000 · web :3000</text>
+    <text x="726" y="468" font-size="10.5" fill="#57606a">phoenix :4317/:9090 · worker :3030</text>
+    <text x="726" y="486" font-size="10.5" fill="#57606a">langfuse pg :5432 · clickhouse :8123/:9000</text>
+    <text x="726" y="504" font-size="10.5" fill="#57606a">redis :6379 · minio :9001 · 3×PG 容器端口</text>
+    <line x1="720" y1="516" x2="972" y2="516" stroke="#d8dee4"/>
+    <text x="726" y="540" font-size="11.5" font-weight="700" fill="#8250df">三个独立 Postgres（版本/库互不合并）：</text>
+    <text x="726" y="558" font-size="10.5" fill="#1f2328">① agent-mem → pgvector:0.8.0-pg17</text>
+    <text x="726" y="574" font-size="10.5" fill="#57606a">   agent-postgres:5432/agent_mem</text>
+    <text x="726" y="592" font-size="10.5" fill="#1f2328">② langfuse → postgres:17（pg17）</text>
+    <text x="726" y="608" font-size="10.5" fill="#57606a">   langfuse-postgres:5432/postgres</text>
+    <text x="726" y="626" font-size="10.5" fill="#1f2328">③ phoenix → postgres:16.14</text>
+    <text x="726" y="642" font-size="10.5" fill="#57606a">   phoenix-db:5432/phoenix</text>
+    <line x1="720" y1="654" x2="972" y2="654" stroke="#d8dee4"/>
+    <text x="726" y="676" font-size="11.5" font-weight="700" fill="#1f2328">外部端点（agent/mcp 出网方向）：</text>
+    <text x="726" y="694" font-size="10.5" fill="#1f2328">vLLM 172.16.66.13:8003/v1</text>
+    <text x="726" y="710" font-size="10.5" fill="#1f2328">cube-api 172.16.66.13:6000（E2B）</text>
+    <text x="726" y="726" font-size="10.5" fill="#1f2328">LDAP 192.168.1.241:389</text>
+    <text x="726" y="742" font-size="10.5" fill="#1f2328">DLP 解密网关（DECRYPT_API_URL）</text>
+    <text x="726" y="758" font-size="10.5" fill="#1f2328">devpi 192.168.10.136:3141（沙箱 pip）</text>
+    <line x1="720" y1="772" x2="972" y2="772" stroke="#d8dee4"/>
+    <text x="726" y="794" font-size="11.5" font-weight="700" fill="#cf222e">⚠ 出网规则（内网合规关键）：</text>
+    <text x="726" y="812" font-size="10.5" fill="#1f2328">沙箱默认出网经 egress MITM 拦截</text>
+    <text x="726" y="828" font-size="10.5" fill="#1f2328">（AC 网关/伪 CA），agent/mcp 容器内</text>
+    <text x="726" y="844" font-size="10.5" fill="#1f2328">挂 combined-ca.pem 信任（.env:36-50）</text>
+    <text x="726" y="860" font-size="10.5" fill="#1f2328">仅 devpi 目标经 allow-out-cidr 白名单放行</text>
+  </svg>
+  <div class="figcap">图 2 · 栈内拓扑：17 服务同挂 <code>geesun_appnet2</code>；对外只发布 7 端口；左侧卡片 ★ = 编排/采集核心（agent、alloy）</div>
+
+  <h3>端口发布矩阵（声明 vs 实况）</h3>
+  <table>
+    <tr><th>主机端口</th><th>目标服务</th><th>容器端口</th><th>发布模式</th><th>访问者/用途</th><th>出处</th></tr>
+    <tr><td><code>:80</code></td><td>caddy</td><td>80</td><td>ingress</td><td>全站唯一主入口：/api/*、/docs、/openapi.json → agent:8009；其余 → agent-web:3000</td><td>docker-compose.yml:119-122；Caddyfile:14-27</td></tr>
+    <tr><td><code>:3000</code></td><td>langfuse-web</td><td>3000</td><td><b>host</b>（直绑）</td><td>Langfuse UI + OTLP ingest；agent 上报走 LANGFUSE_BASE_URL</td><td>docker-compose.langfuse.yml:124-127</td></tr>
+    <tr><td><code>:6006</code></td><td>phoenix</td><td>6006</td><td>ingress</td><td>Phoenix UI（OpenInference trace 检索）</td><td>docker-compose.phoenix.yml:31-34</td></tr>
+    <tr><td><code>:3100</code></td><td>grafana</td><td>3000</td><td>ingress</td><td>Grafana UI（Loki 日志/Prom 指标检索）</td><td>docker-compose.yml:228-229</td></tr>
+    <tr><td><code>:19091</code></td><td>prometheus</td><td>9090</td><td>ingress</td><td>Prometheus UI</td><td>docker-compose.yml:205-206</td></tr>
+    <tr><td><code>:12345</code></td><td>alloy</td><td>12345</td><td>ingress</td><td>Alloy 调试 UI（4317/4321 不发布）</td><td>docker-compose.yml:177-178</td></tr>
+    <tr><td><code>:9092</code></td><td>minio</td><td>9000(S3)</td><td>ingress</td><td>浏览器取 langfuse 媒体（LANGFUSE_S3_MEDIA_UPLOAD_EXTERNAL_ENDPOINT）</td><td>docker-compose.langfuse.yml:179-182；.env.example:217</td></tr>
+    <tr><td><code>:53</code></td><td>dnsmasq（宿主机）</td><td>—</td><td>—</td><td>*.cube.app 沙箱域名解析（setup-cube-dns.sh）</td><td>实况 ss 监听</td></tr>
+    <tr><td><code>:22</code> <code>:2377</code> <code>:7946</code></td><td>sshd / swarm</td><td>—</td><td>—</td><td>管理面</td><td>实况</td></tr>
+  </table>
+  <div class="note">容器内端口 <code>8009</code>(agent) / <code>8000</code>(mcp) / <code>3000</code>(web) / <code>4317</code>(phoenix gRPC) / <code>8123</code>/<code>9000</code>(clickhouse) / <code>6379</code>(redis) 等<b>一律不发布主机</b>，只在 overlay 内可达——这是安全设计而非疏漏（DEPLOYMENT.md §1.4 端口发布模式）。</div>
+<section>
+  <h2>3 · 数据流向（一次问答的完整链路 + 遥测三通道）</h2>
+  <div class="sub">图 3A 是「用户问一句话」从请求到工具执行的主链路；图 3B 是链路产生的可观测数据（logs/metrics/traces）如何分三路落库与检索。</div>
+
+  <svg viewBox="0 0 1000 620" xmlns="http://www.w3.org/2000/svg" font-family="'Microsoft YaHei','PingFang SC',sans-serif">
+    <defs>
+      <marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0969da"/></marker>
+      <marker id="a3g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#57606a"/></marker>
+    </defs>
+    <rect x="0" y="0" width="1000" height="620" fill="#fff"/>
+    <text x="14" y="20" font-size="12" fill="#57606a">图 3A · 请求链路（数字 = 时序，详解见下方编号列表）</text>
+
+    <!-- 浏览器 -->
+    <rect x="410" y="34" width="180" height="62" rx="9" fill="#ddf4ff" stroke="#0969da" stroke-width="1.6"/>
+    <text x="500" y="60" text-anchor="middle" font-size="13.5" font-weight="700" fill="#0969da">用户浏览器</text>
+    <text x="500" y="80" text-anchor="middle" font-size="10.5" fill="#1f2328">http://10.10.10.67/ · SSE 会话</text>
+
+    <!-- Caddy -->
+    <rect x="420" y="140" width="160" height="66" rx="9" fill="#fff1e5" stroke="#bc4c00" stroke-width="1.6"/>
+    <text x="500" y="164" text-anchor="middle" font-size="13.5" font-weight="700" fill="#bc4c00">Caddy :80</text>
+    <text x="500" y="184" text-anchor="middle" font-size="10" fill="#1f2328">路径分流（唯一对外入口）</text>
+    <text x="500" y="198" text-anchor="middle" font-size="9.5" fill="#57606a">/api/* /docs → agent；其余 → web</text>
+
+    <!-- web + agent -->
+    <rect x="180" y="248" width="270" height="86" rx="9" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+    <text x="315" y="272" text-anchor="middle" font-size="13" font-weight="700" fill="#0969da">geesun-agent-web :3000</text>
+    <text x="315" y="292" text-anchor="middle" font-size="10.5" fill="#1f2328">Next.js：页面渲染 + SSE 客户端</text>
+    <text x="315" y="310" text-anchor="middle" font-size="10" fill="#57606a">API 地址构建期内联（NEXT_PUBLIC_API_BASE）</text>
+    <text x="315" y="326" text-anchor="middle" font-size="10" fill="#57606a">会话列表 / 消息 / 模型切换走 /api/*</text>
+
+    <rect x="560" y="248" width="280" height="86" rx="9" fill="#0969da" stroke="#0969da" stroke-width="2"/>
+    <text x="700" y="272" text-anchor="middle" font-size="13.5" font-weight="700" fill="#fff">geesun-agent :8009（编排核心）</text>
+    <text x="700" y="292" text-anchor="middle" font-size="10.5" fill="#e8f4ff">FastAPI · LangGraph 状态机（DeepAgents 1.0.6）</text>
+    <text x="700" y="310" text-anchor="middle" font-size="10.5" fill="#e8f4ff">循环：思考 → 调工具 → 观察 → 再思考</text>
+    <text x="700" y="326" text-anchor="middle" font-size="10" fill="#c8e0ff">每轮写 checkpoint 到 PG（可续跑/断点恢复）</text>
+
+    <!-- 依赖层 -->
+    <rect x="90" y="380" width="820" height="210" rx="12" fill="#f6f8fa" stroke="#8250df" stroke-width="1.4" stroke-dasharray="7,4"/>
+    <text x="104" y="402" font-size="12" font-weight="700" fill="#8250df">依赖 / 工具执行层（agent 循环内按需调用）</text>
+
+    <rect x="104" y="416" width="176" height="116" rx="8" fill="#fbefff" stroke="#8250df" stroke-width="1.3"/>
+    <text x="192" y="440" text-anchor="middle" font-size="12.5" font-weight="700" fill="#8250df">vLLM :8003 /v1</text>
+    <text x="192" y="458" text-anchor="middle" font-size="10" fill="#1f2328">ChatOpenAI 推理</text>
+    <text x="192" y="474" text-anchor="middle" font-size="10" fill="#1f2328">Qwen3.6-35B-A3B-FP8</text>
+    <text x="192" y="490" text-anchor="middle" font-size="9.5" fill="#57606a">172.16.66.13 · TP4</text>
+    <text x="192" y="506" text-anchor="middle" font-size="9.5" fill="#57606a">自动工具选择(enable-auto-tool-choice)</text>
+    <text x="192" y="522" text-anchor="middle" font-size="9.5" fill="#57606a">SSE 心跳 15s 保活（agent 侧）</text>
+
+    <rect x="298" y="416" width="196" height="116" rx="8" fill="#ddf4ff" stroke="#0969da" stroke-width="1.3"/>
+    <text x="396" y="440" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0969da">geesun-mcp :8000/mcp</text>
+    <text x="396" y="458" text-anchor="middle" font-size="10" fill="#1f2328">工具：DLP 解密 / 上传</text>
+    <text x="396" y="474" text-anchor="middle" font-size="10" fill="#1f2328">报告生成 / skill 执行</text>
+    <text x="396" y="490" text-anchor="middle" font-size="9.5" fill="#57606a">mcp_server_url（.env:25）</text>
+    <text x="396" y="506" text-anchor="middle" font-size="9.5" fill="#57606a">共享 /data 卷（agent/reports）</text>
+    <text x="396" y="522" text-anchor="middle" font-size="9.5" fill="#57606a">→ DLP 网关 POST /decrypt</text>
+
+    <rect x="512" y="416" width="190" height="116" rx="8" fill="#e6f6fb" stroke="#0e7490" stroke-width="1.3"/>
+    <text x="607" y="440" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0e7490">cube-api :6000 → 沙箱 VM</text>
+    <text x="607" y="458" text-anchor="middle" font-size="10" fill="#1f2328">e2b_code_interpreter</text>
+    <text x="607" y="474" text-anchor="middle" font-size="10" fill="#1f2328">PDF 解析 / 跑脚本 / 联网下载</text>
+    <text x="607" y="490" text-anchor="middle" font-size="9.5" fill="#57606a">模板 dev-pipfix</text>
+    <text x="607" y="506" text-anchor="middle" font-size="9.5" fill="#57606a">pip → 136 devpi:3141（allow-out-cidr）</text>
+    <text x="607" y="522" text-anchor="middle" font-size="9.5" fill="#57606a">出网 egress MITM CA 拦截</text>
+
+    <rect x="720" y="416" width="176" height="116" rx="8" fill="#fbefff" stroke="#8250df" stroke-width="1.3"/>
+    <text x="808" y="440" text-anchor="middle" font-size="12.5" font-weight="700" fill="#8250df">agent-postgres :5432</text>
+    <text x="808" y="458" text-anchor="middle" font-size="10" fill="#1f2328">DB=agent_mem（pgvector 镜像）</text>
+    <text x="808" y="474" text-anchor="middle" font-size="10" fill="#1f2328">checkpointer：每会话图状态</text>
+    <text x="808" y="490" text-anchor="middle" font-size="10" fill="#1f2328">store：跨会话记忆(KV)</text>
+    <text x="808" y="506" text-anchor="middle" font-size="9.5" fill="#57606a">AsyncPostgresSaver/Store</text>
+    <text x="808" y="522" text-anchor="middle" font-size="9.5" fill="#57606a">prefix: messages.&lt;user&gt;.&lt;session&gt;</text>
+
+    <!-- 主链连线 -->
+    <path d="M 500 96 L 500 140" stroke="#bc4c00" stroke-width="2" marker-end="url(#a3g)"/>
+    <text x="508" y="122" font-size="10.5" fill="#bc4c00" font-weight="600">① 页面/消息请求</text>
+    <path d="M 445 206 L 336 248" stroke="#0969da" stroke-width="1.8" marker-end="url(#a3)"/>
+    <text x="330" y="224" font-size="10" fill="#0969da">②a 静态/页面资源</text>
+    <path d="M 555 206 L 690 248" stroke="#bc4c00" stroke-width="2" marker-end="url(#a3g)"/>
+    <text x="610" y="224" font-size="10.5" fill="#bc4c00" font-weight="600">②b POST /api/chat（SSE）</text>
+    <path d="M 315 334 L 315 380" stroke="#0969da" stroke-width="1.6" marker-end="url(#a3)"/>
+    <text x="196" y="372" font-size="10" fill="#0969da">③ 会话/消息 API</text>
+    <path d="M 700 334 L 700 380 L 700 416" stroke="#8250df" stroke-width="1.8" marker-end="url(#a3g)"/>
+    <text x="708" y="400" font-size="10.5" fill="#8250df" font-weight="600">④ 每轮 agent 循环（多次）</text>
+    <!-- agent 到各依赖 -->
+    <path d="M 580 380 L 240 416" stroke="#8250df" stroke-width="1.4" marker-end="url(#a3g)"/>
+    <text x="330" y="408" font-size="9.5" fill="#8250df">ChatOpenAI（推理+工具选择）</text>
+    <path d="M 640 380 L 396 416" stroke="#0969da" stroke-width="1.4" marker-end="url(#a3)"/>
+    <text x="478" y="408" font-size="9.5" fill="#0969da">MCP 工具调用</text>
+    <path d="M 700 380 L 607 416" stroke="#0e7490" stroke-width="1.4" marker-end="url(#a3g)"/>
+    <text x="650" y="408" font-size="9.5" fill="#0e7490">E2B sandbox 执行</text>
+    <path d="M 760 380 L 808 416" stroke="#8250df" stroke-width="1.4" marker-end="url(#a3g)"/>
+    <text x="828" y="406" font-size="9.5" fill="#8250df">checkpoint 写入</text>
+    <!-- 响应回流 -->
+    <path d="M 500 96 C 240 96 240 240 315 248" fill="none" stroke="#1a7f37" stroke-width="2" marker-end="url(#a3g)"/>
+    <text x="270" y="80" font-size="10.5" fill="#1a7f37" font-weight="600">⑤ SSE 流式回传（思考/工具过程实时可见）</text>
+    <path d="M 660 96 C 940 96 940 240 800 248" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#a3g)"/>
+    <text x="800" y="76" font-size="10" fill="#1a7f37">⑥ 结束 → 触发遥测上报（图 3B）</text>
+  </svg>
+
+  <ol style="font-size:13.5px;">
+    <li><b>页面与鉴权</b>：浏览器 <code>GET http://10.10.10.67/</code> → Caddy :80 →（非 /api）geesun-agent-web:3000。登录走 LDAP/AD（agent 侧 <code>ldap://192.168.1.241:389</code>，DC=geesun,DC=li）或 JWT，前端 Token 存浏览器。</li>
+    <li><b>发消息</b>：浏览器 <code>POST /api/chat</code>（SSE）→ Caddy 按 <code>/api/*</code> 转发 geesun-agent:8009（Caddyfile:15-17）。<b>关键</b>：/api/* 必须在 Caddy 直连后端，否则 Next.js 自身 rewrite 会形成回环（Caddyfile 头注释）。</li>
+    <li><b>agent 编排循环</b>（agent 内部，一次回答可能多轮）：LangGraph 状态机每步：取 checkpoint/记忆 → 调 vLLM 推理（OpenAI 兼容，<code>base_url=http://172.16.66.13:8003/v1</code>，model=Qwen3.6-35B-A3B，启用 auto-tool-choice）→ 若模型选择工具则执行 → 结果回填再推理，直到给最终答案。</li>
+    <li><b>工具执行去向</b>（按工具类型）：MCP 工具 → geesun-mcp:8000/mcp（解密 DLP 文件、解析 uploads/reports、跑 skill）；代码/解析类 → cube-api:6000 起沙箱 VM（模板 dev-pipfix，缺包现场 pip → 136 devpi）；记忆读写 → agent-postgres:5432（checkpointer 每轮快照 + store 跨会话记忆）。</li>
+    <li><b>流式回传</b>：SSE 通道全程回传 agent 的思考与工具输出（15s 心跳保活，避免代理 60s 空闲掐断）；web 不参与业务转发，仅 UI。</li>
+    <li><b>会话结束</b>：异步触发可观测上报（traces → Phoenix + Langfuse；metrics → Prometheus；logs 由 Alloy 持续采集），见 3B。</li>
+  </ol>
+
+  <svg viewBox="0 0 1000 500" xmlns="http://www.w3.org/2000/svg" font-family="'Microsoft YaHei','PingFang SC',sans-serif">
+    <defs>
+      <marker id="b3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#57606a"/></marker>
+    </defs>
+    <rect x="0" y="0" width="1000" height="500" fill="#fff"/>
+    <text x="14" y="20" font-size="12" fill="#57606a">图 3B · 可观测三通道 + Langfuse 落库链（数据 → 存储 → 检索）</text>
+
+    <!-- 通道 A logs -->
+    <rect x="20" y="40" width="120" height="26" rx="5" fill="#dafbe1" stroke="#1a7f37"/><text x="80" y="58" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a7f37">A · logs</text>
+    <rect x="40" y="76" width="200" height="54" rx="7" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="140" y="98" text-anchor="middle" font-size="11" fill="#1f2328">全部栈内容器 stdout</text>
+    <text x="140" y="114" text-anchor="middle" font-size="10" fill="#57606a">json-file 驱动 · max 50m×5</text>
+    <path d="M 240 103 L 340 103" stroke="#57606a" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="258" y="96" font-size="9.5" fill="#57606a">docker.sock 发现+读取</text>
+    <rect x="342" y="76" width="150" height="54" rx="7" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="417" y="98" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a7f37">alloy</text>
+    <text x="417" y="114" text-anchor="middle" font-size="9.5" fill="#1f2328">提取 level/logger/msg 标签</text>
+    <path d="M 492 103 L 560 103" stroke="#57606a" stroke-width="1.6" marker-end="url(#b3)"/>
+    <rect x="562" y="76" width="130" height="54" rx="7" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="627" y="98" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a7f37">loki :3100</text>
+    <text x="627" y="114" text-anchor="middle" font-size="9.5" fill="#57606a">loki.api/v1/push</text>
+    <path d="M 692 103 L 760 103" stroke="#57606a" stroke-width="1.6" marker-end="url(#b3)"/>
+    <rect x="762" y="76" width="170" height="54" rx="7" fill="#fff" stroke="#d8dee4"/>
+    <text x="847" y="98" text-anchor="middle" font-size="11" fill="#1f2328">Grafana :3100（UI）</text>
+    <text x="847" y="114" text-anchor="middle" font-size="9.5" fill="#57606a">{level}/{logger} 标签检索</text>
+
+    <!-- 通道 B metrics -->
+    <rect x="20" y="150" width="120" height="26" rx="5" fill="#dafbe1" stroke="#1a7f37"/><text x="80" y="168" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a7f37">B · metrics</text>
+    <rect x="140" y="186" width="120" height="50" rx="7" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="200" y="208" text-anchor="middle" font-size="11" fill="#1f2328">geesun-agent</text>
+    <text x="200" y="224" text-anchor="middle" font-size="9.5" fill="#57606a">OTLP metrics</text>
+    <path d="M 260 211 L 400 211" stroke="#57606a" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="270" y="204" font-size="9.5" fill="#57606a">alloy:4317（统一 OTLP 入口）</text>
+    <rect x="402" y="186" width="120" height="50" rx="7" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="462" y="208" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a7f37">alloy</text>
+    <text x="462" y="224" text-anchor="middle" font-size="9.5" fill="#1f2328">prometheus.remote_write</text>
+    <path d="M 522 211 L 590 211" stroke="#57606a" stroke-width="1.6" marker-end="url(#b3)"/>
+    <rect x="592" y="186" width="140" height="50" rx="7" fill="#dafbe1" stroke="#1a7f37"/>
+    <text x="662" y="208" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1a7f37">prometheus :9090</text>
+    <text x="662" y="224" text-anchor="middle" font-size="9.5" fill="#57606a">rw receiver · 卷持久化</text>
+    <path d="M 732 211 L 795 211" stroke="#57606a" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="752" y="204" font-size="9.5" fill="#57606a">UI :19091 / Grafana 查</text>
+
+    <!-- 通道 C traces phoenix -->
+    <rect x="20" y="260" width="120" height="26" rx="5" fill="#e6f6fb" stroke="#0e7490"/><text x="80" y="278" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e7490">C · traces</text>
+    <rect x="140" y="296" width="120" height="50" rx="7" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="200" y="318" text-anchor="middle" font-size="11" fill="#1f2328">geesun-agent</text>
+    <text x="200" y="334" text-anchor="middle" font-size="9.5" fill="#57606a">OTLP traces（OpenInference）</text>
+    <path d="M 260 321 L 400 321" stroke="#0e7490" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="270" y="314" font-size="9.5" fill="#57606a">PHOENIX_COLLECTOR_ENDPOINT=alloy:4317</text>
+    <rect x="402" y="296" width="120" height="50" rx="7" fill="#e6f6fb" stroke="#0e7490"/>
+    <text x="462" y="318" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e7490">alloy</text>
+    <text x="462" y="334" text-anchor="middle" font-size="9.5" fill="#1f2328">otelcol.exporter.otlp.phoenix</text>
+    <path d="M 522 321 L 590 321" stroke="#0e7490" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="528" y="314" font-size="9.5" fill="#0e7490">phoenix:4317 gRPC</text>
+    <rect x="592" y="296" width="140" height="50" rx="7" fill="#e6f6fb" stroke="#0e7490"/>
+    <text x="662" y="318" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0e7490">phoenix</text>
+    <text x="662" y="334" text-anchor="middle" font-size="9.5" fill="#57606a">→ phoenix-db:5432 持久化</text>
+    <path d="M 732 321 L 795 321" stroke="#0e7490" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="752" y="314" font-size="9.5" fill="#0e7490">UI :6006</text>
+
+    <!-- 通道 D traces langfuse -->
+    <rect x="20" y="370" width="120" height="26" rx="5" fill="#fff1e5" stroke="#bc4c00"/><text x="80" y="388" text-anchor="middle" font-size="11.5" font-weight="700" fill="#bc4c00">D · traces → Langfuse</text>
+    <rect x="140" y="406" width="120" height="50" rx="7" fill="#f6f8fa" stroke="#d8dee4"/>
+    <text x="200" y="428" text-anchor="middle" font-size="11" fill="#1f2328">geesun-agent</text>
+    <text x="200" y="444" text-anchor="middle" font-size="9.5" fill="#57606a">LANGFUSE_BASE_URL=:3000</text>
+    <path d="M 260 431 L 350 431" stroke="#bc4c00" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="265" y="424" font-size="9.5" fill="#bc4c00">走主机 host 发布 3000</text>
+    <rect x="352" y="406" width="150" height="50" rx="7" fill="#fff1e5" stroke="#bc4c00"/>
+    <text x="427" y="428" text-anchor="middle" font-size="11.5" font-weight="700" fill="#bc4c00">langfuse-web :3000</text>
+    <text x="427" y="444" text-anchor="middle" font-size="9.5" fill="#1f2328">OTLP ingest / API</text>
+    <path d="M 502 431 L 560 431" stroke="#bc4c00" stroke-width="1.6" marker-end="url(#b3)"/>
+    <rect x="562" y="406" width="160" height="50" rx="7" fill="#fff7ed" stroke="#bc4c00"/>
+    <text x="642" y="422" text-anchor="middle" font-size="10" fill="#1f2328">事件写 S3(minio events)</text>
+    <text x="642" y="438" text-anchor="middle" font-size="10" fill="#1f2328">+ 入队 BullMQ(redis)</text>
+    <text x="642" y="452" text-anchor="middle" font-size="9.5" fill="#57606a">→ langfuse-worker 消费</text>
+    <path d="M 722 431 L 780 431" stroke="#bc4c00" stroke-width="1.6" marker-end="url(#b3)"/>
+    <text x="738" y="424" font-size="9.5" fill="#bc4c00">写入</text>
+    <rect x="782" y="406" width="160" height="50" rx="7" fill="#fff7ed" stroke="#bc4c00"/>
+    <text x="862" y="422" text-anchor="middle" font-size="10.5" fill="#1f2328">ClickHouse :8123</text>
+    <text x="862" y="438" text-anchor="middle" font-size="9.5" fill="#57606a">observations/traces 表</text>
+    <text x="862" y="452" text-anchor="middle" font-size="9.5" fill="#57606a">元数据在 langfuse PG</text>
+    <path d="M 862 406 C 862 372 900 372 900 240" fill="none" stroke="#bc4c00" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#b3)"/>
+    <text x="906" y="340" font-size="9.5" fill="#bc4c00">UI :3000 检索</text>
+  </svg>
+
+  <div class="sub" style="margin-top:6px;">
+    <b>两条 trace 通道并存（互为备份/互补）</b>：Phoenix（C 通道，OpenInference 协议、经 Alloy 转发、侧重 agent 内部 span 因果）与 Langfuse（D 通道，直发、S3+队列落 ClickHouse、侧重 LLM 调用链路与成本）。<code>otel_project_name=Geesun-Agent-prod</code>。若 ClickHouse 长期 0 trace，先查 langfuse-worker 是否用错 web 镜像（BullMQ 无人消费），勿先怀疑链路（2026-09-03 实测坑，docker-compose.langfuse.yml:26-28 有注释）。
+  </div>
+</section>
+
+<section>
+  <h2>4 · 服务清单与资源（17 服务，实况 2026-09-03）</h2>
+  <div class="sub">镜像列 = 生产实况（Harbor 单仓 <code>172.16.220.74:8333/geesun_ai/</code>）；上限列来自各 compose <code>deploy.resources.limits</code>（仅 swarm 生效）。</div>
+  <table>
+    <tr><th>服务（swarm 名）</th><th>镜像:tag</th><th>容器端口</th><th>主机发布</th><th>上限</th><th>健康（实况）</th><th>数据卷</th><th>compose 出处</th></tr>
+    <tr><td><code>geesun_geesun-agent</code> ★</td><td>geesun-agent:<b>1.0.1</b></td><td>8009</td><td>—</td><td>2c/2g</td><td>Running 22h healthy</td><td>bind /opt/geesun/data/{agent,uploads,reports,skills}</td><td>docker-compose.yml:25-86</td></tr>
+    <tr><td><code>geesun_geesun-mcp</code></td><td>geesun-mcp-server:1.0.0</td><td>8000</td><td>—</td><td>1c/512m</td><td>Running 22h healthy</td><td>同上（共享 agent 卷）</td><td>docker-compose.mcp.yml:21-63</td></tr>
+    <tr><td><code>geesun_geesun-agent-web</code></td><td>geesun-agent-web:1.0.0</td><td>3000</td><td>—</td><td>1c/512m</td><td>Running 39h healthy</td><td>—</td><td>docker-compose.web.yml:14-41</td></tr>
+    <tr><td><code>geesun_caddy</code></td><td>caddy:2.8-alpine</td><td>80</td><td>:80 ingress</td><td>0.5c/256m</td><td>Running 39h</td><td>caddy_data/config</td><td>docker-compose.yml:117-140</td></tr>
+    <tr><td><code>geesun_agent-postgres</code></td><td>pgvector:0.8.0-pg17</td><td>5432</td><td>—</td><td>1c/1g</td><td>Running 39h healthy</td><td>agent_pg_data（DB=agent_mem）</td><td>docker-compose.yml:88-115</td></tr>
+    <tr><td><code>geesun_alloy</code> ★</td><td>alloy:v1.19.2</td><td>4317/4321/12345</td><td>:12345 ingress</td><td>0.5c/512m</td><td>Running 22h</td><td>alloy_data；挂 docker.sock</td><td>docker-compose.yml:163-192</td></tr>
+    <tr><td><code>geesun_loki</code></td><td>loki:3.2.0</td><td>3100</td><td>—</td><td>1c/1g</td><td>Running 39h</td><td>loki_data</td><td>docker-compose.yml:142-160</td></tr>
+    <tr><td><code>geesun_prometheus</code></td><td>prometheus:3.0</td><td>9090</td><td>:19091 ingress</td><td>0.5c/512m</td><td>Running 39h</td><td>prometheus_data</td><td>docker-compose.yml:194-219</td></tr>
+    <tr><td><code>geesun_grafana</code></td><td>grafana:11.3.0</td><td>3000</td><td>:3100 ingress</td><td>0.5c/512m</td><td>Running 39h</td><td>grafana_data</td><td>docker-compose.yml:221-243</td></tr>
+    <tr><td><code>geesun_phoenix</code></td><td>phoenix:19.1.0</td><td>6006/4317/9090</td><td>:6006 ingress</td><td>1c/1g</td><td>Running 26h healthy</td><td>—（数据在 phoenix-db）</td><td>docker-compose.phoenix.yml:22-53</td></tr>
+    <tr><td><code>geesun_phoenix-db</code></td><td>postgres:16.14</td><td>5432</td><td>—</td><td>1c/1g</td><td>Running 26h healthy</td><td>phoenix_pg_data</td><td>docker-compose.phoenix.yml:55-82</td></tr>
+    <tr><td><code>geesun_langfuse-web</code></td><td>langfuse:3.224.3</td><td>3000</td><td>:3000 <b>host</b></td><td>1c/<b>4g</b></td><td>Running 4h（今日热更过）</td><td>—</td><td>docker-compose.langfuse.yml:99-139</td></tr>
+    <tr><td><code>geesun_langfuse-worker</code></td><td>langfuse-worker:3.224.3</td><td>3030</td><td>—</td><td>1c/<b>4g</b></td><td>Running 2h（热更后无 digest 固化 ⚠）</td><td>—</td><td>docker-compose.langfuse.yml:25-97</td></tr>
+    <tr><td><code>geesun_postgres</code>（langfuse）</td><td>postgres:17</td><td>5432</td><td>—</td><td>1c/1g</td><td>Running 22h healthy</td><td>langfuse_postgres_data</td><td>docker-compose.langfuse.yml:232-260</td></tr>
+    <tr><td><code>geesun_clickhouse</code></td><td>clickhouse-server:25.12</td><td>8123/9000/9009</td><td>—</td><td>2c/<b>4g</b></td><td>Running 22h healthy</td><td>langfuse_clickhouse_data/logs</td><td>docker-compose.langfuse.yml:141-170</td></tr>
+    <tr><td><code>geesun_redis</code></td><td>redis:7</td><td>6379</td><td>—</td><td>0.5c/512m</td><td>Running 22h healthy</td><td>langfuse_redis_data</td><td>docker-compose.langfuse.yml:205-230</td></tr>
+    <tr><td><code>geesun_minio</code></td><td>minio:chainguard</td><td>9000/9001</td><td>:9092 ingress(→9000)</td><td>0.5c/512m</td><td>Running 22h healthy</td><td>langfuse_minio_data</td><td>docker-compose.langfuse.yml:172-203</td></tr>
+  </table>
+  <div class="note"><b>资源预算与超卖</b>：主机物理 8 vCPU / 31 GB。limits 之和 ≈ 16.5 CPU / 22.8 GB —— CPU 限额总和是物理核数 2 倍（cgroup 限速非 OOM，高并发时 CPU 争用），内存接近物理上限但可容纳（空闲 22G 含 cache）。Langfuse 系（web+worker+clickhouse 各 4g）是内存大头；langfuse 两个 Node 服务必须配 <code>NODE_OPTIONS=--max-old-space-size=3072</code>，否则先在 V8 heap（~1.5GB）崩溃而非吃满 cgroup 限额（docker-compose.langfuse.yml:78-82 实测注释）。</div>
+</section>
+
+<section>
+  <h2>5 · 外部依赖端点速查（栈外）</h2>
+  <table>
+    <tr><th>端点</th><th>用途</th><th>谁访问</th><th>出处</th></tr>
+    <tr><td><code>172.16.66.13:8003/v1</code></td><td>vLLM OpenAI 兼容推理（Qwen3.6-35B-A3B-FP8，TP4，systemd 裸进程非容器）</td><td>agent（模型主用）/ mcp</td><td>.env.example:13-15</td></tr>
+    <tr><td><code>172.16.66.13:8002</code></td><td>bge-m3 reranker（vllm-bge-m3.service，共享 4 卡）</td><td>按需（RAG/重排预留）</td><td>排障记录 08-24</td></tr>
+    <tr><td><code>172.16.66.13:6000</code></td><td>cube-api / CubeMaster 控制面（E2B sandbox 创建/执行）</td><td>agent + mcp（e2b_code_interpreter / upload_to_sandbox）</td><td>.env.example:31-34（⚠ 别指 8003，实测 KeyError 教训）</td></tr>
+    <tr><td><code>172.16.66.13 沙箱 VM</code></td><td>代码沙箱（模板 dev-pipfix，出网 MITM）</td><td>agent 工具</td><td>docs/sandbox-pypi-mirror-setup.md</td></tr>
+    <tr><td><code>192.168.10.136:3141</code></td><td>devpi PyPI 镜像（沙箱 pip index-url=/root/pypi/+simple/，回源阿里云）</td><td>沙箱内 pip</td><td>docs/sandbox-pypi-mirror-setup.md:9-16；.env.example 无（sandbox.py 内置）</td></tr>
+    <tr><td><code>172.16.220.74:8333</code></td><td>Harbor（HTTP）：项目 geesun_ai（17 镜像）+ cubesandbox（sandbox 模板）</td><td>构建机 push / 67+66.13 pull</td><td>.env.example:128-135；build-push.sh:36-38</td></tr>
+    <tr><td><code>192.168.1.241:389</code></td><td>LDAP/AD（geesun.li；登录鉴权、管理员组）</td><td>agent</td><td>.env.example:70-75</td></tr>
+    <tr><td><code>DECRYPT_API_URL</code>（.env 实值）</td><td>DLP 解密网关（POST /decrypt，加密文件→明文 base64）</td><td>geesun-mcp</td><td>.env.example:29</td></tr>
+    <tr><td><code>10.10.10.67:53</code></td><td>dnsmasq *.cube.app（沙箱域名解析）</td><td>沙箱/内网客户端</td><td>deploy/setup-cube-dns.sh</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>6 · 三个 Postgres 与 overlay 互访速查</h2>
+  <table>
+    <tr><th>实例</th><th>镜像</th><th>库</th><th>访问方</th><th>用途</th><th>卷</th></tr>
+    <tr><td>agent-postgres</td><td>pgvector:0.8.0-pg17</td><td>agent_mem</td><td>仅 geesun-agent</td><td>LangGraph checkpointer（会话图状态）+ store（跨会话记忆）；pgvector 扩展已装未用（RAG 预置）</td><td>geesun_agent_pg_data</td></tr>
+    <tr><td>postgres（langfuse）</td><td>postgres:17</td><td>postgres</td><td>langfuse-web / langfuse-worker</td><td>Langfuse 元数据（projects/orgs/users/api_keys 等）</td><td>geesun_langfuse_postgres_data</td></tr>
+    <tr><td>phoenix-db</td><td>postgres:16.14</td><td>phoenix</td><td>仅 phoenix</td><td>Phoenix spans/traces SQL 存储（历史 opt 卷未迁移）</td><td>geesun_phoenix_pg_data</td></tr>
+  </table>
+  <div class="note">三者版本（pg17 ×2、pg16.14）与卷互相独立，不要合并/串库排查；主机 <code>:5432</code> 原被旧共享栈 opt-db-1（postgres:16.14）占用，已于 2026-09-03 清理（见 §7 ①）。</div>
+  <h3>关键互访（服务名 → 端口，全部经 geesun_appnet2）</h3>
+  <table>
+    <tr><th>来源</th><th>目标</th><th>地址（.env / compose 引用）</th><th>方向出处</th></tr>
+    <tr><td>agent</td><td>geesun-mcp</td><td><code>http://geesun-mcp:8000/mcp</code>（mcp_server_url）</td><td>.env.example:25</td></tr>
+    <tr><td>agent / mcp</td><td>alloy</td><td><code>http://alloy:4317</code>（PHOENIX_COLLECTOR_ENDPOINT，OTLP 收口）</td><td>.env.example:117；docker-compose.yml:42</td></tr>
+    <tr><td>agent</td><td>langfuse-web</td><td><code>http://10.10.10.67:3000</code>（走主机 host 发布，非服务名）</td><td>.env.example:122</td></tr>
+    <tr><td>alloy</td><td>phoenix</td><td><code>phoenix:4317</code>（PHOENIX_OTLP_ENDPOINT，gRPC）</td><td>.env.example:119；alloy.config.alloy:88-95</td></tr>
+    <tr><td>alloy</td><td>loki / prometheus</td><td><code>loki:3100</code> push · <code>prometheus:9090</code> remote_write</td><td>alloy.config.alloy:65-69,102-106</td></tr>
+    <tr><td>phoenix</td><td>phoenix-db</td><td><code>postgresql://phoenix:***@phoenix-db:5432/phoenix</code></td><td>.env.example:159</td></tr>
+    <tr><td>langfuse-web/worker</td><td>4 个后端</td><td><code>postgres:5432</code> · <code>clickhouse:8123</code>(HTTP)/9000(TCP) · <code>redis:6379</code> · <code>minio:9000</code></td><td>.env.example:173,181-192,206,214,224</td></tr>
+    <tr><td>浏览器</td><td>minio（媒体）</td><td><code>http://10.10.10.67:9092</code>（LANGFUSE_S3_MEDIA_UPLOAD_EXTERNAL_ENDPOINT）</td><td>.env.example:217</td></tr>
+    <tr><td>agent</td><td>agent-postgres</td><td><code>agent-postgres:5432/agent_mem</code>（POSTGRES_HOST=agent-postgres）</td><td>.env.example:102-106；docker-compose.yml:36-40</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>7 · 实况核对发现的差异 / 隐患（本文档独有价值）</h2>
+  <div class="ok"><b>✅ 2026-09-03 傍晚已按本清单完成清理并复核</b>：终态 17 容器全 healthy / 13 卷 0 悬空 / 29 镜像 0 可回收 / 主机 :5432 NO-LISTENER / 磁盘 / 35%。<b>①②⑥ 为已处置项</b>（保留记录供同类问题识别），<b>③④⑤ 为现状仍成立的注意项</b>。</div>
+  <div class="ok"><b>①（已处置）主机 :5432 曾被非 swarm 残留 opt-db-1 占用 → 已清理</b>。原状：postgres:16.14（旧共享栈，Up 39h）经 docker-proxy 发布 0.0.0.0:5432，栈内三个 PG 均不发布主机端口故未冲突，但它属该停未停的存量、且挡未来 DBA 直连或端口发布。处置：<code>docker rm -f opt-db-1</code> + <code>docker volume rm opt_database_data</code>；同源 <code>opt-phoenix-1</code>（曾 Exited 47h）、<code>cube-egress</code>（67 机 cube 试验期，cube 已迁 66.13）、14 个 swarm 滚动更新旧 task 一并清理；<code>docker image prune -a</code> 回收 4.33G。终态复核：主机 :5432 <b>NO-LISTENER</b>。</div>
+  <div class="note"><b>② .env.example:247-248 注释说 Grafana「主机 127.0.0.1:3100」，实况是 <code>*:3100</code> ingress 全网卡</b>（09-03 实测登录页 200 可达）——任何内网机器都可开 Grafana（有 admin 密码）→ 文档注释应改；prometheus(:19091) 与 alloy(:12345) UI 全网卡且<b>无鉴权</b>，内网可达即读，属已知接受风险（排障便利），建议后续加 basic-auth 或文档明示。</div>
+  <div class="note"><b>③ langfuse-worker 热更后 spec 未固化 digest</b>（仍成立）：0617e0f 用 <code>docker service update --image</code> 热更后 <code>Spec.TaskTemplate.ContainerSpec.Image</code> 只带 tag 无 <code>@sha256:</code>（其余 16 服务均已固化）。功能正常（队列已消费），但下次 <code>start_stack.sh</code> 重发 spec 会重新解析——「固化 digest」铁律（3338c61 教训）的反例，注意甄别。</div>
+  <div class="note"><b>④ agent 生产 tag 已是 1.0.1</b>（仍成立），而 .env.example/README 默认值仍是 1.0.0 —— 属预期（生产 .env 递增过 GEESUN_AGENT_TAG），对照时别按模板猜版本；当前三自研镜像：agent 1.0.1 / mcp 1.0.0 / web 1.0.0。</div>
+  <div class="note"><b>⑤ CPU limits 超卖</b>（仍成立）：limits 总和 16.5 CPU &gt; 物理 8 核；compose 注释默认值 1.0.0 与生产实际（agent 1.0.1）易造成「同 tag 拉到旧镜像」误判——部署侧已用 §1.6.3/§1.6.4（TAG 递增 + service update）文档覆盖。</div>
+  <div class="ok"><b>⑥（已处置）旧共享 Langfuse 迁移残留 → 全栈已清</b>。原状：docker-compose.langfuse.yml 头注释要求停用旧共享实例释放 3000/9092，实况 3000 已被自托管 langfuse-web(host) 占用、9092 已被自托管 minio 占用；opt-db-1 曾是唯一仍在跑的旧件。处置：09-03 连同其卷与 5 个旧 langfuse 悬空卷（并入 swarm 前历史 trace，未迁移即随卷删除）一并清理——如需追溯 09-02 前的 langfuse 历史 trace，现仅剩 docker service logs（json-file 轮转窗口内）。</div>
+</section>
+
+</section>
+</div>
+<footer>生成于 2026-09-03（§7 傍晚随生产机残留清理执行后更新为终态）· geesun_ai 部署架构梳理（仅新增文档，不改仓库行为）</footer>
+</body>
+</html>
