@@ -1,0 +1,54 @@
+groups:
+  # ── 主机告警（数据源 node-exporter）──
+  - name: geesun-host
+    rules:
+      # 磁盘使用率 >80%（覆盖 /、/home 及所有块设备分区；/boot 等小分区命中时按 labels 区分）
+      - alert: HostDiskUsageHigh
+        expr: |
+          (1 - node_filesystem_avail_bytes{device=~"/dev/.*"}
+              / node_filesystem_size_bytes{device=~"/dev/.*"}) * 100 > 80
+        for: 3m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: '主机磁盘使用率超 80%：{{ $labels.mountpoint }}（{{ $labels.instance }}）'
+          description: '分区 {{ $labels.mountpoint }}（设备 {{ $labels.device }}）当前使用率 {{ printf "%.1f" $value }}%，阈值 80%。建议：df -h / 查看，清理日志/coredump 或扩盘。'
+
+      # node-exporter 失联（主机指标断流，看板/告警全失效）
+      - alert: NodeExporterDown
+        expr: up{job="node-exporter"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: 'node-exporter 不可达（{{ $labels.instance }}）'
+          description: '主机指标采集断开已持续 3 分钟，主机看板与磁盘告警将失效。'
+
+  # ── 容器告警（数据源 cadvisor）──
+  - name: geesun-containers
+    rules:
+      # 崩溃循环：同一容器 10 分钟内 start_time 变化 ≥2 次（Swarm 崩溃重启时任务名不变、
+      # start_time 重置 → changes() 可捕获；单次正常部署只重启 1 次不会触发）
+      - alert: ContainerCrashLooping
+        expr: |
+          changes(container_start_time_seconds{name=~"geesun_.*"}[10m]) > 1
+        for: 2m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: '容器疑似崩溃循环：{{ $labels.name }}'
+          description: '{{ $labels.name }} 在 10 分钟窗口内重启 {{ $value }} 次。排查：docker service ps 对应服务 --no-trunc'
+
+      # cadvisor 失联（容器级指标断流）
+      - alert: CAdvisorDown
+        expr: up{job="cadvisor"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: 'cadvisor 不可达（{{ $labels.instance }}）'
+          description: '容器级指标采集断开已持续 3 分钟，容器概览看板与容器告警将失效。'

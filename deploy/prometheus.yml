@@ -2,6 +2,10 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# 告警规则（node-exporter/cadvisor 数据源；geesun.rules 维护于 prometheus.rules.yml）
+rule_files:
+  - /etc/prometheus/geesun-alerts.yml
+
 scrape_configs:
   # Prometheus 自身
   - job_name: prometheus
