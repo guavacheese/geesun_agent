@@ -520,7 +520,7 @@
           "refId": "A",
           "expr": "node_uname_info",
           "legendFormat": "{{release}}",
-          "format": "table",
+          "format": "time_series",
           "instant": true
         }
       ],
