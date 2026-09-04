@@ -157,14 +157,14 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "5 分钟负载 / 已运行",
+      "title": "5 分钟负载",
       "datasource": {
         "type": "prometheus",
         "uid": "geesun-prometheus"
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 3,
         "x": 18,
         "y": 0
       },
@@ -186,15 +186,69 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "node_load5",
-          "legendFormat": "5分钟负载"
-        },
-        {
-          "refId": "B",
-          "expr": "(node_time_seconds - node_boot_time_seconds) / 86400",
-          "legendFormat": "运行天数"
+          "expr": "node_load5"
         }
-      ]
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "已运行（天）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(node_time_seconds - node_boot_time_seconds) / 86400"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none"
+      }
     },
     {
       "id": 5,
