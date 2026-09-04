@@ -96,19 +96,19 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "容器文件系统用量（可写层，排查日志/缓存暴涨）",
+      "title": "容器可写层写入速率（排查日志/缓存暴涨）",
       "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
+          "unit": "Bps",
           "min": 0,
           "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never" }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "sum by (name) (container_filesystem_usage_bytes{name=~\"/?geesun_.*\"})", "legendFormat": "{{name}}" }
+        { "refId": "A", "expr": "sum by (name) (rate(container_fs_writes_bytes_total{name=~\"/?geesun_.*\"}[5m]))", "legendFormat": "{{name}}" }
       ]
     }
   ]
