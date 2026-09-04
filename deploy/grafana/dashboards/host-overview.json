@@ -186,7 +186,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "node_load5"
+          "expr": "node_load5",
+          "legendFormat": "5分钟负载"
         },
         {
           "refId": "B",
