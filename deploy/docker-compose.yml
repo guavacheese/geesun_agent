@@ -62,6 +62,11 @@ services:
       # CubeSandbox CA：挂载源见 .env 的 CA_MOUNT_SRC，由 deploy/setup-combined-ca.sh 生成
       # （mkcert+系统根 bundle，约 148 证书——不能只挂 rootCA.pem 单证书，原因见 .env.example 注释）
       - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
+      # 时区：宿主机 localtime 指向 Asia/Singapore（UTC+8 无 DST），此处同步避免应用日志
+      # 打印 UTC 与 Grafana UI（按浏览器 UTC+8 渲染）差 8 小时（2026-09-04 实测日志 ts=01:30Z
+      # 而 UI 显示 09:30）。Singapore 与 Shanghai 同为 UTC+8、无夏令时，数值完全一致；
+      # 中国机器语义上若需更准确可改为 Asia/Shanghai。
+      TZ: "${TZ:-Asia/Singapore}"
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
     # agent 连不上 postgres 时靠自身重试/重启直至就绪（等效等待 healthy）
     depends_on: [agent-postgres]
@@ -91,8 +96,9 @@ services:
       POSTGRES_USER: ${AGENT_PG_USER:-geesun}
       POSTGRES_PASSWORD: ${AGENT_PG_PASSWORD}
       POSTGRES_DB: ${AGENT_PG_DB:-agent_mem}
-      TZ: UTC
-      PGTZ: UTC
+      # 时区与 geesun-agent 保持一致（Asia/Singapore / UTC+8），避免应用日志与 PG 会话时区错位
+      TZ: "${TZ:-Asia/Singapore}"
+      PGTZ: "${TZ:-Asia/Singapore}"
     volumes:
       - agent_pg_data:/var/lib/postgresql/data
     networks: [appnet2]
