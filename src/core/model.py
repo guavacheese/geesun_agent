@@ -38,25 +38,53 @@ def get_engine_prompt_tokens(session_id: str) -> int | None:
 _no_usage_warned = False  # 防字段漂移：usage_metadata 缺失仅告警一次（避免刷屏）
 
 
+def _extract_tokens(resp) -> tuple[int | None, int | None]:
+    """从模型响应稳健提取真实 token 数，兼容多种 provider 返回结构。
+
+    优先级（与 geesun_agent 长期踩坑的 vLLM 真实计数同源）：
+    1) usage_metadata（标准 OTel 键 input_tokens/output_tokens）
+    2) OpenAI 兼容 usage 对象（prompt_tokens/completion_tokens）—— vLLM 走这条
+    3) response_metadata.usage（部分 provider 把真实 usage 落在这里）
+    取不到返回 (None, None)，调用方据此决定是否记 token 维度（避免记 0 污染指标）。
+    """
+    # 1) 标准 OTel 键（OpenInference 0.1.67+ 会把 usage 映射成 usage_metadata）
+    um = getattr(resp, "usage_metadata", None)
+    if isinstance(um, dict) and (um.get("input_tokens") or um.get("output_tokens")):
+        return um.get("input_tokens"), um.get("output_tokens")
+    # 2) OpenAI 兼容 usage 对象（vLLM/Kimi/GLM 走这条；引擎侧真实计数，含视觉 token）
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        if isinstance(usage, dict):
+            return usage.get("prompt_tokens"), usage.get("completion_tokens")
+        pin = getattr(usage, "prompt_tokens", None)
+        pout = getattr(usage, "completion_tokens", None)
+        if pin is not None or pout is not None:
+            return pin, pout
+    # 3) response_metadata.usage（部分 provider 落点）
+    rm = getattr(resp, "response_metadata", None)
+    if isinstance(rm, dict):
+        u = rm.get("usage")
+        if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+            return u.get("prompt_tokens"), u.get("completion_tokens")
+    return None, None
+
+
 def _capture_usage(resp, request) -> None:
     """每次模型成功回复后，把引擎真实 prompt_tokens 存进每会话缓存（含视觉 token）。"""
     global _no_usage_warned
     sid = getattr(request.model, "_session_id", None)
     if not sid:
         return
-    um = getattr(resp, "usage_metadata", None)
-    if not isinstance(um, dict):
-        # 字段漂移告警：stream_usage=True 已开启却无 usage_metadata → 计数退化本地估算。
-        # 仅告警一次，足以暴露"引擎真实计数没接上"（OpenInference 0.1.67 字段漂移同类坑）。
+    real_in, _ = _extract_tokens(resp)
+    if not real_in:
+        # 三种来源(usage_metadata/usage/response_metadata)都没拿到 → 引擎真实计数没接上
+        # （stream_usage 未生效 / 响应层字段漂移）→ 计数退化本地估算。
         if not _no_usage_warned:
             _no_usage_warned = True
             logger.warning(
-                "[DIAG] resp 无 usage_metadata（stream_usage 可能未生效 / 响应层字段漂移）；"
-                "本次及后续退化本地估算，引擎真实计数不可用"
+                "[DIAG] 引擎真实 prompt_tokens 三种来源(usage_metadata/usage/response_metadata)"
+                "均缺失；本次及后续退化本地估算，引擎真实计数不可用"
             )
-        return
-    real_in = um.get("input_tokens") or um.get("prompt_tokens")
-    if not real_in:
         return
     _session_prompt_tokens[sid] = real_in
     # 简单防泄漏：长驻服务会话数不会过千，超限清一次（仅少量会话退化 cold，可接受）
@@ -87,7 +115,15 @@ def _get_genai_instruments() -> dict:
         try:
             from opentelemetry import metrics as metrics_api
 
-            meter = metrics_api.get_meter("geesun.agent", "0.1.0")
+            # 版本号绑定埋点代码版本（优先读 package 版本，缺包时回退 0.1.0），
+            # 仅作 OTel 资源元数据，不影响指标名/数值/落库。
+            try:
+                from importlib.metadata import version as _pkg_ver
+
+                _agent_ver = _pkg_ver("geesun-agent")
+            except Exception:
+                _agent_ver = "0.1.0"
+            meter = metrics_api.get_meter("geesun.agent", _agent_ver)
             _genai_instruments = {
                 "token_usage": meter.create_histogram(
                     name="gen_ai.client.token.usage",
@@ -542,13 +578,11 @@ async def model_call_guard(
         # 成功路径（未抛异常）：捕获引擎真实 prompt_tokens 回写每会话缓存，再返回
         _capture_usage(resp, request)
         # GenAI 指标打点（标准 semconv 名；metrics 未启用时 no-op 静默，零风险）
-        _um = getattr(resp, "usage_metadata", None)
-        if not isinstance(_um, dict):
-            _um = {}  # usage_metadata 缺失/漂移 → 仅记 duration，token 维度不记
+        real_in, real_out = _extract_tokens(resp)
         _record_genai_metrics(
             model_name=getattr(request.model, "model_name", None),
             duration_s=time.perf_counter() - t0,
-            input_tokens=_um.get("input_tokens") or _um.get("prompt_tokens"),
-            output_tokens=_um.get("output_tokens") or _um.get("completion_tokens"),
+            input_tokens=real_in,
+            output_tokens=real_out,
         )
         return resp
