@@ -219,10 +219,13 @@ services:
         max-size: "20m"
         max-file: "3"
 
-  # ── node-exporter：主机指标（CPU / 内存 / 磁盘 / 网络 / 负载）──
-  # Grafana「主机概览」看板的数据源；此前 Prometheus 里 node_* 指标为 0（2026-09-03 实测），
-  # 主机 CPU/内存/磁盘压根没有采集源，只能命令行 df/top 看，故补此服务。
+  # ── node-exporter：主机指标采集（CPU / 内存 / 磁盘 / 网络 / 负载）──
+  # 职责：Grafana「主机概览」看板（uid geesun-host）的唯一数据源，提供 node_* 系列。
   # global 模式：每节点一份（当前单节点，将来加节点自动覆盖），不发布主机端口。
+  #
+  # 📜 历史背景（2026-09-03，勿当现状问题）：
+  #   补此服务前 Prometheus 里 node_* 指标为 0——主机没有采集源，只能命令行 df/top 看。
+  #   服务上线后 node_* 已正常入库，主机概览看板有值（当前状态），此段仅为变更动机存档。
   node-exporter:
     image: ${REGISTRY_HUB}/node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}
     command:
