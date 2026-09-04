@@ -1,209 +1,557 @@
 {
   "uid": "geesun-host",
   "title": "Geesun · 主机概览",
-  "tags": ["geesun", "host"],
+  "tags": [
+    "geesun",
+    "host"
+  ],
   "description": "生产机 10.10.10.67 主机资源总览（数据源：node-exporter）。用于回答「CPU/内存/磁盘还剩多少、谁在吃」。",
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "editable": false,
   "refresh": "30s",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "CPU 使用率",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
           "min": 0,
           "max": 100,
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "orange", "value": 70 },
-            { "color": "red", "value": 88 }
-          ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 88
+              }
+            ]
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)" }
+        {
+          "refId": "A",
+          "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)"
+        }
       ]
     },
     {
       "id": 2,
       "type": "stat",
       "title": "内存使用率",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
           "min": 0,
           "max": 100,
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "orange", "value": 75 },
-            { "color": "red", "value": 90 }
-          ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 75
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100" }
+        {
+          "refId": "A",
+          "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100"
+        }
       ]
     },
     {
       "id": 3,
       "type": "stat",
       "title": "根分区 / 使用率",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
           "min": 0,
           "max": 100,
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "orange", "value": 70 },
-            { "color": "red", "value": 85 }
-          ] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "100 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100)" }
+        {
+          "refId": "A",
+          "expr": "100 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100)"
+        }
       ]
     },
     {
       "id": 4,
       "type": "stat",
       "title": "5 分钟负载 / 已运行",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "node_load5" },
-        { "refId": "B", "expr": "(node_time_seconds - node_boot_time_seconds) / 86400", "legendFormat": "运行天数" }
+        {
+          "refId": "A",
+          "expr": "node_load5"
+        },
+        {
+          "refId": "B",
+          "expr": "(node_time_seconds - node_boot_time_seconds) / 86400",
+          "legendFormat": "运行天数"
+        }
       ]
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "CPU 使用率（按模式）",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
           "min": 0,
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 12, "showPoints": "never", "stacking": { "mode": "normal" } }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "sum by (mode) (rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])) * 100", "legendFormat": "{{mode}}" }
+        {
+          "refId": "A",
+          "expr": "sum by (mode) (rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])) * 100",
+          "legendFormat": "{{mode}}"
+        }
       ]
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "内存（总量 / 已用 / 可用）",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
           "min": 0,
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never" }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "node_memory_MemTotal_bytes", "legendFormat": "总量" },
-        { "refId": "B", "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes", "legendFormat": "已用" },
-        { "refId": "C", "expr": "node_memory_MemAvailable_bytes", "legendFormat": "可用" }
+        {
+          "refId": "A",
+          "expr": "node_memory_MemTotal_bytes",
+          "legendFormat": "总量"
+        },
+        {
+          "refId": "B",
+          "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+          "legendFormat": "已用"
+        },
+        {
+          "refId": "C",
+          "expr": "node_memory_MemAvailable_bytes",
+          "legendFormat": "可用"
+        }
       ]
     },
     {
       "id": 7,
       "type": "timeseries",
       "title": "磁盘使用率（按挂载点）",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
           "min": 0,
           "max": 100,
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0, "showPoints": "never" }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "100 - (node_filesystem_avail_bytes{fstype=~\"ext4|xfs\"} / node_filesystem_size_bytes{fstype=~\"ext4|xfs\"} * 100)", "legendFormat": "{{mountpoint}}" }
+        {
+          "refId": "A",
+          "expr": "100 - (node_filesystem_avail_bytes{fstype=~\"ext4|xfs\"} / node_filesystem_size_bytes{fstype=~\"ext4|xfs\"} * 100)",
+          "legendFormat": "{{mountpoint}}"
+        }
       ]
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "网络吞吐（物理网卡）",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
           "min": 0,
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never" }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "rate(node_network_receive_bytes_total{device!~\"lo|veth.*|br-.*|docker.*|virbr.*|flannel.*|cni.*\"}[5m])", "legendFormat": "收 {{device}}" },
-        { "refId": "B", "expr": "rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|br-.*|docker.*|virbr.*|flannel.*|cni.*\"}[5m])", "legendFormat": "发 {{device}}" }
+        {
+          "refId": "A",
+          "expr": "rate(node_network_receive_bytes_total{device!~\"lo|veth.*|br-.*|docker.*|virbr.*|flannel.*|cni.*\"}[5m])",
+          "legendFormat": "收 {{device}}"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|br-.*|docker.*|virbr.*|flannel.*|cni.*\"}[5m])",
+          "legendFormat": "发 {{device}}"
+        }
       ]
     },
     {
       "id": 9,
       "type": "timeseries",
       "title": "磁盘 IO（读写字节/秒）",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
           "min": 0,
-          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never" }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
         },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "rate(node_disk_read_bytes_total{device=~\"sd.*|vd.*|nvme.*\"}[5m])", "legendFormat": "读 {{device}}" },
-        { "refId": "B", "expr": "rate(node_disk_written_bytes_total{device=~\"sd.*|vd.*|nvme.*\"}[5m])", "legendFormat": "写 {{device}}" }
+        {
+          "refId": "A",
+          "expr": "rate(node_disk_read_bytes_total{device=~\"sd.*|vd.*|nvme.*\"}[5m])",
+          "legendFormat": "读 {{device}}"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(node_disk_written_bytes_total{device=~\"sd.*|vd.*|nvme.*\"}[5m])",
+          "legendFormat": "写 {{device}}"
+        }
       ]
     },
     {
       "id": 10,
-      "type": "table",
-      "title": "主机明细（CPU 核数 / 内存总量 / 内核）",
-      "datasource": { "type": "prometheus", "uid": "geesun-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
-      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "type": "stat",
+      "title": "CPU 核数",
+      "description": "来自 node-exporter（主机指标采集器）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 20
+      },
       "targets": [
-        { "refId": "A", "expr": "count by (instance) (count by (instance, cpu) (node_cpu_seconds_total))", "legendFormat": "CPU 核数", "format": "table", "instant": true },
-        { "refId": "B", "expr": "node_memory_MemTotal_bytes", "legendFormat": "内存总量", "format": "table", "instant": true },
-        { "refId": "C", "expr": "node_uname_info", "legendFormat": "内核", "format": "table", "instant": true }
-      ]
+        {
+          "refId": "A",
+          "expr": "count by (instance) (count by (instance, cpu) (node_cpu_seconds_total))",
+          "legendFormat": "{{instance}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "内存总量",
+      "description": "来自 node-exporter（主机指标采集器）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 20
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemTotal_bytes",
+          "legendFormat": "{{instance}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "内核版本",
+      "description": "来自 node-exporter（主机指标采集器）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "geesun-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 20
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_uname_info",
+          "legendFormat": "{{release}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     }
   ]
 }
