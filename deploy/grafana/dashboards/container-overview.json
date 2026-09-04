@@ -108,7 +108,7 @@
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "sum by (name) (container_fs_usage_bytes{name=~\"/?geesun_.*\"})", "legendFormat": "{{name}}" }
+        { "refId": "A", "expr": "sum by (name) (container_filesystem_usage_bytes{name=~\"/?geesun_.*\"})", "legendFormat": "{{name}}" }
       ]
     }
   ]
