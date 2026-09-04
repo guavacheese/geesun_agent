@@ -51,6 +51,15 @@ services:
       # 无 MITM 可删挂载+这两行。
       REQUESTS_CA_BUNDLE: /etc/ssl/certs/combined-ca.pem
       SSL_CERT_FILE: /etc/ssl/certs/combined-ca.pem
+      # 时区（全栈统一 UTC+8，国内部署）：
+      # - geesun-agent 自身日志 ts 已在 src/core/logging.py:25,49 硬编码 UTC+8（与容器 TZ 无关）；
+      #   此前"差 8 小时"的截图实为 Loki 容器自身日志（service_name=geesun_loki，容器 UTC，
+      #   日志体 ts=...Z），Grafana UI 列按浏览器 UTC+8 渲染——属 UTC 容器常态分屏，非故障。
+      # - agent 与下方各 infra 服务（loki/prometheus/alloy/grafana/caddy/node-exporter）统一设为
+      #   Asia/Singapore（=UTC+8 无 DST），使现场读任意容器原始日志零时区转换。
+      # - Singapore 与 Shanghai 数值等价、均无夏令时；中国机器语义上可改 Asia/Shanghai。
+      #   统一走 ${TZ:-...} 变量，宿主设 TZ 即全局覆盖。
+      TZ: "${TZ:-Asia/Singapore}"
     # 宿主机挂载：报告/上传/工作目录防容器重建丢失（AGENT_DATA_ROOT 见 .env）
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
@@ -62,11 +71,6 @@ services:
       # CubeSandbox CA：挂载源见 .env 的 CA_MOUNT_SRC，由 deploy/setup-combined-ca.sh 生成
       # （mkcert+系统根 bundle，约 148 证书——不能只挂 rootCA.pem 单证书，原因见 .env.example 注释）
       - ${CA_MOUNT_SRC:-../certs/combined-ca.pem}:/etc/ssl/certs/combined-ca.pem:ro
-      # 时区：宿主机 localtime 指向 Asia/Singapore（UTC+8 无 DST），此处同步避免应用日志
-      # 打印 UTC 与 Grafana UI（按浏览器 UTC+8 渲染）差 8 小时（2026-09-04 实测日志 ts=01:30Z
-      # 而 UI 显示 09:30）。Singapore 与 Shanghai 同为 UTC+8、无夏令时，数值完全一致；
-      # 中国机器语义上若需更准确可改为 Asia/Shanghai。
-      TZ: "${TZ:-Asia/Singapore}"
     # Swarm 模式 depends_on 仅支持列表语法（无 condition，仅保证先创建）；
     # agent 连不上 postgres 时靠自身重试/重启直至就绪（等效等待 healthy）
     depends_on: [agent-postgres]
@@ -122,6 +126,8 @@ services:
 
   caddy:
     image: ${REGISTRY_HUB}/caddy:2.8-alpine
+    environment:
+      TZ: "${TZ:-Asia/Singapore}"
     ports:
       # 仅主入口 :80（前端 + /api/* 路由）；Phoenix(:6006)/Langfuse(:3000) 由现网共享容器直出，
       # 不经 Caddy 代理（避免与它们的已发布端口冲突）。
@@ -147,6 +153,8 @@ services:
 
   loki:
     image: ${REGISTRY_HUB}/loki:3.2.0
+    environment:
+      TZ: "${TZ:-Asia/Singapore}"
     command: -config.file=/etc/loki/loki-config.yaml
     volumes:
       - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
@@ -168,6 +176,8 @@ services:
   # ── Grafana Alloy：统一采集 logs→Loki / metrics→Prometheus / traces→Phoenix（替代原 Promtail）──
   alloy:
     image: ${REGISTRY_HUB}/alloy:${ALLOY_TAG:-v1.19.2}
+    environment:
+      TZ: "${TZ:-Asia/Singapore}"
     command:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
@@ -201,6 +211,8 @@ services:
   # 需 --web.enable-remote-write-receiver 才能接收 Alloy 的 prometheus.remote_write。
   prometheus:
     image: ${REGISTRY_HUB}/prometheus:${PROMETHEUS_TAG:-3.0}
+    environment:
+      TZ: "${TZ:-Asia/Singapore}"
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -234,6 +246,8 @@ services:
   #   服务上线后 node_* 已正常入库，主机概览看板有值（当前状态），此段仅为变更动机存档。
   node-exporter:
     image: ${REGISTRY_HUB}/node-exporter:${NODE_EXPORTER_TAG:-v1.8.2}
+    environment:
+      TZ: "${TZ:-Asia/Singapore}"
     command:
       - --path.rootfs=/host
       - --path.procfs=/host/proc
@@ -270,6 +284,7 @@ services:
     image: ${REGISTRY_HUB}/grafana:11.3.0
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      TZ: "${TZ:-Asia/Singapore}"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       # 看板 JSON 随代码进 git（dashboard as code），由 provisioning/dashboards/geesun.yaml 加载；
