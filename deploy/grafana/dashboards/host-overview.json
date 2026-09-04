@@ -573,7 +573,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "node_uname_info",
+          "expr": "max by(release) (node_uname_info)",
           "legendFormat": "{{release}}",
           "format": "time_series"
         }
