@@ -69,6 +69,10 @@ def setup_tracing() -> bool:
             )
 
         resource = Resource.create({
+            # service.name 缺省时 OTel SDK 给 unknown_service → alloy prometheus exporter
+            # 映射成 job="unknown_service"（2026-09-07 实测 gen_ai_*/http_server_* 全中招）。
+            # 必须显式给，SDK 不会自动从 OTEL_SERVICE_NAME env 合并到 create() 的 resource。
+            "service.name": settings.otel_service_name,
             # Phoenix 19.x 按标准 OTel `project.name` 资源属性分组项目；
             # 旧版 OpenInference 用 `openinference.project.name`，现代 Phoenix 已忽略，
             # 缺失 `project.name` 时所有 trace 落入内置 "default" 项目（2026-09-02 实测）。

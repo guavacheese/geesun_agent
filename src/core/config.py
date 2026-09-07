@@ -39,6 +39,10 @@ class Settings(BaseSettings):
 
     # OpenTelemetry 项目名（dev / prod 区分，便于在 Phoenix / Langfuse 中隔离 trace）
     otel_project_name: str = "Geesun-Agent"
+    # OTel resource service.name（2026-09-07 补）：缺省时 SDK 用 unknown_service → alloy
+    # prometheus exporter 把 service.name 映射成 job 标签 → 全部指标 job="unknown_service"，
+    # 无法按服务筛选/告警。设此字段让 job=geesun-agent（trace 侧 service 名同步正确）。
+    otel_service_name: str = "geesun-agent"
 
     # 允许的前端跨域源（逗号分隔）；生产部署填 Web 实际域名 / IP
     cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
