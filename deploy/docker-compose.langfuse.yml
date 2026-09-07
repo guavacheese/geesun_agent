@@ -148,6 +148,11 @@ services:
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
       - langfuse_clickhouse_logs:/var/log/clickhouse-server
+      # host bind mount：config.xml + config.d 持久化（否则 Swarm 滚动重启会用镜像内置 config 覆盖，
+      # 导致 system 日志表 TTL / text_log level 回滚）。config.xml 覆盖镜像主体，config.d 保留
+      # docker_related_config.xml 的 listen_host 等关键项。2026-09-07 落地。
+      - /opt/geesun/deploy/clickhouse-config/config.xml:/etc/clickhouse-server/config.xml:ro
+      - /opt/geesun/deploy/clickhouse-config/config.d:/etc/clickhouse-server/config.d:ro
     # 仅 appnet2 内（CLICKHOUSE_URL=http://clickhouse:8123 经服务名互访）；不发布主机端口
     networks: [appnet2]
     healthcheck:
@@ -162,7 +167,11 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 4g
+          # 8 GB：system.trace_log/text_log 后台 merge 大 part 会一次吃掉 ~3.6G，
+          # 4G 下限（ClickHouse 自算 4G×0.9=3.6G）在 29-part 合并时会 MEMORY_LIMIT_EXCEEDED
+          # （2026-09-07 实测：周末无人用却刷 4.3 万条错误，根因即后台 merge 内存超限）。
+          # 提到 8G 且配 max_parts_in_merge=8，给合并留足余量。
+          memory: 8g
     logging:
       driver: json-file
       options:
