@@ -42,11 +42,21 @@ def _extract_tokens(resp) -> tuple[int | None, int | None]:
     """从模型响应稳健提取真实 token 数，兼容多种 provider 返回结构。
 
     优先级（与 geesun_agent 长期踩坑的 vLLM 真实计数同源）：
+    0) langchain 1.0 middleware 路径返回 ModelResponse(result=AIMessage)，先解包
+       —— model_call_guard 的 handler(request) 经 middleware 链返回的是 ModelResponse，
+       真实 AIMessage 在 .result 下；直接 ainvoke() 走非 middleware 返回 AIMessage。
+       2026-09-07 实测：解包缺失导致 middleware 路径 usage_metadata/usage/response_metadata
+       三层全 None → token 系列永不落库（而 operation_duration 有 3 次成功），探针走
+       ainvoke 直调反而绕过该 bug 全绿——探针验证与真实路径分叉的盲点。
     1) usage_metadata（标准 OTel 键 input_tokens/output_tokens）
     2) OpenAI 兼容 usage 对象（prompt_tokens/completion_tokens）—— vLLM 走这条
     3) response_metadata.usage（部分 provider 把真实 usage 落在这里）
     取不到返回 (None, None)，调用方据此决定是否记 token 维度（避免记 0 污染指标）。
     """
+    # 0) ModelResponse → AIMessage 解包（防御：无 .result 或 .result 为 None 时原样用）
+    inner = getattr(resp, "result", None)
+    if inner is not None and inner is not resp:
+        resp = inner
     # 1) 标准 OTel 键（OpenInference 0.1.67+ 会把 usage 映射成 usage_metadata）
     um = getattr(resp, "usage_metadata", None)
     if isinstance(um, dict) and (um.get("input_tokens") or um.get("output_tokens")):
