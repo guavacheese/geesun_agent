@@ -166,6 +166,7 @@ deploy/.env.example ──cp──> deploy/.env（填全部密钥）
 | `.env.example` | **全部环境变量安全模板**（可入库）；复制为 `.env` 后填密钥 |
 | `.env` | 真实连接配置（**不入库**，务必 `chmod 600`） |
 | `Caddyfile` / `alloy.config.alloy` / `loki-config.yaml` / `prometheus.yml` / `grafana/` | 各服务运行时配置（bind mount 进容器） |
+| `clickhouse-config/` | ClickHouse `config.xml` + `config.d/docker_related_config.xml` bind mount 源（**需同步到 67 `/opt/geesun/deploy/clickhouse-config/`**，否则 Swarm 重启后 system 日志表 TTL / text_log level 回滚，见 DEPLOYMENT.md §2.8.1） |
 | `setup-cube-dns.sh` / `setup-combined-ca.sh` / `init-host.sh` | 主机侧辅助：`*.cube.app` DNS 解析、生成 combined-ca.pem（mkcert+系统根 bundle）、主机初始化 |
 | `backup.sh` | 数据卷备份 |
 | `certs/` | CubeSandbox egress MITM CA（供 agent / mcp 容器信任 sandbox 出网 TLS 拦截）。**`combined-ca.pem` 由 `deploy/setup-combined-ca.sh` 生成**（自动合并你上传的 `rootCA.pem` 单证书 + 系统根 bundle），不要手动 cat；目录不入库 |

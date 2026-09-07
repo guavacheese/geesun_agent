@@ -415,6 +415,45 @@ Grafana：`http://10.10.10.67:3100`（admin + `.env` 的 `GRAFANA_PASSWORD`）�
 | `LANGFUSE_PUBLIC_KEY` | `pk-lf-init-CHANGE_ME` | src/core/tracing.py（agent 上报） | 项目 API key（自托管须=INIT key） |
 | `LANGFUSE_SECRET_KEY` | `sk-lf-init-CHANGE_ME` | src/core/tracing.py | 项目 API secret（自托管须=INIT key） |
 
+#### 2.8.1 ClickHouse config 挂载（bind mount，跨 Swarm 重启持久化）
+
+**背景**：`docker-compose.langfuse.yml` 的 clickhouse 只挂载了 `langfuse_clickhouse_data` / `langfuse_clickhouse_logs` 两个命名卷，`/etc/clickhouse-server/config.xml` 与 `config.d/` **是镜像内置**。Swarm 滚动重启（`docker service update --force`）会重建容器文件系统，**镜像内置 config 覆盖一切**——因此：
+
+- 之前用 `config.d/*.xml` 加 `<ttl>`：对**已存在的主表无效**。system 库由 config 驱动，重启时主表是 `ATTACH` 复用现有 data 目录 + 其 `.sql` 文件，**不读 config.d 的 ttl**——只有表「从未存在、首次创建」时 config.d 才生效。
+- 之前用 `docker cp` 改容器内 config.xml：Swarm 重启后 config.xml 被镜像覆盖**回滚**，text_log.level 打回 trace、ttl 丢失。
+- **唯一可靠方案**：宿主机 bind mount，把 `config.xml` + `config.d/` 挂到容器 `/etc/clickhouse-server/`，跨重启持久化。
+
+**挂载源（已入库，版本控制）**：`deploy/clickhouse-config/`，含：
+
+| 文件 | 作用 |
+| --- | --- |
+| `config.xml` | 镜像内置 config.xml 的改版：6 张 system 表加 active `<ttl>`（trace_log=3天 / text_log=7天 / query_log=7天 / part_log=7天 / metric_log=3天 / asynchronous_metric_log=7天），text_log `<level>` trace→**warning** |
+| `config.d/docker_related_config.xml` | 保留镜像官方 config.d 的 `<listen_host>` 等关键网络项（bind mount 整个 config.d 目录用） |
+
+**部署到 67（`/opt/geesun/deploy/`）**：仓库 `deploy/clickhouse-config/` 只是版本控制源，**部署时需同步到宿主机绝对路径**（compose 里挂载的是绝对路径）：
+
+```bash
+# 在 67 上（或从 CI/Runner 同步）把仓库 deploy/clickhouse-config/ 拷到 /opt/geesun/deploy/clickhouse-config/
+# 再确认 compose 的 bind mount 两行存在
+docker service update --force geesun_clickhouse   # 关键：--force 强制重建 task，容器才会重新加载挂载的 config
+```
+
+**验证**（确认新 config 已生效，而非仍用镜像内置）：
+
+```bash
+docker exec geesun_clickhouse clickhouse-client --query \
+  "SELECT name, hasTTL FROM system.tables WHERE database='system' AND name IN ('trace_log','text_log','query_log','part_log','metric_log','asynchronous_metric_log','processors_profile_log') ORDER BY name"
+# 期望：除 opentelemetry_span_log 外，其余均 hasTTL=1
+docker exec geesun_clickhouse clickhouse-client --query "SELECT value FROM system.settings WHERE name='max_server_memory_usage_to_ram_ratio'"
+```
+
+**两条铁律**：
+
+1. **只挂 `config.xml` + `config.d/` 两个源**，**不要挂整个 `/etc/clickhouse-server/`**——否则会覆盖镜像的 `users.xml`（认证配置），导致连接认证丢失。
+2. bind mount 加到 service spec 后，**必须 `docker service update --force`** 强制重建任务才加载；否则同节点 bind 不被视为调度变化，容器 `restarted: False`，新 config 不生效。
+
+**`opentelemetry_span_log` 特意不加 config `<ttl>`**：该表在 config.xml 有 active `<engine>`（官方 workaround），`engine` 与 `ttl` 同时设会抛异常启动失败。该表用运行期 `ALTER TABLE ... MODIFY TTL` 加 TTL，不影响启动。
+
 ### 2.9 Grafana / 其他
 
 | 变量 | 默认 / 示例 | 消费方 | 说明 |
