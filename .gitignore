@@ -41,3 +41,6 @@ mcp.json.bak.*
 
 # 临时探针脚本（tests/infra 下正式测试需保留，仅忽略该临时文件）
 tests/infra/*quick_probe.py
+
+# 带 SSH 凭据的验收脚本（不要入库，避免泄露 67 root 密码）
+deploy/.verify/
