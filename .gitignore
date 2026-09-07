@@ -26,6 +26,9 @@ skills/
 !deploy/DEPLOYMENT.md
 !deploy/*.json
 !deploy/.env.example
+# ClickHouse config（bind mount 挂载源，须入库；覆盖上方的 *.xml 通配）
+!deploy/clickhouse-config/config.xml
+!deploy/clickhouse-config/config.d/*.xml
 
 # 证书 / CA（含 egress MITM rootCA，禁止进版本库）
 certs/
