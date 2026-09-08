@@ -44,3 +44,7 @@ tests/infra/*quick_probe.py
 
 # 带 SSH 凭据的验收脚本（不要入库，避免泄露 67 root 密码）
 deploy/.verify/
+
+# 本地排障/评估脚本目录（debug 含 SSH 密码探针，tests/evals 为本地评估，均不入库）
+debug/
+tests/evals/
