@@ -44,7 +44,7 @@ services:
       langfuse_public_key: "${LANGFUSE_PUBLIC_KEY}"
       langfuse_secret_key: "${LANGFUSE_SECRET_KEY}"
       otel_project_name: "${OTEL_PROJECT_NAME:-Geesun-Agent-prod}"
-      cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67}"
+      cors_allow_origins: "${CORS_ALLOW_ORIGINS:-http://10.10.10.67,http://agent.geesun.com}"
       # CubeSandbox egress MITM CA：必须用 combined-ca.pem（mkcert+系统根 bundle），
       # 仅挂 rootCA.pem 单证书会整体替换信任库、排除系统根 → uv 拉 pypi UnknownIssuer
       # 启动即崩（2026-09-01 实测）。生成：宿主机 bash deploy/setup-combined-ca.sh。

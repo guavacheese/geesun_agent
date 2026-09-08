@@ -115,7 +115,10 @@ build_push_mcp
 # 命名说明：同 2.5——「构建自有代码镜像 + push 进 geesun_ai 项目」，旧名 sync_web 易与
 # sync()（同步第三方镜像）混淆，故命名为 build_push_web。
 # NEXT_PUBLIC_API_BASE 是 build-time 变量（Next.js 公共变量构建时内联进浏览器产物），
-# 默认生产 http://10.10.10.67/（Caddy :80 同域，/api/* 由 Caddy 转发后端）；换环境重构建。
+# 用途：仅 next dev（本地开发）时 next.config.ts rewrites 用它转发到后端。
+# 生产走域名 agent.geesun.com：前端全部请求用相对路径 /api/*，由 Caddy :80 同域反代
+# 到 geesun-agent:8009，zero CORS——因此生产**无需注入此变量**，交给 build 默认 localhost 兜底。
+# 换环境/域名时如需本地指向其他后端，再以 --build-arg 显式覆盖。
 build_push_web() {
   local web_repo="$REPO_ROOT/../geesun_agent_web"
   if [[ ! -d "$web_repo" ]]; then
@@ -123,12 +126,17 @@ build_push_web() {
     return 0
   fi
   local WEB_TAG="${WEB_TAG:-1.0.0}"
-  local API_BASE="${NEXT_PUBLIC_API_BASE:-http://10.10.10.67}"
+  local API_BASE="${NEXT_PUBLIC_API_BASE:-}"
   local WEB_IMAGE="$REGISTRY_GEESUN/geesun-agent-web:$WEB_TAG"
-  echo "==> 构建 $WEB_IMAGE (context=$web_repo, NEXT_PUBLIC_API_BASE=$API_BASE)"
-  docker build \
-    --build-arg "NEXT_PUBLIC_API_BASE=$API_BASE" \
-    -f "$web_repo/Dockerfile" -t "$WEB_IMAGE" "$web_repo"
+  echo "==> 构建 $WEB_IMAGE (context=$web_repo, NEXT_PUBLIC_API_BASE=${API_BASE:-生产默认相对路径，不注入})"
+  if [[ -n "$API_BASE" ]]; then
+    docker build \
+      --build-arg "NEXT_PUBLIC_API_BASE=$API_BASE" \
+      -f "$web_repo/Dockerfile" -t "$WEB_IMAGE" "$web_repo"
+  else
+    docker build \
+      -f "$web_repo/Dockerfile" -t "$WEB_IMAGE" "$web_repo"
+  fi
   docker push "$WEB_IMAGE"
 }
 build_push_web
