@@ -308,12 +308,22 @@ chmod 600 .env
 
 ```bash
 cd deploy
+# ★ 生产标准全量命令（推荐，唯一 safe 全栈对齐方式）
+./start_stack.sh --with=phoenix,langfuse,mcp,web
+#   跳过打包、仅用已推送镜像重发（改 .env / 换镜像 tag 后，几十秒完成）
+./start_stack.sh --with=phoenix,langfuse,mcp,web --no-build
+# ── 仅限本地/临时排查，勿上生产 ──
 ./start_stack.sh                          # 默认仅主栈（先 build-push 再发布）
-./start_stack.sh --no-build               # 跳过打包，仅用已推送镜像重新部署（改配置时只重启）
-./start_stack.sh --with=mcp,web           # 并入 MCP / 前端
-./start_stack.sh --with=phoenix,langfuse  # 可观测栈随栈自托管（与 agent/mcp/web 统一启动）
+./start_stack.sh --with=mcp,web           # 并入 MCP / 前端（缺 phoenix/langfuse → 生产 502！）
 STACK_NAME=geesun ./start_stack.sh         # 显式指定 stack 名（默认 geesun）
 ```
+
+> 🔴 **高危警示（2026-09-08 实锤）**：`--with` **必须带全 `phoenix,langfuse,mcp,web`**，缺项会触发 `--prune` 清掉该服务，更致命的是——
+> 漏带 `phoenix,langfuse` → `phoenix:4317` 在 overlay 网络解析不到 → agent 同步 OTel exporter 阻塞 →
+> `/docs` healthcheck 连续超时 → Swarm kill → `geesun_geesun-agent` **0/1 → 前端全站 502**。
+> **每次滚动更新（哪怕只换 web 的域名配置）都用同一条全量命令**：stack deploy 是**声明式幂等 diff**，
+> 只有 spec 真正变化（如 caddy/web 重新构建、`.env` 变更）的那几个服务才会滚动重启，
+> **未升级的镜像服务不会重启、连接不断**——不存在"全量重启一遍"，放心用全量命令。
 
 按场景选命令（参数/变量语义、影响范围与推演详见 [`deploy/DEPLOYMENT.md`](./deploy/DEPLOYMENT.md) §1.6）：
 

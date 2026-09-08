@@ -17,12 +17,25 @@
 #                              --prune（compose 中删掉的服务会被真正清理）
 #   - --with=phoenix,langfuse,mcp,web 按需叠加附加 compose（默认只部署主文件）
 #
+# ⚠️⚠️ 默认推荐命令（生产全量，别用子集！）：
+#     ./start_stack.sh --with=phoenix,langfuse,mcp,web
+#
+#   这是唯一"全栈对齐"的启动方式。生产环境(67) trace 链依赖 Phoenix/Langfuse 在栈内：
+#   agent → alloy:4317 → phoenix:4317 / langfuse-web:3000。若 --with 漏带 phoenix/langfuse，
+#   phoenix:4317 在 overlay 网络解析不到 → agent 的同步 OTel exporter 阻塞 → /docs healthcheck
+#   连续超时 → Swarm kill → geesun_geesun-agent 0/1 → 前端**全站 502**（2026-09-08 实测）。
+#
+#   【铁律】--with 每次必须与上次【完全一致】，缺项会触发 --prune 清掉该服务；多带无副作用。
+#   只改 .env / 只换某个镜像 tag 也一样：用同一条全量命令，stack deploy 是声明式幂等 diff，
+#   只有 spec 真正变化的服务才会滚动重启，其余零中断——不存在"全量重启一遍"。
+#
 # 用法：
-#   ./start_stack.sh                          # 默认仅主栈（先打包再发布）
-#   ./start_stack.sh --no-build               # 跳过打包，仅用已推送镜像重新部署
-#   ./start_stack.sh --with=mcp,web           # 并入 MCP / 前端
-#   ./start_stack.sh --with=phoenix,langfuse  # 可观测栈随栈自托管（与 agent/mcp/web 统一启动）
-#   STACK_NAME=geesun ./start_stack.sh         # 显式指定 stack 名（默认 geesun）
+#   ./start_stack.sh --with=phoenix,langfuse,mcp,web          # ★ 生产标准全量（推荐）
+#   ./start_stack.sh --with=phoenix,langfuse,mcp,web --no-build  # 跳过打包，仅重发（改配置/换tag后）
+#   ./start_stack.sh                                        # 仅主栈（不含 mcp/web/phoenix/langfuse）
+#   STACK_NAME=geesun ./start_stack.sh                       # 显式指定 stack 名（默认 geesun）
+#   ── 半量用法（仅限本地/临时排查，勿上生产）──
+#   ./start_stack.sh --no-build --with=mcp,web               # 本地仅调试前端，缺 phoenix（会产生 502，勿用于生产）
 #
 set -euo pipefail
 

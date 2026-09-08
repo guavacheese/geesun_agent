@@ -88,6 +88,13 @@
 
 ### 1.6 部署操作手册（按场景）
 
+> 🔴 **高危警示（2026-09-08 实锤）：生产部署永远用全量命令** `./start_stack.sh --with=phoenix,langfuse,mcp,web`。
+> `--with` **漏带 `phoenix,langfuse`** → `phoenix:4317` 在 overlay 网络解析不到 → agent 同步 OTel exporter 阻塞 →
+> `/docs` healthcheck 连续超时 → Swarm kill → `geesun_geesun-agent` **0/1 → 前端全站 502**。
+> **每次滚动更新（哪怕只换 web 域名配置、只改 `.env`、只换一个镜像 tag）都用同一条全量命令**：
+> stack deploy 是声明式幂等 diff，只有 spec 真正变化的那几个服务会滚动重启，**未升级的镜像服务不会重启**。
+> 子集 `--with=mcp,web` 只用于本地调试，**勿上生产**。
+
 > 部署唯一入口是 `deploy/start_stack.sh`（头部注释是速查，本节是完整语义）。它最终汇成一条 `docker stack deploy`：
 > `docker stack deploy -c docker-compose.yml [-c docker-compose.<附加>.yml…] --with-registry-auth --resolve-image=always --prune <STACK_NAME>`
 > **核心机制：swarm stack deploy 是声明式幂等 diff**——重跑时只滚动** spec 真正变化**的服务，其余服务零操作（容器不重启、连接不断）。不存在"全部重启一遍"，也**不需要**为单服务写专用重启脚本。
