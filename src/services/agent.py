@@ -29,6 +29,7 @@ from deepagents.middleware.skills import (
     _alist_skills_with_errors,
     _list_skills_with_errors,
 )
+from src.core.loop_detection import LoopDetectionMiddleware
 
 
 def _strip_system_messages(request):
@@ -828,6 +829,16 @@ async def create_agent(
             file_to_image,
             summarization_mw,
             model_call_guard,
+            # ★ 链尾最后一道守卫：防"工具全成功但整体不收敛"烧满 recursion_limit。
+            # 两段式：≥warn_threshold 次重复 → 软提醒（wrap_model_call 注入 human msg）；
+            # ≥hard_limit 次 → 剥离 tool_calls 逼模型出纯文本（不抛异常，SSE 不中断）。
+            # 阈值从 settings 读（config.py loop_detect_*）。2026-09-08 移植 deer-flow。
+            LoopDetectionMiddleware(
+                warn_threshold=settings.loop_detect_warn_threshold,
+                hard_limit=settings.loop_detect_hard_limit,
+                tool_freq_warn=settings.loop_detect_tool_freq_warn,
+                tool_freq_hard_limit=settings.loop_detect_tool_freq_hard,
+            ),
         ],
         interrupt_on={
             "write_file": False,

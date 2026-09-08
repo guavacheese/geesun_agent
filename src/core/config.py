@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     no_progress_max_injections: int = 1
     # 无进展窗口判定：重复 N 次内是否有新交付物（file_generated / reports 新文件）
     no_progress_window_files: int = 3
+    # ─── LoopDetectionMiddleware（2026-09-08 移植 deer-flow，防烧满 recursion_limit）───
+    # 已写码并通过单测：src/core/loop_detection.py + tests/core/test_loop_detection.py
+    # Layer 1（hash 级）：同一组工具调用（名+参数摘要）重复 N 次 → 注入软提醒
+    loop_detect_warn_threshold: int = 3
+    # Layer 1 硬剥阈值：重复 N 次后剥离 tool_calls 逼模型出纯文本（不抛异常，SSE 不中断）
+    loop_detect_hard_limit: int = 5
+    # Layer 2（频次级）：同工具名在滑动窗口内出现 N 次 → 软提醒
+    # （捕获"换参数/换文件但同工具高频"型空转，deer-flow 默认 30，我们调低防烧满）
+    loop_detect_tool_freq_warn: int = 12
+    # Layer 2 硬剥阈值：同工具名高频达 N 次后剥离 tool_calls
+    loop_detect_tool_freq_hard: int = 20
     # ─── model 调用灾难性总时长超时（兜底中的兜底，2026-08-28 由 600 上调至 1800）───
     # openai SDK 的 timeout 是"字节间隔超时"（httpx read timeout），vLLM 慢速流式时
     # 永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时）；
