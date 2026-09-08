@@ -308,28 +308,29 @@ chmod 600 .env
 
 ```bash
 cd deploy
-# ★ 生产标准全量命令（推荐，唯一 safe 全栈对齐方式）
-./start_stack.sh --with=phoenix,langfuse,mcp,web
-#   跳过打包、仅用已推送镜像重发（改 .env / 换镜像 tag 后，几十秒完成）
+# ★ 生产标准：脚本【默认全量】= --with=phoenix,langfuse,mcp,web（会先 build-push 再发布）
+./start_stack.sh
+#   跳过打包、仅用已推送镜像重发（改 .env / 换镜像 tag 后，几十秒完成）；同样默认全量
+./start_stack.sh --no-build
+# ── 显式指定组合（等价默认，仅当你想人肉确认子栈时用；或用于本地/临时精简）──
 ./start_stack.sh --with=phoenix,langfuse,mcp,web --no-build
 # ── 仅限本地/临时排查，勿上生产 ──
-./start_stack.sh                          # 默认仅主栈（先 build-push 再发布）
-./start_stack.sh --with=mcp,web           # 并入 MCP / 前端（缺 phoenix/langfuse → 生产 502！）
+./start_stack.sh --with=mcp,web           # 缺 phoenix/langfuse → 生产 502！
 STACK_NAME=geesun ./start_stack.sh         # 显式指定 stack 名（默认 geesun）
 ```
 
 > 🔴 **高危警示（2026-09-08 实锤）**：`--with` **必须带全 `phoenix,langfuse,mcp,web`**，缺项会触发 `--prune` 清掉该服务，更致命的是——
 > 漏带 `phoenix,langfuse` → `phoenix:4317` 在 overlay 网络解析不到 → agent 同步 OTel exporter 阻塞 →
 > `/docs` healthcheck 连续超时 → Swarm kill → `geesun_geesun-agent` **0/1 → 前端全站 502**。
-> **每次滚动更新（哪怕只换 web 的域名配置）都用同一条全量命令**：stack deploy 是**声明式幂等 diff**，
-> 只有 spec 真正变化（如 caddy/web 重新构建、`.env` 变更）的那几个服务才会滚动重启，
-> **未升级的镜像服务不会重启、连接不断**——不存在"全量重启一遍"，放心用全量命令。
+> **脚本已把全量子栈设为默认**（`start_stack.sh` 裸跑 = 全量），**每次滚动更新（哪怕只换 web 的域名配置）
+> 直接用默认命令即可**：stack deploy 是**声明式幂等 diff**，只有 spec 真正变化（如 caddy/web 重新构建、`.env` 变更）
+> 的那几个服务才会滚动重启，**未升级的镜像服务不会重启、连接不断**——不存在"全量重启一遍"。
 
 按场景选命令（参数/变量语义、影响范围与推演详见 [`deploy/DEPLOYMENT.md`](./deploy/DEPLOYMENT.md) §1.6）：
 
 | 场景 | 操作 | 影响范围 |
 | --- | --- | --- |
-| **首次部署**（从零拉起） | 目标机先 `docker swarm init` + `docker login <Harbor>`；构建机 `./build-push.sh` 全量打包推送；目标机 `./start_stack.sh`（默认只发主栈；要带子栈就补全 `--with=...`） | 全新拉起 |
+| **首次部署**（从零拉起） | 目标机先 `docker swarm init` + `docker login <Harbor>`；构建机 `./build-push.sh` 全量打包推送；目标机 `./start_stack.sh`（**默认全量**：主栈+phoenix/langfuse/mcp/web；要精简才显式 `--with=<子集>`） | 全新拉起 |
 | **加挂子栈**（首次引入 mcp/web/phoenix/langfuse） | `./start_stack.sh --with=<完整复刻>`——`--with` 每次必须与上次完全一致，漏项会触发 `--prune` 清掉对应服务 | 新增服务 |
 | **只改了 `.env`**（如 langfuse PK/SK、DB 密码） | `./start_stack.sh --no-build --with=<与上次完全一致>`（几十秒完成）。`.env` 是 deploy 那一刻固化的快照，`docker service update --force` 不会重读 `.env`，重跑 deploy 是唯一生效入口 | 仅引用了变更 env 的服务滚动重启，其余零中断 |
 | **改了源码**（agent/mcp/web 任一） | 回构建机 `./build-push.sh`（**先递增 `*_TAG`**，否则同 tag 拉到的还是旧镜像）→ 目标机 `.env` 改对应 tag → `./start_stack.sh --no-build --with=<复刻>` | 单服务滚动重启 |

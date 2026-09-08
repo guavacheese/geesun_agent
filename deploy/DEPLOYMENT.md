@@ -103,9 +103,9 @@
 
 | 参数 | 作用 | 何时用 / 注意 |
 | --- | --- | --- |
-| （无参数） | 先跑 `build-push.sh` 打包推 Harbor，再 deploy | **首次部署、改了源码**（想只发镜像见 `--no-build`） |
-| `--no-build` | 跳过打包推送，仅用已推送镜像重发 spec | **只改了 `.env` / compose** 时用，几十秒完成；镜像没变就不要省它 |
-| `--with=mcp,web,phoenix,langfuse` | 叠加 `docker-compose.<name>.yml`（逗号分隔，名称必须对应存在的附加 compose 文件） | 加挂子栈；**每次都必须完整复刻上次的参数组合**——漏项会触发 `--prune` 清掉对应服务（见 1.6.3 场景⑤） |
+| （无参数） | 先跑 `build-push.sh` 打包推 Harbor，再 deploy；**默认带全量子栈** `--with=phoenix,langfuse,mcp,web` | **生产标准**。首次部署、改了源码（想只发镜像见 `--no-build`）。裸跑 = 主栈 + phoenix/langfuse/mcp/web |
+| `--no-build` | 跳过打包推送，仅用已推送镜像重发 spec；**同样默认全量子栈** | **只改了 `.env` / compose** 时用，几十秒完成；镜像没变就不要省它 |
+| `--with=<组合>` | **覆盖默认全量**，改用调用者指定的附加 compose 组合 | 仅本地/临时排查用。**每次都必须完整复刻上次的参数组合**——漏项会触发 `--prune` 清掉对应服务（见 1.6.3 场景⑤）；**生产别用子集**（漏 phoenix/langfuse → 全站 502） |
 | `STACK_NAME=geesun ./start_stack.sh` | **环境变量前缀**（不是参数）指定 stack 名 | 默认 `geesun`，**一旦定了别改**——改名 = 另起一套 stack，旧服务全部孤立（见 §1.2 卷前缀语义） |
 | `--with-registry-auth` | deploy 时把本机 Harbor 登录凭证传给 swarm 节点 | 私有 Harbor 必需；依赖本机已 `docker login ${REGISTRY_HUB%/*}`，未登录则节点拉镜像 401/失败 |
 | `--resolve-image=always` | 固定 tag（如 `:3.224.3`）也强制重新拉镜像 | 保证同 tag 重发布拉到新镜像；但**改了源码必须递增 tag**，否则拉到的还是旧 tag 内容 |
@@ -120,7 +120,7 @@
 
 | 场景 | 操作 | 影响范围 |
 | --- | --- | --- |
-| **① 首次部署**（构建机 + 生产机均从零） | 生产机先 `docker swarm init` + `docker login ${REGISTRY_HUB%/*}`；构建机 `deploy/build-push.sh` 全量打包推送；生产机 `deploy/start_stack.sh`（默认参数 = 只发主栈；要带子栈就带全 `--with=...`） | 全新拉起 |
+| **① 首次部署**（构建机 + 生产机均从零） | 生产机先 `docker swarm init` + `docker login ${REGISTRY_HUB%/*}`；构建机 `deploy/build-push.sh` 全量打包推送；生产机 `deploy/start_stack.sh`（**默认参数 = 全量子栈** `--with=phoenix,langfuse,mcp,web`；要精简才显式 `--with=<子集>`） | 全新拉起 |
 | **② 加挂可观测栈**（首次引入 phoenix/langfuse） | `./start_stack.sh --with=phoenix,langfuse,mcp,web`（**完整复刻**，勿只写新增项） | 新增服务；端口矩阵见 §1.4 / README `## Deployment` |
 | **③ 只改了 `.env`**（如 langfuse PK/SK、DB 密码） | `./start_stack.sh --no-build --with=<与上次完全一致>` | 仅引用变更 env 的服务滚动重启（其余零中断）——例：改 `LANGFUSE_PUBLIC/SECRET_KEY` 只滚 `geesun_geesun-agent`，langfuse 服务端不碰 |
 | **④ 改了源码**（agent/mcp/web 任一） | 回构建机 `build-push.sh`（**递增 `*_TAG`**）→ 生产机 `.env` 改对应 tag → `./start_stack.sh --no-build --with=<复刻>` | 单服务滚动重启 |

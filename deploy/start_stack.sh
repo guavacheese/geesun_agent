@@ -17,25 +17,29 @@
 #                              --prune（compose 中删掉的服务会被真正清理）
 #   - --with=phoenix,langfuse,mcp,web 按需叠加附加 compose（默认只部署主文件）
 #
-# ⚠️⚠️ 默认推荐命令（生产全量，别用子集！）：
-#     ./start_stack.sh --with=phoenix,langfuse,mcp,web
+# ⚠️⚠️ 默认「全量启动」（不再"默认仅主栈"！）：
+#     ./start_stack.sh                          # 默认 = --with=phoenix,langfuse,mcp,web + 先 build-push
+#     ./start_stack.sh --no-build               # 默认全量子栈 + 跳过打包（改 .env / 换镜像 tag 后，几十秒）
+#     ./start_stack.sh --with=mcp,web           # 覆盖默认：只带 mcp,web（仅本地/临时排查，勿上生产）
 #
-#   这是唯一"全栈对齐"的启动方式。生产环境(67) trace 链依赖 Phoenix/Langfuse 在栈内：
-#   agent → alloy:4317 → phoenix:4317 / langfuse-web:3000。若 --with 漏带 phoenix/langfuse，
-#   phoenix:4317 在 overlay 网络解析不到 → agent 的同步 OTel exporter 阻塞 → /docs healthcheck
-#   连续超时 → Swarm kill → geesun_geesun-agent 0/1 → 前端**全站 502**（2026-09-08 实测）。
+#   生产 trace 链依赖 Phoenix/Langfuse 在栈内：agent → alloy:4317 → phoenix:4317 / langfuse-web:3000。
+#   若 --with 漏带 phoenix/langfuse，phoenix:4317 在 overlay 网络解析不到 → agent 的同步 OTel exporter
+#   阻塞 → /docs healthcheck 连续超时 → Swarm kill → geesun_geesun-agent 0/1 → 前端**全站 502**
+#   （2026-09-08 实测）。因此把全量子栈设为默认；显式 --with= 仅用于本地调试等临时精简。
 #
-#   【铁律】--with 每次必须与上次【完全一致】，缺项会触发 --prune 清掉该服务；多带无副作用。
-#   只改 .env / 只换某个镜像 tag 也一样：用同一条全量命令，stack deploy 是声明式幂等 diff，
+#   【铁律】显式 --with 每次必须与上次【完全一致】，缺项会触发 --prune 清掉该服务；多带无副作用。
+#   只改 .env / 只换某个镜像 tag 也一样：用默认即可，stack deploy 是声明式幂等 diff，
 #   只有 spec 真正变化的服务才会滚动重启，其余零中断——不存在"全量重启一遍"。
 #
 # 用法：
-#   ./start_stack.sh --with=phoenix,langfuse,mcp,web          # ★ 生产标准全量（推荐）
+#   ./start_stack.sh --with=phoenix,langfuse,mcp,web          # ★ 生产标准全量（推荐，等价默认）
 #   ./start_stack.sh --with=phoenix,langfuse,mcp,web --no-build  # 跳过打包，仅重发（改配置/换tag后）
-#   ./start_stack.sh                                        # 仅主栈（不含 mcp/web/phoenix/langfuse）
+#   ./start_stack.sh                                        # 默认全量（含 phoenix/langfuse/mcp/web）
+#   ./start_stack.sh --no-build                             # 默认全量 + 跳过打包
 #   STACK_NAME=geesun ./start_stack.sh                       # 显式指定 stack 名（默认 geesun）
 #   ── 半量用法（仅限本地/临时排查，勿上生产）──
-#   ./start_stack.sh --no-build --with=mcp,web               # 本地仅调试前端，缺 phoenix（会产生 502，勿用于生产）
+#   ./start_stack.sh --with=mcp,web                           # 仅 mcp,web，缺 phoenix/langfuse（会产生 502）
+#   ./start_stack.sh --no-build --with=mcp,web               # 本地仅调试前端（会产生 502，勿用于生产）
 #
 set -euo pipefail
 
@@ -67,11 +71,22 @@ fi
 set -a; source "$ENV_FILE"; set +a
 
 # ── 解析参数 ───────────────────────────────────────────────
-EXTRA=()
+# 默认带全量子栈（生产标准，防漏带 phoenix/langfuse 触发 --prune 清服务 → agent 同步
+# OTel exporter 阻塞 → /docs healthcheck 超时 → 0/1 → 前端全站 502，2026-09-08 实锤）。
+# 显式传 --with= 会覆盖默认组合（仅本地/临时精简用，勿上生产）。
+EXTRA=(
+  -c "$COMPOSE_DIR/docker-compose.phoenix.yml"
+  -c "$COMPOSE_DIR/docker-compose.langfuse.yml"
+  -c "$COMPOSE_DIR/docker-compose.mcp.yml"
+  -c "$COMPOSE_DIR/docker-compose.web.yml"
+)
 BUILD=1
+_WITH_SET=0
 for arg in "$@"; do
   case "$arg" in
     --with=*)
+      _WITH_SET=1
+      EXTRA=()   # 清除默认全量，改用调用者指定的组合
       IFS=',' read -ra parts <<< "${arg#*=}"
       for p in "${parts[@]}"; do
         f="$COMPOSE_DIR/docker-compose.$p.yml"
