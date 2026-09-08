@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import logging
 import psycopg
 from datetime import datetime, timezone
@@ -387,6 +388,10 @@ async def chat(
         generated_files: list | None = None,
         disk_files: frozenset[str] | None = None,
         completion_blocked: bool = False,
+        reasoning_started_at_ms: int | None = None,
+        reasoning_ended_at_ms: int | None = None,
+        turn_started_at_ms: int | None = None,
+        turn_ended_at_ms: int | None = None,
         reason: str = "normal",
     ) -> int:
         """把 agent checkpoint 中的消息保存到会话历史（store）。
@@ -397,6 +402,12 @@ async def chat(
           打断时在 finally 中强制保存，防止用户刷新/关闭页面后本轮消息丢失
           （2026-08-11 15:26 实测：断连后"写 skill"指令未保存，前端重拉即消失）。
         函数内部只有 await 没有 yield，可在 finally 块中安全调用。
+
+        时间戳参数（reasoning_started/ended/turn_started/ended）来自 event_stream
+        流式阶段埋点（2026-09-08 加）：首个 reasoning 事件 → 推理起始；首个 token
+        事件 → 推理结束；while 循环 break → turn 结束。持久化到 AI 消息 entry 的
+        reasoning_duration_ms / turn_duration_ms / reasoning_started_at 三个字段，
+        让前端 ReasoningBlock 跨刷新稳定显示秒数（对齐 deer-flow 风格）。
         """
         generated_files = generated_files or []
         if disk_files:
@@ -497,7 +508,34 @@ async def chat(
                             }
                             for i, tc in enumerate(msg.tool_calls)
                         ]
+                    # 持久化时长字段（2026-09-08 加，对齐 deer-flow）：
+                    # reasoning_duration_ms：本条 AI 消息的推理时长（首个 reasoning 事件 →
+                    #   首个 token 事件）。仅当 reasoning 存在 + 两个时间戳都有值时写入。
+                    # reasoning_started_at：推理起始的 ISO 时间戳，供前端 ReasoningBlock
+                    #   锚定（防组件挂载漂移），与 reasoning_duration_ms 配合使用。
+                    if (
+                        role == "ai"
+                        and reasoning
+                        and reasoning_started_at_ms is not None
+                        and reasoning_ended_at_ms is not None
+                    ):
+                        entry["reasoning_duration_ms"] = max(
+                            0, reasoning_ended_at_ms - reasoning_started_at_ms
+                        )
+                        entry["reasoning_started_at"] = datetime.fromtimestamp(
+                            reasoning_started_at_ms / 1000, tz=timezone.utc
+                        ).isoformat()
                     history.append(entry)
+
+                # 持久化 turn_duration_ms（整轮耗时）：仅写到 history 最后一条 AI 消息。
+                # turn_start = event_stream 进入时刻；turn_end = while 循环 break / 兜底 now。
+                # 仅当两个时间戳都有值时写入（断连路径兜底时刻已设，正常路径 break 前已设）。
+                if turn_started_at_ms is not None and turn_ended_at_ms is not None:
+                    turn_duration_ms = max(0, turn_ended_at_ms - turn_started_at_ms)
+                    for i in range(len(history) - 1, -1, -1):
+                        if history[i].get("role") == "ai":
+                            history[i]["turn_duration_ms"] = turn_duration_ms
+                            break
 
                 # 循环结束后，将 generated_files 关联到合适的 AI 消息
                 # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
@@ -647,6 +685,15 @@ async def chat(
         thinking_emitted = False
         # 标记当前是否刚发出过 generating 事件（答案 token 阶段，区别于 thinking/CoT）
         generating_emitted = False
+        # ─── 本轮时长埋点（持久化到 AI 消息 metadata，跨刷新保留秒数显示）───
+        # _turn_started_at_ms：event_stream 进入时刻（每个 SSE 连接新建一次）
+        # _reasoning_started_at_ms：首个 reasoning 事件触发时刻（首字节推理到达）
+        # _reasoning_ended_at_ms：首个 token 事件触发时刻（推理结束 / 进入答案生成）
+        # _turn_ended_at_ms：while 循环 break 时由内层 finally 兜底设置
+        _turn_started_at_ms = int(time.time() * 1000)
+        _reasoning_started_at_ms: int | None = None
+        _reasoning_ended_at_ms: int | None = None
+        _turn_ended_at_ms: int | None = None
         # Qwen 系模型将推理放在 content 的 </think> 前，流式场景下可能跨 chunk 截断
         _think_buffer = ""
         _think_done = False
@@ -774,6 +821,9 @@ async def chat(
                             # 模型通过 API 字段返回推理内容（不经过 content）
                             if not thinking_emitted:
                                 thinking_emitted = True
+                                # 持久化埋点：首个 reasoning 事件 → 记录推理起始时刻
+                                if _reasoning_started_at_ms is None:
+                                    _reasoning_started_at_ms = int(time.time() * 1000)
                                 yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
                             yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning}, ensure_ascii=False)}\n\n"
                         elif not _think_done and content:
@@ -792,11 +842,17 @@ async def chat(
                                 if thinking_part.strip():
                                     if not thinking_emitted:
                                         thinking_emitted = True
+                                        # 持久化埋点：Qwen 首个 <think> 段 → 推理起始
+                                        if _reasoning_started_at_ms is None:
+                                            _reasoning_started_at_ms = int(time.time() * 1000)
                                         yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
                                     yield f"data: {json.dumps({'type': 'reasoning', 'content': thinking_part}, ensure_ascii=False)}\n\n"
                                 if remaining:
                                     if not generating_emitted:
                                         generating_emitted = True
+                                        # 持久化埋点：首个 token 事件 → 推理结束 / 进入答案生成
+                                        if _reasoning_ended_at_ms is None:
+                                            _reasoning_ended_at_ms = int(time.time() * 1000)
                                         yield f"data: {json.dumps({'type': 'agent_status', 'status': 'generating'}, ensure_ascii=False)}\n\n"
                                     yield f"data: {json.dumps({'type': 'token', 'content': remaining}, ensure_ascii=False)}\n\n"
                         elif content:
@@ -805,6 +861,10 @@ async def chat(
                             #    之前误把首个答案 token 标成 thinking，导致整段答案生成都显示"思考中…"。
                             if not generating_emitted:
                                 generating_emitted = True
+                                # 持久化埋点：首个 token 事件 → 推理结束 / 进入答案生成
+                                # （覆盖路径：无 reasoning 内容直接进 token 的场景，如某些非 CoT 模型）
+                                if _reasoning_ended_at_ms is None:
+                                    _reasoning_ended_at_ms = int(time.time() * 1000)
                                 yield f"data: {json.dumps({'type': 'agent_status', 'status': 'generating'}, ensure_ascii=False)}\n\n"
                             yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
 
@@ -1340,11 +1400,17 @@ async def chat(
                         "[DIAG] SSE 流中断（断连/取消），强制保存当前会话: user=%s, session=%s",
                         user_id, session_id,
                     )
+                    # 断连路径：turn_ended 兜底取 now（持久化时刻作为 turn 终点）
+                    interrupted_turn_end = _turn_ended_at_ms if _turn_ended_at_ms is not None else int(time.time() * 1000)
                     await _persist_session(
                         agent, thread_id, user_id, session_id, store, body,
                         generated_files=_generated_files,
                         disk_files=_new_files,
                         completion_blocked=_completion_blocked,
+                        reasoning_started_at_ms=_reasoning_started_at_ms,
+                        reasoning_ended_at_ms=_reasoning_ended_at_ms,
+                        turn_started_at_ms=_turn_started_at_ms,
+                        turn_ended_at_ms=interrupted_turn_end,
                         reason="interrupted",
                     )
                 except Exception as e:
@@ -1355,11 +1421,22 @@ async def chat(
 
         # ─── SSE 流结束，先保存消息到会话历史，再发 [DONE] ───
         # 防止前端 [DONE] 后立即编辑导致竞态（消息尚未落盘 → from_index 越界）
+        # turn_ended 兜底：while 循环有 4 个 break 出口都没主动设 turn_ended，
+        # 在这里统一设值为 now（持久化时刻），这样无论 break / 异常早退
+        # / 断连走外层 finally 都至少能算到"持久化时刻"。
+        # 偏差是 _persist_session 函数执行耗时（读 checkpoint + 写 store，
+        # 几十到几百毫秒，可忽略）。
+        if _turn_ended_at_ms is None:
+            _turn_ended_at_ms = int(time.time() * 1000)
         await _persist_session(
             agent, thread_id, user_id, session_id, store, body,
             generated_files=_generated_files,
             disk_files=_new_files,
             completion_blocked=_completion_blocked,
+            reasoning_started_at_ms=_reasoning_started_at_ms,
+            reasoning_ended_at_ms=_reasoning_ended_at_ms,
+            turn_started_at_ms=_turn_started_at_ms,
+            turn_ended_at_ms=_turn_ended_at_ms,
             reason="normal",
         )
         yield "data: [DONE]\n\n"

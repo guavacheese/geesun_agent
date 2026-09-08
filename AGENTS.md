@@ -162,4 +162,40 @@ download_from_sandbox(
 ## 沙箱环境与完成门（系统兜底，勿对抗）
 - **环境快照由系统自动注入**：每条用户消息会附带 `【沙箱环境】` 段（已装工具、磁盘空间、rustup toolchain），直接使用即可。**禁止**自行 `which`/`df`/重装工具/下载 toolchain——重装必然超时或磁盘不足，属于已知弯路
 - **完成门系统校验**：任务结束时系统会检查 `/reports/{user_id}/{session_id}/` 是否有本轮新文件。零产出会被拦截并打回提示，**必须**把交付物（报告/代码/结果文件）落到 reports 目录才算任务完成
+
+---
+
+## 工程经验附录（工程 reviewer 看，非 Agent prompt）
+
+> 这一节是给工程 reviewer（开发者）看的 lessons-learned，不是给 Agent 看的 prompt 规则。
+
+### 2026-09-08：流式时长字段持久化（跨刷新稳定显示）
+
+**目的**：前端 ReasoningBlock 标题"思考过程 (共 Ns)"刷新页面后仍稳定显示秒数；对齐 deer-flow 的 `additional_kwargs.turn_duration` 风格。
+
+**改动**：`src/api/endpoints/chat.py`
+- `event_stream()` 顶部声明 4 个时间戳变量（`turn_started_at_ms` / `reasoning_started_at_ms` / `reasoning_ended_at_ms` / `turn_ended_at_ms`）
+- 触发时机：首个 reasoning 事件 → reasoning_start；首个 token 事件 → reasoning_end；while break 之后兜底设 turn_end（line ~1424）
+- `_persist_session` 函数签名加 4 个时间戳参数；entry 构造时按条件写入 3 个字段：
+  - `reasoning_duration_ms`：仅当 AI 消息带 reasoning + 两个时间戳都有值
+  - `reasoning_started_at`：ISO 时间戳，前端可锚定
+  - `turn_duration_ms`：仅写到 history 最后一条 AI 消息
+- 调用点（正常 + 断连）两处都传时间戳
+
+**经验**：
+- 前端 React state/useRef 的计时永远不可信；任何"已完成但仍想展示时长"的 UI 必须从持久化层读
+- 断连兜底路径（`reason="interrupted"`）也要持久化——避免"刷新后丢秒数"和"丢内容"同时发生
+- 持久化前 `max(0, ...)` 兜底，防止异常时间戳顺序（end < start）写入负数
+
+**验证**：`python tests/spikes/chat_persist_duration.py` 跑 8 个对照表（全 PASS）
+
+### 2026-09-08：前端切换 session 不丢内容（与 chat.py 配合）
+
+**改动**：前端 `app/chat/components/ChatArea.tsx:90-141` useEffect 改为"无重叠覆盖"——`msgs` 拉到后强制 server 覆盖 cache 骨架，唯一例外是 `streamSig.current.isStreaming === true`（runStream 仍在跑）。
+
+**对应后端配合**：`_persist_session` 必须在 SSE 流结束后**立即**调用，把 checkpoint 写入 store，保证 msgs 切回时拿得到完整最终版。
+
+**教训**：
+- 后端持久化是唯一真相，前端 cache 仅作骨架
+- 切 session 不丢失内容的端到端保证 = "不 abort + guard 丢弃 + server 真相 + 切回强制 reload"四件套
 - 提示词只是引导，不负责兜底；以上行为由服务端强制校验，违反只会浪费你自己的步数
