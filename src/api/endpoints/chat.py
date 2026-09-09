@@ -811,7 +811,28 @@ async def chat(
                                 )
 
                         # ─── 流式 token 处理：分离推理内容与回复内容 ───
-                        content = token.content if hasattr(token, "content") else ""
+                        _raw_content = token.content if hasattr(token, "content") else ""
+                        # vLLM 0.19+（启用 reasoning-parser / 多模态后）流式 delta.content
+                        # 可能不是 str 而是 OpenAI content-parts 数组
+                        # （[{"type": "text", "text": "..."}, ...]）。这里统一归一化为 str，
+                        # 防下方 _think_buffer += content 的 str += list TypeError
+                        # （2026-09-09 实测：upload_to_sandbox 后正文输出 chunk 崩）。
+                        # None（tool_calls chunk）与未知类型一律置 ""，保持原 falsy 语义，
+                        # 避免 str(None)="None" 之类污染流内容。
+                        if _raw_content is None:
+                            content = ""
+                        elif isinstance(_raw_content, list):
+                            _text_parts: list[str] = []
+                            for _p in _raw_content:
+                                if isinstance(_p, str):
+                                    _text_parts.append(_p)
+                                elif isinstance(_p, dict) and _p.get("type") == "text":
+                                    _text_parts.append(_p.get("text", ""))
+                            content = "".join(_text_parts)
+                        elif isinstance(_raw_content, str):
+                            content = _raw_content
+                        else:
+                            content = ""
 
                         # 1. 优先从 additional_kwargs 提取推理内容（DeepSeek/Groq/Ollama/XAI 等）
                         reasoning = ""
