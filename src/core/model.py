@@ -2,7 +2,9 @@ from dataclasses import dataclass, field, asdict
 from typing import Callable
 import asyncio
 import logging
+import os
 import re
+import threading
 import time
 
 from langchain_openai import ChatOpenAI
@@ -181,6 +183,70 @@ def _record_genai_metrics(
         )
 
 
+# ─── 模型 HTTP client 显式 CA（2026-09-09 B 防御：纵深隔离 SSL_CERT_FILE 污染）───
+# 背景：langchain_cubesandbox 旧实现把内网 CA 写进 os.environ["SSL_CERT_FILE"]
+#（进程级全局），Linux 上 ssl.create_default_context() 无参时走 set_default_verify_paths()
+# 只信该文件 → 同进程 openai/httpx 访问公网 api.deepseek.com 报 CERTIFICATE_VERIFY_FAILED
+#（2026-09-09 本机 A/B 实测复现，报错与 server.log 一字不差：self-signed certificate
+# in certificate chain）。A 方案已在 SDK 侧根治（langchain-cubesandbox/sandbox.py
+# _install_e2b_ca：e2b transport 类级局部注入，不再写全局 env）；此处为纵深防御（B）：
+# ChatOpenAI / 探活显式注入独立 SSLContext 的 httpx client——CA = certifi 公网 bundle
+#（显式 cafile 分支 → 不读 env 默认路径）+ 可选追加当前 SSL_CERT_FILE 指向的现存文件
+#（兼容生产 combined-ca.pem / 内网 MITM），即便未来再有库污染 env，模型 API 访问不受影响。
+_model_verify_ctx = None  # 共享只读 SSLContext；httpx.Client 每次新建（防外部 close 污染单例）
+_model_verify_lock = threading.Lock()
+
+
+def _get_model_verify_ctx():
+    """懒建（幂等）：显式 CA 的 SSLContext = certifi 公网 bundle + 可选追加 env 现有 CA。
+
+    显式传 cafile 时 CPython 走 load_verify_locations 分支，不再读 SSL_CERT_FILE env
+    默认路径——这是绕开污染的关键；再把 env 指向的文件（若存在）手动追加为额外信任源，
+    使 dev（rootCA.pem）/prod（combined-ca.pem）原有内网链路语义保持不变。
+    构造失败回落 True（httpx verify=True，与未防御前一致，不阻断启动）。
+    """
+    global _model_verify_ctx
+    if _model_verify_ctx is not None:
+        return _model_verify_ctx
+    with _model_verify_lock:
+        if _model_verify_ctx is not None:
+            return _model_verify_ctx
+        try:
+            import ssl
+
+            import certifi  # langchain_openai/openai 依赖链自带
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            env_ca = os.getenv("SSL_CERT_FILE")
+            if (
+                env_ca
+                and os.path.isfile(env_ca)
+                and os.path.realpath(env_ca) != os.path.realpath(certifi.where())
+            ):
+                try:
+                    ctx.load_verify_locations(cafile=env_ca)
+                    logger.info("[DIAG] 模型 client 追加信任 SSL_CERT_FILE CA: %s", env_ca)
+                except Exception as e:
+                    logger.warning("[DIAG] 追加 SSL_CERT_FILE CA 失败（仅公网 CA）: %s", e)
+            _model_verify_ctx = ctx
+        except Exception as e:
+            logger.warning("[DIAG] 显式 SSLContext 构造失败，回落默认校验: %s", e)
+            _model_verify_ctx = True
+    return _model_verify_ctx
+
+
+def _make_model_http_client() -> "httpx.Client":
+    """每次新建 httpx.Client（共享 verify ctx，不共享 client）。
+
+    不建单例 client：ChatOpenAI 实例被 close 时会连带关闭其 http_client（openai SDK
+    close() 无条件 close self._client），共享单例存在"一处 close 全部失效"的风险。
+    SSLContext 只读可跨 client 安全共享，连接池随单个 ChatOpenAI 生命周期复用即可。
+    """
+    import httpx
+
+    return httpx.Client(verify=_get_model_verify_ctx(), timeout=300)
+
+
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
 
 @dataclass
@@ -210,6 +276,8 @@ async def create_model() -> ChatOpenAI:
         temperature=0,
         max_retries=5,
         timeout=300,
+        # B 防御：显式独立 CA 的 http_client，隔离全局 SSL_CERT_FILE 污染（见上）
+        http_client=_make_model_http_client(),
         # 单次调用输出上限：防 thinking 失控无限生成（2026-08-24 实测未设时
         # vLLM 按 max_model_len=262144 无限生成，8.5min/87k tokens 撞 600s 超时）
         max_tokens=settings.model_max_tokens,
@@ -256,6 +324,10 @@ async def switch_model(
         api_key=cfg.api_key or "not-used",
         temperature=0,
         max_tokens=settings.model_max_tokens,  # 与默认模型一致，防超长生成
+        # B 防御：显式独立 CA 的 http_client（自定义模型多为公网 API，
+        # 必须绕开可能被内网 CA 污染的全局 SSL_CERT_FILE——2026-09-09 deepseek-v4-pro
+        # CERTIFICATE_VERIFY_FAILED 根因）；见 _get_model_verify_ctx 注释
+        http_client=_make_model_http_client(),
         # 注入上下文上限 → SummarizationMiddleware fraction 触发（覆盖默认模型时的 profile）
         profile={"max_input_tokens": max_len},
         # 流式块间隔空闲超时：只杀静默流，不杀长生成（见 config 注释）
@@ -363,7 +435,10 @@ def resolve_max_len(base_url: str, model_name: str, api_key: str) -> int:
     try:
         import httpx  # langchain_openai 依赖 httpx，必可用
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        with httpx.Client(timeout=5) as c:
+        # 探活 client 同样绕开全局 SSL_CERT_FILE 污染（B 防御）：
+        # 自定义模型 base_url 为公网 API（如 api.deepseek.com）时，被污染的 env
+        # 会让这里也 CERTIFICATE_VERIFY_FAILED（2026-09-09 server.log 17:11:18 实测）
+        with httpx.Client(timeout=5, verify=_get_model_verify_ctx()) as c:
             # base_url 可能已含 /v1 后缀（如 http://172.16.66.13:8003/v1），
             # 直接拼 /v1/models 会变双 /v1 → 404（2026-08-31 server.log:83 实测）
             models_url = base_url.rstrip("/")
