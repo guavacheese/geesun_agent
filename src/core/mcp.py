@@ -29,6 +29,7 @@ from pathlib import Path
 
 from langchain.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt.tool_node import ToolInvocationError
 from pydantic import PrivateAttr
 from src.core.config import settings
 
@@ -309,50 +310,52 @@ def _first_exception(exc: BaseException) -> BaseException | None:
     return exc
 
 
-def _mcp_error_text(tool_name: str, exc: BaseException, max_len: int = 600) -> str:
-    """把 MCP 工具执行异常归一化为给模型的友好中文错误文本。
+def _shield_error(
+    tool_name: str, exc: BaseException, tool_kwargs: dict | None
+) -> ToolInvocationError:
+    """把 MCP 工具执行异常包装成 ToolInvocationError 抛出。
 
-    - 递归展开 ExceptionGroup/TaskGroup（_first_exception）取最内层首个
-      根因，避免只显示 "unhandled errors in a TaskGroup (N sub-exception)"
-    - 超长截断（默认 600 字符）防错误文本撑爆上下文
+    走 langgraph 原生错误通道：ToolNode._execute_tool_async 的 except 分支
+    捕获后经 _default_handle_tool_errors（tool_node.py:383-393，只放行
+    ToolInvocationError）自动转 ToolMessage(status="error") 回灌模型自纠，
+    agent 流不中断——对齐 deer-flow（tool_error_handling_middleware.py:
+    128-152）/ deepseek-harness（index.ts:1554）"工具错误永不崩流"哲学。
 
-    错误文本作为**正常工具结果**返回给模型据此自纠（换参数/换工具/换
-    思路），不崩流——对齐 deer-flow（tool_error_handling_middleware.py:
-    128-152）/ deepseek-harness（index.ts:1554）"工具错误永不崩流、回灌
-    模型自纠"哲学（2026-09-09 落地，背景：paddleocr_vl 服务端 isError
-    曾致整轮 langgraph panic、M3 零产出）。
+    2026-09-09 演进：初版 shield 直接返回错误 str，实测 langgraph 新版
+    _normalize_tool_response（tool_node.py:1432-1454）只接受 Command /
+    ToolMessage，裸 str 抛 TypeError 照样崩流（"Tool paddleocr_vl returned
+    unexpected type: <class 'str'>"）——故改为抛出 ToolInvocationError 走
+    原生通道（message 模板含工具名/参数/根因，模型可据此自纠）。
+
+    ExceptionGroup/TaskGroup 递归展开取最内层根因（防 "unhandled errors
+    in a TaskGroup (N sub-exception)" 外壳吞细节）；kwargs 超长截断防错误
+    消息撑爆上下文。
     """
-    inner = _first_exception(exc)
-    if inner is not None:
-        detail = f"{type(inner).__name__}: {inner}"
-    else:
-        detail = f"{type(exc).__name__}: {exc}"
-    if len(detail) > max_len:
-        detail = detail[:max_len] + "…(已截断)"
-    return (
-        f"[工具 {tool_name} 调用失败] {detail}。"
-        "请检查参数是否指向该服务可达的绝对路径/URL/Base64，或换一种输入方式；"
-        "不要原样重试同一次调用，可改用其他工具完成同样目标。"
-    )
+    inner = _first_exception(exc) or exc
+    kw: dict = {}
+    if isinstance(tool_kwargs, dict):
+        for k, v in tool_kwargs.items():
+            s = str(v)
+            kw[k] = s[:200] + "…(截断)" if len(s) > 200 else v
+    return ToolInvocationError(tool_name=tool_name, source=inner, tool_kwargs=kw)
 
 
 class _MCPErrorShieldTool(BaseTool):
     """通用 MCP 工具错误防护包装（2026-09-09）。
 
     捕获 MCP 工具执行期一切异常（含 langchain_mcp_adapters 对服务端
-    isError 转出的 ToolException、网络/超时/连接错等），归一化为友好中文
-    错误文本作为正常工具结果返回——模型据此自纠，agent 流不中断。
+    isError 转出的 ToolException、网络/超时/连接错等），包装成
+    ToolInvocationError 抛出——langgraph 原生错误通道自动把它转成
+    ToolMessage(status="error") 回灌模型自纠，agent 流不中断。
 
     实现要点（沿用 _DownloadGuardTool 的既有教训）：
     1. pydantic v2 模型不可做实例属性赋值（__setattr__ 校验拦截，
        "StructuredTool object has no field ainvoke" 启动失败），必须子类
        覆写 ainvoke/invoke；
-    2. 绝不能把捕获的异常再 raise——langgraph prebuilt ToolNode 的
-       _default_handle_tool_errors（tool_node.py:383-393）只把
-       ToolInvocationError（pydantic 校验）转 error ToolMessage 给模型，
-       其余异常（含 ToolException）一律 raise 崩流（2026-09-09
-       paddleocr_vl 实证 + _DownloadGuardTool 19:58 实测）。要吞掉异常、
-       以字符串作为成功结果返回；
+    2. 只能 raise ToolInvocationError（_default_handle_tool_errors 唯一
+       放行类型）——直接 re-raise 原异常（ToolException 等）会被 langgraph
+       当作未处理错误整轮崩流（2026-09-09 paddleocr_vl 实证）；返回裸 str
+       也会被 _normalize_tool_response 拒绝（同上实证）；
     3. 幂等：已包 shield 的不重复包。
     """
 
@@ -372,20 +375,20 @@ class _MCPErrorShieldTool(BaseTool):
             return await self._inner.ainvoke(input, config, **kwargs)
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "MCP 工具 [%s] 执行失败（错误文本已回灌模型自纠）: %s",
+                "MCP 工具 [%s] 执行失败（已包装 ToolInvocationError 回灌模型自纠）: %s",
                 self.name, _first_exception(e) or e,
             )
-            return _mcp_error_text(self.name, e)
+            raise _shield_error(self.name, e, input if isinstance(input, dict) else {}) from e
 
     def invoke(self, input, config=None, **kwargs):
         try:
             return self._inner.invoke(input, config, **kwargs)
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "MCP 工具 [%s] 执行失败（错误文本已回灌模型自纠）: %s",
+                "MCP 工具 [%s] 执行失败（已包装 ToolInvocationError 回灌模型自纠）: %s",
                 self.name, _first_exception(e) or e,
             )
-            return _mcp_error_text(self.name, e)
+            raise _shield_error(self.name, e, input if isinstance(input, dict) else {}) from e
 
     def _run(self, *args, **kwargs):  # pragma: no cover - 同步路径兜底
         raise NotImplementedError("MCP 工具仅支持异步执行")

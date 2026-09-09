@@ -1,14 +1,21 @@
-"""spike: _MCPErrorShieldTool 错误防护逻辑验证（2026-09-09）。
+"""spike v2: _MCPErrorShieldTool 走 langgraph 原生错误通道验证（2026-09-09）。
 
-背景：paddleocr_vl 服务端 isError → langchain_mcp_adapters raise ToolException
-→ langgraph ToolNode._default_handle_tool_errors 只放行 ToolInvocationError，
-其余异常一律 raise → 整轮 panic（tool_node.py:383-393 + 当日实证）。
-修复（src/core/mcp.py）：通用 shield 包装捕获一切异常，归一化为友好中文
-错误文本作为正常工具结果返回给模型自纠——不 re-raise、不崩流。
+v1 教训：shield 直接返回错误 str，实测 langgraph 新版
+_normalize_tool_response（tool_node.py:1432-1454）只接受 Command /
+ToolMessage，裸 str 抛 TypeError 照样崩流：
+  TypeError: Tool paddleocr_vl returned unexpected type: <class 'str'>
+（server.log 16:19:18 实证，错误路径 1116 → 1453 → 崩）
 
-本 spike 因 mcp.py import langchain（Windows python 无此依赖），独立复刻
-被验证逻辑（_first_exception / _mcp_error_text / shield try-except 结构），
-与 mcp.py 实现保持逐字一致；mcp.py 本身另做 py_compile + 端到端复测。
+v2 方案：捕获一切异常 → raise ToolInvocationError —— langgraph
+ToolNode._execute_tool_async 的 except 分支捕获后经 _default_handle_tool_errors
+（tool_node.py:383-393，唯一放行类型）自动转 ToolMessage(status="error")
+回灌模型自纠，不崩流。
+
+本 spike 因 mcp.py import langchain/langgraph（Windows python 无此依赖），
+用最小 stub 复刻 langgraph 侧语义（_default_handle_tool_errors 等价逻辑 +
+_execute_tool_async except 分支等价逻辑）+ 复刻 mcp.py 的 _shield_error/
+shield except 结构（与 mcp.py 实现逐字一致），断言错误通道行为正确。
+langgraph 真实行为以源码引用为准，端到端由重启后端复测确认。
 """
 
 import asyncio
@@ -27,78 +34,125 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  FAIL {name}  {detail}")
 
 
-# ── 复刻 mcp.py（逐字一致）─────────────────────────────────────────────
+# ── langgraph 侧最小 stub（语义与 tool_node.py:383-393,1149-1156 一致）──
+class ToolInvocationError(Exception):
+    """stub：与 langgraph ToolInvocationError 等价的 message 模板。"""
+
+    def __init__(self, tool_name, source, tool_kwargs):
+        self.tool_name = tool_name
+        self.source = source
+        self.tool_kwargs = tool_kwargs
+        super().__init__(
+            f"Error invoking tool '{tool_name}' with kwargs {tool_kwargs} with error:\n"
+            f" {source}\n"
+            f" Please fix the error and try again."
+        )
+
+
+def langgraph_default_handler(e: Exception) -> str:
+    """stub：langgraph _default_handle_tool_errors（tool_node.py:383-393）。"""
+    if isinstance(e, ToolInvocationError):
+        return str(e)
+    raise e
+
+
+# ── 复刻 mcp.py（与 src/core/mcp.py 逐字一致）─────────────────────────
 def _first_exception(exc: BaseException) -> BaseException | None:
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         exc = exc.exceptions[0]
     return exc
 
 
-def _mcp_error_text(tool_name: str, exc: BaseException, max_len: int = 600) -> str:
-    inner = _first_exception(exc)
-    if inner is not None:
-        detail = f"{type(inner).__name__}: {inner}"
-    else:
-        detail = f"{type(exc).__name__}: {exc}"
-    if len(detail) > max_len:
-        detail = detail[:max_len] + "…(已截断)"
-    return (
-        f"[工具 {tool_name} 调用失败] {detail}。"
-        "请检查参数是否指向该服务可达的绝对路径/URL/Base64，或换一种输入方式；"
-        "不要原样重试同一次调用，可改用其他工具完成同样目标。"
-    )
+def _shield_error(tool_name, exc, tool_kwargs) -> ToolInvocationError:
+    inner = _first_exception(exc) or exc
+    kw = {}
+    if isinstance(tool_kwargs, dict):
+        for k, v in tool_kwargs.items():
+            s = str(v)
+            kw[k] = s[:200] + "…(截断)" if len(s) > 200 else v
+    return ToolInvocationError(tool_name=tool_name, source=inner, tool_kwargs=kw)
 
 
 async def shielded_ainvoke(inner, input_):
-    """复刻 _MCPErrorShieldTool.ainvoke 的 try-except 结构。"""
+    """复刻 _MCPErrorShieldTool.ainvoke 的 try-except-raise 结构。"""
     try:
         return await inner(input_)
     except Exception as e:  # noqa: BLE001
-        return _mcp_error_text("paddleocr_vl", e)
+        raise _shield_error("paddleocr_vl", e, input_ if isinstance(input_, dict) else {}) from e
 
 
-class ToolException(Exception):
-    """模拟 langchain_mcp_adapters 对服务端 isError 转出的 ToolException。"""
+async def langgraph_execute(inner, input_):
+    """复刻 _execute_tool_async except 分支（tool_node.py:1124-1156）：捕获
+    异常 → 默认 handler → ToolInvocationError 转错误文本，其余 raise。"""
+    try:
+        return await shielded_ainvoke(inner, input_)
+    except Exception as e:  # noqa: BLE001
+        try:
+            content = langgraph_default_handler(e)
+            return ("ToolMessage(status=error)", content)
+        except Exception:
+            raise
 
 
 # ── 用例 ────────────────────────────────────────────────────────────────
 async def main():
-    print("=== S1: 成功路径原样返回 ===")
+    print("=== S1: 成功路径原样返回（shield 不干预）===")
     async def ok(_): return "识别结果: 立项审批表"
     r = await shielded_ainvoke(ok, {"input_data": "/x.pdf"})
     check("S1 成功返回不包装", r == "识别结果: 立项审批表", f"r={r!r}")
 
-    print("=== S2: 普通异常 → 文本含工具名/类型/消息，不 raise ===")
-    async def boom(_): raise RuntimeError("connection refused: 5081")
-    r = await shielded_ainvoke(boom, {})
-    check("S2 含工具名", "paddleocr_vl" in r, r)
-    check("S2 含异常类型", "RuntimeError" in r, r)
-    check("S2 含根因消息", "connection refused" in r, r)
-    check("S2 含自纠指引", "不要原样重试" in r and "改用其他工具" in r, r)
+    print("=== S2: MCP 失败 → 抛 ToolInvocationError 而非裸异常 ===")
+    async def mcp_err(_): raise RuntimeError("Error calling tool 'paddleocr_vl'")
+    try:
+        await shielded_ainvoke(mcp_err, {"input_data": "/home/user/a.pdf"})
+        check("S2 raise 了 ToolInvocationError", False, "未抛异常")
+    except ToolInvocationError as e:
+        check("S2 类型正确", True)
+        check("S2 message 含工具名", "paddleocr_vl" in str(e), str(e)[:120])
+        check("S2 message 含根因", "Error calling tool" in str(e), str(e)[:120])
+    except Exception as e:
+        check("S2 raise 了 ToolInvocationError", False, f"抛了 {type(e).__name__}")
 
-    print("=== S3: ToolException（MCP isError 语义）→ 回灌原文不崩 ===")
-    async def mcp_err(_): raise ToolException("Error calling tool 'paddleocr_vl'")
-    r = await shielded_ainvoke(mcp_err, {"input_data": "/home/user/a.pdf"})
-    check("S3 不 raise 且含原文", "Error calling tool 'paddleocr_vl'" in r, r)
-    check("S3 类型标注 ToolException", "ToolException" in r, r)
+    print("=== S3: langgraph 原生通道——ToolInvocationError 转错误文本不崩 ===")
+    async def mcp_err2(_): raise RuntimeError("isError from server")
+    status, content = await langgraph_execute(mcp_err2, {"input_data": "/x"})
+    check("S3 返回 error ToolMessage 语义", status == "ToolMessage(status=error)", status)
+    check("S3 content 含根因", "isError from server" in content, content[:150])
 
-    print("=== S4: ExceptionGroup 嵌套 → 展开到最内层根因 ===")
+    print("=== S4: 非 ToolInvocationError（未包装直抛）→ langgraph 仍 raise（对照）===")
+    async def raw_raise(_): raise ConnectionError("connect refused")
+    try:
+        async def naked():
+            try:
+                return await raw_raise({})
+            except Exception as e:
+                langgraph_default_handler(e)  # 非 ToolInvocationError → raise
+        await naked()
+        check("S4 未包装异常会崩（现状对照）", False, "未抛异常")
+    except ConnectionError:
+        check("S4 未包装异常会崩（现状对照）", True)
+
+    print("=== S5: ExceptionGroup 展开 → message 含最内层根因 ===")
     inner_exc = ConnectionError("Connect call failed ('192.168.10.136', 5081)")
     eg = BaseExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [inner_exc])
     async def grp(_): raise eg
-    r = await shielded_ainvoke(grp, {})
-    check("S4 不含 TaskGroup 外壳文本", "TaskGroup" not in r.split("。")[0], r)
-    check("S4 含最内层根因", "192.168.10.136" in r and "ConnectionError" in r, r)
+    try:
+        await shielded_ainvoke(grp, {})
+        check("S5 抛 ToolInvocationError", False, "未抛")
+    except ToolInvocationError as e:
+        msg = str(e)
+        tail = msg.split("error:")[1][:120] if "error:" in msg else msg
+        check("S5 message 无 TaskGroup 外壳", "TaskGroup (1 sub-exception)" not in tail, msg[:150])
+        check("S5 message 含最内层根因", "192.168.10.136" in msg and "Connect call failed" in msg, msg[:150])
 
-    print("=== S5: 超长错误截断 ≤ 600+后缀 ===")
-    async def long_err(_): raise ValueError("x" * 5000)
-    r = await shielded_ainvoke(long_err, {})
-    check("S5 截断", len(r) < 700 and "已截断" in r, f"len={len(r)}")
-
-    print("=== S6: 文本长度上限内完整可读 ===")
-    async def normal(_): raise PermissionError("no permission")
-    r = await shielded_ainvoke(normal, {})
-    check("S6 可读", r.startswith("[工具 paddleocr_vl 调用失败] PermissionError: no permission"), r)
+    print("=== S6: kwargs 超长截断防错误消息撑爆上下文 ===")
+    async def bigkw(_): raise ValueError("bad input")
+    try:
+        await shielded_ainvoke(bigkw, {"data": "B" * 5000})
+        check("S6 抛 ToolInvocationError", False, "未抛")
+    except ToolInvocationError as e:
+        kw_str = str(e.tool_kwargs)
+        check("S6 kwargs 已截断", "…(截断)" in kw_str and len(kw_str) < 600, f"len={len(kw_str)}")
 
     print(f"\n结果: {PASS} PASS / {FAIL} FAIL")
     raise SystemExit(1 if FAIL else 0)
