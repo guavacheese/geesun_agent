@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     cube_template_id: str = ""
     cube_api_url: str = ""
     cube_api_key: str = "e2b_0000000000000000000000000000000000000000"
+    # CubeSandbox 交互 CA 证书路径（读 .env CUBE_CA_PATH）。
+    # 2026-09-09：infra/sandbox.py 原用 os.getenv("CUBE_CA_PATH") 只读 shell env——
+    # dev 经 start.sh 直接 uvicorn 不注入 .env → 落回默认 certs/rootCA.pem（不存在）
+    # → langchain_cubesandbox 把坏路径写进 os.environ["SSL_CERT_FILE"]
+    # → 同进程后续 ChatOpenAI 构造 httpx 崩溃 FileNotFoundError → chat 500。
+    # 声明为 pydantic 字段后：dev 从 .env 读；生产经 docker compose env_file 注入 os.environ 读。
+    cube_ca_path: str = ""
 
     # ─── 沙箱护栏（设计文档 M1：环境快照注入 + 磁盘前置校验）───
     # 覆盖默认探测命令白名单（JSON 数组），空 = 用 sandbox.py 内置默认

@@ -11,7 +11,23 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-ca_path = os.getenv("CUBE_CA_PATH", str(BASE_DIR / "certs" / "rootCA.pem"))
+# CubeSandbox 交互 CA 路径候选链，取第一个真实存在的文件（2026-09-09 加固）：
+# 1. settings.cube_ca_path — pydantic 读 .env 的 CUBE_CA_PATH（dev 经 env_file；
+#    生产经 docker compose env_file 注入 os.environ，与 3 同值）
+# 2. os.getenv("CUBE_CA_PATH") — shell export / compose env（兼容旧用法）
+# 3. os.getenv("SSL_CERT_FILE") — 复用全局 SSL_CERT_FILE（dev .env:42 / 生产 .env:36）
+# 4. BASE_DIR/certs/rootCA.pem — 部署默认（生产 CA 同步目录）
+# 全部缺失/不存在 → "" → CubeSandbox.get_or_create 的 `if ssl_cert:` 不触发，
+# 不再把坏路径写进 os.environ["SSL_CERT_FILE"] 污染同进程其他 httpx 客户端
+# （2026-09-09 实测：坏路径被 langchain_cubesandbox/sandbox.py:78 写入 →
+#   后续 ChatOpenAI 构造 httpx 崩 FileNotFoundError → chat 500）
+_ca_candidates = [
+    settings.cube_ca_path,
+    os.getenv("CUBE_CA_PATH"),
+    os.getenv("SSL_CERT_FILE"),
+    str(BASE_DIR / "certs" / "rootCA.pem"),
+]
+ca_path = next((c for c in _ca_candidates if c and os.path.isfile(c)), "")
 
 # ─── 沙箱实例缓存 ────────────────────────────────────────────────
 # 同 thread_id 复用同一 CubeSandbox 实例：避免每次 POST /api/v1/chat 重建对象，
