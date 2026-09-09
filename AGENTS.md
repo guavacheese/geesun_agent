@@ -199,3 +199,33 @@ download_from_sandbox(
 - 后端持久化是唯一真相，前端 cache 仅作骨架
 - 切 session 不丢失内容的端到端保证 = "不 abort + guard 丢弃 + server 真相 + 切回强制 reload"四件套
 - 提示词只是引导，不负责兜底；以上行为由服务端强制校验，违反只会浪费你自己的步数
+
+### 2026-09-09：vLLM content-parts 数组——解析层类型假设过强致 agent 流中断
+
+**现象**：带文件上传的任务（ls → upload_to_sandbox ×2 → 正文输出）在工具执行完成后崩，
+前端表现为"处理不了/无输出"。server.log 实证：
+`TypeError: can only concatenate str (not "list") to str`
+（chat.py `_drain_astream` line 837 `_think_buffer += content`），崩后 M3 完成门拦截 `generated=0`。
+
+**根因**：流式解析假设 `token.content` 恒为 str。但 **vLLM 0.19 启用 `--reasoning-parser` +
+`enable_thinking` 后，OpenAI 兼容流式 delta.content 可能为 content-parts 数组**
+（`[{"type": "text", "text": "..."}, ...]`），`str += list` 直接 TypeError。
+属上游服务器配置变更（2026-09-09 上午为 thinking 加的参）暴露了既有解析缺陷——
+不是新任务类型的问题，是响应格式变了。
+
+**修复**：`chat.py` `_drain_astream` content 取值处加类型归一化：
+- `None`（tool_calls chunk 常见）与未知类型 → `""`（保持 falsy，防 `str(None)="None"` 污染流）
+- `list` → 提取全部 text part 拼接为 str（非 text part 忽略、保序）
+- `str` → 原样
+归一化后 `</think>` 增量流式与 token 两分支共用同一 content（一处修复覆盖两处隐患：
+崩溃点 + token yield 潜在 list 进 SSE payload）。
+
+**经验**：
+- 解析上游响应时，凡是"假设字段恒为某类型"的地方都要做类型防御；模型服务器升级/
+  加参（reasoning parser、多模态）会悄悄改变响应结构，`str += list` 这类崩溃是典型症状
+- 排查"agent 处理不了任务"先看 server.log 尾部有没有 traceback——M3 零产出拦截通常
+  只是结果，真正原因在更早的异常行
+- 单测要覆盖 content 的异常形态（None/list/混合 parts），不只是正常 str 路径
+
+**验证**：`python tests/spikes/qwen_content_parts.py`（13 断言 PASS，含跨 chunk
+`</think>` 残片、闭合后正文走 token 等场景）。端到端回归 = 真实会话重发原任务。
