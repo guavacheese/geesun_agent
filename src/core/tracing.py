@@ -11,7 +11,7 @@
     from .api.router import api_router      # ← 安全了
 """
 
-import os
+# import os  # [2026-09-09] 仅 exporter 启用时用于 os.environ 注入，已随禁用注释
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,27 +34,28 @@ def setup_tracing() -> bool:
 
     try:
         from opentelemetry import trace as trace_api
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-            OTLPSpanExporter as GrpcExporter,
-        )
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-            OTLPSpanExporter as HttpExporter,
-        )
         from opentelemetry.sdk import trace as trace_sdk
         from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace.export import (
-            SimpleSpanProcessor,
-            BatchSpanProcessor,
-        )
-        # ── Metrics SDK（2026-09-03 补链路：此前只注册 trace → genai_*/http_server_* 全 0）──
-        from opentelemetry import metrics as metrics_api
-        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
-            OTLPMetricExporter,
-        )
-        from opentelemetry.sdk.metrics import MeterProvider
-        from opentelemetry.sdk.metrics.export import (
-            PeriodicExportingMetricReader,
-        )
+        # [2026-09-09] 以下 import 仅 exporter 启用时使用，已随禁用一并注释（恢复时取消）：
+        # from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+        #     OTLPSpanExporter as GrpcExporter,
+        # )
+        # from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        #     OTLPSpanExporter as HttpExporter,
+        # )
+        # from opentelemetry.sdk.trace.export import (
+        #     SimpleSpanProcessor,
+        #     BatchSpanProcessor,
+        # )
+        # # ── Metrics SDK（2026-09-03 补链路：此前只注册 trace → genai_*/http_server_* 全 0）──
+        # from opentelemetry import metrics as metrics_api
+        # from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+        #     OTLPMetricExporter,
+        # )
+        # from opentelemetry.sdk.metrics import MeterProvider
+        # from opentelemetry.sdk.metrics.export import (
+        #     PeriodicExportingMetricReader,
+        # )
         from openinference.instrumentation.langchain import LangChainInstrumentor
 
         # FastAPI instrumentor 是新增依赖（pyproject ≥0.50b0），缺包时仅 http_server
@@ -82,47 +83,56 @@ def setup_tracing() -> bool:
         tracer_provider = trace_sdk.TracerProvider(resource=resource)
 
         # ── 1. Phoenix gRPC exporter ──
-        phoenix_endpoint = settings.phoenix_collector_endpoint
-        if phoenix_endpoint:
-            os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = phoenix_endpoint
-            tracer_provider.add_span_processor(
-                SimpleSpanProcessor(
-                    GrpcExporter(endpoint=phoenix_endpoint)
-                )
-            )
-            logger.info(
-                "[TRACING] Phoenix gRPC exporter 已添加 — endpoint=%s",
-                phoenix_endpoint,
-            )
+        # [2026-09-09 开发环境临时禁用] 本地开发不接 Phoenix（本机 .env 指向生产
+        # 10.10.10.67:4317，本地网络不通 → No route to host 无限刷屏）。
+        # 生产部署由 deploy/.env 注入 http://alloy:4317，与此无关。
+        # 恢复：取消本块注释 + 本地 .env 配 dev 工程 endpoint 即可。
+        # [2026-09-09] 本行原为 `phoenix_endpoint = settings.phoenix_collector_endpoint`，
+        # 被下方 Phoenix/metrics 注释块引用——恢复时先取消本行注释。
+        # phoenix_endpoint = settings.phoenix_collector_endpoint
+        # if phoenix_endpoint:
+        #     os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = phoenix_endpoint
+        #     tracer_provider.add_span_processor(
+        #         SimpleSpanProcessor(
+        #             GrpcExporter(endpoint=phoenix_endpoint)
+        #         )
+        #     )
+        #     logger.info(
+        #         "[TRACING] Phoenix gRPC exporter 已添加 — endpoint=%s",
+        #         phoenix_endpoint,
+        #     )
 
         # ── 2. Langfuse HTTP exporter ──
-        if settings.langfuse_secret_key and settings.langfuse_base_url:
-            import base64
-
-            auth_bytes = base64.b64encode(
-                f"{settings.langfuse_public_key}:{settings.langfuse_secret_key}".encode()
-            )
-            headers = {
-                "Authorization": f"Basic {auth_bytes.decode()}",
-                "x-langfuse-ingestion-version": "4",
-            }
-            langfuse_endpoint = (
-                f"{settings.langfuse_base_url.rstrip('/')}"
-                "/api/public/otel/v1/traces"
-            )
-            tracer_provider.add_span_processor(
-                BatchSpanProcessor(
-                    HttpExporter(endpoint=langfuse_endpoint, headers=headers)
-                )
-            )
-            logger.info(
-                "[TRACING] Langfuse HTTP exporter 已添加 — endpoint=%s",
-                langfuse_endpoint,
-            )
-        else:
-            logger.warning(
-                "[TRACING] LANGFUSE 配置不完整 — Langfuse exporter 跳过"
-            )
+        # [2026-09-09 开发环境临时禁用] 同上——本地 .env 用的生产 Langfuse PK/SK 与
+        # 10.10.10.67:3000 实例不匹配 → 401 Unauthorized 无限刷屏。
+        # 恢复：取消本块注释 + 本地建 dev Langfuse 工程并把 PK/SK 配进 .env。
+        # if settings.langfuse_secret_key and settings.langfuse_base_url:
+        #     import base64
+        #
+        #     auth_bytes = base64.b64encode(
+        #         f"{settings.langfuse_public_key}:{settings.langfuse_secret_key}".encode()
+        #     )
+        #     headers = {
+        #         "Authorization": f"Basic {auth_bytes.decode()}",
+        #         "x-langfuse-ingestion-version": "4",
+        #     }
+        #     langfuse_endpoint = (
+        #         f"{settings.langfuse_base_url.rstrip('/')}"
+        #         "/api/public/otel/v1/traces"
+        #     )
+        #     tracer_provider.add_span_processor(
+        #         BatchSpanProcessor(
+        #             HttpExporter(endpoint=langfuse_endpoint, headers=headers)
+        #         )
+        #     )
+        #     logger.info(
+        #         "[TRACING] Langfuse HTTP exporter 已添加 — endpoint=%s",
+        #         langfuse_endpoint,
+        #     )
+        # else:
+        #     logger.warning(
+        #         "[TRACING] LANGFUSE 配置不完整 — Langfuse exporter 跳过"
+        #     )
 
         # ── 3. Metrics：MeterProvider + OTLP gRPC exporter（2026-09-03 补链路）──
         # 根因：此前只注册了 TracerProvider → metrics API 走 no-op，进程从未发出任何
@@ -130,35 +140,40 @@ def setup_tracing() -> bool:
         # metrics 与 trace 共用同一 OTLP gRPC 端点（生产 = alloy:4317 统一入口，
         # grpc 同端口按 OTLP service path 分流 trace/metrics，alloy 侧零改动）；
         # 15s 周期导出（PeriodicExportingMetricReader），兼顾观察时效与开销。
-        metrics_registered = False
-        if settings.otel_metrics_enabled:
-            metrics_endpoint = settings.otel_metrics_endpoint or phoenix_endpoint
-            if metrics_endpoint:
-                try:
-                    metric_reader = PeriodicExportingMetricReader(
-                        OTLPMetricExporter(
-                            endpoint=metrics_endpoint,
-                            timeout=5,
-                        ),
-                        export_interval_millis=15000,
-                    )
-                    meter_provider = MeterProvider(
-                        metric_readers=[metric_reader],
-                        resource=resource,
-                    )
-                    metrics_api.set_meter_provider(meter_provider)
-                    metrics_registered = True
-                    logger.info(
-                        "[METRICS] MeterProvider 已注册 — OTLP gRPC endpoint=%s, 导出周期=15s",
-                        metrics_endpoint,
-                    )
-                except Exception as e:
-                    logger.warning("[METRICS] MeterProvider 初始化异常: %s", e)
-            else:
-                logger.warning(
-                    "[METRICS] otel_metrics_enabled=True 但无 endpoint "
-                    "（phoenix_collector_endpoint 为空）— metrics 跳过"
-                )
+        # [2026-09-09 开发环境临时禁用] metrics_endpoint 复用 phoenix_endpoint，
+        # 本地 .env 指向 10.10.10.67:4317 → No route to host 同步刷屏，一并注释。
+        # 恢复：取消本块注释即可（生产走 alloy:4317，与此无关）。
+        # [2026-09-09] 原 `metrics_registered = False` 初始化已随禁用注释；
+        # 恢复 metrics 块时需先补回此行（保持 was_setup 语义）。
+        # metrics_registered = False
+        # if settings.otel_metrics_enabled:
+        #     metrics_endpoint = settings.otel_metrics_endpoint or phoenix_endpoint
+        #     if metrics_endpoint:
+        #         try:
+        #             metric_reader = PeriodicExportingMetricReader(
+        #                 OTLPMetricExporter(
+        #                     endpoint=metrics_endpoint,
+        #                     timeout=5,
+        #                 ),
+        #                 export_interval_millis=15000,
+        #             )
+        #             meter_provider = MeterProvider(
+        #                 metric_readers=[metric_reader],
+        #                 resource=resource,
+        #             )
+        #             metrics_api.set_meter_provider(meter_provider)
+        #             metrics_registered = True
+        #             logger.info(
+        #                 "[METRICS] MeterProvider 已注册 — OTLP gRPC endpoint=%s, 导出周期=15s",
+        #                 metrics_endpoint,
+        #             )
+        #         except Exception as e:
+        #             logger.warning("[METRICS] MeterProvider 初始化异常: %s", e)
+        #     else:
+        #         logger.warning(
+        #             "[METRICS] otel_metrics_enabled=True 但无 endpoint "
+        #             "（phoenix_collector_endpoint 为空）— metrics 跳过"
+        #         )
 
         # ── 4. 激活 ──
         trace_api.set_tracer_provider(tracer_provider)
@@ -176,18 +191,14 @@ def setup_tracing() -> bool:
             except Exception as e:
                 logger.warning("[TRACING] FastAPIInstrumentor 注册失败: %s", e)
 
-        was_setup = bool(
-            phoenix_endpoint
-            or (settings.langfuse_secret_key and settings.langfuse_base_url)
-        )
+        # [2026-09-09] exporter 全部注释（开发环境禁用）→ was_setup 恒 False，
+        # 供 server.py 语义判断（当前未使用返回值，仅语义正确）。
+        was_setup = False
         _initialized = True
         logger.info(
             "[TRACING] OpenInference 初始化完成 — "
             "auto_instrument=langchain, "
-            "Phoenix=%s, Langfuse=%s, Metrics=%s",
-            bool(phoenix_endpoint),
-            bool(settings.langfuse_secret_key and settings.langfuse_base_url),
-            metrics_registered,
+            "exporter=DISABLED(dev 2026-09-09, Phoenix/Langfuse/metrics 已注释)"
         )
         return was_setup
 
