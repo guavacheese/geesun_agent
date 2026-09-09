@@ -13,6 +13,7 @@ from langchain.agents.middleware import (
     ModelRequest,
     ModelResponse,
 )
+from langchain_core.messages import AIMessageChunk
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,75 @@ def _make_model_http_client() -> "httpx.Client":
     return httpx.Client(verify=_get_model_verify_ctx(), timeout=300)
 
 
+class ReasoningChatOpenAI(ChatOpenAI):
+    """透传 provider 扩展推理字段（delta.reasoning_content / delta.reasoning）到
+    additional_kwargs["reasoning_content"]。
+
+    背景（2026-09-09 实测）：langchain-openai 1.2.1 的 ChatOpenAI 只按官方 OpenAI
+    规范消费响应——模块 docstring 明示第三方扩展字段 "not extracted or preserved"。
+    实测两种 thinking 模型的思考都被静默丢弃：
+    - DeepSeek V4（默认 thinking）：思考走 delta.reasoning_content
+    - vLLM Qwen3.6（--reasoning-parser qwen3）：思考走 delta.reasoning
+      （直连 vLLM 原始流实证：680 个 reasoning chunk / 2045 字符 vs 46 个 content
+        chunk，思考与正文完全分离，全被 ChatOpenAI 丢）
+    丢弃后果：思考期 content 为空 → 前端只有心跳、无 thinking 内容 → 思考完正文
+    才到 → 体感"非流式 + thinking 不分离"。
+
+    机制：openai SDK extra="allow" → 流式 chunk 经 model_dump() 后 extra 字段仍保留
+    在 dict（langchain base.py:1577-1579 转 dict 后传 _convert_chunk_to_generation_chunk）。
+    本子类在该转换后把 delta 里的推理文本增量写回 additional_kwargs["reasoning_content"]：
+    - 流式：chat.py:838-852 已按该 key 逐 chunk yield reasoning 事件 → 前端增量拼接，
+      思考实时滚动（前端/chat.py 零改动）
+    - 聚合：langchain 对 additional_kwargs 同名 str 值跨 chunk 自动拼接 → 完整消息
+      得全量思考文本（存库/回放正确）
+    sync _stream 与 async _astream 共用本实例方法（base.py:1580/1845）→ 一处覆盖全链路。
+    """
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict,
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ):
+        gc = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if gc is None:
+            return None
+        delta = self._extract_delta(chunk)
+        rc = ""
+        if isinstance(delta, dict):
+            # 兼容各家字段命名：DeepSeek=reasoning_content；vLLM/Qwen=reasoning；
+            # 保守多取几个常见名，取第一个非空（同 chunk 一般只有一个）
+            for k in ("reasoning_content", "reasoning", "reasoning_details"):
+                v = delta.get(k)
+                if isinstance(v, str) and v:
+                    rc = v
+                    break
+        if rc:
+            msg = gc.message
+            if isinstance(msg, AIMessageChunk):
+                msg.additional_kwargs["reasoning_content"] = rc
+        return gc
+
+    @staticmethod
+    def _extract_delta(chunk: dict) -> dict | None:
+        """从 chunk dict 取 choices[0].delta；兼容 beta stream 包装 {chunk:{choices}}。"""
+        if not isinstance(chunk, dict):
+            return None
+        choices = chunk.get("choices")
+        if not choices:
+            inner = chunk.get("chunk")
+            if isinstance(inner, dict):
+                choices = inner.get("choices")
+        if not choices:
+            return None
+        first = choices[0]
+        if isinstance(first, dict):
+            return first.get("delta")
+        return None
+
+
 # ─── 模型配置（支持多 provider，走 OpenAI 兼容协议） ───
 
 @dataclass
@@ -269,7 +339,7 @@ async def create_model() -> ChatOpenAI:
     max_len = await asyncio.to_thread(
         resolve_max_len, settings.base_url, settings.model_name, settings.openai_api_key
     )
-    return ChatOpenAI(
+    return ReasoningChatOpenAI(
         base_url=settings.base_url,
         model=settings.model_name,
         api_key=settings.openai_api_key,
@@ -318,7 +388,7 @@ async def switch_model(
     max_len = await asyncio.to_thread(
         resolve_max_len, cfg.base_url, cfg.model_name, cfg.api_key or "not-used"
     )
-    model = ChatOpenAI(
+    model = ReasoningChatOpenAI(
         model=cfg.model_name,
         base_url=cfg.base_url,
         api_key=cfg.api_key or "not-used",
