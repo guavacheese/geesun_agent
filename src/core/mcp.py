@@ -309,6 +309,103 @@ def _first_exception(exc: BaseException) -> BaseException | None:
     return exc
 
 
+def _mcp_error_text(tool_name: str, exc: BaseException, max_len: int = 600) -> str:
+    """把 MCP 工具执行异常归一化为给模型的友好中文错误文本。
+
+    - 递归展开 ExceptionGroup/TaskGroup（_first_exception）取最内层首个
+      根因，避免只显示 "unhandled errors in a TaskGroup (N sub-exception)"
+    - 超长截断（默认 600 字符）防错误文本撑爆上下文
+
+    错误文本作为**正常工具结果**返回给模型据此自纠（换参数/换工具/换
+    思路），不崩流——对齐 deer-flow（tool_error_handling_middleware.py:
+    128-152）/ deepseek-harness（index.ts:1554）"工具错误永不崩流、回灌
+    模型自纠"哲学（2026-09-09 落地，背景：paddleocr_vl 服务端 isError
+    曾致整轮 langgraph panic、M3 零产出）。
+    """
+    inner = _first_exception(exc)
+    if inner is not None:
+        detail = f"{type(inner).__name__}: {inner}"
+    else:
+        detail = f"{type(exc).__name__}: {exc}"
+    if len(detail) > max_len:
+        detail = detail[:max_len] + "…(已截断)"
+    return (
+        f"[工具 {tool_name} 调用失败] {detail}。"
+        "请检查参数是否指向该服务可达的绝对路径/URL/Base64，或换一种输入方式；"
+        "不要原样重试同一次调用，可改用其他工具完成同样目标。"
+    )
+
+
+class _MCPErrorShieldTool(BaseTool):
+    """通用 MCP 工具错误防护包装（2026-09-09）。
+
+    捕获 MCP 工具执行期一切异常（含 langchain_mcp_adapters 对服务端
+    isError 转出的 ToolException、网络/超时/连接错等），归一化为友好中文
+    错误文本作为正常工具结果返回——模型据此自纠，agent 流不中断。
+
+    实现要点（沿用 _DownloadGuardTool 的既有教训）：
+    1. pydantic v2 模型不可做实例属性赋值（__setattr__ 校验拦截，
+       "StructuredTool object has no field ainvoke" 启动失败），必须子类
+       覆写 ainvoke/invoke；
+    2. 绝不能把捕获的异常再 raise——langgraph prebuilt ToolNode 的
+       _default_handle_tool_errors（tool_node.py:383-393）只把
+       ToolInvocationError（pydantic 校验）转 error ToolMessage 给模型，
+       其余异常（含 ToolException）一律 raise 崩流（2026-09-09
+       paddleocr_vl 实证 + _DownloadGuardTool 19:58 实测）。要吞掉异常、
+       以字符串作为成功结果返回；
+    3. 幂等：已包 shield 的不重复包。
+    """
+
+    _inner: BaseTool = PrivateAttr()
+
+    def __init__(self, inner: BaseTool):
+        super().__init__(
+            name=inner.name,
+            description=inner.description,
+            args_schema=inner.args_schema,
+            return_direct=getattr(inner, "return_direct", False),
+        )
+        self._inner = inner
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        try:
+            return await self._inner.ainvoke(input, config, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "MCP 工具 [%s] 执行失败（错误文本已回灌模型自纠）: %s",
+                self.name, _first_exception(e) or e,
+            )
+            return _mcp_error_text(self.name, e)
+
+    def invoke(self, input, config=None, **kwargs):
+        try:
+            return self._inner.invoke(input, config, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "MCP 工具 [%s] 执行失败（错误文本已回灌模型自纠）: %s",
+                self.name, _first_exception(e) or e,
+            )
+            return _mcp_error_text(self.name, e)
+
+    def _run(self, *args, **kwargs):  # pragma: no cover - 同步路径兜底
+        raise NotImplementedError("MCP 工具仅支持异步执行")
+
+    async def _arun(self, *args, **kwargs):  # pragma: no cover
+        raise NotImplementedError("MCP 工具仅支持异步执行")
+
+
+def _shield_tools(tools: list[BaseTool]) -> list[BaseTool]:
+    """给所有 MCP 工具批量套错误防护包装（幂等）。
+
+    download_from_sandbox 的参数修正 guard 在内层、shield 在外层兜错误
+    （guard 内层 MCP 调用失败同样会被 shield 接住，不崩流）。
+    """
+    return [
+        _MCPErrorShieldTool(t) if not isinstance(t, _MCPErrorShieldTool) else t
+        for t in tools
+    ]
+
+
 async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
     """获取 MCP 工具。
 
@@ -361,7 +458,7 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
             ", ".join(failed),
         )
 
-    _tools_cache[cache_key] = (None, _guard_download_tool(results))
+    _tools_cache[cache_key] = (None, _shield_tools(_guard_download_tool(results)))
     return _tools_cache[cache_key][1]
 
 
