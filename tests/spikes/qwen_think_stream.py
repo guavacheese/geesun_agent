@@ -1,4 +1,26 @@
-"""spike：Qwen </think> 增量流式切分逻辑验证（与 chat.py _drain_astream 内算法同构）。
+"""⚠️ DEPRECATED（2026-09-10）——对应实现已删除，本 spike 不再有回归保护作用。
+
+本 spike 验证的是 chat.py 中「content 内 `</think>` 标签兜底切分」分支的增量流式
+算法（`_think_buffer` / `_think_sent_len` / `_think_done`）。该分支已于 commit
+7e22daf（2026-09-10）**整体删除**——它的锚点是**闭标签**且默认假设"未见 `</think>`
+即仍在思考"，在 vLLM 启用 `--reasoning-parser qwen3` 后正确路径永不命中，普通正文
+chunk 反而命中 → 正文被无限吞进思考区（实测事故：1+1=2 也显示"思考过程"）。
+
+当前 `src/api/endpoints/chat.py` 已无任何 `_think_*` 符号（grep 计数 0），流式归类
+只剩纯字段分流：`reasoning` 字段 → reasoning 事件；`content` → token 事件。
+
+**本文件测的是 FakeStream 复刻的已删除算法，与仓库代码无关。它每次仍会 PASS，
+请勿据此判断回归安全。** 保留仅作历史参考（记录当时的算法与验证思路）。
+建议随下次清理删除；若保留，不要把它计入任何回归红线清单。
+
+替代的回归保护（当前有效）：
+- `tests/spikes/reasoning_field_passthrough.py` —— 推理字段透传（流式 + 非流式双钩子）
+- `tests/spikes/qwen_content_parts.py` —— content-parts 数组归一化
+- 前端 `scripts/spike-sse-url.cjs` —— SSE 目标 URL 解析（dev/prod 双判据）
+
+以下为原始说明（已失效）：
+
+spike：Qwen </think> 增量流式切分逻辑验证（与 chat.py _drain_astream 内算法同构）。
 
 验证点（2026-09-09 修复）：
 1. 思考期间每个 chunk 都立即 yield reasoning（不再攒到 </think> 一次性发）

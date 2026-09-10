@@ -18,7 +18,7 @@
 | 是"不剥"还是"被丢"？ | **被丢**。不是主动剥离，是 langchain 的转换函数**不认识**该字段名，静默丢弃 |
 | 为什么流式能拿到？ | 项目子类覆盖了**流式专属钩子** `_convert_chunk_to_generation_chunk` 把字段捞回来 |
 | 为什么非流式拿不到？ | 非流式走 `_create_chat_result`，**项目没有覆盖它** → 无人捞 → 丢 |
-| 怎么修？ | 覆盖 `_create_chat_result`，从原始响应里取 `reasoning` 写回 `additional_kwargs` |
+| 怎么修？ | 覆盖 `_create_chat_result`，从原始响应里取 `reasoning` 写回 `additional_kwargs`。**已落地**：commit `29f65fc`（2026-09-10） |
 
 ---
 
@@ -91,7 +91,7 @@ if isinstance(response, openai.BaseModel) and getattr(response, "choices", None)
 
 ---
 
-## 3. 修复方案（已验证有效）
+## 3. 修复方案（**已落地**，commit `29f65fc`）
 
 在 `ReasoningChatOpenAI` 中补 `_create_chat_result` 覆盖：
 
@@ -126,28 +126,55 @@ def _create_chat_result(self, response, generation_info=None):
 
 ---
 
-## 4. 影响范围与优先级
+## 4. 影响范围
 
-### 当前实际影响：**有限但需确认**
+### 修复前
 
 项目的对话主链路走 `chat.py` 的 **`agent.astream`**（流式），因此**生产对话不受影响**
 ——思考能正常流式显示（这也与用户此前截图一致）。
 
-**需要排查的是非流式调用点**：
+受影响的是**非流式调用点**：
 - `deepagents` / `langgraph` 内部是否有 middleware 或工具走 `ainvoke`
 - 任何"摘要/标题生成/结构化抽取"类调用（这类常图省事用 `ainvoke`）
-- 若存在，这些路径的 thinking 会**静默丢失**（不报错，难察觉）
+- 这些路径的 thinking 会**静默丢失**（不报错、无日志，只在需要 thinking 时才暴露）
 
-### 修复优先级
+### 修复后（commit `29f65fc`）
 
-**中**。理由：
-- 主链路（流式对话）不受影响
-- 但非流式路径丢字段是**静默失败**——不报错、无日志，只在需要 thinking 时才暴露
-- 修复成本低（约 20 行，已实证有效）
+`ainvoke` 与 `astream` 行为一致。实测两条路径均拿到 603 字符，量级一致无截断。
+
+**下游零改动**：写回的 key 仍是 `additional_kwargs["reasoning_content"]`，
+`chat.py` 与前端按同一 key 消费，无需任何分支。
+
+**修复优先级评估**：当时判为"中"——主链路不受影响，但静默失败难察觉，且修复成本低
+（约 20 行）。事后看这个判断成立：修复本身很小，但**发现它**花了三轮实测对照。
 
 ---
 
-## 5. 通用教训
+## 5. 回归防护
+
+`tests/spikes/reasoning_field_passthrough.py`（新增，随 commit `29f65fc`）：
+
+- 用 `ast.get_source_segment` 从 `src/core/model.py` **提取真实类定义**执行
+  —— **不是复刻**。复刻版只能证明方案可行，证明不了仓库里那份代码是对的；
+  提取真实源码才能发现"源码被改坏"
+- **18 例**覆盖：三种字段名（`reasoning` / `reasoning_content` / `reasoning_details`）
+  × 两条路径（流式钩子 / 非流式钩子）、两条路径 key 集合一致性、
+  空串/None/缺字段/非字符串值不写入、`content` 不被破坏、`choices` 为空不崩
+- `--live` 追加真连后端验证（配置从 `src.core.settings` 读，**不硬编码 key**）
+
+```bash
+python tests/spikes/reasoning_field_passthrough.py          # 纯逻辑（无网络）
+python tests/spikes/reasoning_field_passthrough.py --live   # 额外真连
+```
+
+**回归红线**：`src/core/model.py` 的 `ReasoningChatOpenAI` 任何改动后必须重跑并保持全 PASS。
+
+> 相关：`tests/spikes/qwen_think_stream.py` 已于 2026-09-10 标注 **DEPRECATED**
+> —— 它测的 `</think>` 标签切分逻辑已随 commit `7e22daf` 删除，不再有回归保护作用。
+
+---
+
+## 6. 通用教训
 
 1. **"直连 provider 有字段" ≠ "经过框架后还有字段"**。中间框架按自己的规范消费响应，
    第三方扩展字段默认不保留。排查任何"字段消失"问题，都要**逐层打印实际结构**，

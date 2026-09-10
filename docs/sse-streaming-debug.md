@@ -246,5 +246,9 @@ const start = src.indexOf("export function resolveChatUrl");
 
 **修复 commit**：
 - `1948e61` — SSE 直连后端绕开 Next.js dev rewrites
-- `6748c3e` — resolveChatUrl 开发态兜底 + spike
-- （生产回归修复）— 生产判据前置 + Dockerfile 默认值改空
+- `6748c3e` — resolveChatUrl 开发态兜底 + spike（11 例）
+- `d4f34d8` — **生产回归修复**：生产判据前置 + 运行时 hostname 兜底 + Dockerfile
+  ARG 默认值改空；spike 扩到 18 例（含不可删的回归红线）
+- `451bb24` — 本文档
+- `29f65fc` — （相关）ReasoningChatOpenAI 补非流式钩子，见
+  `llm-reasoning-field-passthrough.md`
