@@ -13,7 +13,7 @@ from langchain.agents.middleware import (
     ModelRequest,
     ModelResponse,
 )
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -262,14 +262,23 @@ class ReasoningChatOpenAI(ChatOpenAI):
     丢弃后果：思考期 content 为空 → 前端只有心跳、无 thinking 内容 → 思考完正文
     才到 → 体感"非流式 + thinking 不分离"。
 
-    机制：openai SDK extra="allow" → 流式 chunk 经 model_dump() 后 extra 字段仍保留
-    在 dict（langchain base.py:1577-1579 转 dict 后传 _convert_chunk_to_generation_chunk）。
-    本子类在该转换后把 delta 里的推理文本增量写回 additional_kwargs["reasoning_content"]：
-    - 流式：chat.py:838-852 已按该 key 逐 chunk yield reasoning 事件 → 前端增量拼接，
-      思考实时滚动（前端/chat.py 零改动）
-    - 聚合：langchain 对 additional_kwargs 同名 str 值跨 chunk 自动拼接 → 完整消息
-      得全量思考文本（存库/回放正确）
-    sync _stream 与 async _astream 共用本实例方法（base.py:1580/1845）→ 一处覆盖全链路。
+    机制：openai SDK extra="allow" → chunk/message 经 model_dump() 后 extra 字段仍保留
+    在 dict。本子类在**两条转换路径**上分别把推理文本写回
+    additional_kwargs["reasoning_content"]：
+
+    - 流式（_stream/_astream）→ `_convert_chunk_to_generation_chunk`
+      （langchain base.py:1577-1579 转 dict 后调用；sync/async 共用本实例方法
+      → 一处覆盖全链路）。chat.py:838-852 已按该 key 逐 chunk yield reasoning
+      事件 → 前端增量拼接，思考实时滚动（前端/chat.py 零改动）。langchain 对
+      additional_kwargs 同名 str 值跨 chunk 自动拼接 → 完整消息得全量思考文本。
+
+    - 非流式（invoke/ainvoke）→ `_create_chat_result`（2026-09-10 补）
+      原缺口：非流式走 _generate/_agenerate → _create_chat_result
+      （langchain_openai/chat_models/base.py:1714），其第 1760 行调用**模块级**
+      _convert_dict_to_message（同文件 base.py:198）——该函数只按官方 OpenAI 规范
+      取值，第三方扩展字段被静默丢弃；其末尾仅对 openai.BaseModel 响应显式补
+      parsed/refusal，**没有 reasoning**（这解释了为何 refusal 能存活而 reasoning 不能）。
+      实测缺口影响：同一次请求 astream 得 603 字符、ainvoke 得 0 字符。
     """
 
     def _convert_chunk_to_generation_chunk(
@@ -283,21 +292,62 @@ class ReasoningChatOpenAI(ChatOpenAI):
         )
         if gc is None:
             return None
-        delta = self._extract_delta(chunk)
-        rc = ""
-        if isinstance(delta, dict):
-            # 兼容各家字段命名：DeepSeek=reasoning_content；vLLM/Qwen=reasoning；
-            # 保守多取几个常见名，取第一个非空（同 chunk 一般只有一个）
-            for k in ("reasoning_content", "reasoning", "reasoning_details"):
-                v = delta.get(k)
-                if isinstance(v, str) and v:
-                    rc = v
-                    break
+        rc = self._pick_reasoning(self._extract_delta(chunk))
         if rc:
             msg = gc.message
             if isinstance(msg, AIMessageChunk):
                 msg.additional_kwargs["reasoning_content"] = rc
         return gc
+
+    def _create_chat_result(
+        self,
+        response: dict | object,
+        generation_info: dict | None = None,
+    ):
+        """非流式路径（invoke/ainvoke）的推理字段透传。
+
+        super() 已按官方规范转好其余字段，这里只补 langchain 会丢的扩展推理字段：
+        从**原始响应 dict** 里取 choices[i].message 的 reasoning，写回对应
+        ChatGeneration 的 additional_kwargs["reasoning_content"]，与流式路径的 key
+        保持一致（下游 chat.py / 前端按同一 key 消费，无需分支）。
+        """
+        result = super()._create_chat_result(response, generation_info)
+        # 取原始响应 dict：dict 直接用；Pydantic 响应 model_dump（排除 parsed，
+        # 与 super 内的 dump 口径一致，避免结构化输出模型序列化失败）
+        resp_dict = (
+            response
+            if isinstance(response, dict)
+            else response.model_dump(
+                exclude={"choices": {"__all__": {"message": {"parsed"}}}}
+            )
+        )
+        choices = resp_dict.get("choices") or []
+        # zip 而非按下标配对：choices 与 generations 数量/顺序一致（super 逐 choice
+        # append），zip 天然防越界
+        for gen, res in zip(result.generations, choices):
+            msg = gen.message
+            if not isinstance(msg, AIMessage):
+                continue
+            rc = self._pick_reasoning(res.get("message") or {})
+            if rc:
+                msg.additional_kwargs["reasoning_content"] = rc
+        return result
+
+    @staticmethod
+    def _pick_reasoning(d: dict | None) -> str:
+        """从 delta / message dict 取推理文本，兼容各家字段命名。
+
+        DeepSeek=reasoning_content；vLLM/Qwen=reasoning；其他=reasoning_details。
+        取第一个非空（同一次响应一般只有一个）。流式与非流式共用本方法，
+        避免两处字段名列表漂移。
+        """
+        if not isinstance(d, dict):
+            return ""
+        for k in ("reasoning_content", "reasoning", "reasoning_details"):
+            v = d.get(k)
+            if isinstance(v, str) and v:
+                return v
+        return ""
 
     @staticmethod
     def _extract_delta(chunk: dict) -> dict | None:
