@@ -31,3 +31,34 @@ geesun_agent_web
 
 # 非 agent 镜像所需的兄弟仓库（各有独立构建；减小 agent 构建上下文）
 geesun_mcp_server
+
+# ── geesun_agent 运行时数据与私有资产（2026-09-10 增补，绝不进镜像）──
+# Dockerfile 的 `COPY geesun_agent /app` 会把整个仓库拷进镜像，而生产运行时这些
+# 路径**全部走 bind mount**（生产 .env:16 `agent_workspace=/data/agent`）：
+#   /opt/geesun/data/agent    -> /data/agent          （AGENT_WORKSPACE）
+#   /opt/geesun/data/skills   -> /data/agent/skills   （运行时 skills 真身）
+#   /opt/geesun/data/uploads  -> /data/uploads
+#   /opt/geesun/data/reports  -> /data/reports
+# 故镜像内 /app/data、/app/skills 那份**从不被读取**，是纯死重量 + 数据泄漏。
+# 实测 1.0.5 镜像：/app/data 437M（含 uploads/<用户>/ 私有上传）、
+# /app/skills 2.0M（含 __user_<用户>/ 私有 skill）。私有资产一旦进镜像层，
+# 任何有 Harbor 读权限者 `docker save` 即可提取。
+geesun_agent/data
+geesun_agent/skills
+
+# ── geesun_agent 非运行时目录（镜像不需要）──
+# 实测 1.0.5 镜像内占用：deploy 352K / debug 312K / docs 224K / memories 8K。
+# - deploy：部署脚本与 compose，构建机侧使用；容器 CMD 只读 /app/logging.uvicorn.json
+# - debug：调试脚本（仓库 .gitignore:49 已忽略，非版本控制资产）
+# - docs：设计文档
+# - memories：运行期记忆，运行时走 /data/agent/memories
+# - tests / .pytest_cache / .ruff_cache / .claude / code：开发与测试期产物
+geesun_agent/deploy
+geesun_agent/debug
+geesun_agent/docs
+geesun_agent/memories
+geesun_agent/tests
+geesun_agent/.pytest_cache
+geesun_agent/.ruff_cache
+geesun_agent/.claude
+geesun_agent/code
