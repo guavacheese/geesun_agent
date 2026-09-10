@@ -129,3 +129,24 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> dict[str, str]:
+    """容器 healthcheck 专用探活端点。
+
+    为什么单独建这个端点（2026-09-10 之前 healthcheck 探的是 /docs）：
+    /docs 是 FastAPI 的 Swagger UI 路由，会被 FastAPIInstrumentor 建 HTTP server
+    span —— 而 healthcheck 每 15s 探一次 → 每天 5760 次 × 3 span = 17,280 span
+    灌进 Phoenix/Langfuse。实测 Phoenix spans 表 108,209 条里 HTTP 形态占 98.3%、
+    其中 `GET /docs` 占 91.8%，真正有价值的 LLM trace 只剩 1.1%。
+
+    /healthz 同时列在 src/core/tracing.py 的 _HTTP_EXCLUDED_URLS 中
+    （excluded_urls 在 ASGI middleware 入口直接 return），双保险：既不建 span，
+    也不计入 http_server_* 指标。
+
+    刻意不查数据库：原 /docs 探活同样不查库，此处保持等价语义 —— 探活的职责是
+    "进程是否活着"，DB 依赖由服务启动时的 lifespan 负责（连不上就起不来、由
+    restart_policy 兜底）。
+    """
+    return {"status": "ok"}

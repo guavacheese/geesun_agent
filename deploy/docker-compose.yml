@@ -76,10 +76,17 @@ services:
     depends_on: [agent-postgres]
     networks: [appnet2]
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8009/docs').status==200 else 1)"]
-      interval: 15s
+      # 探活端点用 /healthz 而不是 /docs（2026-09-10 修正）：
+      # /docs 是 FastAPI 路由，会被 FastAPIInstrumentor 建 HTTP server span ——
+      # 15s 一次 → 每天 5760 次 × 3 span = 17,280 span 灌进 Phoenix/Langfuse
+      # （实测占观测后端 98%+，真实 LLM trace 只剩 1.1%）。
+      # /healthz 同时列在 src/core/tracing.py 的 _HTTP_EXCLUDED_URLS，双重不产生 trace。
+      # 间隔 15s→30s、retries 10→5：探活只需发现"进程死了"，30s×5=150s 的判死窗口
+      # 与原来 15s×10 完全等价，但无效请求再减半。
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8009/healthz').status==200 else 1)"]
+      interval: 30s
       timeout: 5s
-      retries: 10
+      retries: 5
       start_period: 30s
     deploy:
       restart_policy:
