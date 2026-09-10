@@ -229,3 +229,58 @@ download_from_sandbox(
 
 **验证**：`python tests/spikes/qwen_content_parts.py`（13 断言 PASS，含跨 chunk
 `</think>` 残片、闭合后正文走 token 等场景）。端到端回归 = 真实会话重发原任务。
+
+### 2026-09-10：观测后端被容器 healthcheck 灌满——注释 exporter ≠ 停止埋点
+
+**现象**：生产 Phoenix `spans` 表 108,209 条中 HTTP 形态占 **98.3%**（`GET /docs`
+健康检查占 **91.8%**），真实 LLM trace 只剩 **1.1%**；Langfuse 最近 30 条全是
+`name="GET /docs"`（`http.user_agent=Python-urllib/3.13`、相邻 Δ=15.2s）。
+
+**根因**：`deploy/docker-compose.yml` 的 healthcheck 每 15s 用
+`python3 urllib.request.urlopen('http://127.0.0.1:8009/docs')` 探活，而 `/docs` 是
+FastAPI 路由 → `FastAPIInstrumentor` 给每个请求建 3 个 span。
+自校验：`86400/15 × 3 = 17,280 span/天`，与 Phoenix 按天实测（16,986 / 16,983 / 17,252）吻合。
+
+**误判澄清**：曾认为"应用 log 被导进了观测后端"，六条 OTLP 日志通道逐一证伪 ——
+代码 0 处 `LoggingHandler`（`git log -S` 全历史也 0）、未装
+`opentelemetry-instrumentation-logging`、未装 `opentelemetry-distro`（SDK 的
+`_configuration` 会自动把 `LoggingHandler` 挂 root logger，但 entry point 不存在 →
+永不触发）、`phoenix/otel/otel.py` 0 引用、alloy 的 `otelcol.receiver.otlp` 无 logs
+出口、应用 stdout 只去 Loki。
+
+**修复（四层，见 `src/core/tracing.py`）**：
+① `src/server.py:134` 新增 `/healthz`（`include_in_schema=False`，不查库）；
+② `_HTTP_EXCLUDED_URLS` 经 `excluded_urls` 让探活/文档端点在 ASGI 入口 `return`；
+③ `_OpenInferenceOnlySpanProcessor` 只放行带 `openinference.span.kind` 的 span；
+④ Phoenix + Langfuse + metrics 三路 exporter 全部恢复。
+
+**经验**：
+- **注释 exporter ≠ 停止埋点**。OTLP 分四层：`opentelemetry-api`（provider 注册点）→
+  `opentelemetry-sdk`（TracerProvider/SpanProcessor/MeterProvider）→
+  `opentelemetry-exporter-otlp-proto-{grpc,http}`（**一个包同时提供
+  traces/metrics/logs 三种 exporter**，用哪个类才决定发哪种信号）→
+  `*-instrumentation-*` / `openinference-*`（**只造 span，不发送**）。
+  关掉 exporter 后 instrumentation 照跑、span 照造，白耗 CPU 且埋点结构不变。
+  另外 `arize-phoenix-otel` 只是便捷封装，其 `add_span_processor` 会**替换**已有
+  processor（这是本项目弃用它、手写 TracerProvider 的原因）；**Langfuse 不是 SDK**，
+  只是个 OTLP traces 接收端，收到什么完全取决于你挂了哪些 span。
+- **`FastAPIInstrumentor.instrument()` 是 patch `fastapi.FastAPI` 类属性**
+  （`opentelemetry/instrumentation/fastapi/__init__.py:442-445`），所以
+  `from fastapi import FastAPI` **必须**在 `instrument()` **之后**执行 ——
+  顺序反了该名字绑定到旧类，app 完全不被埋点、**不报任何错**。
+  `server.py` 当前顺序正确（`setup_tracing()` L13 → `from fastapi import FastAPI` L17），
+  调整顶部 import 顺序时务必保持。
+- **断源优先于过滤**：`excluded_urls`（逗号分隔、`re.search` 语义、在 ASGI 入口直接
+  `return`）零开销；SpanProcessor 白名单是兜底。两者都要，前者省 CPU 后者防漏网。
+- **判据选 `openinference.span.kind`，别维护 URL 黑名单**：OpenInference 埋点一定设置它
+  （`openinference/instrumentation/langchain/_tracer.py:294`，且在 `span.end()` **之前**
+  写入 → `SpanProcessor.on_end()` 必定可读）；OTel 的 HTTP/ASGI 埋点一定不设。
+  实测交叉验证：Phoenix `span_kind` 列 UNKNOWN 106,434 全是 HTTP，
+  CHAIN/LLM/TOOL/AGENT 共 1,775 全是非 HTTP。
+
+**验证**：`tests/spikes/tracing_span_filter.py` 18/18 PASS（真实 OTel SDK + 真实
+LangChain Runnable + 真实 FastAPI 请求，无 mock）。核心对照：同一进程挂两个 exporter，
+raw 收到 6 条（OI 3 + HTTP 3），kept 收到 3 条（OI 3 + HTTP **0**）。
+完整复盘见 `docs/tracing-span-pollution-postmortem.md`。
+注意 `.venv` 是 Linux 布局、Windows 本机 Python 用不了，spike 需在生产同款镜像内运行
+（命令见该文档第 6 节）。
