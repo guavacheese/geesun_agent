@@ -694,11 +694,6 @@ async def chat(
         _reasoning_started_at_ms: int | None = None
         _reasoning_ended_at_ms: int | None = None
         _turn_ended_at_ms: int | None = None
-        # Qwen 系模型将推理放在 content 的 </think> 前，流式场景下可能跨 chunk 截断
-        _think_buffer = ""
-        # 已作为 reasoning 事件流式发出的缓冲长度（增量流式：避免攒到 </think> 一次性发）
-        _think_sent_len = 0
-        _think_done = False
         # [DEBUG] 记录上一个 langgraph_step，避免逐 token 重复打印
         _last_debug_step = None
         # 记录本次流式生成过程中产生/下载的文件
@@ -737,7 +732,7 @@ async def chat(
             M3-v2 继续轮传入 {'messages': [SystemMessage(...)]} 追加系统消息，
             依赖 deepagents astream 继续模式（spike 验证，未通过时自动继续保持关闭）。
             """
-            nonlocal _last_debug_step, thinking_emitted, generating_emitted, _think_buffer, _think_sent_len, _think_done, _generated_files, _consecutive_tool_failures, _reasoning_started_at_ms, _reasoning_ended_at_ms
+            nonlocal _last_debug_step, thinking_emitted, generating_emitted, _generated_files, _consecutive_tool_failures, _reasoning_started_at_ms, _reasoning_ended_at_ms
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # ─── 清洗：messages 里不应有 SystemMessage ───
@@ -797,25 +792,13 @@ async def chat(
                                 _last_debug_step = step
                                 thinking_emitted = False  # 新 step → 重置 thinking 标记
                                 generating_emitted = False  # 新 step → 重置 generating 标记
-                                # 关键：每条 AIMessage 独立切分 <think> 段
-                                # 之前 _think_done 跨消息保留导致第二条 AIMessage 的
-                                # <think> 段（被 langchain 拼在 ToolMessage 之后）无法切分
-                                _think_done = False
-                                _think_buffer = ""
-                                _think_sent_len = 0
-                                logger.warning(
-                                    "[DIAG] new messages stream: step=%s, node=%s, metadata keys=%s",
-                                    step,
-                                    metadata.get("langgraph_node"),
-                                    list(metadata.keys()),
-                                )
 
                         # ─── 流式 token 处理：分离推理内容与回复内容 ───
                         _raw_content = token.content if hasattr(token, "content") else ""
                         # vLLM 0.19+（启用 reasoning-parser / 多模态后）流式 delta.content
                         # 可能不是 str 而是 OpenAI content-parts 数组
                         # （[{"type": "text", "text": "..."}, ...]）。这里统一归一化为 str，
-                        # 防下方 _think_buffer += content 的 str += list TypeError
+                        # 防 str += list 的 TypeError
                         # （2026-09-09 实测：upload_to_sandbox 后正文输出 chunk 崩）。
                         # None（tool_calls chunk）与未知类型一律置 ""，保持原 falsy 语义，
                         # 避免 str(None)="None" 之类污染流内容。
@@ -850,65 +833,22 @@ async def chat(
                                     _reasoning_started_at_ms = int(time.time() * 1000)
                                 yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
                             yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning}, ensure_ascii=False)}\n\n"
-                        elif not _think_done and content:
-                            # 2. Qwen 系：仅以 </think> 作为推理结束标记（无开始标签）。
-                            #    增量流式（2026-09-09 改）：思考文本边收边 yield reasoning，
-                            #    对齐 deer-flow / deepseek-harness 的 reasoning-delta 实时滚出，
-                            #    而非攒到 </think> 一次性发（否则思考期间前端只有计时无内容）。
-                            _think_buffer += content
-                            think_end = _think_buffer.find("</think>")
-                            if think_end >= 0:
-                                _think_done = True
-                                # 发出 </think> 前尚未流式发送的增量（含本 chunk 尾部）
-                                pending = _think_buffer[_think_sent_len:think_end]
-                                _think_sent_len = think_end
-                                # remaining 是 </think> 之后 8 字符（跳过标签）开始的内容
-                                remaining = _think_buffer[think_end + 8 :]
-                                # 去掉 remaining 开头的换行
-                                if remaining.startswith("\n"):
-                                    remaining = remaining[1:]
-                                if pending.strip():
-                                    if not thinking_emitted:
-                                        thinking_emitted = True
-                                        # 持久化埋点：Qwen 首个 <think> 段 → 推理起始
-                                        if _reasoning_started_at_ms is None:
-                                            _reasoning_started_at_ms = int(time.time() * 1000)
-                                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
-                                    yield f"data: {json.dumps({'type': 'reasoning', 'content': pending}, ensure_ascii=False)}\n\n"
-                                if remaining:
-                                    if not generating_emitted:
-                                        generating_emitted = True
-                                        # 持久化埋点：首个 token 事件 → 推理结束 / 进入答案生成
-                                        if _reasoning_ended_at_ms is None:
-                                            _reasoning_ended_at_ms = int(time.time() * 1000)
-                                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'generating'}, ensure_ascii=False)}\n\n"
-                                    yield f"data: {json.dumps({'type': 'token', 'content': remaining}, ensure_ascii=False)}\n\n"
-                            else:
-                                # 未到 </think>：整个 chunk 都是思考增量 → 立即流式发出
-                                # （thinking 文本实时滚出，而非憋到思考结束；前端按
-                                #  reasoning 事件增量拼接到 message.reasoning）
-                                # 若 chunk 尾部恰是 </think> 标签前缀（跨 chunk 截断，
-                                # 如 "…</t"），截留该前缀待下 chunk 判定，避免思考文本
-                                # 末尾显示标签残片（spike 场景 3 实测暴露）。
-                                hold = 0
-                                for _k in range(7, 1, -1):  # 最长优先：</think>[:7..2]
-                                    if content.endswith("</think>"[:_k]):
-                                        hold = _k
-                                        break
-                                _send = content[:-hold] if hold else content
-                                _think_sent_len = len(_think_buffer) - hold
-                                if _send:
-                                    if not thinking_emitted:
-                                        thinking_emitted = True
-                                        # 持久化埋点：首个 reasoning chunk → 推理起始
-                                        if _reasoning_started_at_ms is None:
-                                            _reasoning_started_at_ms = int(time.time() * 1000)
-                                        yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
-                                    yield f"data: {json.dumps({'type': 'reasoning', 'content': _send}, ensure_ascii=False)}\n\n"
                         elif content:
-                            # 3. 正常 token：已过 </think> 或无推理内容——这是"写答案"阶段，
-                            #    状态应为 generating（生成中），而非 thinking（思考中）。
-                            #    之前误把首个答案 token 标成 thinking，导致整段答案生成都显示"思考中…"。
+                            # 2. 正常 token：这是"写答案"阶段，状态应为 generating（生成中），
+                            #    而非 thinking（思考中）。之前误把首个答案 token 标成 thinking，
+                            #    导致整段答案生成都显示"思考中…"。
+                            #
+                            # 注：此处原为「content 内 </think> 标签兜底切分」分支
+                            # （2026-07-13 cf81106 引入，服务当时未启 reasoning-parser 的 Qwen）。
+                            # 该分支锚点是**闭标签**且默认假设"未见 </think> 即仍在思考"；一旦
+                            # vLLM 的 reasoning-parser 把 thinking 剥进 reasoning 字段（当前部署
+                            # --reasoning-parser qwen3），它的正确路径永不命中，而普通正文 chunk
+                            # 恰好满足其条件 → 正文被无限吞进思考区。实测现象：1+1=2 也显示
+                            # "思考过程"、散文正文混入思考块。
+                            # 2026-09-10 删除，对齐 deepseek-harness 与 deer-flow 后端：流式路径
+                            # 零标签解析，reasoning 只认 additional_kwargs.reasoning_content；
+                            # 无 parser 模型的标签兜底改由前端渲染派生层承担（开标签锚点 +
+                            # 乐观默认正文，物理上不可能吞正文）。请勿在后端流式归类里重加标签猜测。
                             if not generating_emitted:
                                 generating_emitted = True
                                 # 持久化埋点：首个 token 事件 → 推理结束 / 进入答案生成
