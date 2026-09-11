@@ -109,6 +109,13 @@ def _capture_usage(resp, request) -> None:
     **会把 100% 失败伪装成偶发**——实测生产一条警告、成功分支 0 条，极易被误读成
     "抖动一下"。现改为：首次必打 + 每 `_USAGE_MISS_LOG_EVERY` 次汇总一条（仍不刷屏），
     **且成功分支也有周期性痕迹**，让"到底通没通"看日志就能判。
+
+    文案修订（2026-09-11 二次）：旧文案"三种来源(usage_metadata/usage/response_metadata)
+    均缺失"有两处误导——① 读起来像"三种 token 统计"（提示词/回答/问题），实际是**同一个
+    usage 对象的三个落点**，查的是 prompt/input tokens 一个量；② "（累计缺失>0 且成功=0
+    → 整条链路失效，非偶发）"这句判断被写死在消息串里，任何一次缺失都会印上"整条链路失效"，
+    包括真的偶发。现改为：逐条说明三个落点各自是什么/来自哪，影响（退化本地估算）写清，
+    结论由 `verdict` 按 `_usage_ok_count` 现算。
     """
     global _usage_ok_count, _usage_miss_count
     sid = getattr(request.model, "_session_id", None)
@@ -118,11 +125,20 @@ def _capture_usage(resp, request) -> None:
     if not real_in:
         _usage_miss_count += 1
         if _usage_miss_count == 1 or _usage_miss_count % _USAGE_MISS_LOG_EVERY == 0:
+            # 结论动态算，不写死在文案里——写死会让"偶发"也印上"整条链路失效"
+            verdict = (
+                "整条链路失效（成功次数为 0，非偶发）"
+                if _usage_ok_count == 0
+                else "偶发缺失（成功分支仍在工作）"
+            )
             logger.warning(
-                "[DIAG] 引擎真实 prompt_tokens 三种来源(usage_metadata/usage/"
-                "response_metadata)均缺失：累计 %d 次缺失 / %d 次成功"
-                "（累计缺失>0 且成功=0 → 整条链路失效，非偶发）",
-                _usage_miss_count, _usage_ok_count,
+                "[DIAG] 未取到引擎真实 usage（prompt/input tokens）——三个落点全空："
+                "① usage_metadata（LangChain 标准 OTel 键，OpenInference 由引擎响应映射而来）；"
+                "② usage（OpenAI 兼容 usage 对象，vLLM 原生走这条）；"
+                "③ response_metadata.usage（部分 provider 落点）。"
+                "影响：该会话 token 计数退化为本地估算（tiktoken 低估中文、图片 token 按 0 计），"
+                "动态 max_tokens 与摘要触发阈值偏保守。累计缺失 %d 次 / 成功 %d 次 → %s",
+                _usage_miss_count, _usage_ok_count, verdict,
             )
         return
     _usage_ok_count += 1
@@ -130,10 +146,13 @@ def _capture_usage(resp, request) -> None:
     # 简单防泄漏：长驻服务会话数不会过千，超限清一次（仅少量会话退化 cold，可接受）
     if len(_session_prompt_tokens) > 2000:
         _session_prompt_tokens.clear()
-    # 首次成功必打（确认链路通），之后每 N 次打一条，避免刷屏
+    # 首次成功必打（确认链路通），之后每 N 次打一条，避免刷屏。
+    # 刻意保留 WARNING 级别：若降为 INFO，日志级别过滤到 WARNING 时成功分支将完全消失，
+    # 又回到"只看得到失败、判不出是偶发还是 100% 失效"的老问题。
     if _usage_ok_count == 1 or _usage_ok_count % _USAGE_MISS_LOG_EVERY == 0:
         logger.warning(
-            "[DIAG] 引擎真实 prompt_tokens=%d (session=%s, 累计成功=%d/缺失=%d)",
+            "[DIAG] 取到引擎真实 usage：prompt_tokens=%d (session=%s)，"
+            "已写入会话缓存供动态 max_tokens / 摘要阈值使用；累计成功 %d / 缺失 %d",
             real_in, sid, _usage_ok_count, _usage_miss_count,
         )
 

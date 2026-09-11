@@ -15,6 +15,7 @@ langchain 1.x 的 `ModelResponse.result` 类型是 **list[BaseMessage]**（@data
   A) _extract_tokens 的形态矩阵（含本 bug 的回归位、结构化输出混合 ToolMessage、空列表）
   B) _capture_usage 把引擎真实值写进每会话缓存（修复前恒不写入）
   C) 健康度计数：miss/ok 都留痕（替代原「全局只告警一次」的误判源）
+     + 告警文案回归：三个落点说明齐全、影响写明、verdict 按 ok 计数动态现算（非写死）
   D) 端到端：真实 middleware 链（create_agent + wrap_model_call）取到真实 vLLM usage
   E) 端到端：astream（生产真实 SSE 路径）同样取到
 """
@@ -117,17 +118,74 @@ check("B2 无 session_id 不写缓存", M._session_prompt_tokens == before, True
 
 print()
 print("=" * 74)
-print("[C] 健康度计数（替代「全局只告警一次」）")
+print("[C] 健康度计数（替代「全局只告警一次」）+ 告警文案回归")
 print("=" * 74)
-M._usage_ok_count = 0
-M._usage_miss_count = 0
-_capture_usage(ModelResponse(result=[ai(None)]), SimpleNamespace(
-    model=SimpleNamespace(_session_id="s-miss")))
-check("C1 缺失计入 miss", (M._usage_ok_count, M._usage_miss_count), (0, 1))
-_capture_usage(ModelResponse(result=[ai()]), SimpleNamespace(
-    model=SimpleNamespace(_session_id="s-ok")))
-check("C2 成功计入 ok", (M._usage_ok_count, M._usage_miss_count), (1, 1))
-check("C3 阈值常量存在", M._USAGE_MISS_LOG_EVERY, 50)
+import logging as _logging
+
+
+class _Cap(_logging.Handler):
+    """捕获 _capture_usage 打出的告警原文（含 %-格式展开，格式错会被记成带 ERROR 的行）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: _logging.LogRecord) -> None:
+        try:
+            self.lines.append(record.getMessage())
+        except Exception as e:  # noqa: BLE001
+            # 参数个数/类型与占位符不匹配 → 真实生产里会变成 "--- Logging error ---"
+            self.lines.append(f"<<LOG-FORMAT-ERROR: {type(e).__name__}: {e}>>")
+
+
+_cap = _Cap()
+_old_level = M.logger.level
+M.logger.setLevel(_logging.DEBUG)
+M.logger.addHandler(_cap)
+try:
+    M._usage_ok_count = 0
+    M._usage_miss_count = 0
+    _cap.lines.clear()
+    _capture_usage(ModelResponse(result=[ai(None)]), SimpleNamespace(
+        model=SimpleNamespace(_session_id="s-miss")))
+    check("C1 缺失计入 miss", (M._usage_ok_count, M._usage_miss_count), (0, 1))
+
+    # C4~C7：缺失文案（首次必打 miss=1）
+    miss_all = _cap.lines[-1]
+    print(f"  · 缺失文案原文: {miss_all}")
+    check("C4 文案无 %-格式错误", "<<LOG-FORMAT-ERROR" in miss_all, False)
+    check("C5 三个落点逐一说明（usage_metadata/usage/response_metadata 齐全）",
+          all(k in miss_all for k in ("usage_metadata", "usage", "response_metadata")), True)
+    check("C6 说明查的是 prompt/input tokens 一个量，不再像「三类 token 统计」",
+          ("prompt/input tokens" in miss_all) and ("三种来源" not in miss_all), True)
+    check("C7 写清退化影响（本地估算）", "本地估算" in miss_all, True)
+    check("C8 ok=0 → verdict 判为整条链路失效（非偶发）", "整条链路失效" in miss_all, True)
+
+    # C9~C10：成功文案
+    _cap.lines.clear()
+    _capture_usage(ModelResponse(result=[ai()]), SimpleNamespace(
+        model=SimpleNamespace(_session_id="s-ok")))
+    check("C9 成功计入 ok", (M._usage_ok_count, M._usage_miss_count), (1, 1))
+    ok_line = _cap.lines[-1]
+    print(f"  · 成功文案原文: {ok_line}")
+    check("C10 成功文案含真实值与累计计数",
+          ("prompt_tokens=111" in ok_line) and ("累计成功 1 / 缺失 1" in ok_line), True)
+
+    # C11~C12：verdict 必须动态现算——第 50 次缺失时 ok>0，应判「偶发」而非写死的「整条链路失效」
+    _cap.lines.clear()
+    M._usage_miss_count = M._USAGE_MISS_LOG_EVERY - 1  # 下一次 = 50，命中周期日志
+    _capture_usage(ModelResponse(result=[ai(None)]), SimpleNamespace(
+        model=SimpleNamespace(_session_id="s-miss2")))
+    check("C11 第 50 次缺失命中周期日志", M._usage_miss_count, M._USAGE_MISS_LOG_EVERY)
+    cyc = _cap.lines[-1]
+    print(f"  · 周期文案原文: {cyc}")
+    check("C12 ok>0 → verdict 判为偶发缺失（证明判断未写死在文案里）",
+          ("偶发缺失" in cyc) and ("整条链路失效" not in cyc), True)
+
+    check("C13 阈值常量存在", M._USAGE_MISS_LOG_EVERY, 50)
+finally:
+    M.logger.removeHandler(_cap)
+    M.logger.setLevel(_old_level)
 
 print()
 print("=" * 74)
