@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="GAVVGFS7jGlJJtjlJTcEdP">
+<head data-page-node-id="NW10AGwRiqhjGg84JaMr8P">
+<meta charset="UTF-8" data-page-node-id="UeJiHxug1aGB1bLV6OaFdf">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="yL957Lw4TuJrAbFORK51xk">
+<title>finish_reason 取证链路验证 × 三项拍板落地确认（2026-09-11）</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2328; --ink2:#5b6471;
+    --line:#e3e6ea; --red:#c62828; --redbg:#fdecea; --grn:#1b7f4b; --grnbg:#e8f5ee;
+    --amb:#a05a00; --ambbg:#fff5e5; --blu:#1a5fb4; --blubg:#eaf2fd; --pur:#6b3fa0; --purbg:#f3ecfb;
+    --mono:"Cascadia Mono","JetBrains Mono",Consolas,Monaco,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px 24px 64px;background:var(--bg);color:var(--ink);
+       font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1120px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 8px;letter-spacing:-.2px}
+  .sub{color:var(--ink2);font-size:13.5px;margin-bottom:22px;line-height:1.75}
+  h2{font-size:18px;margin:36px 0 12px;padding-left:11px;border-left:4px solid var(--blu)}
+  h3{font-size:15.5px;margin:22px 0 8px;color:#2c3138}
+  h4{font-size:14px;margin:16px 0 6px;color:#3a4047}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:16px 20px;margin:12px 0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  .verdict{background:var(--grnbg);border:1px solid #bfe3ce;border-left:4px solid var(--grn);
+           border-radius:8px;padding:15px 18px;margin:16px 0}
+  .warn{background:var(--ambbg);border:1px solid #f0d9b0;border-left:4px solid var(--amb);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .info{background:var(--blubg);border:1px solid #c9dcf5;border-left:4px solid var(--blu);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .danger{background:var(--redbg);border:1px solid #f3c4c0;border-left:4px solid var(--red);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .pur{background:var(--purbg);border:1px solid #ddd0f0;border-left:4px solid var(--pur);
+       border-radius:8px;padding:13px 17px;margin:14px 0}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+  th{background:#f0f2f5;text-align:left;padding:8px 10px;border:1px solid var(--line);
+     font-weight:600;white-space:nowrap}
+  td{padding:7px 10px;border:1px solid var(--line);vertical-align:top}
+  tbody tr:nth-child(even){background:#fafbfc}
+  code{font-family:var(--mono);font-size:12px;background:#f1f3f5;
+       padding:1.5px 5px;border-radius:4px;color:#b3261e;word-break:break-all}
+  pre{font-family:var(--mono);font-size:12px;background:#fbfbfc;border:1px solid var(--line);
+      border-radius:7px;padding:11px 13px;overflow-x:auto;line-height:1.55;margin:9px 0}
+  pre .rc{color:var(--red);font-weight:600}
+  pre .gc{color:var(--grn);font-weight:600}
+  pre .cc{color:var(--ink2)}
+  .hl-red{background:var(--redbg);color:var(--red);font-weight:600;padding:0 3px;border-radius:3px}
+  .hl-grn{background:var(--grnbg);color:var(--grn);font-weight:600;padding:0 3px;border-radius:3px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 7px;border-radius:99px;
+       border:1px solid;margin-right:5px;white-space:nowrap}
+  .t-red{color:var(--red);border-color:#f0b8b4;background:var(--redbg)}
+  .t-grn{color:var(--grn);border-color:#bfe3ce;background:var(--grnbg)}
+  .t-amb{color:var(--amb);border-color:#f0d9b0;background:var(--ambbg)}
+  .t-blu{color:var(--blu);border-color:#c9dcf5;background:var(--blubg)}
+  ul,ol{margin:8px 0 8px 22px;padding:0}
+  li{margin:5px 0}
+  .kv{display:grid;grid-template-columns:190px 1fr;gap:5px 14px;font-size:13px}
+  .kv dt{color:var(--ink2)}
+  .kv dd{margin:0;font-family:var(--mono);font-size:12px;word-break:break-all}
+  .ok::before{content:"✓ ";color:var(--grn);font-weight:700}
+  .no::before{content:"✗ ";color:var(--red);font-weight:700}
+  .foot{margin-top:36px;padding-top:14px;border-top:1px solid var(--line);
+        color:var(--ink2);font-size:12px;line-height:1.8}
+  .decision{display:grid;grid-template-columns:52px 1fr;gap:14px;align-items:start;
+            padding:13px 0;border-bottom:1px dashed var(--line)}
+  .decision:last-child{border-bottom:none}
+  .dnum{font:700 22px/1 var(--mono);color:var(--grn)}
+</style>
+</head>
+<body data-page-node-id="BfRPaeF5m4W1UA82FHZljI">
+<div class="wrap" data-page-node-id="3cFyxASeV8Fs4F0R5R9be2">
+
+<h1 data-page-node-id="ZdvYF8WkBfqaoPDWwwht0H">finish_reason 取证链路验证 × 三项拍板落地确认</h1>
+<div class="sub" data-page-node-id="pbBOLw9W6D73e1adGbcGJq">
+生成时间：2026-09-11 08:30 GMT+8 · 目标环境：生产 <code data-page-node-id="ltpsHl2oAAwDDnFL1ch0wU">10.10.10.67</code>（Docker Swarm）<br data-page-node-id="A98EAq8GsO9AcG4xQpI9bD">
+验证方式：<b data-page-node-id="hZEdpwkSsijHjLlzW826sD">生产实测</b>（SSH → Phoenix PostgreSQL / Langfuse ClickHouse / 容器内源码直查）+
+<b data-page-node-id="hSJ7KBE02UCIy1GwbMbrOv">生产同款镜像 spike</b>（langchain 1.3.13 / langchain-core 1.4.9 / langgraph 1.2.9 / openinference-instrumentation-langchain 0.1.67）。<br data-page-node-id="ZfYyRqkIefaBVc6NgF9Hjs">
+<b data-page-node-id="AZ6z0iKOWShTZ81I6rKVTi">未修改任何既有生产文件</b>；守卫中间件为<b data-page-node-id="cB090Z9gy9J1hB817WXnMq">新增文件</b>（<code data-page-node-id="BKLIVttQrCdpkSt9wHLQ9I">src/core/terminal_response.py</code>），
+尚未接入 <code data-page-node-id="CLrrNVik5IXjfIug0FDhyL">agent.py</code>、尚未提交。
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="LnxFtVuH5xMrX3WIXd5Ni8">零、先给结论（三项拍板 + 一个认知纠正）</h2>
+
+<div class="verdict" data-page-node-id="8hxs4QfniL1Ink6DhhOfYm">
+<b data-page-node-id="Wtr3447tTDBeEvOMVx5xcF">① finish_reason 现在满足条件吗？——满足「修复所需」，但不满足「复盘已有故障所需」。</b><br data-page-node-id="4WXb7DUhOevXcakJzDQKWu">
+这里有个关键认知纠正：<b data-page-node-id="usV9NBehch6tnrBz8FLQIb">D 项根本不需要依赖 trace 后端。</b>
+<code data-page-node-id="AfoGjk0BaeSThMkhFtx004">finish_reason</code> 本来就在<b data-page-node-id="fs6HDWQUZ4rZc9VKMycfIn">运行时内存</b>里（聚合后的
+<code data-page-node-id="Eh1ddgI1oArf86py5A26VI">AIMessage.response_metadata["finish_reason"]</code>），我们在
+<code data-page-node-id="msVKaM30bOL69sXmG43ueG">loop_detection.py:357</code> 已经在读它了。trace 只是<b data-page-node-id="35vNKQ6Uub2cxuHtyvGA2b">事后复盘</b>用的副本，不是修复的前置条件。
+<br data-page-node-id="eeO4LtGCZEmC9dnLPrJNh0"><br data-page-node-id="EmUlTU5piM3mwaRXKojHy2">
+<b data-page-node-id="1zhhWJEK03Cpys5a3VA3W3">② 重试 1 次</b> —— 已确认采纳。<br data-page-node-id="HuGGMcOPNnCyhROXqKcloT">
+<b data-page-node-id="nyp4YYH5GgBh5ElhRqr3Wd">③ 隐藏重试（不用户可见）</b> —— 已确认采纳，走 deer-flow 同款
+<code data-page-node-id="16v9g4WWdhQWpvqgLHV061">HumanMessage + hide_from_ui</code> 方案。
+</div>
+
+<div class="danger" data-page-node-id="wPprRgwzAXnasYjeOBSyCw">
+<b data-page-node-id="uFBNXsHNxudizPLzCCI9LP">但必须同时告诉你两件不开心的事：</b>
+<ol data-page-node-id="XMyNbFkpWgBzhZ47TkS09n">
+<li data-page-node-id="LoeTAkWMwEYTApC7xteRhn"><b data-page-node-id="x3DpytbbjPZDBnHEw3jiRg">f3fd075 的 tracing 修复还没有部署到生产。</b>
+    容器 <code data-page-node-id="sM2UHD9MQOdUKFoLekGors">geesun_geesun-agent.1.dxz23vw0ag97y3cjgaaif2z3y</code> 启动于
+    <b data-page-node-id="a7ZU1eWowdrSmNiTBincqn">2026-09-10 15:29 CST</b>，而 <code data-page-node-id="hSJdYtfdAmt6tsECe4y6VW">f3fd075</code> 提交于 <b data-page-node-id="opw478Iy4aGxx5QCFPU9Oa">20:16 CST</b> —— 晚了近 5 小时
+    （镜像 <code data-page-node-id="RvQRblWZHv7u5pO2oXySQ6">geesun-agent:1.0.6</code> 构建于 <b data-page-node-id="m0jMHtqEXSaB5rBgnQ9jrT">14:03 CST</b>，同样早于该提交）。
+    <br data-page-node-id="TfRSbn8DWZtgnTvCgPtp4X"><b data-page-node-id="VaRFVTQNbJRSwOL5s0dkQL">最直接的一行证据</b>：实测运行中容器内的 <code data-page-node-id="IFf76lcwQ6Csaf9trTaP0B">/app/src/core/tracing.py:201</code>
+    仍写着 ——
+    <pre data-page-node-id="kQcDOKOEi69YCFI0PosPmo">exporter=<span class="rc" data-page-node-id="sjcxKPwikmJHdrgKgIQAwt">DISABLED(dev 2026-09-09, Phoenix/Langfuse/metrics 已注释)</span></pre>
+    这是 <code data-page-node-id="9YzbtwBELprliGPUt3t2sh">ea303fe</code> 留下的状态，说明 <code data-page-node-id="Gp4kvK5e0upmxnBZdvlY7z">f3fd075</code> 的「断源+过滤后恢复三路 exporter」
+    <b data-page-node-id="J8EJ2IAsC0cVVoJdQa66ge">确实只在 git 里，没进生产镜像</b>。修复已推到 <code data-page-node-id="B5pIviBEZUHjQ5sj4Qji9g">origin/master</code>，但镜像未重建。</li>
+<li data-page-node-id="H4VWKJXV9X5zgLCagUiMyZ"><b data-page-node-id="2fTGOJYijjLrteRAVW7MEB">本次故障（09-10 17:35 CST）的 finish_reason 永久无法回溯。</b>
+    Phoenix 最新的 LLM span 停在 <b data-page-node-id="Qu1JYGDpfAOyYnYHEudBVI">2026-09-09 08:59 UTC</b>（= 09-09 16:59 CST），
+    而故障发生在 <b data-page-node-id="swMDhePTHhPphvpZkBeKnU">09-10 09:35 UTC</b>（= 17:35 CST）—— <b data-page-node-id="05hgEiHuCjQquv7YtgR4AU">那个窗口一条 LLM span 都没有</b>。
+    这不是过滤策略的问题，是当时 exporter 已被 <code data-page-node-id="EgdIoiUw67pDBkj4sAVLIR">ea303fe</code> 关停。</li>
+<li data-page-node-id="7LoEtPez5WdO0AaV0OhE8a"><b data-page-node-id="3n9vB1dEV1SeOtzBkir2N8">但这不影响修复上线。</b>同一时刻实测运行中容器的
+    <code data-page-node-id="3qNqGOPMIEFnEnAfhcuStx">/app/src/core/loop_detection.py:357-358</code> ——
+    <pre data-page-node-id="TcYHEs96jaJZJLR0ZHCm2S">if response_metadata.get(<span class="gc" data-page-node-id="C6LQ1aiBIwmloZQGyGTGIZ">"finish_reason"</span>) == "tool_calls":
+    response_metadata[<span class="gc" data-page-node-id="r55KdNLvY01sk43jJErU5B">"finish_reason"</span>] = "stop"</pre>
+    证明 <code data-page-node-id="nvAYWBbK8YzSdoxtRQhOnO">finish_reason</code> <b data-page-node-id="hhKPvQmYZbUJd4yBkYJwfR">此刻就在生产内存里被正常读取</b>，
+    与 trace 后端是否开启<b data-page-node-id="gItEXV21dKiD7DMAKJrc3u">完全无关</b>。这也是「D 项不需要 trace 后端」的现场铁证。</li>
+</ol>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="BLBi8ZCIUZ8njqyl6PiUW3">一、生产实测：观测后端现状</h2>
+
+<h3 data-page-node-id="tYsTAsAu768EcvYBy7eMzI">1.1 Phoenix（PostgreSQL）——span 分布</h3>
+<div class="card" data-page-node-id="e85Ca7s6uzdSQOwsLIesGb">
+数据源：<code data-page-node-id="GxYtLtRsJEsSNGxcef6KnK">geesun_phoenix-db.1.jb04xdgqyuahwpn8quk49b7ze</code>，库 <code data-page-node-id="HiAwKSJNrg5MUFVa6GiHBN">phoenix</code>，<code data-page-node-id="B0F5N8OR4zAFBoKDoz6kR6">spans</code> 表。
+<pre data-page-node-id="aOuzsCiqirXCM92lgk59cg">span_kind 分布（全表）：
+  UNKNOWN   106,434   <span class="rc" data-page-node-id="GsewwG0CSxT8ib39CImufV">← HTTP/ASGI span，正是 ea303fe 要挡的东西</span>
+  CHAIN       1,119
+  LLM           261
+  TOOL          257
+  AGENT         138
+
+spans 最新时间戳 = <span class="rc" data-page-node-id="6yjNGk35icxUNz0UAMl1G0">2026-09-10 07:08:14 UTC</span>（= 15:08 CST）</pre>
+<div class="warn" data-page-node-id="RLBnDoRo57y3fyKn89AkIR">
+容器 15:29 CST 重启后再无新 span 写入。结合容器内 <code data-page-node-id="c0BM4YEbJn2taL5mLVTSaC">grep</code> 结果（过滤类不存在），
+可确认<b data-page-node-id="1pYeqEdifIm1liZAUMo9IG">当前生产跑的是 ea303fe 的「全关」版本</b>——埋点还在造 span，但没有 exporter 接收。
+</div>
+</div>
+
+<h3 data-page-node-id="zAradbzD3g0bwly3GouT3P">1.2 Langfuse（ClickHouse）——验证 ea303fe 的污染结论</h3>
+<div class="card" data-page-node-id="9BEGWq8iE29TRgaC6M7ZCM">
+数据源：<code data-page-node-id="COToypNumdOCz2w0q4BUk6">geesun_clickhouse.1.vvrguyc24f9f2upia2vo3wqhx</code>，<code data-page-node-id="OkL9iRr4OTl1lAvMmZcOAo">observations</code> 表（107,103 条）。
+<pre data-page-node-id="JQx3HzttkUYZc25tBfs9dB">observation 名称 Top 6：
+  GET /docs http send          66,003   <span class="rc" data-page-node-id="PIqumpfqvAXTOTOXDdCY52">← 健康检查！</span>
+  GET /docs                    33,001   <span class="rc" data-page-node-id="z1EDLoHoUthaVKgBcMYUvj">← 健康检查！</span>
+  POST /api/v1/chat http send   5,607
+  model                           212
+  ChatOpenAI                      211
+  <span class="gc" data-page-node-id="ZEpXEftMSSLGN9Y5YV2twa">HumanInTheLoopMiddleware.after_model   210</span>
+  <span class="gc" data-page-node-id="AphmKpZOeisj8CjRISnHsa">TodoListMiddleware.after_model          210</span>
+  tools                           208</pre>
+<b data-page-node-id="5t4pcJYUBC77QBFofNEXrY">era303fe / f3fd075 的归因被生产数据完全证实</b>：<code data-page-node-id="RBSPAAzvF2Ws4qZxnf2Yqf">GET /docs</code> 两类合计
+<b data-page-node-id="QYlKQTQ0n8krXBIMy7XKUb">99,004 条 = 92.4%</b>，与 f3fd075 commit message 里写的 91.8% 吻合。
+<br data-page-node-id="LJkKJxOHMl49gL9HtLbLpM"><br data-page-node-id="74PVsLilp9GqgNh0c1kFgA">
+顺带一个对第八节有用的旁证：<code data-page-node-id="VF2TVfLaPxNAFQePdUvkAc">HumanInTheLoopMiddleware.after_model</code> 与
+<code data-page-node-id="4HuRTdfKL0mrnvjp0Ip4M2">TodoListMiddleware.after_model</code> 各 210 条 —— 说明这两个 <code data-page-node-id="eWTAyCXI4nQUSiec8sjxBt">after_model</code>
+<b data-page-node-id="0M3BiApPRpsFMpm6q96MAN">确实在每轮跑</b>（印证 part 2 的「逆序执行、它们都参与」推演）。
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="Nz1SCkojU0qXNkHvxslqcM">二、核心问题：finish_reason 到底能不能拿到</h2>
+
+<h3 data-page-node-id="Mmhzkx8yNc7X0qc8BkbW4C">2.1 能拿到——Phoenix 侧</h3>
+<div class="card" data-page-node-id="mDjFUnFifnuhoAeOz7iM8R">
+<pre data-page-node-id="ZjHNM2pNfqRFnp9sKZtHmY">LLM span 总数                       = 261
+含 finish_reason 的 LLM span        = <span class="gc" data-page-node-id="BpjSNcAukMiNkyKaHrAHwH">77</span>   (29.5%)
+  其中 finish_reason = tool_calls   = 63
+  其中 finish_reason = stop         = 14
+  其中 finish_reason = <span class="hl-red" data-page-node-id="8B9uBPax6KTu3XEkESwKjC">length</span>        = <span class="rc" data-page-node-id="XPYSxfUeyCsdcGZ1zuCH7X">0</span>
+含 reasoning_content 的 LLM span    = <span class="rc" data-page-node-id="KxDc6wIQB9gBKqA1NuIzr6">0</span></pre>
+<b data-page-node-id="ERqGWlTzh79uAB9NepdvuD">落点确认</b>（直接从 attributes 文本里抠出来的片段）：
+<pre data-page-node-id="kGKwccRidHnxC0E3Nq0ebX">\", \"response_metadata\": {\"finish_reason\": \"tool_calls\", \"model_name\": \"Qwen3.6-35B-A3B\", \"model_provider\": ...
+ \"generation_info\":   {\"finish_reason\": \"tool_calls\", \"model_name\": \"Qwen3.6-35B-A3B\"}, \"type\": \"ChatGen...</pre>
+即 <code data-page-node-id="Rdl2FVz08MmNe64r95AGkY">finish_reason</code> 同时出现在 <b data-page-node-id="VHRnZF1Atnr5sBgNri8DyO">两个位置</b>：<code data-page-node-id="ZzX5yWQ1pFPsIoHWpEpp0t">response_metadata</code> 与
+<code data-page-node-id="qDOELBjh1GGTh6wzH19H7N">generation_info</code>。这与本地 spike 的结论一致。
+</div>
+
+<h3 data-page-node-id="ewsWfW8n6eCmf5booGKvbV">2.2 能拿到——Langfuse 侧</h3>
+<div class="card" data-page-node-id="2OkdEg9V7MQOZsvvrxgwQO">
+<pre data-page-node-id="SbrCuESPoM06svrSsTJMqZ">GENERATION（即 LLM 调用）总数            = 211
+output 含 finish_reason                  = <span class="gc" data-page-node-id="rDxLDptk3rjySB2OWvf9AV">60</span>   (28.4%)
+output 为空                              = 0
+output 无 "generations" 结构             = 151</pre>
+<b data-page-node-id="Ou0bxOTIu9Tc0oBJceTidt">有 finish_reason 的样本（真实生产数据）</b>：
+<pre data-page-node-id="t0NPpoA1E79FR6dkQH1EMp">... "id": ["langchain","schema","messages","AIMessage"], "kwargs": {
+      "content": "\n\n三个文件都是二进制/加密文件，需要上传到沙箱后解析。先全部上传。\n\n",
+      "response_metadata": {<span class="gc" data-page-node-id="b7jLXCtqrkBe9bChBOm0rB">"finish_reason": "tool_calls"</span>, "model_name": "Qwen3.6-35B-A3B",
+                            "model_provider": "openai"},
+      "type": "ai", "id": "lc_run--01a08564-..."
+      "tool_calls": [{"name": "upload_to_sandbox", ...</pre>
+<b data-page-node-id="1ltvhRvi0BlfYNoPItYxeG">这条样本同时给出了两个关键事实</b>：
+<ul data-page-node-id="jMBIHaBcRNW15GYDka73sS">
+<li data-page-node-id="bECkPmCMKtRyRoD1VpJ033"><code data-page-node-id="kR7sKCJTOqOYfYldR6Skgi">finish_reason</code> 落点是 <code data-page-node-id="5fma3K3hNOvNh8w9j00zYw">AIMessage.response_metadata</code> ——
+    <b data-page-node-id="LQ5qpkuGlTQlsjdMjoP4q0">与本地 spike 推断的完全一致，且这是真实流式调用产生的</b>（不是构造的）。</li>
+<li data-page-node-id="POJMGuRxUw76RBdinP6H7L">Langfuse 的 <code data-page-node-id="7VuoQm79Sg0SNmBaZYXUGP">usage_details</code> 只有 <code data-page-node-id="TE4XkR6kaRfJFjwXgO8Q7f">input/output/total</code> 三个 key，
+    <b data-page-node-id="PaJrrc7t5MPpWn9EsGigb1">没有 reasoning token 维度</b>。想追踪「thinking 吃了多少预算」在 Langfuse 侧做不到。</li>
+</ul>
+</div>
+
+<h3 data-page-node-id="3dNedoXGXqKC1XImnankws">2.3 为什么覆盖率只有 ~29%？</h3>
+<div class="card" data-page-node-id="duim14CPW2mxq4OLxfHjuM">
+对比两种 output 形态：
+<table data-page-node-id="iva3rBqqQW3z2rBt6C7UIy">
+<thead data-page-node-id="OLrTEWcP0fAtMHaqYC4JxH"><tr data-page-node-id="CTksaUmcaa3cJCjobZjNu1"><th data-page-node-id="C95Pl7GV2NH5qWMTSnuvYz">形态</th><th data-page-node-id="VMJfYzzcBc8Gz2iGpZ1d3b">数量</th><th data-page-node-id="uMTfnt0vA4lRBOWxK9SPdT">特征</th><th data-page-node-id="iz9E0INLIWS3bIuPHKTVq3">有 finish_reason</th></tr></thead>
+<tbody data-page-node-id="RHS180w4ZIrkj3cCYaNQwH">
+<tr data-page-node-id="KCZF7HfKVom83e2BnRFELJ">
+<td data-page-node-id="QEV1z8hGQtTqdXHGcvr854">LangChain LLMResult 序列化</td><td data-page-node-id="YjgYQogXFVwluVhwvlb8l3">60</td>
+<td data-page-node-id="mYsFHkaUxtCzCOggHEl11b"><code data-page-node-id="YYl2cQXcKgIxxTAv1rm6k6">{"generations": [[{"text":..., "generation_info": {...}, "message": {"lc":1, ...}}]]}</code></td>
+<td class="ok" data-page-node-id="3QFNUC9y1uuBeJdpf50lVI">有</td>
+</tr>
+<tr data-page-node-id="0kqv2VqG0uFKpIHdwi2Uj3">
+<td data-page-node-id="ANbXdTvEGGl0gWpBPeWt2g">OpenAI 风格消息数组</td><td data-page-node-id="Kr1lmWtkm7LIL14pVrcztg">151</td>
+<td data-page-node-id="KyUbC3EbaYHIASj41u4izf"><code data-page-node-id="5LSKKt3tGhDQa4ChMsmTRi">[{"message": {"role":"assistant","content":...,"tool_calls":[...]}}]</code></td>
+<td class="no" data-page-node-id="TC1XadIxLWBmHjWF9XuKA4">无</td>
+</tr>
+</tbody>
+</table>
+<b data-page-node-id="Ma39z08rPSBhDtSsDlmsDE">这是两条不同的序列化路径</b>：前者经 LangChain 的 <code data-page-node-id="ZxOiSuEwu0iIqXH86dwpz8">to_json()</code> 保留了
+<code data-page-node-id="ZRCGCEW1FFBd1e280R1dwn">response_metadata</code>；后者是精简后的 OpenAI 格式，<code data-page-node-id="fsiSPaArIJdGOIMIAoQ4EC">response_metadata</code> 被剥掉。
+<br data-page-node-id="iarWC0lnkix44D0tqt8aMK"><br data-page-node-id="lWxqGUHiu9a7gpaIJpZhzY">
+<div class="warn" data-page-node-id="MujDR88xf5B9mL3przLVeF">
+<b data-page-node-id="YsRFuUxxH5fe4CNKMTrIUt">实践含义</b>：不能假设 trace 里一定有 <code data-page-node-id="Q6yjdZTTjzXk4DEqAYbjMe">finish_reason</code>。
+<b data-page-node-id="hj7yQh8opdwThRcFhgUNvS">把它当「辅助取证」而不是「判定依据」</b>——真正的判定必须在运行时从 AIMessage 直接读。
+</div>
+</div>
+
+<h3 data-page-node-id="A7ftdcP3AwwWtXrhMiLcWS">2.4 本地 spike：确认运行时链路可读</h3>
+<div class="card" data-page-node-id="Ofk7PdDes71CxYmoTxHmuo">
+脚本：<code data-page-node-id="tlE0SAJpruDj3oJYVExMN1">.workbuddy/spikes/finish_reason_span_spike.py</code>；
+另有一段对照实验复刻 langchain_core 的合并逻辑。
+<pre data-page-node-id="1qgicd0Wg4mxvYYDeI9lhV"><span class="cc" data-page-node-id="wAGCpFrFt6FK12rhtXv5La"># 复刻 langchain_core/language_models/chat_models.py:2109</span>
+chunk.message.response_metadata = _gen_info_and_msg_metadata(chunk)
+
+逐 chunk：
+  reasoning#1        resp_meta={'model_provider': 'openai'}
+  reasoning#2        resp_meta={'model_provider': 'openai'}
+  收尾 finish=length  resp_meta={<span class="gc" data-page-node-id="HRPT72fu366OqVQPjGXddb">'finish_reason': 'length'</span>, 'model_name':'qwen3', 'model_provider':'openai'}
+
+聚合后（模拟真实流式累积）：
+  content        = ''            <span class="rc" data-page-node-id="0XgJMtW6k3ZmL0wqznDW9G">← 纯 reasoning，正文为空</span>
+  response_meta  = {'model_provider':'openai', <span class="gc" data-page-node-id="mBwEG6cZznBFcFKBsNu8Ry">'finish_reason': 'length'</span>, 'model_name':'qwen3'}
+  >>>>>> finish_reason = 'length'  <span class="gc" data-page-node-id="n7vA8T3PJdJ20fqAkD1Ov6">← 可取证 ✓</span></pre>
+<b data-page-node-id="L5CmR5gdUfGobpYzq42Zm7">关键源码位置</b>：
+<ul data-page-node-id="4qM3h4SRtKcVt0aR5RziNn">
+<li data-page-node-id="8ftVbTBiBgtiKURIc720z5"><code data-page-node-id="vGLSq3Xux60forKoF2ur22">langchain_openai/chat_models/base.py:1362</code> —— 流式下
+    <code data-page-node-id="xLCo6ZGXZVy0aQGxVX1MDv">if finish_reason := choice.get("finish_reason"): generation_info["finish_reason"] = finish_reason</code>（先落在 generation_info）</li>
+<li data-page-node-id="AMkcDOdu48hRHBooVo0CzE"><code data-page-node-id="aU5ZtxDqv90dg8idHbE977">langchain_core/language_models/chat_models.py:2109</code>（异步）/ <code data-page-node-id="5AotrSK87cDir0SqRPygCe">:781</code>（同步）——
+    <code data-page-node-id="8wKsebqeJeTo2L73FBh2Bv">chunk.message.response_metadata = _gen_info_and_msg_metadata(chunk)</code>，把 generation_info 合并进 message</li>
+<li data-page-node-id="LAzZBMml9DKYSFQkOoT1lv"><code data-page-node-id="JwKEhlc6bGnPjCGhcToDbn">chat_models.py:2677</code> <code data-page-node-id="2WVDnMB9OcvwdZFyneLQU2">_gen_info_and_msg_metadata()</code> —— <code data-page-node-id="4QC0HlxO8fK2cgABvEI3Ti">{**generation_info, **message.response_metadata}</code></li>
+</ul>
+<div class="danger" data-page-node-id="0fXc0MTKDLO78d0WpJRo6m">
+<b data-page-node-id="xk8CHpx9Rrwaq6LwGgQtOw">这里有个坑必须记住</b>：如果只看 <code data-page-node-id="SAHGCM50zP9dcY3zmLC9xV">ChatGenerationChunk.generation_info</code>，聚合后<b data-page-node-id="7nKlfjzojDy1NuY6ttQxEX">会丢</b>
+（实测 <code data-page-node-id="Jqj8XhhGlBglKdf3ExGbBq">acc.generation_info</code> 有值但 <code data-page-node-id="kaySj5ulYci990XUhVVWxD">acc.message.response_metadata</code> 是空的 ——
+因为我漏了 2109 那步）。<b data-page-node-id="pmrMGX2bEGT1XvOF6u5aVM">正确的读取位置是 message 上的 <code data-page-node-id="PqephWAm9iayMF52fy9PqR">response_metadata</code></b>，
+而且必须模拟 langchain_core 的合并步骤。直接建 <code data-page-node-id="sHbxWVYVLKX9EJgfiwUv74">ChatGenerationChunk</code> 手工拼是拿不到的。
+</div>
+
+<h3>二·补 决定性验证：关掉全部 tracing，用真实 vLLM 复现故障形态</h3>
+<div class="info">
+前面是「读源码推出来的结论」。这一节是<b>实测反证</b> —— 把 tracing 彻底关掉，
+用<b>项目真实的 <code>ReasoningChatOpenAI</code></b> 打<b>真实 vLLM</b>
+（<code>172.16.66.13:8003</code>），并把 <code>max_tokens</code> 压到 32
+以<b>真实触发 <code>finish_reason=length</code></b>。
+</div>
+
+<p><b>先证明「真的没有 trace」</b>：</p>
+<pre><span class="gc">tracer_provider = ProxyTracerProvider</span>        <span class="cc">← 默认空实现，未注册任何 exporter</span>
+LangChainInstrumentor 已启用? <span class="gc">False</span>      <span class="cc">← OpenInference 埋点（trace 的唯一入口）是关的</span></pre>
+
+<p><b>再看结果（12 PASS / 0 FAIL）</b>：</p>
+<table>
+<thead><tr><th>段</th><th>操作</th><th>实测结果</th></tr></thead>
+<tbody>
+<tr><td>A</td><td>流式 <code>astream</code>，<code>max_tokens=32</code></td>
+  <td><code>finish_reason='length'</code>、content 长度 <b>0</b>、reasoning 长度 <b>134</b><br>
+  <span class="hl-grn">这正是生产故障的真实形态，被完整复现</span></td></tr>
+<tr><td>A</td><td><code>response_metadata</code> 的键</td>
+  <td><code>['finish_reason', 'model_name', 'model_provider']</code> ——
+  <b>全是 provider 原生字段，没有任何 trace/span 键</b></td></tr>
+<tr><td>B</td><td>非流式 <code>ainvoke</code>，同参数</td>
+  <td><code>finish_reason='length'</code> —— 两条路径都能读到</td></tr>
+<tr><td>C</td><td>把 A 的真实消息喂给 <code>classify_empty_response()</code></td>
+  <td>判定 = <code>thinking_truncated</code> <span class="hl-grn">命中</span></td></tr>
+<tr><td>D</td><td>正常调用（不限 token）</td>
+  <td><code>finish_reason='stop'</code>、content 非空 → 判定 <code>ok</code>（<b>不误拦</b>）</td></tr>
+</tbody>
+</table>
+
+<div class="verdict">
+<b>数据流真相（与 trace 无关）</b>：
+<pre>vLLM SSE chunk
+   └─ <span class="cc">{"choices":[{"delta":{...},"finish_reason":"length"}]}</span>
+        ↓  langchain_openai/chat_models/base.py:1362
+      generation_info["finish_reason"]
+        ↓  langchain_core/…/chat_models.py:2109 (async) / :781 (sync)
+      <span class="gc">_gen_info_and_msg_metadata()</span>  <span class="cc">← chat_models.py:2677</span>
+        ↓  {**generation_info, **message.response_metadata}
+      <span class="gc">AIMessage.response_metadata["finish_reason"]</span>   ← 运行时内存，直接可读</pre>
+<b>全程是 HTTP 响应 → langchain 解析 → 内存对象，Phoenix / Langfuse / OpenInference
+任何一个都不在这条链路上。</b>trace 只是把同一份数据<b>额外复制一份</b>给观测后端，
+关掉 trace 只会让「事后复盘」变难，不影响「运行时判定」。
+</div>
+
+<div class="warn">
+<b>补充确认：我们自己的 <code>ReasoningChatOpenAI</code> 没有丢掉这个字段。</b>
+它重写了 <code>_convert_chunk_to_generation_chunk</code>（流式）与
+<code>_create_chat_result</code>（非流式）两个方法，但都<b>先调 <code>super()</code> 拿完整结果</b>，
+再<b>只往 <code>additional_kwargs</code> 里追加</b> <code>reasoning_content</code> ——
+<b>从不重建消息、不覆盖 <code>response_metadata</code></b>，所以 <code>finish_reason</code> 原样保留。
+上面的实测（真实 key + 真实端点）也证明了这一点。
+</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="hM0j7vWLmdzq8YADCcBh8o">三、时间线：为什么本次故障的 finish_reason 永久拿不到</h2>
+<div class="card" data-page-node-id="0KlrxR1SaKWYdBG6b7KFBm">
+<table data-page-node-id="tluBZO5X0FcAZDmuUXjLGK">
+<thead data-page-node-id="B6G8MVMozsWSIXB33vTME3"><tr data-page-node-id="ZJ4YJPYufiPRBWhVDuYcMI"><th data-page-node-id="OUi66yfK6okaolMSF8SgMn">时间（CST）</th><th data-page-node-id="XE1PgbvmE92D1V5UrQh4BZ">事件</th><th data-page-node-id="JunFmomqwcrnFJcYcvFxwH">commit</th></tr></thead>
+<tbody data-page-node-id="WmDqEIzQONc9SuDwROFFUw">
+<tr data-page-node-id="8M0aNNrLPU7pzuwKbyOJI2"><td data-page-node-id="Lwr3rzYGdaxz4hmlC5w7No">2026-09-09</td><td data-page-node-id="OHpsyDkFHAf4JFlF5hg83D"><code data-page-node-id="HZsUSJIgcMZzxxPamSMHDI">ea303fe</code> 注释三路 exporter（归因写错，实际是 healthcheck 污染）</td><td data-page-node-id="f8JXC7OyY1gBkBmioNRdHF"><code data-page-node-id="akGsUlkcGjUeY6MTIOBglL">ea303fe</code></td></tr>
+<tr data-page-node-id="jebo2nmLgFZhKSsuXW6BV7"><td data-page-node-id="wfIJRwn6RDFFs29foXuMIz">09-09 16:59</td><td data-page-node-id="WyN6SjyHUa7t9qBQ54ZgNA"><b data-page-node-id="sWBIHjEHd2vO84VcSSYwCH">Phoenix 最后一条 LLM span</b>（UTC 08:59）</td><td data-page-node-id="ZvTvCdr05oH6TQ5J98eQkH">—</td></tr>
+<tr data-page-node-id="z8gBzAA2LBFwMVJFFYA5CB"><td data-page-node-id="btP8RLLccAOPSN5PAL7D0N">09-10 15:08</td><td data-page-node-id="QdgBeDRdTfYNqMWPkSSrfR">Phoenix 最后一个 span（HTTP 类，UTC 07:08）</td><td data-page-node-id="Y2UsknLRb7LDUxJ5AzZBxx">—</td></tr>
+<tr data-page-node-id="0emmU188qVatHWofSnILs2"><td data-page-node-id="vkFB0CwuqPBJ48Py65kJ4B">09-10 15:29</td><td data-page-node-id="SNiqSPEATXRxH1baAID8cl"><b data-page-node-id="GfY5F4rwVuQmtPxGbrUYVe">容器重启</b>（<code data-page-node-id="xmFoDhNa1qFO8BHtZwuAmr">geesun-agent:1.0.6</code>）—— 不含 tracing 修复</td><td data-page-node-id="9ABFqjyYAPtpRpszbTcUtp">—</td></tr>
+<tr data-page-node-id="a2Z5u7r4DEl2RtacCzlNFt"><td class="hl-red" data-page-node-id="zJFLZk3UmyBssHWzuT3Ygp">09-10 17:35</td><td class="hl-red" data-page-node-id="cbo1gzd80R3eUfRIdbdj4l"><b data-page-node-id="jYm3U2RbGl5JGzCpmeUnu7">【本次故障】336s 后返回纯空响应</b> —— 此时无任何 LLM span 落库</td><td data-page-node-id="qSDtrcvEDHGo3bcCpy5XeK">—</td></tr>
+<tr data-page-node-id="bX6IRmQAdD2MsN2EBkx9TQ"><td data-page-node-id="8B28tcBdIuQehco1joWmgc">09-10 17:40</td><td data-page-node-id="xi7QOSz4LGLPsavtRMP9zC">M3 完成门拦截（<code data-page-node-id="ssUm31mGg0VcTkS1I2s10p">retries=0</code>）</td><td data-page-node-id="LJ7HNvUrEw8NKJFkFutdxP">—</td></tr>
+<tr data-page-node-id="88BEATLhf8JH18p9CiOM7c"><td data-page-node-id="40sdBhUQsusqyKypZYXZUx">09-10 20:16</td><td data-page-node-id="SldBUxYtGfbKGsMYqGU3U4">tracing 修复提交（断源 + 过滤 + 恢复）</td><td data-page-node-id="h7Hif8Nbo3S9V99eyA4TdU"><code data-page-node-id="v4z3PKkSBpPYrdAPxQAiGt">f3fd075</code></td></tr>
+<tr data-page-node-id="DOzqfAp2ixCLaWBFOhC1Ne"><td data-page-node-id="HHxWZJM9uuRxYpt5cPTLlh">09-10 20:17</td><td data-page-node-id="PDd3h5Lvp4yVrn0TyGCBa9">复盘文档 + AGENTS.md 经验</td><td data-page-node-id="uIo5pgsvxSS4ROupEyPVTC"><code data-page-node-id="IwQIFYmxbcXdCYHfGDtC1Y">01556d3</code></td></tr>
+</tbody>
+</table>
+<div class="danger" data-page-node-id="xwp6rgdDj3OZRSuUWoZell">
+<b data-page-node-id="nmtPQ7fHZjJYVy1ftUR7PE">结论</b>：故障发生在 17:35，exporter 处于关闭状态 → <b data-page-node-id="w1786osATDiRogZz0rQzCo">那个窗口零 LLM span</b>。
+即便现在把 <code data-page-node-id="yeVO4TRwWEFiiQFO3QKLYk">f3fd075</code> 部署上去，也只能为<b data-page-node-id="rRHNZ8y26Tmo2mnsxearOd">未来</b>的故障取证，
+<b data-page-node-id="041xXz5F0WDPJVSBKsmHrX">无法追溯这一次</b>。
+<br data-page-node-id="iApT2OoyLRCIpP6PgJP3xh"><br data-page-node-id="HlcwCArGL1F3FSggCeVlU2">
+<b data-page-node-id="U9hzjGm9A6nVQLk2MWG5DN">所以「假设 A」在本机环境下永远无法被证实或证伪。</b>
+但这不影响修复——因为 D 项的设计本来就应该<b data-page-node-id="r8VhKOlIcGXSr2xhLCBbOH">不依赖 trace</b>。
+</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="nV9jn3IKqP2H3PZbnmvN9E">四、认知纠正：D 项不需要 trace 后端</h2>
+
+<div class="verdict" data-page-node-id="4q3g5eC45LAAX9Krrq6VC7">
+<b data-page-node-id="o57hSR7l1DuAnrABpN87TP">之前把 D（finish_reason 识别）的判断依据挂在「恢复 trace 导出」上是错的。</b>
+<code data-page-node-id="PHT1YsTU8tpqgDntjR6M5S">finish_reason</code> 是<b data-page-node-id="m4jjyIYA4l3g33QvUCth7T">运行时数据</b>，就挂在 Agent 拿到的 AIMessage 上。
+恢复 trace 只能让<b data-page-node-id="DTBJ0sNVnQLHofMswu0IHc">事后</b>从 Phoenix/Langfuse 面板翻看，属于「可观测性加分」，
+不是修复的必要条件。
+</div>
+
+<div class="card" data-page-node-id="X5by85NJeUrDUA1hVaLvGl">
+<h4 data-page-node-id="scdhvjiZVDYMr5gfxpOT17">证据一：我们代码里已经在读它了</h4>
+<pre data-page-node-id="UiUhZGjYbTwxhJ207B2XVZ"><span class="cc" data-page-node-id="p06WN7IdLgOnsSZjQoqfgz">// src/core/loop_detection.py:357-358</span>
+response_metadata = deepcopy(getattr(last_msg, "response_metadata", {}) or {})
+if response_metadata.get("finish_reason") == "tool_calls":
+    response_metadata["finish_reason"] = "stop"</pre>
+既然 <code data-page-node-id="suxNP8F4ziXpMRAFbShLYZ">LoopDetectionMiddleware</code> 能在 <code data-page-node-id="6tPisJYoZzVM9TQamIQ4cf">after_model</code> 里读到它，
+<b data-page-node-id="cS27HjFA2xCQoiEUHERbL4">A（TerminalResponseMiddleware）在同一个 hook 上必然也能读到</b>。零额外成本。
+
+<h4 data-page-node-id="hEUOHKB8w47E7hpXueg7Ku">证据二：deer-flow 也是这么做的</h4>
+<code data-page-node-id="BYtDKLwxHqYH1hwVm9zBVs">ModelLengthFinishReasonMiddleware._detect()</code> 直接吃 <code data-page-node-id="oDih7dMZaUXTpgajH8ltYa">AIMessage</code>，
+走的是 <code data-page-node-id="tZB7GxO1muG1ouWjtVy07T">ModelLengthTerminationDetector</code> 对 message 字段的检查，
+<b data-page-node-id="uExClBRvPSyQ7raayO4cYp">完全不碰 OTel/Phoenix</b>。它的 <code data-page-node-id="C8CykL1Lk8QIsZ47w8cfJK">stop_reason</code> 是写进 <code data-page-node-id="F1uRCaD1p5jpdG5bvfKCC0">runtime.context</code> 的。
+
+<h4 data-page-node-id="qHw8apIvR9MIFzOib14nLh">证据三：生产已验证落点</h4>
+第 2.2 节那条 Langfuse 样本（真实流式调用）
+<code data-page-node-id="47CzyCZ5paoUswhB4MKL3F">"response_metadata": {"finish_reason": "tool_calls", ...}</code> —— 落点确认无误。
+
+<h4 data-page-node-id="AHQbLXTecWD22ubtd3rquh">结论：D 项的定位要改</h4>
+<table data-page-node-id="FN7D6UcyxGkRWU8FLlqJSE">
+<thead data-page-node-id="BqpTY8F4nHgewA2QuviC2d"><tr data-page-node-id="IjD3aVnIOj3XHKiF12qzWd"><th data-page-node-id="ByXGtycWQK2G3nWoBjDtGN">项</th><th data-page-node-id="2lRf24Xd8pgS6hRQcqs1BW">原定位</th><th data-page-node-id="B3q70OVVuE7QHKbNWuHXYv">修正后定位</th></tr></thead>
+<tbody data-page-node-id="lQB0IMi97berJXPRmcUaBe">
+<tr data-page-node-id="xMAZ9XO9af1v4uU413tLTE">
+<td data-page-node-id="jekQnr1HZ8lVdJRGfrYxbU"><b data-page-node-id="OUaXP0bzCsEmR6iAjjzzIm">D</b> finish_reason 识别</td>
+<td data-page-node-id="0ye8SHGQBSZwaLKW55GkQh"><span class="tag t-amb" data-page-node-id="mDaa7GRS5YzWHOvOYqCfim">P1</span> 前提是「恢复 trace 才能拿到」→ 若确认 length 则升 P0</td>
+<td data-page-node-id="Be70NWxW77vQkG3AT30Vr4"><span class="tag t-red" data-page-node-id="l8hetb9birdc1lG5HWPENu">P0</span> <b data-page-node-id="MsoZSyzsvwuh7GBScd1NY5">与 A 合并实现</b>——在 <code data-page-node-id="8DlZQu5b8EY88Fxl41BhyD">after_model</code> 里直接读
+<code data-page-node-id="IfHQJQ4GlkFJRGVXyULlPT">last.response_metadata["finish_reason"]</code>，用于<b data-page-node-id="xrL9zC9Kn8COQkMe4QuHAd">分支判定</b>（见下）</td>
+</tr>
+<tr data-page-node-id="BTKKxyR89UThCjlPB0WROU">
+<td data-page-node-id="YHBO9GDgWAPjNmBYk5XaFg">恢复 trace 导出</td>
+<td data-page-node-id="e1TTdjIU4c0MoGkSBjR8wV">D 的前置条件</td>
+<td data-page-node-id="DWD0taHERR5H3nbDvUcSas"><span class="tag t-blu" data-page-node-id="GxGX9gZ1XJqgPN6E0kRgnF">独立项</span> 仅用于<b data-page-node-id="qQGuCy3g6vca9ivVri5Nro">事后复盘面板</b>，与修复解耦。
+且 <code data-page-node-id="8v2Ed4JFJiO8HDPGgW6xke">f3fd075</code> 已修复，只需<b data-page-node-id="tNeXqeUku0PYDvfy7Dh3Je">重新构建镜像并部署</b></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3 data-page-node-id="szI2CaQHLUthF9a3LjmPHL">4.1 三分支判定（我们独有的 reasoning 感知）</h3>
+<div class="card" data-page-node-id="okrqRt8pdIXwr0jOwUjc2R">
+现在可以用 <code data-page-node-id="QSwTjSuPNk2L51UCmREeQz">finish_reason</code> + <code data-page-node-id="FC47l1DcBM7VL7yrYfPCni">reasoning_content</code> 做精准分流，
+<b data-page-node-id="pN7n6iffS38B9EwTAaIAor">比 deer-flow 和 deepseek-harness 都细</b>：
+
+<table data-page-node-id="U0nPKmp4ZUgJkpxbVhAIfB">
+<thead data-page-node-id="G5aYmqpl05pFF2iYva2P0D"><tr data-page-node-id="2LuSb2aSD62SoK86bDRD9S"><th data-page-node-id="8j0Qe1CqHZ70D7dHJOPwWz">分支</th><th data-page-node-id="HknGC0yuBHMdiDSvZWHMta">判据</th><th data-page-node-id="MzVqAVzo3ECjHWP45SXpIa">语义</th><th data-page-node-id="yB06VuSMQ5LljCGbCzmJI9">处置</th></tr></thead>
+<tbody data-page-node-id="ItGChZnUEtZCuJVezYGioz">
+<tr data-page-node-id="W09L0kW5PWxY12Ddp54nKy">
+<td data-page-node-id="YqVseCmd0OYsBGJfExxt0H"><b data-page-node-id="aw6EqVc9aS71bJH6Rk3Oc8">① 正常</b></td>
+<td data-page-node-id="zIQd7euNNggAxD9t4Sv86n"><code data-page-node-id="YMn0uGSDxiHOcabHQzassk">content</code> 非空</td>
+<td data-page-node-id="RHWsupHhmbDlC7zalELOmE">正常收尾</td>
+<td data-page-node-id="6W5LF6mRgAFpekVaqy0ylL">放行</td>
+</tr>
+<tr data-page-node-id="n1ifzcqiNQM87hxcAUMyYd">
+<td data-page-node-id="dg0XJD24IEAwlye04PNHeC"><b data-page-node-id="fXtc5gZGXfUpsUL2xACkBS">② thinking 截断</b></td>
+<td data-page-node-id="InHsqZczBDmp8EgI58tlBY"><code data-page-node-id="kzkJmxjCEZOFIwWdBYUVXc">content</code> 空 + <code data-page-node-id="bphJIoRVgNV5dNPhuxrReb">reasoning_content</code> 非空 +
+<code data-page-node-id="phJYtKZ55PgUSVJSco2rba">finish_reason == "length"</code></td>
+<td class="hl-red" data-page-node-id="NVyDrq8RCDhsdBtuh8xUwZ"><b data-page-node-id="IUjSenJBisNYW7PzC75ZIx">本次故障形态</b>：思考吃光 65536 输出预算被硬截断</td>
+<td data-page-node-id="aF7mFxTtTVjlNYHDjrXthX">删空消息 + <code data-page-node-id="g3iWqADMs13Ltoa8hAPI6b">jump_to="model"</code> 重试 1 次；
+重试提示要<b data-page-node-id="Q8JYZ6CaCfi8tLJgBAAHvv">明确告知「上轮思考超长被截断，请直接给结论」</b></td>
+</tr>
+<tr data-page-node-id="RUE64hPZlJxJtliluBLHoR">
+<td data-page-node-id="Budn5iKA4XLvjuABOZxKmG"><b data-page-node-id="yspR3Vo9Uf9JLgPebrfJXq">③ 思考完没说</b></td>
+<td data-page-node-id="jdoSbmXiD0FJqSZMKxDBDD"><code data-page-node-id="7B4Rr0BlcKo7SaF3JxnSWV">content</code> 空 + <code data-page-node-id="bgKrr3fCe7ab9F5wG2HMpy">reasoning_content</code> 非空 +
+<code data-page-node-id="8HzGTnUS21XrVsi81h31ve">finish_reason == "stop"</code></td>
+<td data-page-node-id="QtCAHxMy3HGOlngVT0EyIH">想完了但没输出正文（模型行为问题）</td>
+<td data-page-node-id="sG2lDpOksTHfYgcREJRaKF">同 ② 的重试，但提示语不同（「你已有结论，请输出正文」）</td>
+</tr>
+<tr data-page-node-id="AraSCG9BIdGZhndBt70Pn1">
+<td data-page-node-id="l0Yzvb9ja5P8N7mCCjviJA"><b data-page-node-id="96LpaOBsOtvfbDU9oFHrm1">④ 彻底空</b></td>
+<td data-page-node-id="aAaRaEtdWjbZGDhGMJZULN"><code data-page-node-id="ngDIJWLF8oz1JtxpQ7JZO0">content</code> 空 + <code data-page-node-id="9dmuOMkOVX4aM4fEuHAlTK">reasoning_content</code> 空</td>
+<td data-page-node-id="Id8y5AyBqjHGGq47hIKa4A">完全没吐东西</td>
+<td data-page-node-id="AVkOaG7C3CfZcqIfh53cJ1">重试 1 次；仍空则写降级文案</td>
+</tr>
+</tbody>
+</table>
+<div class="info" data-page-node-id="eMxPE0kashNL1DCdxhDbug">
+<b data-page-node-id="scNbzIVT3SGS8xOxy4MjPr">为什么我们能做四分支、两个参考仓只能做两分支</b>：
+<ul data-page-node-id="iSB0hD5dIgmfXoJGAzOkZt">
+<li data-page-node-id="z8x5AoFyjyAUdchEq7djFb">deer-flow 的 <code data-page-node-id="fxhEh2VYLZSCoR58qE0mJg">ModelLengthFinishReasonMiddleware</code>
+    <code data-page-node-id="NI51O9l6lweLMpvVqjrdI6">if not _has_visible_content(last): return None</code> → <b data-page-node-id="JhBOvdWWtDmya9kni84ZBq">②③④ 它全部跳过</b>；</li>
+<li data-page-node-id="3l5ZuTh77WpaE0hgdAmcX1">deepseek-harness 判空靠 <code data-page-node-id="hv0ZQA0soKk8gNxvI8sRRH">order.length === 0</code>，而 reasoning block 计入 <code data-page-node-id="2jnXIyyeBdMwGg8LDhzAB6">order</code>
+    → <b data-page-node-id="yTNMuxwZX7viVvWHS0p3Mc">②③ 它判不出来</b>；</li>
+<li data-page-node-id="FOZ3S2T4GdBRm36p2kbuIo">我们因 <code data-page-node-id="PjXXgZBlkohzIJuRyCQFnK">ReasoningChatOpenAI</code>（<code data-page-node-id="45NwCVUAOqODBC6f4KXKdX">model.py:251-282</code>）把 thinking 分离进
+    <code data-page-node-id="fyL5DBBsoSkfQv2Nk03Bln">additional_kwargs["reasoning_content"]</code>，<code data-page-node-id="eAggU7hSOQnnmHIp2gIHxJ">content</code> 与 thinking 天然可分辨
+    → 四分支全可做。</li>
+</ul>
+</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="hipRcmGU7Foi5ZDi8mhgLT">五、三项拍板：落地确认</h2>
+
+<div class="card" data-page-node-id="E9GoHcwvSNIv41nFLzorcJ">
+<div class="decision" data-page-node-id="wI5naQXC0EBVSWTG9Ki1Pt">
+  <div class="dnum" data-page-node-id="mKASYygxhB3HHzS9uHC6Xn">2</div>
+  <div data-page-node-id="iO6lWVNQeghgQDZVx57EoP">
+    <b data-page-node-id="4DXd6aryuNezHwFrzlxXo9">重试 1 次</b>
+    <span class="tag t-grn" data-page-node-id="Q5tq0CcnmbxodNOIQKFaB9">已确认</span><br data-page-node-id="ZQYRoOg4x5Fx9CAztTEusP">
+    <b data-page-node-id="Y9ujXvmzriCLcrKCYVbxD0">理由（你我共识）</b>：deer-flow 用 1 次、dsh 用 5 次。我们单次调用最坏可达 336 秒，
+    5 次重试意味着单轮可能超过 28 分钟，用户无法接受。
+    <br data-page-node-id="G4JyVVaoJnkwYyTUECpeGm"><br data-page-node-id="ABv03hdIbEj9iZeArsQTtc">
+    <b data-page-node-id="qrY5qDjSRuBm3vILYR9Wae">1 次的最坏耗时</b>：336s（原始） + 336s（重试） ≈ <b data-page-node-id="DOIYIvUKQ3ZBNguSQ1qMmw">11 分钟</b>。
+    配合第四节的「② thinking 截断」精准识别，重试提示会明确要求「直接给结论」，
+    实际重试耗时通常远小于 336s。
+    <br data-page-node-id="xbtcftQYIyDQ7ifO7V0fFh"><br data-page-node-id="AQHjYJzF2FPAJs7O2QSUBZ">
+    <b data-page-node-id="ax0K7GEzkx2p0kyLDiLNNQ">预算语义</b>：沿用 deer-flow 的「<b data-page-node-id="ZCuPdAP2TeLrKuxzG0Dkdz">每次 run 只给 1 次</b>」而非「每条空消息 1 次」——
+    防止「空 → 重试 → 调工具 → 又空 → 再重试」的无限循环
+    （deer-flow 源码注释里明确写了这个陷阱）。
+  </div>
+</div>
+
+<div class="decision" data-page-node-id="OOsD4UXx0q1a5zG7t0HxA9">
+  <div class="dnum" data-page-node-id="PC0zRWG0dj0fbmC36AxGFq">3</div>
+  <div data-page-node-id="h36uhCYbD7TXkg5i966P0U">
+    <b data-page-node-id="3d1Jhte2dyc3iUydj0yKko">重试对用户不可见</b>
+    <span class="tag t-grn" data-page-node-id="hOQHnZrLsd45u7z7jY8zAS">已确认</span><br data-page-node-id="GRlRt6uPFBGRJgu0XLZFSY">
+    <b data-page-node-id="NGOJDLOfPHxUYNEJAnR7pS">实现方式</b>（deer-flow 同款）：
+    <pre data-page-node-id="CuoAK2GL3s0ulH9RjeTFEN">HumanMessage(
+    content=_RECOVERY_PROMPT,
+    name="terminal_response_recovery",
+    additional_kwargs={"<span class="gc" data-page-node-id="5djDaYMHeDWLsPbeXH2McP">hide_from_ui</span>": True},
+)</pre>
+    恢复提示以 <code data-page-node-id="8aEyo5tzXNtV3pC7GNwWQM">HumanMessage</code> 注入（<b data-page-node-id="e0Up02koB6EYPSD6UraGae">不是 <code data-page-node-id="MCRx7xZyvkOshBbghDtcCu">SystemMessage</code></b>——
+    规避 <code data-page-node-id="hG63LUwXx8ER80J385tw78">chat.py:1264-1267</code> 记录的 vLLM「System message must be at the beginning」400），
+    同时带 <code data-page-node-id="aD0GVbbehY100kGykVlmJd">hide_from_ui</code> 标记，前端不渲染。
+    <br data-page-node-id="okjLl7HovN0CPGpcXCTWKE"><br data-page-node-id="8GoJTvWmrH5888uZLYygkR">
+    <b data-page-node-id="il2L2RfxpLqQ1HOH9FnCM6">要一并确认的两个副作用</b>：
+    <ol data-page-node-id="AUHMv2CJRaWkEv83tetC8T">
+    <li data-page-node-id="t2szswCmHJTlevnWBS74Dk"><b data-page-node-id="SGOq2mP6Zxh37FuTsATCBu">空消息会被删除</b>（<code data-page-node-id="PXWX0tSaKMhvzw7p8zRZEs">RemoveMessage</code>），所以用户看不到那条空白气泡 ——
+        符合「不可见」预期；</li>
+    <li data-page-node-id="LcCJNRyWyfQfWIFTBKBfZF"><b data-page-node-id="badxjOjKnMH1ckm1TeoiFX">SSE 侧不会产生额外事件</b>，用户视角就是「思考久了点然后出结果」。
+        如果将来想加「正在重试」的提示，属于新增需求，不在本次范围。</li>
+    </ol>
+    <b data-page-node-id="5EL2amxYWOBNLTuJUMgb1V">前置条件</b>：前端已支持 <code data-page-node-id="XW6QIR2dnJHUgGRYKzvIQP">hide_from_ui</code> 过滤吗？
+    <code data-page-node-id="2mmyxZmtn8O3dXw1DqrN9b">loop_detection.py</code> 的软提醒用的是 <code data-page-node-id="pxSYsXGBHJMMUrZKmsNNFi">name="loop_warning"</code> 无隐藏标记
+    → <b data-page-node-id="dh5Q0l9IBDkm0PbQx8upKN">这个需要确认</b>（见第七节遗留项）。
+  </div>
+</div>
+
+<div class="decision" data-page-node-id="vOvagHz4rpMMGtGFoUEUsC">
+  <div class="dnum" data-page-node-id="72cLkz1E2gJrF7lIyWRH1R">1</div>
+  <div data-page-node-id="DNAGHpptUDlDwUXYOSKhek">
+    <b data-page-node-id="l8CJy8QiwCc0DWlA4GMwBq">finish_reason 条件是否满足</b>
+    <span class="tag t-amb" data-page-node-id="aHf8NBDR96h26ZB2QMJLhl">部分满足</span><br data-page-node-id="AevIGgTPyUuNuMBZ7xd5jR">
+    <b data-page-node-id="iJmW4wNcnqBgPRTFCwerfp">满足的部分</b>：修复所需的运行时读取 <b data-page-node-id="007P61s88inStdR5CEE8Kq">100% 可用</b>（第四节三条证据）。
+    <br data-page-node-id="T7xXSXP1JpjSuJxdefY2r9">
+    <b data-page-node-id="NYoFhNH4WAhdPrdjGGm0mO">不满足的部分</b>：① 本次故障窗口永久无法取证（第二节时间线）；
+    ② trace 覆盖率只有 ~29%（第 2.3 节），不能作为判定依据。
+    <br data-page-node-id="hMVJdRRpmFCB5NvnuoUpLT">
+    <b data-page-node-id="WmKlU5MOK3ApBijbBDNfHl">建议</b>：直接按第四节的「运行时读取」方案落地 D。
+    同时把 <code data-page-node-id="9ZzL429j88qOBBpBPnN3er">f3fd075</code> 重建镜像部署（它是独立的可观测性改进，
+    能为<b data-page-node-id="FG80Wu5s765l7hiVRSM4eP">未来</b>的故障留下完整证据链）。
+  </div>
+</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="vsz0g1zi2Gts6L1nH8x9Go">六、修正后的落地清单</h2>
+<table data-page-node-id="nqU68zHprqyMBXw3taXAyQ">
+<thead data-page-node-id="VnGykcsUI1EfZxMhUQALlt"><tr data-page-node-id="KG8K1K5Crf2meh7v9PVXzq"><th style="width:46px" data-page-node-id="zbFYy9mhMbVHPyDYkviXTe">编号</th><th data-page-node-id="nBf1CBU615CV56c3CDipnD">项</th><th data-page-node-id="P6VP8Id8EDQb31pGnItldy">优先级变化</th><th data-page-node-id="hNUJBe1vYaWBWhWvT7u2cD">关键实现点</th></tr></thead>
+<tbody data-page-node-id="wgw54PtlyeUiw1AlKszGYo">
+<tr data-page-node-id="3Wvf8Gf6evXHZ0jAImtZEZ">
+<td data-page-node-id="QZlU0YGvPlqLFjTYJ7gUZd"><span class="tag t-grn" data-page-node-id="oELluXCuRjA8K0Mp3AzBY1">A</span></td>
+<td data-page-node-id="AnVuCFXrPNawoasUUQw1vr">TerminalResponseMiddleware</td>
+<td data-page-node-id="pq9Ed4HHFXYaQxOZ3J6BIv"><span class="tag t-red" data-page-node-id="8k0jQ8cnBWLiARWvnXBcQh">P0</span> 不变</td>
+<td data-page-node-id="Di1bF4ZuFVmD9D7KI0kkLN">注册在 <code data-page-node-id="UXFqQhwrtbVJv3mkEoInMC">agent.py:842</code> 列表<b data-page-node-id="EWmBhcriCVp7P4xavIG7lD">末尾</b>；
+sync/async 两个 hook 都要 <code data-page-node-id="P4zZVMP92QC2IRFBiZeaN3">@hook_config(can_jump_to=["model"])</code></td>
+</tr>
+<tr data-page-node-id="sFPN5AF3SIEPSD1reypbdd">
+<td data-page-node-id="b3L0tsirQVXtf0w9DiN29Z"><span class="tag t-grn" data-page-node-id="1thiqp9fCL052IlHSwySgO">E</span></td>
+<td data-page-node-id="7zxxdJ6FvDmIzFpkNwhuAW">reasoning 感知的四分支判定</td>
+<td data-page-node-id="GuZ0dEjxbED81zZ7lvVnzs"><span class="tag t-red" data-page-node-id="6ohAa5szuwAN2avH2UZdgi">P0</span> 不变</td>
+<td data-page-node-id="oZAeWJn5RhmH6apK1ZGmdd">见第 4.1 节表</td>
+</tr>
+<tr class="hl-grn" data-page-node-id="Gm4kJUoJv5rU9uWgnpSW1e">
+<td data-page-node-id="0wGOyzjCpEDTpk7AoFIDwk"><span class="tag t-grn" data-page-node-id="sx6OPSYHU32EZ3bmPdCfDt">D</span></td>
+<td data-page-node-id="66myOxj6YadUPlB3WATiLf"><code data-page-node-id="7Bus64JUVEI8T919GBoVie">finish_reason</code> 识别</td>
+<td data-page-node-id="7i0dYRm03YxTqeOK2Nbyqm"><span class="tag t-amb" data-page-node-id="xTbaaOlvK1krmFFnYfhhBr">P1</span> → <span class="tag t-red" data-page-node-id="h5R9GbO42Em9UtPWIIZRez">P0</span><br data-page-node-id="mSHr2G1fdljJ0wBAa9w1se"><b data-page-node-id="FkDH5SUxludiPkV6NJjtX7">已解除 trace 依赖</b></td>
+<td data-page-node-id="N1CD4CNffKBMOGKxlcgbsd">与 A 合并：<code data-page-node-id="VTMd1KaerAWmh4FpdkT9dI">last.response_metadata.get("finish_reason")</code>。
+<b data-page-node-id="8rmNbC44Ews5EYJ3lzxG4V">不需要读 Phoenix/Langfuse</b></td>
+</tr>
+<tr data-page-node-id="B25iW2h0ruCO9h782lfkUp">
+<td data-page-node-id="nITZBDCE5SA0TecSu1VkEo"><span class="tag t-grn" data-page-node-id="8uz7TvnnxJbDXHKNw92BQf">B</span></td>
+<td data-page-node-id="jAAF3grlH4U1rMZzYeomF6">恢复提示 <code data-page-node-id="1FvfPTfV4BZFbzJliWy0on">HumanMessage + hide_from_ui</code></td>
+<td data-page-node-id="kEWwGdOF19PYjzZsTFnP2h"><span class="tag t-red" data-page-node-id="qD9Yx6vMwS4y5Vs5M55DSI">P0</span> 不变</td>
+<td data-page-node-id="xlhD9IsLAmyG83rlyQMNag">避开 <code data-page-node-id="xd9mFX9eWZq1GrI6dOUH2y">chat.py:1264-1267</code> 的 SystemMessage 400 风险</td>
+</tr>
+<tr data-page-node-id="fpwXGAtsAReMuEjurHHSUd">
+<td data-page-node-id="oe8wwIy1fQQifrVHbNwBIm"><span class="tag t-grn" data-page-node-id="WogehlYSILqQUFLzOGF3OC">C</span></td>
+<td data-page-node-id="LN2FSiqBqtVsHJ8yi24Bts">完成门归因三态化</td>
+<td data-page-node-id="rMLGG29UjOfrqGuBEEpS0N"><span class="tag t-amb" data-page-node-id="mTCxlDioB9FWh88Wf8OcW6">P1</span> 不变</td>
+<td data-page-node-id="9N7eJ4yIBqLJI0IwZDw5BO">现在可以更准：用四分支结果决定文案</td>
+</tr>
+<tr data-page-node-id="iQMWgBSAklsw5X9clkBIC3">
+<td data-page-node-id="1y0qfBmSLVnqtugi20YHME"><span class="tag t-grn" data-page-node-id="XPnXYU3dAVQ7B4l2MiF0sl">G</span></td>
+<td data-page-node-id="EPpKCFRzLgKBM229S9ICIo">按 run 维度的重试预算</td>
+<td data-page-node-id="dLcAP3ohHUyMErgy9S1PpI"><span class="tag t-amb" data-page-node-id="9MWRFOMfiWWbQqyJwF1NHj">P1</span> 不变</td>
+<td data-page-node-id="WEZVQyDVhcjGTnQVDgPelV">用 <code data-page-node-id="BHeNb5uRSpZSc2V8o834dy">get_config()["configurable"]["thread_id"]</code> + <code data-page-node-id="2DR04DC2TX6uORUna7x6RI">id(runtime)</code> 兜底</td>
+</tr>
+<tr data-page-node-id="Z3J0i00CfcM5u3iIL4uGkf">
+<td data-page-node-id="mNKI2vlfNIdLaaOxUXz28A"><span class="tag t-grn" data-page-node-id="zwSgBnvU9cwUM9YNFyBBMY">F</span></td>
+<td data-page-node-id="oKKhknFBR0SDJhLAFGbS00">重试可见性事件</td>
+<td data-page-node-id="897n8Hxynysc9KXwO5EwdS"><span class="tag t-blu" data-page-node-id="bdmk1xCDa057H9Ab77tukZ">P2</span> 不变</td>
+<td data-page-node-id="isue72mlnWmpGJgLceNb85">deer-flow 的 <code data-page-node-id="Gqa1WkBSx0W8zkemVpNrof">llm/retry</code> 式事件，仅进日志不进 UI</td>
+</tr>
+<tr class="hl-red" data-page-node-id="yT1QXKLfqAnBwlZnnHau2q">
+<td data-page-node-id="9h2LCwNiJEZhtKERHw7JiE"><span class="tag t-blu" data-page-node-id="WL0sWGWGcwTtqOcT86PuyB">新</span></td>
+<td data-page-node-id="DADwDvDtQ4GpCkEc45pK88"><b data-page-node-id="DAscECTUazs54TOEMvEEti">重建镜像部署 <code data-page-node-id="KCob7LGwsYWuryRLojS7fd">f3fd075</code></b></td>
+<td data-page-node-id="mons4p01ZclVRl27PCMLMI"><span class="tag t-amb" data-page-node-id="bOFTE73yNmQXiEufxw6wL6">P1</span> 独立项</td>
+<td data-page-node-id="RycnPLtsXpajRgLrLPlYt6">当前生产跑的还是 ea303fe 的「全关」版 → <b data-page-node-id="FDcxqzPwSjKWtP3SCnF6uS">观测全瞎</b>。
+非修复前置，但强烈建议并行推进</td>
+</tr>
+</tbody>
+</table>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<h2 data-page-node-id="hlmCNHogPYoDj7OzWhC4L7">七、阻塞点：<code data-page-node-id="GDgnTdwrHFRW7mLPI6ySOQ">hide_from_ui</code> 前后端都没实现——但影响面比想象的小</h2>
+
+<div class="danger" data-page-node-id="eRRY2eepwMpH3830YX62iE">
+<b data-page-node-id="dk0wSvPdjEbrvvsZ6r5sTV">第 3 项拍板（重试不可见）不能直接照搬 deer-flow 的 <code data-page-node-id="Cq6f0C6lYpc1zvcHdusIOG">hide_from_ui</code> —— 我们前后端都没有这套机制。</b>
+<b data-page-node-id="llj4z0wOEj1xB7rFjH9VnM">但实测表明：只要恢复提示沿用我们现有的 <code data-page-node-id="7l7tVBEaJNFxFHidR30W7W">wrap_model_call + request.override()</code> 注入方式，
+它压根不会进 state、也就不会污染历史</b>，<code data-page-node-id="o9GMA5V64U6oQ0DS6yDBvJ">hide_from_ui</code> 反而变成「锦上添花」而非必需品。
+</div>
+
+<h3 data-page-node-id="RTHfDdYawmhIZOQajGUPVD">7.1 代码级证据：前后端均无 <code data-page-node-id="2Wk8krZDMUh9upv0zFgttQ">hide_from_ui</code></h3>
+<div class="card" data-page-node-id="to1oysfPyD0QzwEzHpa1Hf">
+<b data-page-node-id="s9dtAkhJjrYYL8aexRxulZ">证据 A：后端全仓零命中</b>
+<pre data-page-node-id="sKnKmqwSnsAtpBx9OV0HRJ">$ grep -rn "hide_from_ui" src/
+<span class="rc" data-page-node-id="SWpOT2dZYc3kJSBT3bTeqx">(无匹配)</span></pre>
+
+<b data-page-node-id="pFoDSXOuElGDRr2DHCBAMt">证据 B：前端全仓零命中</b>
+<pre data-page-node-id="ufevM4My4vo6Y8XvCcoxer">$ grep -rn "hide_from_ui" geesun_agent_web/ --include="*.ts" --include="*.tsx"
+<span class="rc" data-page-node-id="Sv4sExA0czgAPjsPL4zL5Z">(无匹配)</span></pre>
+前端 <code data-page-node-id="JPd0NGyum6Y9pFWuFpqAkE">lib/types.ts:45-66</code> 的 <code data-page-node-id="PgMZF2pnnvB7laX68FeMoS">Message</code> 接口<b data-page-node-id="x0Yz06SQAtj3Ls3ut9NCsP">没有</b>任何隐藏标记字段
+（只有 <code data-page-node-id="XeLJUucUZfDmZjPfdC7vKk">id/role/content/reasoning/tool_calls/generated_files/files</code> 与三个时长字段）。
+
+<b data-page-node-id="8qgiLDyzeJeA6NtBjzh37b">证据 C：持久化路径不读隐藏标记</b><br data-page-node-id="9GOvlONdtfQY0brAeljGkk">
+<code data-page-node-id="ACKNFqE5LporjbF8wd8yIT">chat.py:443-528</code> 的 <code data-page-node-id="peEsGWiUXZZgW32kmo2ZYb">_persist_session</code> 遍历 checkpoint 里<b data-page-node-id="KeNW7niwHHEblHRQpnTvZu">全部</b>消息，全程不读
+<code data-page-node-id="bCCeCCkfNJtQlIfXb2Qolg">additional_kwargs</code> 里的 <code data-page-node-id="mGiOn6PZBgvBR1RyQY8Flo">hide_from_ui</code>：
+<pre data-page-node-id="HNo77Qlx37BhUkFV5Jwxcw"><span class="cc" data-page-node-id="lcoYTJQCIDkAduc080kUeO">// src/api/endpoints/chat.py:443-447</span>
+for msg in all_msgs:
+    role = getattr(msg, "type", "unknown")
+    if role == "human":
+        role = "user"          <span class="cc" data-page-node-id="5RaTr3AMRYVmYjz8e8Lsne">← 若有 HumanMessage 进 state，会变成 "user" 落库</span>
+    content = str(msg.content) if msg.content else ""</pre>
+</div>
+
+<h3 data-page-node-id="BgTGtXfOh2HDjX6pJQWvZu">7.2 关键实测：<code data-page-node-id="EtanSGjjv5StoKeHX2N9pQ">request.override()</code> 注入<b data-page-node-id="exHOZSCrYEBqo96eP9oTSD">不会</b>进 state</h3>
+<div class="verdict" data-page-node-id="ArMdn9VGLX0v9Ta2tA6rwy">
+<b data-page-node-id="Be7VPRxTAbYHVrCRxBxSFE">这纠正了我上一版的错误推断。</b>原以为「注入的 HumanMessage 会被 <code data-page-node-id="j8vbJgQzbh5G0isAPLoOxL">_persist_session</code> 落库」，
+但实测证明：<b data-page-node-id="ZuTzvPMikLDMC4hxAxwPU2">通过 <code data-page-node-id="tSV4ryK9qk4Eig37us2jiY">request.override(messages=...)</code> 注入的消息只对本轮模型调用可见，
+不会写回 agent state，因此不会进 checkpoint、不会被持久化。</b>
+</div>
+<div class="card" data-page-node-id="ZxZYmyAtgBoWhX556W0NvS">
+脚本：<code data-page-node-id="pGr9Yt4vdWGjOPGIgorxKD">.workbuddy/spikes/inject_state_spike.py</code>，用真实 <code data-page-node-id="K1mtpxvidNfiwUhdLGkgEO">create_agent</code> + 脚本化模型对照两种注入方式：
+<pre data-page-node-id="3iq3Nomjn1gfflRQLrotUE"><span class="cc" data-page-node-id="0x18mDxcYxbbuLK6GgAGf0">### A_override —— wrap_model_call + request.override(messages=[...加 HumanMessage...])</span>
+模型实际看到：  ['HumanMessage:hi', 'HumanMessage:[[INJECTED-REMINDER]]']  <span class="gc" data-page-node-id="Jfq96lgrbhEWttbM7ji7if">← 模型能看到提示</span>
+最终 state：    HumanMessage 'hi' / AIMessage 'reply1'
+                <span class="gc" data-page-node-id="nBkWBfpVDh5NOVbURRDmmO">>>> 注入消息未进入 state ✓ 不污染历史</span>
+
+<span class="cc" data-page-node-id="ockZ9CVxEmYL7DHFY3F463">### B_state —— after_model 返回 {"messages": [HumanMessage(...)]}</span>
+模型实际看到：  ['HumanMessage:hi']                                     <span class="rc" data-page-node-id="HND1WLtENyJa8ytKX49wiH">← 本轮模型反而没看到</span>
+最终 state：    HumanMessage 'hi' / AIMessage 'reply1' / <span class="rc" data-page-node-id="uDq0pyMSHL0vZFrFVS7wx5">HumanMessage '[[INJECTED-REMINDER]]'</span>
+                <span class="rc" data-page-node-id="OxszV6pJ2ShfBje2EdiVh0">>>> 注入消息进入了 state ✗ 会被落库污染历史</span></pre>
+<b data-page-node-id="1HJmXR8l2mD1aJj9YJCuhX">两条结论</b>：
+<ol data-page-node-id="TlqTE2tH93KVPUw9mXZciv">
+<li data-page-node-id="G6xx1v9GGo6Eb6BRiUC34I"><b data-page-node-id="CxwVeyptjDUYVmi1pYymWm"><code data-page-node-id="zZ4tgBJXWYnwjkOorr4Mg6">request.override()</code> 是「只读注入」</b> —— 符合我们「重试对用户不可见」的需求，
+    且不需要 <code data-page-node-id="1HMYFPuEUBMQ4EeoHCmA03">hide_from_ui</code> 配合。</li>
+<li data-page-node-id="6lrfBaEjaCxh7GXeG2gKax"><b data-page-node-id="AFtu3ZhhMPlfn416AWkvB5">我们现有的 <code data-page-node-id="uKLZYkmqq7TEFalNC43Uh2">loop_warning</code> 没有污染历史</b> —— 它正是走
+    <code data-page-node-id="2d48kIgHTPHTNMBiwGEDXh">loop_detection.py:410-412</code> 的 <code data-page-node-id="yy0hm0NrEEb5DizvoDs0lr">request.override()</code> 路径。
+    之前担心的「既有同类问题」<b data-page-node-id="We1AyZiIjLAyL8ENrzo5mw">并不存在</b>。</li>
+</ol>
+</div>
+
+<h3 data-page-node-id="wT1AR2M6tM19VpccjC5Kk6">7.3 那还需要做什么？</h3>
+<div class="card" data-page-node-id="FtaSbkQ0E3qX31plwmxTOs">
+<table data-page-node-id="OfAg1bpGISghmF1z2vsrn3">
+<thead data-page-node-id="9wnooIkSRWezGGzT54WyDc"><tr data-page-node-id="LEzI1gyyZfu3opQJQi17eH"><th data-page-node-id="5Qv85svtZe8JEBqXr2iExo">项</th><th data-page-node-id="elbmHZA7ZriZtBBXNeCMBq">是否需要</th><th data-page-node-id="g3PXE4sn7rxHTc4PDzlBPg">说明</th></tr></thead>
+<tbody data-page-node-id="HmCz0YKEtov0kgWBfzarJi">
+<tr data-page-node-id="6uDgER9ItnkGBpILFUufEv">
+<td data-page-node-id="vQSAqahkFjJynZtg4xhGRq">恢复提示用 <code data-page-node-id="WDBBMLi5gEPLVbYDKSTWAm">request.override()</code> 注入</td>
+<td data-page-node-id="5yFH3r0T6CppZxRPGuTDCz"><span class="tag t-grn" data-page-node-id="PeU8Z1egF7vTtiYQoIykli">必须</span></td>
+<td data-page-node-id="i6nCd3w9wuKD5eZKCdyQkO">直接复用 <code data-page-node-id="5lkSfYgmXamZgsXbGGbHZV">loop_detection.py:410-412</code> 已验证的成熟模式，零新增风险</td>
+</tr>
+<tr data-page-node-id="gSCVzi02iQvoVPTi4Vy9az">
+<td data-page-node-id="YwxGuzMUJvOu5WaBlwkPoh">给恢复提示打 <code data-page-node-id="1MJvYODzfjfYkr2kcwgZtl">hide_from_ui</code> 标记</td>
+<td data-page-node-id="jib4Zvh3hiUVHIZEeh9GUh"><span class="tag t-amb" data-page-node-id="CfirAlB8IUMWD7D3rHJtco">建议但非必需</span></td>
+<td data-page-node-id="lG8D6magW2mroJ5rd10MMe">虽然不落库，但打标记可让<b data-page-node-id="AtUr6g7Sg9YYQu2pjNkemX">日志/调试时</b>一眼分辨「这条是系统注入的」，
+    且为将来兼容 deer-flow 语义留口子。成本极低（一个 dict key）</td>
+</tr>
+<tr data-page-node-id="7M944DvYhAKI0LbFJFMgfY">
+<td data-page-node-id="iYnkfRM3DgGZmfI6UbeXmc">改 <code data-page-node-id="5KD8nSZpiZD8vkLmRlCG2B">_persist_session</code> / 前端类型</td>
+<td data-page-node-id="gq0daaChTbI60Qmj5uZPdZ"><span class="tag t-blu" data-page-node-id="SnJxOHsjwk9RC9QY85Zq6q">不需要</span></td>
+<td data-page-node-id="ZReuvGpDQXbJhCIqAqybhQ">实测无污染路径，改动纯属过度设计</td>
+</tr>
+</tbody>
+</table>
+<div class="info" data-page-node-id="05QrnBFnDhPFRBweZe2QxA">
+<b data-page-node-id="twQFL9A89CAyKRYKqLJWTG">唯一还需留意的是删除空消息</b>：A 的第一次触发会用
+<code data-page-node-id="rHC4OANuY8mKVnY6cdEiXz">RemoveMessage(id=last.id)</code> 删掉那条空 AIMessage。
+<code data-page-node-id="8KnedLNydtdu3VCB3RRZtL">RemoveMessage</code> <b data-page-node-id="ioAli0LwTz3rmXKH7ir615">是写 state 的操作</b>（这就是它存在的意义），
+所以空消息会从 checkpoint 里被移除 —— 这正是我们想要的（用户不看到空白气泡 + 不污染后续上下文）。
+</div>
+</div>
+
+<h2 data-page-node-id="f4n6GGhWmEIM5ssOKSCHKf">八、实现落地：<code data-page-node-id="1IFKYIWFNoAWgLwN0mNpwL">TerminalResponseMiddleware</code> 已写码（<span class="hl-grn" data-page-node-id="ch8Now">现为 74 项断言全绿，见第十一章</span>）</h2>
+
+<div class="verdict" data-page-node-id="GAhxWN5AQUnqHlBZYn4fbb">
+<b data-page-node-id="RaBq5KEmGpSAxAeD94cNCN">新增文件</b>：<code data-page-node-id="A6NyWDsUfrtMA0xKrzwbIY">src/core/terminal_response.py</code>（504 行）+ <code data-page-node-id="RdoTP9NSdAj4w9XqEBpX4l">tests/spikes/terminal_response_guard.py</code>（368 行）。<br data-page-node-id="sVbdU0FY0djLx46O2K7SzV">
+<b data-page-node-id="H9u0UtXqN2HL1fyCS3u6LL">验证环境</b>：<code data-page-node-id="cnAITfxEO77tuTjrKEacPg">172.16.220.74:8333/geesun_ai/geesun-agent:1.0.6</code> —— <b data-page-node-id="eFHTgKNQMVDBP0ctm7TMew">生产同款镜像</b>，
+因为项目 <code data-page-node-id="fiddKuEKJNu82zMGH7vv5R">.venv</code> 是 Linux 布局，Windows 本机 Python 无法执行。<br data-page-node-id="vLITVCQtEDD9KXMfNlXRgV">
+<b data-page-node-id="a4WWOjYZ98d1lQaqO6rQZh">结果</b>：<span class="hl-grn" data-page-node-id="1JJGRocvFMWaiba9kH1Nvj">29 PASS / 0 FAIL</span>（主 spike）+
+<span class="hl-grn" data-page-node-id="Aqojop8OPQ0gv9p2TiM8v0">28 PASS / 0 FAIL</span>（装配预检）+
+<span class="hl-grn" data-page-node-id="ch8Plus1">12 PASS / 0 FAIL</span>（接入层 AST）+ 
+<span class="hl-grn" data-page-node-id="ch8Plus2">5 PASS / 0 FAIL</span>（构建前导入闸门）= <b data-page-node-id="aSScbHvLLbMO2oTRlX70CS">74 项断言全绿</b>。
+后续经 <b data-page-node-id="ch8Plus3">1.0.8 镜像内复跑（读镜像自带 <code>/app/src</code>，不挂载源码）结果完全一致</b>，
+并在生产容器内再做 9 项 AST 接入检查——详见第十一章。
+</div>
+
+<h3 data-page-node-id="dSWRRPSgVeGEuIlo7M4mIp">8.1 主 spike：四分支判定 + 端到端拦截</h3>
+<table data-page-node-id="KoF9r2PXdlOFuv1hU0DbAb">
+<thead data-page-node-id="hpVEXCLXXTdmiCTHShIAPL"><tr data-page-node-id="VrHHLoSNo5jExvlqQ3Tc91"><th data-page-node-id="Z6iVxnooVxFPoRWGtA18HE">场景</th><th data-page-node-id="Y7LvMHdgTvI4MRcqwU26dN">断言要点</th><th data-page-node-id="93EuKoAVZsclffDBjl2YnO">结果</th></tr></thead>
+<tbody data-page-node-id="incQyjCvZsj6waPZY54L2q">
+<tr data-page-node-id="pCDVDhSwn5lmvEi9s7JR3V"><td data-page-node-id="rGd6cdmpPy6eUwB6yAp43K">A 纯函数四分支</td><td data-page-node-id="bfJQAmLMALPOdFc3CRCMBn">①有正文→ok ②reasoning+length→thinking_truncated
+  ③reasoning+stop→thinking_only ④全空→fully_empty；另含 tool_call 豁免、content parts、
+  <code data-page-node-id="qWFzFhEnv9mxC40iT3TlqY">reasoning</code> 键名兼容等 11 项</td><td class="ok" data-page-node-id="eBzW22GGiFRXuevQ1kwc9H">11/11</td></tr>
+<tr data-page-node-id="NAzFGAklPGHPS91Qwsfpcw"><td data-page-node-id="7zk020y0Lv9QOK45moa2wR">B 空→重试→恢复</td><td data-page-node-id="gAGzw3X7r9Dceb6uEgIhwG">模型被调用 2 次、空消息 id 已从历史移除、末条为恢复正文、
+  第 2 次调用确实看到恢复提示、注入消息未进 state</td><td class="ok" data-page-node-id="E3qLV7m2BSVLowSHUdvpUI">6/6</td></tr>
+<tr data-page-node-id="VKUTc5FokCAIdKW6PuvnYX"><td data-page-node-id="ehpBYLtPQVoG2BNHDVtLbg">C 两次都空→降级</td><td data-page-node-id="HGOVcYuYBNFb5fBpFkqbhg">预算 1 次用尽、末条为降级文案、打了
+  <code data-page-node-id="CiQUiE3YzGUd7TIcr44Kei">terminal_response_fallback</code> 标记、标出触发分支、<code data-page-node-id="jgJTJTxAVdHFp4hs4P7elG">tool_calls</code> 已清空</td><td class="ok" data-page-node-id="HzU4phhkcqXzJw5DpZ7Thd">6/6</td></tr>
+<tr data-page-node-id="98sfHqykyJKW0XMTD2Xw5X"><td data-page-node-id="zBkHQIbT3ncXM1LBurUl0y">D 本轮无工具结果</td><td data-page-node-id="ARcTHAfmz1utglGPdlK8Xb">不介入（模型只调 1 次、空消息保留、统计为空）——交给 M3 完成门</td><td class="ok" data-page-node-id="1KvM1nemnFlcYxfaoiWE63">3/3</td></tr>
+<tr data-page-node-id="7ENABwrXOrXKeksuL0TOJ7"><td data-page-node-id="XWMWhTHZXD3BAPqjy77cLd">E hook_config 生效</td><td data-page-node-id="ZfNQmpPI0y875O8FXJyzFS">sync <code data-page-node-id="FdRIOCJhKuEWvRechGsGJu">can_jump_to=["model"]</code>、
+  async <code data-page-node-id="fQXkDx82FqB68iZyGV47f3">aafter_model</code> 也带 <code data-page-node-id="hQta9lyUz0St2D7ucJFwGA">__can_jump_to__</code>、图中存在
+  <code data-page-node-id="kSgKlS0B0xKSvtoH6IHSsX">after_model → model</code> 条件边</td><td class="ok" data-page-node-id="3EVdhfV7KccKhQ0wvlcrim">3/3</td></tr>
+</tbody>
+</table>
+
+<h3 data-page-node-id="uzuPK69dWtU0xc0LcRL8zD">8.2 装配预检：接进 <code data-page-node-id="TzloGarWWll2zHaHOfDHN6">create_deep_agent</code> 前必须确认的事</h3>
+<div class="info" data-page-node-id="40nvZ8FJL4r5UmENLEdoY8">
+主 spike 用的是裸 <code data-page-node-id="5DrF8Y63OXwBuXHRlYDHTF">create_agent</code>，但生产走的是 <code data-page-node-id="Zv950hOcJhUk62XND8ywix">create_deep_agent</code>
+（会在我们的 middleware <b data-page-node-id="xYo6cC7VlfPmzklItnl79A">之后</b>再追加 tail stack：<code data-page-node-id="WH97v6sJnHFKRk1334RHFU">HumanInTheLoopMiddleware</code>、
+<code data-page-node-id="oRNAqgqz2EfUL9x1yUYLJW">MemoryMiddleware</code>、prompt-caching 等）。所以必须单独验证真实装配。
+</div>
+<table data-page-node-id="9VEF7BwGQCG63oh4O7qMNX">
+<thead data-page-node-id="BTRlDz1flhLeGOdnhDtxdP"><tr data-page-node-id="QyJqJSxStBPU6J9rzNpyBD"><th data-page-node-id="vFgCAm15O27DbRULC4UpVD">#</th><th data-page-node-id="TYXPRuX5miJT0S0sU3xdyD">预检项</th><th data-page-node-id="LeD3ehM8nPE517qgRDUjdM">实测结论</th></tr></thead>
+<tbody data-page-node-id="6TpQG05maPFuAG8TCVPNq5">
+<tr data-page-node-id="RbebUkQwyDfoHxUaPAElmh"><td data-page-node-id="CCz8GgEM7p44xNWOVoHPot">1</td><td data-page-node-id="CLuke5BpVkmtBnDIFwRnQE"><code data-page-node-id="WZ0IuGbqev58lMCTPzo5eH">middleware.name</code> 是否与默认栈冲突</td>
+  <td data-page-node-id="b6NKB6Ey14o3haHN22lpmP"><code data-page-node-id="GswW1scxRvl7eDyqZcSs5V">'TerminalResponseMiddleware'</code> 与 <code data-page-node-id="KRthp8SkS9mqASUPmLaWgy">'LoopDetectionMiddleware'</code> 不同名，
+  且不在 deepagents 默认栈名单里 → <code data-page-node-id="lvXBZwhWoWcmSX4nRexHBK">factory.py:1079-1080</code> 的断言不会触发</td></tr>
+<tr data-page-node-id="0D4xbDLoWp6uKGDdAQ7m31"><td data-page-node-id="j9DMjd0u8kgMWlucSTVmYL">2</td><td data-page-node-id="25vulcZMXAbD6VRAxA8E9Y">after_model 逆序契约</td>
+  <td data-page-node-id="8udaxrHvJyRU65PEEK3BjC">注册 <code data-page-node-id="mlbFpmfXyOsgxQBhMOGyi1">[ProbeFirst, ProbeLast]</code> → 执行顺序 <code data-page-node-id="Gzzj6dSd4F7IuTDJvdYCmJ">['ProbeLast','ProbeFirst']</code>
+  → <b data-page-node-id="myEfrxswK3Y44QihXwqob0">实证「最后注册的最先看到模型输出」</b></td></tr>
+<tr data-page-node-id="gG9YsieJbfoTjvjQLwcHKi"><td data-page-node-id="T8DXxVBH812Px3BP5HOi9M">3</td><td data-page-node-id="rI3OAPPdwscAhA4FFACpPf">恢复提示是否真到达模型</td>
+  <td data-page-node-id="oilLHHFSsojwTewdnDSPIz">第 1 次模型看到 <code data-page-node-id="3kOud1x4bAOoMGapqODh5Z">[Human, AI, Tool]</code>；第 2 次看到
+  <code data-page-node-id="9rAp8ZhtTtOXzWRY3oKFlI">[Human, AI, Tool, Human]</code>，且新增那条 <code data-page-node-id="ijD0X1dbzcUQFCirBS2aYB">name='terminal_response_recovery'</code>
+  → 注入生效、类型为 HumanMessage、未进最终 state</td></tr>
+<tr data-page-node-id="e6oNBX4UW3UBL29VARlHUp"><td data-page-node-id="HFjIll5YcoMOyT3jU2B6sQ">4</td><td data-page-node-id="wAq3RrA7GeSUZwTUGEBM4F">多层栈里 <code data-page-node-id="sURyXGsZGb2Agn2uKKTXDN">can_jump_to</code> 是否仍生成条件边</td>
+  <td data-page-node-id="wHZgoVx3d3dmqvAqkM6fCU">sync/async 均带 <code data-page-node-id="9yTVVhbAxEyxwBtMtF3DIZ">__can_jump_to__</code>，图中存在
+  <code data-page-node-id="Rm50CBfu0EX3hfFEdGeatJ">TerminalResponseMiddleware.after_model → model</code></td></tr>
+<tr data-page-node-id="yFX06FLDUpnFq1roIOsnzD"><td data-page-node-id="wIPgugiC8eAF66Mh3JO8PI">5</td><td data-page-node-id="2DD7OyUyCpMPDNDGwp2rO8">真实 <code data-page-node-id="17aZ868N725nthtPFm5Eul">create_deep_agent</code> 装配</td>
+  <td data-page-node-id="Q6oJdFnhsmlamvqe5w1F47">装配成功、未因 name 冲突断言失败、模型确实被调用</td></tr>
+<tr data-page-node-id="zGprWoY3wpPs7C0BnYmfv7"><td data-page-node-id="ja8gvTKtrEtaiScToLwtsv">6</td><td data-page-node-id="v9ZFAY24qlHKxxHy6gkB6s"><b data-page-node-id="L1TSBO845qsLGvOqt4OgU8">真实 deepagents 栈里的 E2E</b></td>
+  <td data-page-node-id="GkMAEgHGNXxWIGraJlNNTq">重试确实触发（模型 2 次）、空消息已移除、末条为恢复正文且<b data-page-node-id="pWv2QmVePcBKJetiegbayl">未被 tail stack 改坏</b>、
+  无注入消息残留</td></tr>
+<tr data-page-node-id="pA7BLq2aIhXimpxlqMshU0"><td data-page-node-id="WBLfRj6ErpGsuBtHHyc4UI">7</td><td data-page-node-id="AiPFImQbZtTWrDs6mUcgm5">与 <code data-page-node-id="s9ETuxsum8eWFErL9ZTD6s">LoopDetectionMiddleware</code> 共存</td>
+  <td data-page-node-id="tA6GJ96JLh2C2yFEL4InmI">见 8.3 —— 这里发现了一个<b data-page-node-id="n98eIg6IcHCFYxWBJQNjG9">好</b>的副作用</td></tr>
+<tr data-page-node-id="WkXMON8DjRUKjI7kvCUej3"><td data-page-node-id="7JLQ3IZBexXVDqbuGjMRkX">8</td><td data-page-node-id="tykGH3lOIZtNBwsFunEXPt">降级文案与 <code data-page-node-id="wYBAVma6JjU2NKHUiTghL1">max_retries</code> 一致性</td>
+  <td data-page-node-id="18ekJoqisXonLZ689nCJlL">默认 1 次时文案含「已自动重试 1 次」<span class="tag t-amb" data-page-node-id="PLI0sc8xajrVGBy8BhkHeb">遗留</span>
+  见 8.4</td></tr>
+</tbody>
+</table>
+
+<h3 data-page-node-id="mAGbddiVn72kTVolaqWeF7">8.3 意外收获：<code data-page-node-id="c9OWQTCGyTV77yltP2v3BC">jump_to</code> 短路让两个守卫不会重复处置</h3>
+<p data-page-node-id="bQUI6Y5jeH2Yyo6N09hePE">实测出的图结构（<code data-page-node-id="xYlRShORvb3LEWPdbhyxjU">[LoopDetection, TerminalResponse]</code> 顺序注册）：</p>
+<pre data-page-node-id="YU1jX5Mr9IMScoZ7KJPpQt">model -> TerminalResponseMiddleware.after_model
+<span class="cc" data-page-node-id="t4Qdzb20mFBtOjjJ9ZY6Aq">      ├─ jump_to="model"  ────────────────────→ model      ← 命中空响应时走这条</span>
+<span class="gc" data-page-node-id="a6yclUGtjyJQUqA3sSnL5C">      └─ 非 jump 路径 ──→ _LoopProbe.after_model</span>
+<span class="gc" data-page-node-id="1oICc96iAKafoYWVB6zcOq">                            ├─→ model</span>
+<span class="gc" data-page-node-id="GSFdYm5Igz3DM9DjdbADtf">                            └─→ tools ──→ model</span></pre>
+<div class="verdict" data-page-node-id="A83GOvQINXB9O8ADUvDJDP">
+实测计数：<b data-page-node-id="mZSrrDyDwAO3xnARPMvUFg">模型被调用 2 次，而 LoopDetection 只被调用 1 次</b>。<br data-page-node-id="Xs8TnI8dWCtdkCjH2Gw01h">
+说明 <code data-page-node-id="G86AUrlL1KQ2q61x0u0E3H">jump_to="model"</code> 会<b data-page-node-id="lnjCTnsxJN1cRLv8YXfBxL">短路静态链</b> —— 被判定为空响应的那条消息
+<b data-page-node-id="FVKabdoaA8nzulREzpH36K">不会流到 LoopDetection</b>。<br data-page-node-id="xm7hrlPZpHRo1obzrARvQF">
+这正好消除了我们原本担心的「两个守卫对同一条空消息重复介入」风险：
+<b data-page-node-id="53e5tYIgEXCcmf1cjUBuiJ">空响应由本中间件独家处置，LoopDetection 继续管它自己的重复工具循环</b>。
+两者职责边界天然清晰，无需额外协调代码。
+</div>
+
+<h3 data-page-node-id="vlFJbYZN8tUOzqEQYBr6sS">8.4 遗留问题（已识别，尚未处理）</h3>
+<div class="warn" data-page-node-id="GGPdvyWrz4jlJL5NJyNiVJ">
+<b data-page-node-id="wonn6JxDBaBpb9By0FqbWY">降级文案在 <code data-page-node-id="t4KFJWLCFuEdxG80xEHTVh">max_retries=0</code> 时措辞不准。</b>
+<code data-page-node-id="unirQd048DdMx0fBYF4EwI">_FALLBACK_CONTENT</code> 是模块级常量，硬编码了「已自动重试 1 次」。
+若将来把 <code data-page-node-id="OZGhQNBLioUOO53TMhAwtn">max_retries</code> 配成 0（或 >1），文案会与实际行为不符。<br data-page-node-id="9srJG7gQkgbOwLJLxHJXbm">
+当前默认值就是 1，<b data-page-node-id="6qhC8IN9tR9y50RjQLnWec">不影响本次上线</b>；建议后续把文案改成按
+<code data-page-node-id="liNcwm9nD8LjZ1FQVrFFww">self.max_retries</code> 动态拼接。
+</div>
+
+<h2 data-page-node-id="xlMVrOThkREStkq3qfunSe">九、仍需确认 / 复核（<span class="hl-grn" data-page-node-id="ch9Done">三项均已于 2026-09-11 闭环</span>）</h2>
+<div class="card" data-page-node-id="5Dwx81gzrTwsuE2ozN4Eis">
+<ol data-page-node-id="0Tt7UrcVXIwHVEd3jakMyy">
+<li data-page-node-id="NT7cmeOAkKPSuQu5myjKth"><b data-page-node-id="cmEvUAbC6Bn7qvj6ieG51P"><code data-page-node-id="igZ0pC7JEe2fKiU35099ho">TodoListMiddleware</code> 是否会改动本轮 <code data-page-node-id="ZNjdsMyCp6D3mlnmJSmd57">messages[-1]</code>？</b>
+    <span class="tag t-grn" data-page-node-id="ch9Tag1">已闭环</span>
+    <b data-page-node-id="ch9Ans1">答案：不会——它根本排在我们之后。</b>
+    用真实 <code data-page-node-id="ch9C1">create_deep_agent</code> 装配后导出图结构，实测 after_model 链序为
+    <code data-page-node-id="ch9C2">model → TerminalResponseMiddleware.after_model → LoopDetectionMiddleware.after_model → TodoListMiddleware.after_model → {model | tools}</code>。
+    <b data-page-node-id="ch9Ans2">模型的直接后继就是我们</b>，deepagents tail stack 的 <code data-page-node-id="ch9C3">TodoListMiddleware</code>（生产 trace 里每轮都在跑，210 次）排在我们<b data-page-node-id="ch9Ans3">之后</b>，
+    无法抢先改写末条消息。这条曾是最担心的一项，现以真实图结构钉死。
+    <br data-page-node-id="ExvchyPpvlX2Lz9YCeS17z"><span class="tag t-amb" data-page-node-id="AfrVKYIwYdGRXjPXZTZRka">影响</span>若它会改写末条消息，可能让 <code data-page-node-id="u0TGT1YAvGDnADWq6484Fl">_has_visible_content</code> 误判为「有正文」→ 漏拦。</li>
+<li data-page-node-id="bSPuPoWF9nGydFtjPycEre"><b data-page-node-id="EDcMzQc5F4Mq0sOdiHnf2r">重试是否会顶到 <code data-page-node-id="AgLRXRcAbfIieT0A9QnRyC">recursion_limit</code>？</b>
+    <span class="tag t-grn" data-page-node-id="ch9Tag2">已闭环</span>
+    <b data-page-node-id="ch9Ans4">答案：余量充足。</b>
+    <code data-page-node-id="ch9C4">recursion_limit=200</code>（<code data-page-node-id="ch9C5">src/api/endpoints/chat.py:766</code>），
+    正常流程 25–35 步；<code data-page-node-id="5mFRZ9JQDAEr4eWVFig1wI">jump_to="model"</code> 最多多走 1 轮，
+    相对 200 仍有 5–8 倍余量。且 <code data-page-node-id="ch9C6">max_retries</code> 是「每次 run 1 次」而非「每条空消息 1 次」，
+    不会出现 <code data-page-node-id="ch9C7">空响应 → 重试 → 调工具 → 再空响应 → 再重试</code> 的无界循环
+    （deer-flow 源码注释明确警告过这个陷阱，我们把预算语义照抄了过来）。</li>
+<li data-page-node-id="9H3aY3QCSLgT7iZrn9mrjU"><b data-page-node-id="qpLxHvwB9WFwuUHb8nTBU7">接入 <code data-page-node-id="7sVgMRzVabDpZrTlhezA9r">src/services/agent.py</code></b>
+    <span class="tag t-grn" data-page-node-id="ch9Tag3">已完成</span>
+    <b data-page-node-id="ch9Ans5">2026-09-11 已接入并发布 1.0.8。</b>
+    在 middleware 列表<b data-page-node-id="RTxSE6xBDslF8t6MonwQML">末尾</b>（<code data-page-node-id="GYtEHYF2kJqLPy8FRYUQAJ">LoopDetectionMiddleware</code> 之后）追加
+    <code data-page-node-id="QwePcPXELamrwVEmV7ZyL1">TerminalResponseMiddleware(max_retries=settings.terminal_response_max_retries)</code>
+    （<code data-page-node-id="ch9C8">agent.py:861-863</code>），
+    并在 <code data-page-node-id="VtDCSpBWylLsxgMg7Zmil2">src/core/config.py:131</code> 加配置项
+    <code data-page-node-id="ch9C9">terminal_response_max_retries: int = 1</code>。</li>
+</ol>
+</div>
+
+<h2 data-page-node-id="s1Ch10Stage1">十、阶段 1 发布完成：f3fd075 上线，trace 端到端实证</h2>
+
+<div class="card" data-page-node-id="s1Card1">
+<b data-page-node-id="s1B1">结论：已发布并通过验收。</b>
+镜像 <code data-page-node-id="s1C1">geesun-agent:1.0.7</code>
+（digest <code data-page-node-id="s1C2">sha256:ec38df2694588f2767a850f8f0660943f3d2bad66c70ad4de1caf3b404f8cc61</code>，
+1.78 GB）于 <b data-page-node-id="s1B2">2026-09-11 10:17 CST</b> 构建、
+<b data-page-node-id="s1B3">10:28 CST</b> 上线；19 个服务全 <code data-page-node-id="s1C3">1/1</code>，
+agent 容器 <code data-page-node-id="s1C4">running | health=healthy</code>，容器内镜像 digest 与构建完全一致。
+</div>
+
+<h3 data-page-node-id="s1H31">10.1 为什么先单独发 f3fd075，而不是与中间件一起发</h3>
+<div class="card" data-page-node-id="s1Card2">
+三点理由，按重要性排序：
+<ol data-page-node-id="s1OL1">
+<li data-page-node-id="s1Li1"><b data-page-node-id="s1B4">观测本身就该被止损。</b>
+    本轮故障之所以永久无法回溯，根因不是模型，而是 <code data-page-node-id="s1C5">ea303fe</code>（09-09）
+    关掉 exporter 后<strong data-page-node-id="s1S1">好几天没人发现</strong>。让 f3fd075 单独上线、
+    以「后端真的重新收到 span」当验收标准，本身就是对那次事故的正向修复。</li>
+<li data-page-node-id="s1Li2"><b data-page-node-id="s1B5">职责隔离，故障可归因。</b>
+    f3fd075 动的是 <code data-page-node-id="s1C6">tracing.py</code> /
+    <code data-page-node-id="s1C7">server.py</code> / 健康检查；中间件是全新文件、全新代码路径。
+    两者同时上线，一旦 agent 行为异常就有两个嫌疑在场，得二分定位。</li>
+<li data-page-node-id="s1Li3"><b data-page-node-id="s1B6">中间件的 debug 其实不依赖 trace。</b>
+    它自带 <code data-page-node-id="s1C8">[Guard]</code> 结构化日志（WARNING/ERROR 级，
+    打全 branch / finish_reason / reasoning_len / thread_id），判定链在
+    <code data-page-node-id="s1C9">server.log</code> 里就能完整还原。
+    所以"先发 f3fd075 方便 debug"这个理由其实是**弱**的——真正的理由是前两条。</li>
+</ol>
+代价：多一次全量构建（本次约 2 分 50 秒，依赖层全部命中缓存）。
+</div>
+
+<h3 data-page-node-id="s1H32">10.2 阶段隔离的证据（1.0.7 里确实没有中间件）</h3>
+<div class="card" data-page-node-id="s1Card3">
+<code data-page-node-id="s1C10">src/core/terminal_response.py</code> 会被
+<code data-page-node-id="s1C11">COPY geesun_agent /app</code> 带进镜像，所以必须证明它**没被激活**：
+<table data-page-node-id="s1T1">
+<thead data-page-node-id="s1TH1"><tr data-page-node-id="s1TR1"><th data-page-node-id="s1TH1a">判据</th><th data-page-node-id="s1TH1b">实测</th><th data-page-node-id="s1TH1c">含义</th></tr></thead>
+<tbody data-page-node-id="s1TB1">
+<tr data-page-node-id="s1TR2">
+<td data-page-node-id="s1TD1">镜像内 <code data-page-node-id="s1C12">agent.py</code> 是否引用中间件</td>
+<td class="ok" data-page-node-id="s1TD2">零引用</td>
+<td data-page-node-id="s1TD3">无人 import = 死代码</td></tr>
+<tr data-page-node-id="s1TR3">
+<td data-page-node-id="s1TD4">生产 span 列表里是否出现 <code data-page-node-id="s1C13">TerminalResponseMiddleware</code></td>
+<td class="ok" data-page-node-id="s1TD5">未出现</td>
+<td data-page-node-id="s1TD6">运行时确认未挂载</td></tr>
+<tr data-page-node-id="s1TR4">
+<td data-page-node-id="s1TD7">对照：<code data-page-node-id="s1C14">LoopDetectionMiddleware</code> 是否出现</td>
+<td data-page-node-id="s1TD8">出现（<code data-page-node-id="s1C15">after_model</code> / <code data-page-node-id="s1C16">after_agent</code>）</td>
+<td data-page-node-id="s1TD9">说明"未出现"是因为真没挂，不是因为采样不到</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 data-page-node-id="s1H33">10.3 trace 是否真的恢复上报——端到端实证</h3>
+<div class="card" data-page-node-id="s1Card4">
+<b data-page-node-id="s1B7">先说一个容易误判的点：</b>容器日志里的
+<code data-page-node-id="s1C17">[TRACING] xxx exporter 已添加</code>
+<strong data-page-node-id="s1S2">只能证明 exporter 被创建，不能证明数据出得去</strong>——
+OTLP exporter 的连接是<strong data-page-node-id="s1S3">惰性</strong>的，不产生 span 就永远不碰网络。
+因此「后端最新 trace 还是几小时前」是<strong data-page-node-id="s1S4">歧义状态</strong>
+（空闲系统本来就没新 span），不能当作失败判据。
+<br><br data-page-node-id="s1BR1">
+<b data-page-node-id="s1B8">唯一有效的判据：</b>在同一容器、同一份代码/env 下造一条真实 LangChain span，
+看它能否穿过过滤器、<code data-page-node-id="s1C18">force_flush()</code> 是否成功、后端是否落库。
+</div>
+
+<div class="card" data-page-node-id="s1Card5">
+<b data-page-node-id="s1B9">步骤 1 — 容器启动日志（10:28:22 CST，三路 exporter 全部恢复）</b>
+<pre data-page-node-id="s1P1">[TRACING] Phoenix gRPC exporter 已添加 — endpoint=http://alloy:4317（已挂 OpenInference span 过滤）
+[TRACING] Langfuse HTTP exporter 已添加 — endpoint=http://10.10.10.67:3000/api/public/otel/v1/traces（已挂 OpenInference span 过滤）
+[METRICS] MeterProvider 已注册 — OTLP gRPC endpoint=http://alloy:4317, 导出周期=15s
+[TRACING] FastAPIInstrumentor 已注册（http_server_* metrics + HTTP span；已排除 URL: healthz,/api/health,/docs,/openapi.json,/redoc）
+[TRACING] OpenInference 初始化完成 — auto_instrument=langchain, Phoenix=True, Langfuse=True, Metrics=True, span_filter=OpenInferenceOnly</pre>
+镜像内 <code data-page-node-id="s1C19">tracing.py</code>：<code data-page-node-id="s1C20">DISABLED</code>
+字样 <b data-page-node-id="s1B10">0 处</b>、被注释的 <code data-page-node-id="s1C21">add_span_processor</code>
+<b data-page-node-id="s1B11">0 处</b>。
+</div>
+
+<div class="card" data-page-node-id="s1Card6">
+<b data-page-node-id="s1B12">步骤 2 — 容器内端到端探针
+（<code data-page-node-id="s1C22">probe_trace_export.py</code>，经
+<code data-page-node-id="s1C23">run_in_container.py</code> base64 送入、不落盘）</b>
+<pre data-page-node-id="s1P2">=== 1) 网络连通性（出口链路）===
+alloy:4317               OK
+10.10.10.67:3000         OK
+
+=== 2) setup_tracing() ===
+setup_tracing -> True
+
+=== 3) 最小 LangChain 链（产生真实 OpenInference span）===
+chain.invoke(21) -> 42
+
+=== 4) 强制 flush 各 exporter ===
+span_processors 数量 = 2
+  [0] _OpenInferenceOnlySpanProcessor.force_flush -> True
+  [1] _OpenInferenceOnlySpanProcessor.force_flush -> True
+
+=== 5) span 过滤器计数（放行 = 真的走完埋点链路）===
+放行 passed=2  丢弃 dropped=0</pre>
+<code data-page-node-id="s1C24">force_flush</code> 两次都返回 <code data-page-node-id="s1C25">True</code>
+是关键——<b data-page-node-id="s1B13">超时或失败会返回 False</b>。
+</div>
+
+<div class="card" data-page-node-id="s1Card7">
+<b data-page-node-id="s1B14">步骤 3 — 落库确认（两个后端都查到，见
+<code data-page-node-id="s1C26">verify_trace_landed.py</code>）</b>
+<pre data-page-node-id="s1P3">Phoenix spans 表：
+      name       | span_kind |          start_time
+-----------------+-----------+-------------------------------
+ otlp_link_probe | CHAIN     | 2026-09-11 02:37:18.238964+00
+ otlp_link_probe | CHAIN     | 2026-09-11 02:34:51.761524+00
+ GET /docs http send | UNKNOWN | 2026-09-10 07:08:14.369445+00   ← 旧污染，此后零新增
+
+Langfuse observations 表：
+LoopDetectionMiddleware.after_agent  AGENT      2026-09-11 02:50:42.885
+TodoListMiddleware.after_model       CHAIN      2026-09-11 02:50:42.881
+LoopDetectionMiddleware.after_model  CHAIN      2026-09-11 02:50:42.877
+HumanInTheLoopMiddleware.after_model CHAIN      2026-09-11 02:50:42.872
+ReasoningChatOpenAI                 GENERATION 2026-09-11 02:50:37.117
+model                                CHAIN      2026-09-11 02:50:37.097
+execute                              TOOL       2026-09-11 02:50:36.226
+tools                                CHAIN      2026-09-11 02:50:36.224</pre>
+最后一组是<b data-page-node-id="s1B15">真实生产流量</b>产生的 span
+（`ReasoningChatOpenAI` LLM / `execute` TOOL / 各中间件 CHAIN / AGENT），
+不是探针人造的——说明链路在真实业务路径上同样成立，且<b data-page-node-id="s1B16">没有任何
+<code data-page-node-id="s1C27">GET /docs</code> HTTP span</b>，污染双向终止。
+</div>
+
+<h3 data-page-node-id="s1H34">10.4 部署后标准断言</h3>
+<div class="card" data-page-node-id="s1Card8">
+<table data-page-node-id="s1T2">
+<thead data-page-node-id="s1TH2"><tr data-page-node-id="s1TR5"><th data-page-node-id="s1TH2a">断言</th><th data-page-node-id="s1TH2b">结果</th></tr></thead>
+<tbody data-page-node-id="s1TB2">
+<tr data-page-node-id="s1TR6"><td data-page-node-id="s1TD10">19 个服务</td><td class="ok" data-page-node-id="s1TD11">全 1/1，agent = <code data-page-node-id="s1C28">geesun-agent:1.0.7</code></td></tr>
+<tr data-page-node-id="s1TR7"><td data-page-node-id="s1TD12">agent 任务</td><td class="ok" data-page-node-id="s1TD13"><code data-page-node-id="s1C29">Running</code>，<code data-page-node-id="s1C30">err=</code> 空，无 Failed</td></tr>
+<tr data-page-node-id="s1TR8"><td data-page-node-id="s1TD14">容器健康</td><td class="ok" data-page-node-id="s1TD15"><code data-page-node-id="s1C31">healthy</code>（走新增的 <code data-page-node-id="s1C32">/healthz</code>）</td></tr>
+<tr data-page-node-id="s1TR9"><td data-page-node-id="s1TD16">Caddy <code data-page-node-id="s1C33">/</code></td><td class="ok" data-page-node-id="s1TD17"><code data-page-node-id="s1C34">307 → /chat</code>，跟随得 <code data-page-node-id="s1C35">final=200</code></td></tr>
+<tr data-page-node-id="s1TR10"><td data-page-node-id="s1TD18">API 链路</td><td class="ok" data-page-node-id="s1TD19"><code data-page-node-id="s1C36">/docs 200</code>、<code data-page-node-id="s1C37">/openapi.json 200</code>、<code data-page-node-id="s1C38">/api/v1/sessions 401</code>、<code data-page-node-id="s1C39">/api/v1/models 200</code></td></tr>
+<tr data-page-node-id="s1TR11"><td data-page-node-id="s1TD20">镜像瘦身</td><td class="ok" data-page-node-id="s1TD21"><code data-page-node-id="s1C40">data/skills/deploy/debug/docs/memories/tests</code> 全 absent，<code data-page-node-id="s1C41">/app</code>=395M</td></tr>
+<tr data-page-node-id="s1TR12"><td data-page-node-id="s1TD22">前端产物</td><td class="ok" data-page-node-id="s1TD23"><code data-page-node-id="s1C42">localhost:8009</code> 仅出现在 <code data-page-node-id="s1C43">server.js</code> / <code data-page-node-id="s1C44">required-server-files.json</code> / <code data-page-node-id="s1C45">routes-manifest.json</code>（服务端 rewrites 目标，不下发浏览器），<code data-page-node-id="s1C46">.next/static</code> 零命中</td></tr>
+<tr data-page-node-id="s1TR13"><td data-page-node-id="s1TD24">exporter 报错刷屏（恢复三路的主要风险）</td><td class="ok" data-page-node-id="s1TD25">零 ERROR；WARNING 全是无关的 <code data-page-node-id="s1C47">[DIAG]</code> 噪声</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 data-page-node-id="s1H35">10.5 踩坑：本机 Bash 的沙箱"双跑"</h3>
+<div class="card" data-page-node-id="s1Card9">
+<span class="tag t-red" data-page-node-id="s1Tag1">重要</span>
+发布过程中出现"生产状态与预期不符"：<code data-page-node-id="s1C48">update_prod_tag.py</code>
+报「旧值 <code data-page-node-id="s1C49">GEESUN_AGENT_TAG=1.0.6</code> 命中 0 次」而中止，
+但生产里 TAG 已经是 1.0.7，且目录里躺着不是我命名的备份。
+<br><br data-page-node-id="s1BR2">
+排查结论：<b data-page-node-id="s1B17">不是"另一个 agent 在并发"，是这条命令被执行了两遍。</b>
+本机 Bash 工具在沙箱内先跑一次，被策略拦截后经批准<strong data-page-node-id="s1S5">再跑一次</strong>，
+而每次 Bash 结果末尾的 <code data-page-node-id="s1C50">⚠️ Sandbox bypassed (escalation-approved)</code>
+正是这个信号。
+<table data-page-node-id="s1T3">
+<thead data-page-node-id="s1TH3"><tr data-page-node-id="s1TR14"><th data-page-node-id="s1TH3a">证据</th><th data-page-node-id="s1TH3b">观测</th></tr></thead>
+<tbody data-page-node-id="s1TB3">
+<tr data-page-node-id="s1TR15"><td data-page-node-id="s1TD26">SSH 连接成对出现</td><td data-page-node-id="s1TD27">源端口 <code data-page-node-id="s1C51">61495/61501</code> 与 <code data-page-node-id="s1C52">61541/61542</code>——各对应串联命令的一次 paramiko 连接</td></tr>
+<tr data-page-node-id="s1TR16"><td data-page-node-id="s1TD28">生产备份成对出现</td><td data-page-node-id="s1TD29"><code data-page-node-id="s1C53">docker-compose.yml.bak-…101912</code> 与 <code data-page-node-id="s1C54">…101933</code></td></tr>
+<tr data-page-node-id="s1TR17"><td data-page-node-id="s1TD30">探针 span 成对出现</td><td data-page-node-id="s1TD31">两个后端各有 2 条 <code data-page-node-id="s1C55">otlp_link_probe</code>（10:34:51 / 10:37:18）</td></tr>
+<tr data-page-node-id="s1TR18"><td data-page-node-id="s1TD32">本地无外来产物</td><td data-page-node-id="s1TD33">工具目录里只有本次自建的脚本，无第三方痕迹</td></tr>
+</tbody>
+</table>
+<b data-page-node-id="s1B18">正面结论：</b>给 <code data-page-node-id="s1C56">update_prod_tag.py</code> 加的
+「旧值必须恰好命中 1 次否则中止」断言，在双跑场景下<b data-page-node-id="s1B19">真的挡下了一次破坏</b>。
+<br><br data-page-node-id="s1BR3">
+<b data-page-node-id="s1B20">应对（已写入 <code data-page-node-id="s1C57">geesun-release-prep</code> 技能陷阱 6）：</b>
+远程变更脚本必须<strong data-page-node-id="s1S6">幂等 + 带前置状态断言</strong>；
+发现状态不符时<strong data-page-node-id="s1S7">先怀疑自己双跑</strong>，别急着归因"并发/多 agent"。
+</div>
+
+<h3 data-page-node-id="s1H36">10.6 构建侧决策与阶段 2 待办</h3>
+<div class="card" data-page-node-id="s1Card10">
+<b data-page-node-id="s1B21">没有用 <code data-page-node-id="s1C58">deploy/build-push.sh</code> 全量。</b>
+它除了构 agent，还会<strong data-page-node-id="s1S8">重建并重推
+<code data-page-node-id="s1C59">geesun-mcp-server:1.0.1</code> 与
+<code data-page-node-id="s1C60">geesun-agent-web:1.0.3</code></strong>——那是原地改写生产正在使用的
+同名 tag，而这两个仓库本次一行未改；外加同步 15 个第三方镜像（技能已定性为重复劳动）。
+改用 <code data-page-node-id="s1C61">build_agent_only.sh</code>，只动一个镜像。
+<br><br data-page-node-id="s1BR4">
+<b data-page-node-id="s1B22">阶段 2（待执行）：</b>接入方式已拍板为
+<code data-page-node-id="s1C62">config 配置项</code>（与 <code data-page-node-id="s1C63">loop_detect_*</code> 一致、可热调）：
+<ol data-page-node-id="s1OL2">
+<li data-page-node-id="s1Li4"><code data-page-node-id="s1C64">src/core/config.py</code> 新增
+    <code data-page-node-id="s1C65">terminal_response_max_retries: int = 1</code></li>
+<li data-page-node-id="s1Li5"><code data-page-node-id="s1C66">src/services/agent.py:842</code>
+    在 <code data-page-node-id="s1C67">LoopDetectionMiddleware</code> <b data-page-node-id="s1B23">之后</b>追加
+    <code data-page-node-id="s1C68">TerminalResponseMiddleware(max_retries=settings.terminal_response_max_retries)</code></li>
+<li data-page-node-id="s1Li6"><code data-page-node-id="s1C69">.env.example</code>（根，大写）与
+    <code data-page-node-id="s1C70">deploy/.env.example</code>（小写，风格对齐 <code data-page-node-id="s1C71">loop_detect_*</code>）各补一项</li>
+<li data-page-node-id="s1Li7">tag <b data-page-node-id="s1B24">1.0.8</b> 二次构建部署，按
+    <code data-page-node-id="s1C72">geesun-release-prep</code> §5.1.1 验证</li>
+</ol>
+</div>
+
+<h2 data-page-node-id="s2H2Stage2">十一、阶段 2 发布完成：<code>TerminalResponseMiddleware</code> 上线 1.0.8</h2>
+
+<div class="card" data-page-node-id="s2Verdict">
+<b data-page-node-id="s2B1">结论：已发布，接入正确性三层验证通过。</b>
+镜像 <code data-page-node-id="s2C1">geesun-agent:1.0.8</code>
+（digest <code data-page-node-id="s2C2">sha256:3ef6e0c84b50e56954c12c5d2e9791b9184dfa6cc92be404029e1a8c0808320f</code>，
+1,782,532,692 字节）于 <b data-page-node-id="s2B2">2026-09-11 11:18 CST</b> 构建、
+<b data-page-node-id="s2B3">11:22 CST</b> 上线；19 个服务全 <code data-page-node-id="s2C3">1/1</code>，
+agent 容器 <code data-page-node-id="s2C4">running | health=healthy</code>，容器内 digest 与构建完全一致。
+<br data-page-node-id="s2Br1">
+<b data-page-node-id="s2B4">诚实标注一项未闭环</b>：守卫在生产环境<b data-page-node-id="s2B5">尚未被真实流量触发</b>
+（其 liveness 只能由 span 证明）。部署后无 agent 调用，详见 11.4。
+</div>
+
+<h3 data-page-node-id="s2H31">11.1 本次发布的四类改动</h3>
+<table data-page-node-id="s2T1">
+<thead data-page-node-id="s2TH1"><tr data-page-node-id="s2TR1"><th data-page-node-id="s2THa">文件</th><th data-page-node-id="s2THb">改动</th><th data-page-node-id="s2THc">为什么</th></tr></thead>
+<tbody data-page-node-id="s2TB1">
+<tr data-page-node-id="s2R1"><td data-page-node-id="s2R1a"><code>src/core/config.py:131</code></td>
+<td data-page-node-id="s2R1b">新增 <code>terminal_response_max_retries: int = 1</code></td>
+<td data-page-node-id="s2R1c">走 config 配置项（与 <code>loop_detect_*</code> 一致），避免硬编码</td></tr>
+<tr data-page-node-id="s2R2"><td data-page-node-id="s2R2a"><code>src/services/agent.py:861-863</code></td>
+<td data-page-node-id="s2R2b">在 middleware 列表<b>末位</b>追加 <code>TerminalResponseMiddleware</code></td>
+<td data-page-node-id="s2R2c">接在 <code>LoopDetectionMiddleware</code> 之后是<b>正确性前提</b>，不是风格（见 11.2）</td></tr>
+<tr data-page-node-id="s2R3"><td data-page-node-id="s2R3a"><code>src/core/terminal_response.py</code></td>
+<td data-page-node-id="s2R3b"><code>_FALLBACK_CONTENT</code> 常量 → <code>_fallback_content(retries)</code> 函数</td>
+<td data-page-node-id="s2R3c">预算可配后，硬编码「已自动重试 1 次」在 <code>=0</code> 时会撒谎、<code>&gt;1</code> 时少报次数</td></tr>
+<tr data-page-node-id="s2R4"><td data-page-node-id="s2R4a">两个 <code>.env.example</code></td>
+<td data-page-node-id="s2R4b">各补一项（根大写 / deploy 小写）</td>
+<td data-page-node-id="s2R4c">各自匹配所在文件的既有风格；两边都验证过能驱动字段</td></tr>
+</tbody>
+</table>
+
+<h3 data-page-node-id="s2H32">11.2 关键实测：注册位置为什么必须是末位</h3>
+<div class="card" data-page-node-id="s2Card2">
+用真实 <code data-page-node-id="s2C5">create_deep_agent</code> 装配
+<code data-page-node-id="s2C6">[LoopDetectionMiddleware, TerminalResponseMiddleware]</code> 后导出真实图结构：
+<pre data-page-node-id="s2Pre1">model → TerminalResponseMiddleware.after_model → LoopDetectionMiddleware.after_model
+      → TodoListMiddleware.after_model → {model | tools}</pre>
+<b data-page-node-id="s2B6">模型的直接后继就是我们</b>，所以我们是第一个看到模型输出的节点。
+若挂在 <code data-page-node-id="s2C7">LoopDetection</code> <b>之前</b>，后者会先给消息追加软提醒/硬停文案使其
+<code data-page-node-id="s2C8">content</code> 非空，本中间件的判空即被绕过 → <b data-page-node-id="s2B7">反而漏掉真正的空响应</b>。
+<br data-page-node-id="s2Br2">
+<b data-page-node-id="s2B8">代价（已实测，可接受）</b>：<code data-page-node-id="s2C9">jump_to="model"</code> 会短路 after_model 静态链，
+被判空的那条消息不会再流经 LoopDetection（实测模型调用 2 次、LoopDetection 仅 1 次）。
+两者职责天然不重叠——空响应轮次没有 tool_calls 参与循环判定。
+</div>
+
+<h3 data-page-node-id="s2H33">11.3 验证矩阵（四层，全部为实测）</h3>
+<table data-page-node-id="s2T2">
+<thead data-page-node-id="s2TH2"><tr data-page-node-id="s2TR2"><th data-page-node-id="s2THd">层次</th><th data-page-node-id="s2THe">手段</th><th data-page-node-id="s2THf">结果</th></tr></thead>
+<tbody data-page-node-id="s2TB2">
+<tr data-page-node-id="s2R5"><td data-page-node-id="s2R5a">① 源码级</td>
+<td data-page-node-id="s2R5b">生产同款镜像挂载源码跑 4 个 spike</td>
+<td data-page-node-id="s2R5c"><span class="hl-grn">74 PASS / 0 FAIL</span></td></tr>
+<tr data-page-node-id="s2R6"><td data-page-node-id="s2R6a">② 镜像级</td>
+<td data-page-node-id="s2R6b">在 <code>1.0.8</code> 镜像内<b>不挂载源码</b>复跑同样 4 个 spike（强制读镜像自带 <code>/app/src</code>）</td>
+<td data-page-node-id="s2R6c"><span class="hl-grn">74 PASS / 0 FAIL</span>（与①完全一致）</td></tr>
+<tr data-page-node-id="s2R7"><td data-page-node-id="s2R7a">③ 镜像内容闸门</td>
+<td data-page-node-id="s2R7b"><code>verify_image_content.sh 1.0.8</code> 查标志与瘦身</td>
+<td data-page-node-id="s2R7c"><span class="hl-grn">全绿</span>：<code>can_jump_to=["model"]</code> 在 453/458 两处（sync + async 都在）；<code>data/skills/deploy/docs/tests</code> 全 absent</td></tr>
+<tr data-page-node-id="s2R8"><td data-page-node-id="s2R8a">④ 生产容器级</td>
+<td data-page-node-id="s2R8b">容器内 AST 静态检查（<b>不 import <code>agent.py</code></b>，避免副作用）</td>
+<td data-page-node-id="s2R8c"><span class="hl-grn">9 PASS / 0 FAIL</span>：列表 7 项、末位正确、<code>max_retries</code> 由 settings 驱动、env 已注入</td></tr>
+</tbody>
+</table>
+
+<h3 data-page-node-id="s2H34">11.4 尚未闭环：守卫的 liveness 需要一次真实调用</h3>
+<div class="card" data-page-node-id="s2Card4">
+「接入正确」已被上述四层证明，但「真的跑了」还缺一次真实流量。
+<br data-page-node-id="s2Br3">
+<b data-page-node-id="s2B9">为什么不能自己触发</b>：<code>/auth/login</code> 走 LDAP，本轮没有凭据；
+<code>/api/v1/sessions</code> 返回 401（预期）。
+<br data-page-node-id="s2Br4">
+<b data-page-node-id="s2B10">怎么闭环</b>：守卫的 <code>before_agent</code> / <code>after_agent</code> 会各产生一个
+<b data-page-node-id="s2B11">AGENT span</b>（与生产 trace 里已见的
+<code data-page-node-id="s2C10">LoopDetectionMiddleware.after_agent</code> 同理）。
+下次真实使用 agent 后，查 Phoenix / Langfuse 中 span 名含
+<code data-page-node-id="s2C11">TerminalResponseMiddleware</code> 即可确认。
+<br data-page-node-id="s2Br5">
+<b data-page-node-id="s2B12">当前基线</b>：部署后两个后端的最新 span 仍停在
+<code data-page-node-id="s2C12">2026-09-11 02:50 UTC</code>（= 10:50 CST，1.0.7 部署时那次调用），
+即<b data-page-node-id="s2B13">部署后尚无任何 agent 调用</b>——这是「没有数据」，不是「链路断了」。
+</div>
+
+<h3 data-page-node-id="s2H35">11.5 本机构建踩到的坑（ghcr.io + BuildKit）</h3>
+<div class="card" data-page-node-id="s2Card5">
+<b data-page-node-id="s2B14">症状</b>：构建在 <b>第一步</b>就失败，报
+<code data-page-node-id="s2C13">failed to fetch anonymous token: Get "https://ghcr.io/token?...": EOF</code>，
+且<b data-page-node-id="s2B15">重试同样失败（稳定复现，不是瞬时抖动）</b>。
+<br data-page-node-id="s2Br6">
+<b data-page-node-id="s2B16">排查（每步都有对照实验）</b>：
+<ul data-page-node-id="s2UL1">
+<li data-page-node-id="s2Li8">容器内 <code>urllib.request.urlopen(ghcr.io/token…)</code> → <b data-page-node-id="s2B17">HTTP 200 且拿到 token</b>（网络与 TLS 都正常）</li>
+<li data-page-node-id="s2Li9">BuildKit 构建 <code>FROM alpine:3.20</code> → <b data-page-node-id="s2B18">成功</b>（Docker Hub 走 <code>registry-mirrors</code>）</li>
+<li data-page-node-id="s2Li10"><code>docker pull ghcr.io/astral-sh/uv:python3.13-bookworm</code> → <b data-page-node-id="s2B19">成功，8 层全 Already exists</b></li>
+</ul>
+⇒ 根因：<b data-page-node-id="s2B20">BuildKit 的 registry metadata resolver 与 dockerd 的经典 puller 走了不同的出网路径</b>；
+镜像其实<b data-page-node-id="s2B21">早就在本地</b>（上次构建拉的），但 BuildKit 仍要联网重新解析 tag。
+<br data-page-node-id="s2Br7">
+<b data-page-node-id="s2B22">修复（一行，无需改 Dockerfile、无需重启 Docker Desktop）</b>：
+<pre data-page-node-id="s2Pre2">docker pull ghcr.io/astral-sh/uv:python3.13-bookworm   # 让 tag 在本地可解析
+bash build_agent_only.sh 1.0.8                       # 此后 #3 load metadata = DONE 0.0s</pre>
+修复后依赖层全部 CACHED，<b data-page-node-id="s2B23">构建从 5–15 分钟降到 2 分 15 秒</b>（只重跑最后两层）。
+已写入 <code data-page-node-id="s2C14">geesun-release-prep</code> 陷阱 8。
+</div>
+
+<div class="foot" data-page-node-id="Bc0kT14iKKX4zuloLJeGSr">
+<b data-page-node-id="dgGjoFE7hOmUGb3DYl9pVE">数据来源（全部为实测，非推断）</b>：<br data-page-node-id="bx1tSFdoFGoAFWjyXyv6Aq">
+· SSH <code data-page-node-id="Ca7sEipVP2XSgGQ5w8D8GF">10.10.10.67</code>（paramiko，<code data-page-node-id="5fe2f454qMotHVuoyPEXCC">look_for_keys=False, allow_agent=False</code>）→
+<code data-page-node-id="v3mrxYGnvVV2OW8LlYJbdA">docker logs</code> / <code data-page-node-id="h5htbB0zJzADz2NpSJEedR">docker exec</code> / <code data-page-node-id="65mvvkURIogsEjMk2rgaKv">docker inspect</code><br data-page-node-id="vrYCQmqiOArL5up13IjpiG">
+· Phoenix PostgreSQL：<code data-page-node-id="FuH8ErNkeQWOct3Qxegsen">geesun_phoenix-db.1.jb04xdgqyuahwpn8quk49b7ze</code>，库 <code data-page-node-id="V1DpzLaFvPg4Hc3c2Y2sDz">phoenix</code>，表 <code data-page-node-id="3B3UXvhaC5CQDkzkEYgumq">spans</code>（261 LLM span 全量扫）<br data-page-node-id="7aYFTb0g8jeaqTXuFF4Vck">
+· Langfuse ClickHouse：<code data-page-node-id="V3wJEW8B2IO1545mw8hmX7">geesun_clickhouse.1.vvrguyc24f9f2upia2vo3wqhx</code>，表 <code data-page-node-id="5JssyUDGAjBPi6eZPK33UG">observations</code>（107,103 条）<br data-page-node-id="NlAFKsHQdAsISyjPsgXLUW">
+· 本地 spike：langchain 1.3.13 / langchain-core 1.4.9 / langgraph 1.2.9 / langchain-openai 1.2.1 /
+openinference-instrumentation-langchain <b data-page-node-id="Djnf8eOqB4F6ed2BEYm3bS">0.1.67</b>（与项目 <code data-page-node-id="7izzPmay4f0OYzfS5HER44">.venv</code> 同版本）<br data-page-node-id="aGA9P9YbA0BqBTsjyrgaAg">
+· 本地源码：<code data-page-node-id="vEb8CNy6DUMHiTZ4Y3keRu">D:\workspace\geesun_agent</code>@<code data-page-node-id="GsLE39D0vRROO2EzzfdYvO">01556d3</code>、<code data-page-node-id="gQJzs9F8N0iJFhGBM6BlKM">D:\workspace\geesun_agent_web</code><br data-page-node-id="ydTKAxziRYrKX8qkNaMyZe">
+· 脚本：<code data-page-node-id="OhkP3WgCCfYMiM4G1MdWpq">.workbuddy/spikes/finish_reason_span_spike.py</code>、<code data-page-node-id="ADQCEEB2trruP4bdRjPSEj">.workbuddy/spikes/finish_reason_query*.sql</code>、
+<code data-page-node-id="n2H1WIX1FFBuDS9Vvp5pJa">.workbuddy/spikes/preflight_terminal_response.py</code>、<code data-page-node-id="INDaN5aV9YWQ9s83Bm02Qo">tests/spikes/terminal_response_guard.py</code>、<code data-page-node-id="ftC20">.workbuddy/spikes/verify_wiring.py</code>（接入层 AST）、<code data-page-node-id="ftC21">.workbuddy/spikes/verify_import.py</code>（构建前导入闸门）、<code data-page-node-id="ftC22">.workbuddy/spikes/check_env_case.py</code>（pydantic-settings 大小写实证）
+<span data-page-node-id="ftSp1">；生产侧：</span><code data-page-node-id="ftC23">probe_guard_wiring.py</code>、<code data-page-node-id="ftC24">upsert_prod_env.py</code>（幂等 upsert 生产 .env 键）<br data-page-node-id="Pa3FCOMMCbcKQbgH21LBUa">
+<br data-page-node-id="T1Iy8B0GYFOrMJ7JCsAodq">
+<b data-page-node-id="cOUN4uLcAFTA5BXIlVlh8k">生产代码变更记录</b>（阶段 1 之前本节写作「未改动任何生产代码」，现已更新为事实）：
+<ul data-page-node-id="ftUL1">
+<li data-page-node-id="ftLi1"><code>0cfa40b</code> chore(deploy) —— TAG 1.0.6 → <b>1.0.7</b>，发布 <code>f3fd075</code>（tracing 断源+过滤后恢复三路 exporter）</li>
+<li data-page-node-id="ftLi2"><code>bb05c1e</code> feat(guard) —— <code>TerminalResponseMiddleware</code> 接入（新增 <code>src/core/terminal_response.py</code>、config 项、agent.py 末位注册、两个 env 模板）</li>
+<li data-page-node-id="ftLi3"><code>15c99f3</code> chore(deploy) —— TAG 1.0.7 → <b>1.0.8</b>，发布本次守卫</li>
+</ul>
+三个阶段各自的验证证据见第十章、第十一章。所有结论均标注了实测证据或明确标注为「假设/待确认」。
+</div>
+
+</div>
+</body>
+</html>

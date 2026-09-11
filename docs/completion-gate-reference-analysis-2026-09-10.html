@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="OMTCCStsncGpeRsqpfsN5K">
+<head data-page-node-id="Kb0KTio7FOtWIdsdJKKRWv">
+<meta charset="UTF-8" data-page-node-id="x5NOBtVJFQfMMaOclRjBxn">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="Kz6ARE5llOR2s6YSvtPHUR">
+<title>完成门 / 空响应 / 交付物校验：deer-flow 与 deepseek-harness 对照分析</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2328; --ink2:#5b6471;
+    --line:#e3e6ea; --red:#c62828; --redbg:#fdecea; --grn:#1b7f4b; --grnbg:#e8f5ee;
+    --amb:#a05a00; --ambbg:#fff5e5; --blu:#1a5fb4; --blubg:#eaf2fd; --pur:#6b3fa0; --purbg:#f3ecfb;
+    --mono:"Cascadia Mono","JetBrains Mono",Consolas,Monaco,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px 24px 64px;background:var(--bg);color:var(--ink);
+       font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1120px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 8px;letter-spacing:-.2px}
+  .sub{color:var(--ink2);font-size:13.5px;margin-bottom:22px;line-height:1.75}
+  h2{font-size:18px;margin:36px 0 12px;padding-left:11px;border-left:4px solid var(--blu)}
+  h3{font-size:15.5px;margin:22px 0 8px;color:#2c3138}
+  h4{font-size:14px;margin:16px 0 6px;color:#3a4047}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:16px 20px;margin:12px 0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  .verdict{background:var(--grnbg);border:1px solid #bfe3ce;border-left:4px solid var(--grn);
+           border-radius:8px;padding:15px 18px;margin:16px 0}
+  .warn{background:var(--ambbg);border:1px solid #f0d9b0;border-left:4px solid var(--amb);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .info{background:var(--blubg);border:1px solid #c9dcf5;border-left:4px solid var(--blu);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .danger{background:var(--redbg);border:1px solid #f3c4c0;border-left:4px solid var(--red);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .pur{background:var(--purbg);border:1px solid #ddd0f0;border-left:4px solid var(--pur);
+       border-radius:8px;padding:13px 17px;margin:14px 0}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+  th{background:#f0f2f5;text-align:left;padding:8px 10px;border:1px solid var(--line);
+     font-weight:600;white-space:nowrap}
+  td{padding:7px 10px;border:1px solid var(--line);vertical-align:top}
+  tbody tr:nth-child(even){background:#fafbfc}
+  code{font-family:var(--mono);font-size:12px;background:#f1f3f5;
+       padding:1.5px 5px;border-radius:4px;color:#b3261e;word-break:break-all}
+  pre{font-family:var(--mono);font-size:12px;background:#fbfbfc;border:1px solid var(--line);
+      border-radius:7px;padding:11px 13px;overflow-x:auto;line-height:1.55;margin:9px 0}
+  pre .rc{color:var(--red);font-weight:600}
+  pre .gc{color:var(--grn);font-weight:600}
+  pre .cc{color:var(--ink2)}
+  .hl-red{background:var(--redbg);color:var(--red);font-weight:600;padding:0 3px;border-radius:3px}
+  .hl-grn{background:var(--grnbg);color:var(--grn);font-weight:600;padding:0 3px;border-radius:3px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 7px;border-radius:99px;
+       border:1px solid;margin-right:5px;white-space:nowrap}
+  .t-red{color:var(--red);border-color:#f0b8b4;background:var(--redbg)}
+  .t-grn{color:var(--grn);border-color:#bfe3ce;background:var(--grnbg)}
+  .t-amb{color:var(--amb);border-color:#f0d9b0;background:var(--ambbg)}
+  .t-blu{color:var(--blu);border-color:#c9dcf5;background:var(--blubg)}
+  .t-pur{color:var(--pur);border-color:#ddd0f0;background:var(--purbg)}
+  ul,ol{margin:8px 0 8px 22px;padding:0}
+  li{margin:5px 0}
+  .kv{display:grid;grid-template-columns:180px 1fr;gap:5px 14px;font-size:13px}
+  .kv dt{color:var(--ink2)}
+  .kv dd{margin:0;font-family:var(--mono);font-size:12px;word-break:break-all}
+  .foot{margin-top:40px;padding-top:14px;border-top:1px solid var(--line);color:var(--ink2);font-size:12.5px}
+  .src{font-size:11.5px;color:var(--ink2);font-family:var(--mono);margin-top:-4px;margin-bottom:8px}
+</style>
+</head>
+<body data-page-node-id="ixDWGJ3VcL2YQpSS7o2sEr">
+<div class="wrap" data-page-node-id="pWUIHI1GEFIlZ05aCRzI8w">
+
+<h1 data-page-node-id="L3f63qsJXgBbbK9GJt5GJ7">完成门 / 空响应 / 交付物校验：deer-flow 与 deepseek-harness 对照分析</h1>
+<div class="sub" data-page-node-id="FRv2Au0Zp7r3UA5gmzbluW">
+  承接 2026-09-10 生产事故：会话 <code data-page-node-id="TnbWf3sRV0byD2TF8PzCnR">GY24428:0f6d781d</code> 因模型返回空响应 + <code data-page-node-id="dwQnrT8fvzX86gvhqOnBZH">auto_continue=false</code>，
+  被 M3 完成门判为「本轮未产出交付物」终局失败。<br data-page-node-id="pL06EVEnB1pVzvtiqHCl48">
+  本文回答三问：<b data-page-node-id="rDRAU6PJw5Nbewo96NLL0F">它们有没有做这种门？怎么做的？我们能否借鉴、代码兼容吗？</b><br data-page-node-id="GPVQKkcWoDysqoPXCq19wL">
+  分析对象：<code data-page-node-id="hNpm6K09QZigZThootcwwk">D:\github\deer-flow</code>（backend/packages/harness）· <code data-page-node-id="EuO3WkesCqlrYQY6Xl90OC">D:\github\deepseek-harness</code>（packages/llm）
+</div>
+
+<div class="verdict" data-page-node-id="3xZ9XbD0h5qPcxFgZs0K5f">
+<b data-page-node-id="nQzKDfpZ0utEO6AHXsKJCa">三句话结论：</b>
+<ol style="margin:8px 0 0 20px" data-page-node-id="DvuTRrfMXihHs8o6kefpKK">
+<li data-page-node-id="aGNuQZNIdv95QENIMaAP9l"><b data-page-node-id="RFtxpVKly2vNiZJ9m4L5LW">两者都做了，而且都比我们成熟——但路径完全不同。</b>
+    deer-flow 在 <b data-page-node-id="M92hqhDTKBeSp99IgTP7iS">Agent 中间件层</b>补一个「终点响应守卫」；deepseek-harness 在 <b data-page-node-id="DcmKFn90IsUXb1ZZ0gpF9Q">适配器层</b>把空响应直接定义成
+    <code data-page-node-id="mtf4iHVDIAvmw0saBrHEyy">EMPTY_RESPONSE</code> 错误码 + 有界退避重试。</li>
+<li data-page-node-id="5oPeC8GSkr1gFFOh76Dc4r"><b data-page-node-id="EHq2kzCAvRDVEMoWB2yHN1">我们的 bug，deer-flow 有 1:1 的现成解</b>（<code data-page-node-id="5Gt5pYgrDyLExpKgL38xTs">TerminalResponseMiddleware</code>），
+    且我们<b data-page-node-id="iyaxIWoWJmLmj1N7BQyDa7">已经移植过它的姊妹中间件</b>（<code data-page-node-id="NnSOk5SNeS3eYqBMNw5cw6">LoopDetectionMiddleware</code>，<code data-page-node-id="bU0NVrPQxMElm1ZIvYPbeG">agent.py:836</code> 注释确认），
+    部署版本也用同一套 langchain 1.3.13 中间件 API。<b data-page-node-id="TmLrb8EagjmeC4dHEJMvLL">兼容性已逐项实测验证。</b></li>
+<li data-page-node-id="pLFByDoF7f5GAnxHwokE3E"><b data-page-node-id="A1vhQovgau5LnBWZtLlbK3">但两者各有一个盲区，且都落在我们这次的故障点上</b>——照抄任何一个都不够，
+    需要用「互补组合」+ 补一个我们独有的 <b data-page-node-id="4QH7H03wp5HN0ilt38Htec">reasoning 感知空判定</b>。</li>
+</ol>
+</div>
+
+<h2 data-page-node-id="vX55epXV5Ew4Ays6dPnY38">一、deer-flow：Agent 中间件层的「终点响应守卫」</h2>
+
+<div class="src" data-page-node-id="f6fM9XLXhN4HMaYr2HOEuk">D:\github\deer-flow\backend\packages\harness\deerflow\agents\middlewares\</div>
+
+<p data-page-node-id="lzhvSMHzBdMLXKVzLpMazl">deer-flow 的<b data-page-node-id="4SGzvBUnCaAG5JdZcUFlLU">核心不是「完成门」（校验交付物），而是「防静默成功」</b>——
+它不去检查 <code data-page-node-id="A2wcDZjcmPLHww2aYCrsb7">/reports</code> 是否为空，而是守住<b data-page-node-id="awf5lZRToZvCVm7oD5KmWn">对话是否以一条空的 assistant 消息结束</b>。
+这个定位差异非常关键，后面会展开。</p>
+
+<h3 data-page-node-id="YTAjbXmTsSZyIity836pCt">1.1 <code data-page-node-id="D85yDxdzqbex5mqRhZFDO4">TerminalResponseMiddleware</code> — 与我们的 bug 一一对应</h3>
+<div class="src" data-page-node-id="1kv2G3CbB5kgMkkrgo8k0G">terminal_response_middleware.py（224 行）</div>
+
+<div class="card" data-page-node-id="U7XF7xAECMSrffR0sxao25">
+<p data-page-node-id="riCXBHvZIsyWXtjQktuQ8H">它的自述就写明了要防的场景，与我们遇到的完全一致：</p>
+<pre data-page-node-id="38ozXSSznrOzfqHzfZYdqC"><span class="cc" data-page-node-id="ftG6bSfuHxa68k4sxJ6vj5">"""Retry one empty post-tool response, then persist a visible error fallback."""</span>
+
+_RECOVERY_PROMPT = (
+    "&lt;system_reminder&gt;\n"
+    "Your previous response after the tool execution was empty. Review the tool results "
+    "already present in the conversation and provide a concise, user-visible final response. "
+    "Do not call another tool unless it is strictly necessary.\n"
+    "&lt;/system_reminder&gt;"
+)
+_FALLBACK_CONTENT = "The model completed the tool run but returned no final response, "
+                    "including after one automatic retry. Please try again or use a different model."</pre>
+
+<h4 data-page-node-id="bXgpeQVF4W14gfVzB4pXjF">触发条件（三个 AND，非常克制）</h4>
+<pre data-page-node-id="IP8dAhJSpcDR674IGArhg8">if _has_visible_content(last) or _has_tool_call_intent_or_error(last):
+    return None                      <span class="cc" data-page-node-id="CUKiu2ngeqYqMFNBzplJKI"># 有正文或有工具意图 → 不管</span>
+if not _tool_result_in_current_turn(messages):
+    return None                      <span class="cc" data-page-node-id="d3qGnUUcntzgPFjRLszLtZ"># 本轮没有工具结果 → 不管</span></pre>
+<p data-page-node-id="Ef1sQ8KOGu6j1jjLFcgxmY"><span class="tag t-grn" data-page-node-id="mH1kweivmUdnhIpy8g0As2">要点</span><code data-page-node-id="RuwNVIk5ELzLSDH5FGTPxs">_tool_result_in_current_turn</code> 以<b data-page-node-id="fqanvCC00mjgZZrCe08mCp">最后一条真实 HumanMessage</b>为界，
+只在本轮真的跑过工具时才守——避免把「用户刚发消息、模型还没回」的正常中间态误判。非常严谨。</p>
+
+<h4 data-page-node-id="b58qr8bjciz5QzG3wwpbYc">两步处置：先重试一次，再落可读降级文案</h4>
+<pre data-page-node-id="y1Jaz3yVuHmRdnrRkikMIG"><span class="cc" data-page-node-id="zI8uFEDDBI0jfUAIZxJqiE"># 第 1 次命中：删掉空消息 + 跳回 model 重跑（不是抛错、不是判失败）</span>
+if retry_count == 0:
+    message_updates = [RemoveMessage(id=last.id)] if last.id else []
+    return {"messages": message_updates, <span class="gc" data-page-node-id="W9vw9GRGvIByBY2bcnFuiX">"jump_to": "model"</span>}
+
+<span class="cc" data-page-node-id="Q6C4DPoddHdOsl9EO8tdD9"># 第 2 次仍空：写一条用户可见的降级文案，绝不留空</span>
+fallback = last.model_copy(update={"content": _FALLBACK_CONTENT, ...})</pre>
+
+<h4 data-page-node-id="XD5SWLNG59Su8NHZxHwced">重试提示的注入方式 — 这是最值得抄的一手</h4>
+<pre data-page-node-id="HqmINdoUh3ai5SVFzpiHcu">def _augment_request(self, request: ModelRequest) -> ModelRequest:
+    ... if pending:
+    reminder = HumanMessage(
+        content=_RECOVERY_PROMPT,
+        name="terminal_response_recovery",
+        additional_kwargs={<span class="gc" data-page-node-id="62RcsD6rdny5W60zYSR8zt">"hide_from_ui": True</span>},   <span class="cc" data-page-node-id="fNF0DRvIEKRPFHlynleLAz"># 用户看不到这条</span>
+    )
+    return request.override(messages=[*request.messages, reminder])</pre>
+<p data-page-node-id="fWqhbboLWBFWt99hpO0laU"><span class="tag t-grn" data-page-node-id="ZcUFSkiAkYzNz6aQyeOmnD">要点</span>用 <b data-page-node-id="wmoY4DOYGp4AvC2ywOe0OB">HumanMessage + <code data-page-node-id="XRJhMDWxz1CXzc5d7uYPUY">hide_from_ui</code></b> 而非 SystemMessage。
+这一手同时解决我们的两个历史痛点：
+① 我们 <code data-page-node-id="FT7HeOlSltPMIWFNGesoPf">chat.py:1379</code> 用的 <code data-page-node-id="9LnwMmFcEuZBEywLeoW5eC">SystemMessage</code> 曾触发 vLLM 400
+「System message must be at the beginning」（<code data-page-node-id="y67fB2HKpDf2HYVNpa5liG">chat.py:1264-1267</code> 有记载）；
+② 恢复提示会污染 UI 对话流。</p>
+
+<h4 data-page-node-id="HBoRkgYlmzCtTfGUOH9SgR">重试预算作用域 = 每次 run（不是每条空消息）</h4>
+<pre data-page-node-id="RP4Akj1hAT5JAJ0uePi5NN"><span class="cc" data-page-node-id="SOTGdt8iSBx5dFDuTVvmIu"># The recovery budget is once per run, not once per empty message.</span>
+<span class="cc" data-page-node-id="HgyzC05qjjpFGqEFA9i9AO"># A retry that calls another tool must not refresh the budget and</span>
+<span class="cc" data-page-node-id="PzEVlVwfJPkUDUFWDWMLd9"># create an unbounded empty -&gt; retry -&gt; tool loop.</span>
+self._retry_counts: BoundedDict[tuple[str, str], int] = BoundedDict(1000)</pre>
+<p data-page-node-id="QDsH31bKlocj04npAfFUuX">key = <code data-page-node-id="xRxSt7Rgt9xRQPcTrGIsCw">(thread_id, run_id)</code>，并在 <code data-page-node-id="QKR4NH8Et0R61LYpxFytbn">before_agent</code> / <code data-page-node-id="EtC0ZHA2cDGH97HbFQgko8">after_agent</code> 清理。
+这是防止「空 → 重试 → 调工具 → 又空」死循环的关键，我们的 <code data-page-node-id="q5zYTlDqPhdXprNAXopREh">auto_continue</code> 预算没有这层防护。</p>
+</div>
+
+<h3 data-page-node-id="ur941pBYW2A5EuK3FULhiG">1.2 它其实有三层「终止原因」处理，但彼此有缝</h3>
+
+<table data-page-node-id="aYhRWpxpGixOBwvmvxX1H5">
+<thead data-page-node-id="yuaYU5oR7rDs4IVkoSxCdF"><tr data-page-node-id="HKu3MgUe4Q0A5opQyuqeO8"><th data-page-node-id="tMClXwmaGTXRan1BFrwwWa">中间件</th><th data-page-node-id="AjMHJXraQol9qarKmL98Dy">触发条件</th><th data-page-node-id="N9lQp7N8kz502t8Xg5VY52">动作</th><th data-page-node-id="TftMnbsdEhA4kcrLMZhK3c">对空响应的覆盖</th></tr></thead>
+<tbody data-page-node-id="trOXFdTNXFuTzjeGLOa67g">
+<tr data-page-node-id="LLfriaOztSkzn7f8NMCeRe">
+  <td data-page-node-id="e0bHyiXICTFrf4y0bFs5A2"><code data-page-node-id="sreUkF2dSQMnXFLwDVvBhV">TerminalResponseMiddleware</code><br data-page-node-id="poyBxAGHU5Rz0sdZ55NR1F"><span class="src" data-page-node-id="xrbTWUMGm36adMb1xxgDmf">terminal_response_middleware.py</span></td>
+  <td data-page-node-id="AdMcRCny4DATHaAXGTjnCg">最后一条 AI 消息<b data-page-node-id="jimEMXF4c8EqDmEhet76z1">空正文且无工具调用</b>，且本轮有工具结果</td>
+  <td data-page-node-id="ZcCaWVYNIqD2G5hGq06nB6">重试 1 次 → 仍空则写降级文案</td>
+  <td data-page-node-id="TLd2ftIoizxBRSerCGfyw5"><span class="tag t-grn" data-page-node-id="11RUdFfZDDiHQria9oeReI">完整覆盖</span></td>
+</tr>
+<tr data-page-node-id="4An7eK2Wu6G8iEBZVAyNsh">
+  <td data-page-node-id="eTpbwrJr3yKXcEFjd3HKZj"><code data-page-node-id="0e1GipRsgFz6NVk3P4MeEJ">ModelLengthFinishReasonMiddleware</code><br data-page-node-id="msGtNPR9fq5r2c0OY9YdCI"><span class="src" data-page-node-id="Vi4LxICIfeLPTfYhYpdEqe">model_length_finish_reason_middleware.py</span></td>
+  <td data-page-node-id="OkrDIQmzaTV1D4c8lDnBKA"><code data-page-node-id="8zexBRyFysabvwm6Qh23jK">finish_reason='length'</code> 且<b data-page-node-id="QyTHJADcqwCJa0bVyEhE7o">有可见正文</b>、无工具意图</td>
+  <td data-page-node-id="c4sVHwTGTHBdoooyvhEa3D">只打标 <code data-page-node-id="K675O0nZHwsXoyaAykWRq0">stop_reason='model_length_capped'</code>，不改内容</td>
+  <td data-page-node-id="lGajqKTPZFyE02jpnt6mJx"><span class="tag t-red" data-page-node-id="KEYlFElTqNAud8ch7RCOSL">明确排除空内容</span><br data-page-node-id="fP6gn5J1jXdCLooJp2jmub"><code data-page-node-id="1fHvdCYXxC377QMVHvl3xr">if not _has_visible_content(last): return None</code></td>
+</tr>
+<tr data-page-node-id="MyRzBVDGVyfLM0LYgSRL84">
+  <td data-page-node-id="ZUgHJYafVQ0QmbL8424xDm"><code data-page-node-id="rdyAmJsLMHSmyfYqhvvjRZ">SafetyFinishReasonMiddleware</code><br data-page-node-id="Mi0EGCSKR9KSdFJHpWJlWq"><span class="src" data-page-node-id="BWssA8ThxdL0VCXollbgf3">safety_finish_reason_middleware.py</span></td>
+  <td data-page-node-id="jSdQGtYkGgkJLzrZCfU3By">provider 安全终止信号（<code data-page-node-id="etRWGzXPQ40fq8sGIUGEk2">content_filter</code>/<code data-page-node-id="gVouAnQ59lcX4oqRFYAAiR">refusal</code>/<code data-page-node-id="kf2fmgW5ViV8Gd3zLCHYt2">SAFETY</code>）
+      <b data-page-node-id="09EAtJtzELd8rDkqeN0QXW">且</b>（有工具调用 <b data-page-node-id="VEs4idVO16dAkJTIgztioX">或</b> 内容空白）</td>
+  <td data-page-node-id="XOqJGheGrWlfgvsHNBGq9W">剥离截断的 tool_calls；内容空则回填解释文案</td>
+  <td data-page-node-id="ZUZofnLpiOGTLVkFfFjcZ9"><span class="tag t-amb" data-page-node-id="GDc3Gt8bLTDD6t1Gprxa5Y">覆盖空内容，但仅限安全终止</span><br data-page-node-id="dmgEltzWUzqC8BabkCHepF">它的 issue #4393 正是「空响应毒化会话」</td>
+</tr>
+</tbody>
+</table>
+
+<div class="danger" data-page-node-id="15dGaIpeNtC5hOjGDDG1lY">
+<b data-page-node-id="jyDf9exvqbWHGqTX05REEW">发现的盲区 1（deer-flow 侧）：<code data-page-node-id="wFnoz2aFrkWZ2X3DT7EeY0">finish_reason='length'</code> + 内容为空，三个中间件都不覆盖。</b>
+<ul style="margin:8px 0 0 20px" data-page-node-id="Jsd839GhZNALwT5oSJxQWz">
+<li data-page-node-id="2CWm9UeareHC2pwul78bOK"><code data-page-node-id="OD7tFmnT24IgZ9qJkPYF5D">TerminalResponseMiddleware</code> 会兜住它（因为它是「空 + 无工具调用」），但<b data-page-node-id="J9AkAzELKnIpBws3trajEx">只重试一次</b>，
+    且恢复提示写的是「Your previous response ... was empty」——<b data-page-node-id="ougOGc3KRzeBYHuryHgDtF">没有告诉模型「你的输出预算被截断了」</b>。</li>
+<li data-page-node-id="L6Wo4RKGFcDiF7zBe2XX9S">对「thinking 吃光 max_tokens」这种情形，模型下次很可能<b data-page-node-id="bYQ5ZcACilmNFuAUpHdtlD">又</b>思考到截断，一次重试不足以恢复。</li>
+<li data-page-node-id="iPmqmfr7zE6dcieBJfQanR"><code data-page-node-id="bwgs4ArjQ7ROnLOJelisiH">ModelLengthFinishReasonMiddleware</code> 本可以给出精准信号，但它的守卫把「无可见正文」直接排除，
+    于是<b data-page-node-id="YyGoVXGgrkwEeQgoD9YrcE">最常见的截断形态（截在思考段内）反而没有 <code data-page-node-id="pfEbzewLc0BfhWzT0mSGzN">model_length_capped</code> 标记</b>。</li>
+</ul>
+</div>
+
+<div class="warn" data-page-node-id="Bn0mF56LdETiiAKZwuws3b">
+<b data-page-node-id="v3JVkQslku1s8SpiDh7wBS">另一个发现（属我的代码推断，非实测，需谨慎）：<code data-page-node-id="lZW17ErUAJ7EvgA5nXPhVs">SafetyFinishReasonMiddleware</code> 可能根本没被触发。</b><br data-page-node-id="fbmNyCunFTiwOX70kI4azy">
+它的 docstring 自陈依赖「LangChain factory 按<b data-page-node-id="cBgQyaufvndkkRPVARNAtC">逆序</b>接 <code data-page-node-id="Otb8vBap0HNifU4Z5uYwh9">after_model</code> 边，
+最后注册的中间件最先看到模型输出」，并据此要求在 <code data-page-node-id="9tvWH7cB6SiBrB4LqWSFrF">LoopDetectionMiddleware</code> <b data-page-node-id="dTOyG5GxvbTBte30utZ2Bm">之后</b>注册。<br data-page-node-id="KB8xNML8safN5Ji3xEbGAL">
+但 <code data-page-node-id="VvavlDE0Lz7bLaEEO8EmUt">lead_agent/agent.py:667-673</code> 注释说的是另一套：
+<span class="hl-red" data-page-node-id="oMQzmvz6qFE6W0par1FSzm">「Registered after the terminal-response ... so LangChain's reverse-order after_model dispatch runs Safety first」</span>——
+作者认为后注册 = 先执行。而该中间件自己的 docstring 说「the last registered middleware is the first to observe」——
+两处描述<b data-page-node-id="hsrBBv0h5rYtgx2iNWxDWI">自相矛盾</b>（逆序 vs 正序）。<br data-page-node-id="ADZ03CftD3XD7CFtMa8VW7">
+若实际是正序或存在 <code data-page-node-id="LvxOVQzBOpgG409kyojPoR">pending</code> 状态残留，则该中间件会「注册了但永不触发」，
+其作者在 <code data-page-node-id="mfibZDd5mtpmbsZxMwRXvF">from_config</code> 里特意拒绝空 detector 列表、称其为
+「the worst of both worlds」就是这个担忧。<b data-page-node-id="8tUpLzSVGSaTYByoYKfcss">这一条我未运行验证，仅作为「照抄时需实测」的风险提示。</b>
+</div>
+
+<h3 data-page-node-id="RQpwoZfnwVTMuNq3KyqINj">1.3 交付物校验：产出「结构化 receipt」，而不是一句布尔失败</h3>
+<div class="src" data-page-node-id="nDkqI1CBnisOUPAqaiYGVZ">runtime/runs/worker.py:187-221 · workspace_changes/scanner.py</div>
+
+<div class="card" data-page-node-id="mgMffb0yFol3cmTaAUWBHM">
+<p data-page-node-id="V6gbnyNxZvTGOSVcuy1pDb">deer-flow <b data-page-node-id="LTWS80ka2gADHgSSaQlHkj">确实也做交付物校验</b>（对应我们的 M3），但它的产出是一个<b data-page-node-id="ZvG8C0O5xX9x2rNuf9T8Ra">状态机式的 receipt</b>：</p>
+<pre data-page-node-id="FpmV2eOebCiJXCxHJCJ0mi">def _delivery_content_with_outputs(content, produced_paths):
+    presented_paths = content.get("by_tool", {}).get("present_files", [])
+    matched_paths = [p for p in produced_paths
+                     if any(_presented_path_covers_output(pp, p) for pp in presented_paths)]
+    satisfied = bool(matched_paths)
+    return {
+        **content,
+        "verification": {"source": "outputs_changed",
+                         "requirement": "present_files_matches_produced_output"},
+        "produced_paths": produced_paths,
+        "presented_paths": presented_paths,
+        "matched_paths": matched_paths,
+        <span class="gc" data-page-node-id="4UkHHRxgwvvIragUo2Je0B">"stage": "presented" if satisfied else ("mismatched" if presented_paths else "not_started")</span>,
+        "satisfied": satisfied,
+    }</pre>
+<p data-page-node-id="reA6HtW3q0hr1ut9r3SgFh"><span class="tag t-grn" data-page-node-id="ueJC8vpDSQhnAeKHoR6a31">可借鉴</span>把「失败」拆成 <b data-page-node-id="lB2KJcgCVkZGcnAg9Bszue"><code data-page-node-id="V2HepC9nFTnD76Gdd2jFLX">not_started</code>（压根没产出）
+/ <code data-page-node-id="nAHynbeMTtPvk09WHAgj3R">mismatched</code>（产出了但没呈现）/ <code data-page-node-id="bZIuGcT3mXpKA0EJMceIcq">presented</code>（合规）</b>三态。
+我们目前只有布尔 <code data-page-node-id="BQ37GMN9uQmIUCs0g6xbfP">completion="blocked_no_output"</code>，
+把「模型没回答」和「模型回答了但忘了 download」混成同一个文案——
+<b data-page-node-id="4d0GBerpD3Wn4ystDzrvJl">这正是用户抱怨「不友好」的技术根源</b>。</p>
+<p data-page-node-id="cz4XRJJAUIuO1vKNlKtR8f">另外它的交付判定基于<b data-page-node-id="L2nwXHCuBwY17XUwYX9VeD">工作区快照 diff</b>（<code data-page-node-id="zqO3B9t02IdNtxiIPxqBKG">workspace_changes/scanner.py</code>），
+带完整的目录排除表（<code data-page-node-id="JQQkZbWmL8iJCVNGntWQ4k">.git</code>/<code data-page-node-id="4GA1NQryo919ORjfywR23T">.venv</code>/<code data-page-node-id="hv1gvJGIB8dXdxx6DoKJ8m">.tool-results</code>/<code data-page-node-id="m33qbmsd6e02dI1FFJXIEi">browser-frames</code> 等），
+并且明确注释了排除理由——比我们的 <code data-page-node-id="BFhpiB6ibqFDLW0xi2RW6Z">snapshot_report_files</code> 差集更系统。</p>
+</div>
+
+<h2 data-page-node-id="cLgStCcMPMoLOo6nuofxWd">二、deepseek-harness：适配器层的「空响应 = 可重试错误」</h2>
+
+<div class="src" data-page-node-id="wc2NYiRd9gPfQk9ofBMxCS">D:\github\deepseek-harness\packages\llm\</div>
+
+<p data-page-node-id="OaVMyQbH891jClMtkQFP7j">deepseek-harness 的思路<b data-page-node-id="MiuQVOCI9YAAYwFJtNr5w8">更靠底层、更彻底</b>：它不在 Agent 层打补丁，
+而是在 <b data-page-node-id="pXHc9kjrD2vGg178g3dEED">provider 适配器</b>把空响应<b data-page-node-id="TjrGly2KBZoEnOINmJTYFz">归类为协议错误</b>，让它走既有的重试通道。</p>
+
+<h3 data-page-node-id="wiVgLH40hx2bP5WfTqCaAd">2.1 核心决策：空响应不是「成功的空消息」，而是「错误 finish」</h3>
+<div class="src" data-page-node-id="KokLo3MxzDGDfzyhvRe1Io">packages/llm/llm/README.md:85 · llm-deepseek/src/translate.ts:110-116</div>
+
+<div class="card" data-page-node-id="7AD02KtZBGRCraluykGbDP">
+<pre data-page-node-id="aAHEZclSOGqWmeRUV2rw6o">const reason = pendingFinish ?? { kind: 'stop' as const }
+yield {
+  type: 'finish',
+  reason: reason.kind === 'stop' &amp;&amp; <span class="rc" data-page-node-id="Z610w3KC7WBeqYOyORwqWK">order.length === 0</span>
+    ? {
+        kind: <span class="rc" data-page-node-id="AgiSyThgbAgggUYA5UrtRi">'error'</span>,
+        failure: { message: 'model returned a completed response with no content',
+                   code: <span class="rc" data-page-node-id="ohnnS2IXppXadHo7ckANUd">EMPTY_RESPONSE_CODE</span> },
+      }
+    : reason,
+}</pre>
+<p data-page-node-id="qP6tiHYp3DtBjBmomsUwku">README 的原话（中文版同样明确）：</p>
+<pre data-page-node-id="OvhirWNUUi256NMwTzZIm0"><span class="gc" data-page-node-id="fBq2BlvhuJ5bwOjUo7U6vE">EMPTY_RESPONSE_CODE</span> — 两个适配器都使用的提供方无关 code，用于表示退化的提供方生成结果：
+一个未携带任何内容块的终止 stop。它会被分类为<b data-page-node-id="JxXrm2ProEn5TAXJcAST2j">错误 finish（而非成功空消息）</b>，
+因为尝试未产生持久内容；<span class="gc" data-page-node-id="CIjGX51SekJU7WpuGIbkmG">dsh-llm-retry 默认重试它</span>。</pre>
+<p data-page-node-id="utVE9VW2tNbfAAVT2Gw3wT"><span class="tag t-pur" data-page-node-id="8nPvxBQFgHzkNfZMinqVDo">设计要点</span>判定条件是 <code data-page-node-id="DG4wDJOEXNWtQqxZxfGcF2">order.length === 0</code>——即
+<b data-page-node-id="hEk0KZJhKd9PuGGdh8GYF9">一个内容块都没打开</b>。注意 <code data-page-node-id="1BwXVm5syozLX6louF86dA">order</code> 同时收纳 <code data-page-node-id="IZGK7gwweH2aPHSZquyNUX">text</code>、<code data-page-node-id="E56QBFMkQqSspBBIgjhEPL">reasoning</code>、
+<code data-page-node-id="TantPeHFMr4nkBEdyxgJIu">tool</code> 三类块，所以「只有 reasoning、没有正文」<b data-page-node-id="EXBdxCkWvm3aAsHpMWq8IV">不会</b>被判为空响应
+（这也正是它的盲区，见 2.3）。</p>
+</div>
+
+<h3 data-page-node-id="HQNvRTHkTcNkSgW2GjzyV1">2.2 重试是「一等公民」：有界指数退避 + 抖动，默认 5 次</h3>
+<div class="src" data-page-node-id="yH4MEoLDvGFCu7BgYhAQSF">packages/llm/llm/src/retry-policy.ts:13-23</div>
+
+<pre data-page-node-id="AeKmbip3EGKdVOwoczVVCL">const DEFAULT_MAX_RETRIES = 5
+const DEFAULT_INITIAL_DELAY_MS = 500
+const DEFAULT_MAX_DELAY_MS = 10_000
+const DEFAULT_JITTER_RATIO = 0.1
+const DEFAULT_RETRYABLE_CODES = Object.freeze([
+  <span class="gc" data-page-node-id="kfog0eAth99YCvLBK4ncZV">EMPTY_RESPONSE_CODE</span>,   <span class="cc" data-page-node-id="Z8VjNYKfbOtVrMqBr6Gx0j"># ← 空响应排在第一个</span>
+  'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT',
+])</pre>
+
+<p data-page-node-id="MKv0mEsO47aYXF58JBQFIU">它把「临时性失败」收敛成一个<b data-page-node-id="1Sn3wIat1fEmNGuePrSSn8">极小的、可配置的 code 集合</b>，
+并明确写出「加一个 code 需要适配器 fixture + 有记录的策略决策」。工程纪律很强。</p>
+
+<h4 data-page-node-id="byPdAF6GYO6aEImTRVssn0">几处设计细节值得我们直接学</h4>
+<table data-page-node-id="B3QbI2YOBdt7ruVjUZXbTX">
+<thead data-page-node-id="vnZDoRrlvcZzA2tTla4dWt"><tr data-page-node-id="9HBvEwNJYCa6rniHoqDLEa"><th data-page-node-id="NEsp1gFvaCABpbs6UHHHIM">机制</th><th data-page-node-id="eASyQ1ATmMA6oP0zvepOGV">做法</th><th data-page-node-id="gjXPWsG2dVLYfenSbFKhpQ">对我们的价值</th></tr></thead>
+<tbody data-page-node-id="eMZ4v9v79dvPb6YmgPTkFb">
+<tr data-page-node-id="oK98BoFHkUquWpHbEvXvRQ"><td data-page-node-id="uuELx0ODPzpOaLBLq2GRjr">重试预算归属</td>
+    <td data-page-node-id="3cjLIUzqQkUkAK08GCPc0Z">重试策略插件挂在 <code data-page-node-id="2R1Tcy6VRc2fNWkrSTZzhi">agent/request-error</code> 扩展点，<b data-page-node-id="XqN7fkCPXJdfcg5nzSTq7M">不新增 loop 分支</b>；
+        连续失败历史由 loop 拥有，成功后清空</td>
+    <td data-page-node-id="SMlBSB2pSgqx9Soxq47Nuz">我们若加重试，应避免在 <code data-page-node-id="zb3Kn71arh2mXm4ZGthaxY">chat.py</code> 的 while 循环里再堆分支</td></tr>
+<tr data-page-node-id="Dfty2Ml35v5yM9nlqFc1EM"><td data-page-node-id="9gjDg4KL4dIGCoXKsUnFSt">多失败类型独立预算</td>
+    <td data-page-node-id="IvNWbgpVWevSEhuMSDGUlo">transient 重试与 context-overflow 压缩<b data-page-node-id="eofETEKSHDwWbMDa3ovYnG">各自消耗自己的有限预算</b>，互不挤占</td>
+    <td data-page-node-id="Qic6ApKFpdsjwP7wtqp7mz">我们 <code data-page-node-id="dbD3HyAxooGOfiHbjvANcx">no_progress_max_injections=1</code> 与 <code data-page-node-id="2FHyv9Jzh1uHeZV2PQIiog">auto_continue</code> 是混在一起的</td></tr>
+<tr data-page-node-id="A4jk0LjcaTSCZ2cLFHcnv6"><td data-page-node-id="TmgyVuMSAqFWHsDYArxl74">重试可见性</td>
+    <td data-page-node-id="duK9iEpbFnRbgIZAHU8NSN">sleep 前写一条 <code data-page-node-id="uK1shDgoYT188PMNmt6BpR">llm/retry</code> 会话事件（含 turn/step/provider/延迟/failure），
+        「长静默等待看起来像卡死循环」被显式解决</td>
+    <td data-page-node-id="JleBfuQ7tgvlC11shTaGNR">直接对应我们「336 秒静默、用户只看到心跳」的观感问题</td></tr>
+<tr data-page-node-id="p4IT7XqfqwYSes5Eelva6l"><td data-page-node-id="C939bII40DmlSfKJfcLZAZ">streamIdleTimeoutMs</td>
+    <td data-page-node-id="AXFw0Orh4F7hWXJ8gR03p4">覆盖每次 <code data-page-node-id="qSLZ9AoGrQlmxnFZmTsWQ8">next()</code> 的等待，<b data-page-node-id="paBFDe6kvbi6xGS7Ahc1fe">SSE 注释算传输活动不算内容</b>；
+        超时以能力自有的 <code data-page-node-id="FTrTgLPGD9jfNkMyJ5g0Bt">TimeoutReason</code> abort</td>
+    <td data-page-node-id="dswXseUEl1tqkxZYNFipGa">与我们 <code data-page-node-id="WcCfRqpFanfDKQmKr7oFjX">stream_chunk_timeout=240s</code> 思路一致，可互相印证</td></tr>
+</tbody>
+</table>
+
+<h3 data-page-node-id="5YFUZw43n9Rt4dLHmLjizD">2.3 它的盲区：reasoning 块会掩盖「思考截断」</h3>
+<div class="card" data-page-node-id="WYyJLDn8sgAN2l05bRdKOf">
+<p data-page-node-id="HI9bX4mYw0OZpsuiWBmMkA">deepseek-harness 判定空响应用的是 <code data-page-node-id="EMbhptQGGXNsFpsGNCCoXQ">order.length === 0</code>（<b data-page-node-id="FoLlBKBXXbAgAdN0ciPtWO">任何</b>内容块都没开）。
+但 reasoning 是独立块，会被计入 <code data-page-node-id="E7ZHBBXHvm3VFECYNN9Zuo">order</code>。于是：</p>
+<pre data-page-node-id="FgjKjRCcqDc0Ipvrh4DQsB">模型思考了 6 万 token、被 max_tokens 截断、正文一个字没出
+→ 已开 reasoning 块 → order.length &gt; 0 → <span class="rc" data-page-node-id="QFgXH2CKpBWdbTrqfANo7s">不判 EMPTY_RESPONSE</span>
+→ 不重试 → 作为「成功的空正文消息」结束</pre>
+<p data-page-node-id="ZMHspGdE3fPGzMxo6DaEjx"><span class="tag t-red" data-page-node-id="rCtZEBVp3FGa8k1zx2w8ag">盲区</span>它防住了「完全没吐任何东西」，但防不住
+<b data-page-node-id="p1r8EGg28y5YSrbuET7s07">「只吐了思考、正文被截断」</b>——而这恰好是我们本次故障的<b data-page-node-id="NRobcezMN01rfL9sAIQiYh">首要假设</b>
+（336s ≈ 65536 tokens ≈ <code data-page-node-id="PWuDN4xcUViAV6DFytZD7T">model_max_tokens</code>，且 <code data-page-node-id="pwanKKJMFVCiKuQRCDhAt1">stream_chunk_timeout=240s</code> 未触发，
+反证模型确实在持续吐字）。</p>
+</div>
+
+<div class="pur" data-page-node-id="60LkyPTchBFDjvmwCyA1Cu">
+<b data-page-node-id="rIK0idDhbZFPDbICTr7D53">由此得出本次分析最有价值的一条结论：</b><br data-page-node-id="FJKM3I1hjFcQsNzmFfhfYN">
+deer-flow 的空判定是 <code data-page-node-id="KlPdGS2hLPGQMA9H5EGZBq">content_is_blank = not message_content_to_text(last.content).strip()</code>
+——<b data-page-node-id="AYCipvpwu4JgD2PtOF2V0x">会</b>把「只思考无正文」判为空（因为 reasoning 存在 <code data-page-node-id="0qPqdS1opEVgyORtGbXEGq">additional_kwargs</code>，不在 content 里），
+但它的重试提示不提截断，且只重试 1 次；<br data-page-node-id="Ef4FxpeEqhRsO0Hpf0xlef">
+deepseek-harness 的重试机制更强（5 次 + 退避 + 可见事件），但它的空判定<b data-page-node-id="sF6BR0pUGy4dUHffx6b8Sq">看不见</b>「思考截断」。<br data-page-node-id="YW9XC98NC4Qmtx1gzmy7oC">
+<span class="hl-red" data-page-node-id="BvDqsGyZz4t855MbfmY5o9">两者的盲区正好互补，而我们的场景同时踩中了两边。</span>
+因此正确做法不是二选一，而是：<b data-page-node-id="XFC7O21WAzBEBazyBN5QHU">deer-flow 的判定位置 + deepseek-harness 的重试强度 + 我们自研的截断识别</b>。
+</div>
+
+<h2 data-page-node-id="jjfEiarkGEcH8UkKk6bLe1">三、三方对照总表：我们缺什么、多什么</h2>
+
+<table data-page-node-id="z7mHKqgrw9NPO5ATBA2RUJ">
+<thead data-page-node-id="A4Rp10JvgqkBuH5obbffVV">
+<tr data-page-node-id="wqqQwom5eQ9BhEpbDbqUFm"><th style="width:150px" data-page-node-id="es9U5BvkAxB5fPgH0Tk0lJ">能力项</th><th style="width:250px" data-page-node-id="rVIDNkl3frHdFLdJ1YiWCi">geesun_agent（我们）</th>
+    <th style="width:290px" data-page-node-id="BmTnT9QuGJByuDQnF01JO9">deer-flow</th><th style="width:290px" data-page-node-id="Lng249M32fMVOtGvmRyba6">deepseek-harness</th></tr>
+</thead>
+<tbody data-page-node-id="HBhGeZmiyvJfZhoB2I4GKJ">
+<tr data-page-node-id="kVafUR493wNsyPfUrrezDL"><td data-page-node-id="WnArDcYU5TQGC38xsjbxy1"><b data-page-node-id="MRpke8vBbERfAvpAJHkEM1">空响应检测</b></td>
+    <td data-page-node-id="GmSbIOG3PNzbQWkHnKOaXS"><span class="tag t-red" data-page-node-id="sGZ3SFndVF3o2hTj3sB1Aw">缺失</span>全仓 grep 零命中</td>
+    <td data-page-node-id="bmywLQ5po3bUGLCZGoS4R5"><span class="tag t-grn" data-page-node-id="yaEDsLXV1hv5FqkZ61H1oR">有</span> <code data-page-node-id="oB9WzUj4g83awuFxARww2m">TerminalResponseMiddleware</code><br data-page-node-id="pIDWCAwroCBepsKgQ4TD0p">content 空白 + 无工具意图</td>
+    <td data-page-node-id="P8nl1B24bHkqjhUyClcCbL"><span class="tag t-amb" data-page-node-id="Gb34jCRJICGDYcGt9u9QyC">有但不完整</span> <code data-page-node-id="lWTC0VK0Vzf9vVhWCZm8mV">order.length === 0</code><br data-page-node-id="U9C4vpO44O6WhNOrhqWdXB">reasoning-only 漏判</td></tr>
+<tr data-page-node-id="qv9LwkhvWvVY54HXCKKiBz"><td data-page-node-id="NFbkWuMbTVPdlLL3S7eqDG"><b data-page-node-id="IusXm30qcCho5EV9pIHnmC">空响应处置</b></td>
+    <td data-page-node-id="rQYce8oM4FTNgERZucbccx"><span class="tag t-red" data-page-node-id="EU0uPTBfOFADKRzfPNaPIG">无</span>空消息直接结束 loop</td>
+    <td data-page-node-id="ArTgdV2lY6EUFLts6FaBlW"><span class="tag t-grn" data-page-node-id="S52UvHB5JCOJvh1FIL6BpW">重试 1 次</span> → 降级文案<br data-page-node-id="lQMpUbjs9JKFIekWiqOCPA"><code data-page-node-id="4miUi59CdHNnNU1snu22nw">RemoveMessage</code> + <code data-page-node-id="FiJS739T7SDRSnbFq3jLSM">jump_to=model</code></td>
+    <td data-page-node-id="zwoWeHIvlcm3cOxAftEYUa"><span class="tag t-grn" data-page-node-id="EONkv9HZk98cK0iVXiXaxc">重试 5 次</span><br data-page-node-id="PN2xI4DQExwaTDqDEKpX2N">指数退避 + 10% 抖动</td></tr>
+<tr data-page-node-id="k82KvebBDmGW4D4SG40prL"><td data-page-node-id="vx60oHc9BFrXijA2dzRXfd"><b data-page-node-id="ftUrBYtmBzyVRZjFpY0db4">交付物校验</b></td>
+    <td data-page-node-id="DRGMeRqA9q8Gw6Pczq7r1c"><span class="tag t-amb" data-page-node-id="0Xes77NBLJbGrHVgZPmLKa">有</span> M3 完成门（<code data-page-node-id="u5c4Qs6RYK6WK1z9GYym6j">chat.py:1291-1383</code>）<br data-page-node-id="dGWFvTFh6snEpWXDKvMYrO">布尔结果 + 硬编码文案</td>
+    <td data-page-node-id="YZM8D0LHLdFpYizV2kMM5W"><span class="tag t-grn" data-page-node-id="nJGkKCx3btsLwLB55nT9jV">有</span> <code data-page-node-id="oMuj4OPBPdjbngdp8rYHEq">run.delivery</code> receipt<br data-page-node-id="1siMYNgOrSFCjbUDFyvXPc">三态 <code data-page-node-id="CGtEO5YZihaj2MgHlEExx4">not_started/mismatched/presented</code></td>
+    <td data-page-node-id="2MxEyiay1hNLTYARHUIXeF"><span class="tag t-blu" data-page-node-id="yEv7J2i864lvv4d8XicTGO">无</span>（不做文件交付门，非其目标场景）</td></tr>
+<tr data-page-node-id="dWvLukhgNzU9u0P4gHcg0J"><td data-page-node-id="dxcULTNotXHZP6sMsOTL6Z"><b data-page-node-id="ENCmzd2x0zID5yOcu3NK0B">交付失败归因</b></td>
+    <td data-page-node-id="ch7XYldgj52MDrMVYCnnAE"><span class="tag t-red" data-page-node-id="OL6ZtC1MBZMGvihaHvD5hu">一刀切</span>「请检查是否遗漏 download_from_sandbox」</td>
+    <td data-page-node-id="adbIvGHut1B35bpGfde2C0"><span class="tag t-grn" data-page-node-id="mVH9anz6lCMqeTUQL3WyDv">按 stage 区分</span> + <code data-page-node-id="4C5vkOsqzLmbuY4en2ltmU">matched_paths</code> 明细</td>
+    <td data-page-node-id="2GkKGPTL05NViLEB2msg54"><span class="tag t-blu" data-page-node-id="4aEaC6QMAzUA7MperOv7TL">n/a</span></td></tr>
+<tr data-page-node-id="6ZGpTCMFJtOHEKHI94L7Xq"><td data-page-node-id="oWegLIge53E7iAwvXr057E"><b data-page-node-id="iSmO9Uy3eGLVcPjSSbspIN">length 截断标记</b></td>
+    <td data-page-node-id="MyyjicVDGaRwFZOYcZB707"><span class="tag t-red" data-page-node-id="jxs6VVUaGG9oOS9lCIwLBV">无</span></td>
+    <td data-page-node-id="tYIiBGUeyQIfePOF3r8Sxq"><span class="tag t-amb" data-page-node-id="6aUhAyb9asG69NCUtuRN8P">有，但排除空内容</span> <code data-page-node-id="I6wWHugeW3BAixDVWRAPNR">stop_reason=model_length_capped</code></td>
+    <td data-page-node-id="DPvzihJ6jXPODT9RAd0tYs"><span class="tag t-grn" data-page-node-id="wslpvSgb2eVkXIjRC9FEMb">有</span> <code data-page-node-id="xpYw7ZH5y9cjiMECxGfUZF">finish_reason</code> 归一化 + 未知值转 error</td></tr>
+<tr data-page-node-id="8pcmANaWp48S7tZ1v1PsdT"><td data-page-node-id="cZU0KE51p9cFPnlWDKEpJf"><b data-page-node-id="TO2cMYrSMcKFg5ttbDYnSh">重试预算防失控</b></td>
+    <td data-page-node-id="vmAGOGbNqzq7l2AGD5F1S9"><span class="tag t-red" data-page-node-id="Xeu9DE6bsfd2N5iHEPgsmj">弱</span> <code data-page-node-id="iGRATXAsMpc8d8il4px6Yk">auto_continue=false</code> → 直接判死</td>
+    <td data-page-node-id="b0ghC8zTIPNCtR1FfSRSZ3"><span class="tag t-grn" data-page-node-id="cWOZxzv1vE4Bmsk7G2FMHS">强</span> per-run 预算（非 per-message）</td>
+    <td data-page-node-id="V8OZs81NbWqeYJfk6IgIpA"><span class="tag t-grn" data-page-node-id="luSQ2eOoelZq6XI4i4l0D2">强</span> 各失败类型独立预算 + 成功后清空</td></tr>
+<tr data-page-node-id="maTddyTrW77EzM41EQNgOP"><td data-page-node-id="PwZacMvWYRkwMBvZCvG6LS"><b data-page-node-id="oDKbfeh6oTv1ZbYd6FuaB8">重试可见性</b></td>
+    <td data-page-node-id="GaAgZdxlsR2IUWygcEPZuX"><span class="tag t-red" data-page-node-id="CEUlsTe0AZaAiyoiOb9Klz">无</span>静默 336s</td>
+    <td data-page-node-id="23SUvGsP7T7y3CjFa9Nf62"><span class="tag t-grn" data-page-node-id="q1zBLn0sKyCvdfGFPQ1Abg">有</span> <code data-page-node-id="XxisvDSK90NWM3ZiKAYTth">safety_termination</code> 事件 + 审计落库</td>
+    <td data-page-node-id="nwh9ut0o6SSDVD4E9QQi66"><span class="tag t-grn" data-page-node-id="lSTf23CcjVHp5vYGnNDSVa">有</span> <code data-page-node-id="USbEa9wNmbEXaqOZ2MijeW">llm/retry</code> 事件 + <code data-page-node-id="SxPOrs0hZqSEOofNLYVZpA">turn/end</code></td></tr>
+<tr data-page-node-id="atDOm3qGt8F4rI5OUwwjUJ"><td data-page-node-id="V5i4uvHajurmIE6lcybGcb"><b data-page-node-id="vXQoM9NE3xOFURvUdRPRbW">恢复提示消息类型</b></td>
+    <td data-page-node-id="JcmdHCzf6I0ChY91bHantN"><span class="tag t-red" data-page-node-id="fjST3APAhdGVAGrZlCSisA">SystemMessage</span><br data-page-node-id="OprJX7LNqt0yqpQ99WZzbV">曾致 vLLM 400</td>
+    <td data-page-node-id="YvTBZYfumD0R1nMGY6HDzG"><span class="tag t-grn" data-page-node-id="p9FFZkgRyT0Dc8ShwxkiKx">HumanMessage + hide_from_ui</span></td>
+    <td data-page-node-id="5Bqko2KjV6PBpnZdWxz4SC"><span class="tag t-blu" data-page-node-id="ZhC5hVjejrSzmx76d2c0I1">自家协议，不适用</span></td></tr>
+</tbody>
+</table>
+
+<div class="info" data-page-node-id="CFC0xiPPR8ahvk50n98XsO">
+<b data-page-node-id="KeEA9mo6FFnQBCCGrF581p">一句话：我们的 M3 做的是 deer-flow 的「交付物校验」那一半，却完全没做它的「终点响应守卫」那一半。</b>
+而我们的故障恰好发生在缺失的那一半上——所以完成门成了唯一「说话的人」，也就只能说出那句不友好的文案。
+</div>
+
+<h2 data-page-node-id="T3dwVXxvIOLe6OhuxqLGQb">四、兼容性评估：借鉴起来，我们的代码接得住吗？</h2>
+
+<h3 data-page-node-id="CN9IdVb6F0j3ltxcmD1Q6H">4.1 已逐项实测的 API（本地 <code data-page-node-id="IO3v4hXdpeC1GHdZVlJjsc">.venv</code>，langchain <b data-page-node-id="yO6CzELG4lZG1ftyUIRIkm">1.3.13</b>）</h3>
+
+<table data-page-node-id="iLJGvG1PrDQWJRJ2QctZ2P">
+<thead data-page-node-id="rcQQDrwQi9BVdjfR90hQgt"><tr data-page-node-id="q4QfCSv8OWeH5RRqsfbLtw"><th data-page-node-id="3i1eJ0PYkwstCvmwlZUxTH">deer-flow 用到的 API</th><th data-page-node-id="HksYkXlEgjq6Q9WCPj2NdE">我们的环境</th><th data-page-node-id="ZYyEBs7wZC5W3jRzj3WR46">实测结果</th></tr></thead>
+<tbody data-page-node-id="txFT678AsZ3i2OcQ5nkwFQ">
+<tr data-page-node-id="bKiOCnybGkcsUzA3E4GymD"><td data-page-node-id="NjQKLY2TkI1NJPcrAMJmvy"><code data-page-node-id="qSVxcZDkpGzluu8TUpfj09">from langchain.agents.middleware import AgentMiddleware</code></td>
+    <td data-page-node-id="r4xHGccfz0T1hoEA0Lm90K">已在用（<code data-page-node-id="juHE4ujZODz3fwzA0rDCrQ">loop_detection.py:58</code>）</td><td data-page-node-id="wwz1VPxNyZvRA0XjUO6kt5"><span class="tag t-grn" data-page-node-id="hl6Pi4iJoRHx1BhC5ZsyQ1">可用</span></td></tr>
+<tr data-page-node-id="0rIbZE1vXJklXwg6mBJkat"><td data-page-node-id="LUExothGxoihX0GKp6v5C4"><code data-page-node-id="HoI3BVVPgOdm5euFt3TCQU">from langchain.agents import AgentState</code></td>
+    <td data-page-node-id="WOW5FTirj8NVmR790brTQ2"><code data-page-node-id="4Q08zaPHCqKFQCjBa9BVoQ">langchain/agents/__init__.py:4</code> 导出</td><td data-page-node-id="kdeCRh1H5zXopdyzvXZniJ"><span class="tag t-grn" data-page-node-id="AmdyjuDST8tX0vDHFOM95A">可用</span></td></tr>
+<tr data-page-node-id="sU9dGg2hNVDwGfZVp0o61X"><td data-page-node-id="yVeDEMSQ5BUc9pbHISD8IP"><code data-page-node-id="Gd7wvtDMtwDBMH5TgvTwpJ">hook_config(can_jump_to=["model"])</code></td>
+    <td data-page-node-id="iPL0zsjxvPgVFmvjBpvPSK"><code data-page-node-id="I3U8JHbA5V9fnaQWlXsnqo">langchain/agents/middleware/types.py:867</code></td><td data-page-node-id="hHABIfYhQK99VN0NhiaSvm"><span class="tag t-grn" data-page-node-id="lDG6MDstgPmy6KVVH3tjHD">可用</span>签名一致</td></tr>
+<tr data-page-node-id="1RsqA6faHl96XogSrE1op0"><td data-page-node-id="2RVLhvyx0l8XkTEY0ghSJe"><code data-page-node-id="OSbUb03ONm6Xmzqyiz82lG">{"jump_to": "model"}</code> 跳回模型节点</td>
+    <td data-page-node-id="s47s5TaiFfwBzolFQxEUHy"><code data-page-node-id="DChWD355SU67z9TzD3uRw5">types.py:351</code> <code data-page-node-id="HF2XKCxdA6ckIIrIbZGWCW">jump_to</code> 字段 + 条件边机制</td><td data-page-node-id="PtRvbFSMhFgGcODHaaSh3d"><span class="tag t-grn" data-page-node-id="SqgFtdqnGY2IBdRUGYPoe2">可用</span></td></tr>
+<tr data-page-node-id="vEjwEFa1egRZkedpUXCFvn"><td data-page-node-id="IQ4cxs6XPx77cppuH7rPiy"><code data-page-node-id="ONT3t4Ik2oZdE9fxssCqN3">RemoveMessage</code> 删除空消息</td>
+    <td data-page-node-id="zIeDyRCqFaEAGyUeNqL9Aw"><code data-page-node-id="tsrKxL8SZq9GHTYUWj5n8e">langchain_core.messages</code> 导出（<code data-page-node-id="dE9shdDICEwsO07UBweY6Z">__init__.py:50</code>）</td><td data-page-node-id="OtRdSOyCHCaRRZOZIpOomC"><span class="tag t-grn" data-page-node-id="Qrqv34jZoKPlLiFf2fYCeD">可用</span></td></tr>
+<tr data-page-node-id="FBhAaq9vyJplFDBLNBcvUN"><td data-page-node-id="8P3FZzFsA1KkGg8wqRAnT6"><code data-page-node-id="EArxRXoYHePyQDKZLivpvI">from langgraph.runtime import Runtime</code></td>
+    <td data-page-node-id="EMqm6zCZtfrMDk8CmBHB1K"><code data-page-node-id="pctnCvgOXD8LNgZcgjq2kc">langgraph/runtime.py:125</code>，带 <code data-page-node-id="Vkl7CFwS0OMLmNaKmieh2a">context</code></td><td data-page-node-id="YIXFODxNFY5u7VTUP2VBB4"><span class="tag t-grn" data-page-node-id="Le3h9lArAFVHX7aHcDRL7D">可用</span></td></tr>
+<tr data-page-node-id="ZB0Dc0l27cZRlPwbm7bavG"><td data-page-node-id="0dRdknzgo8LXAHnFj1PNxI"><code data-page-node-id="8E4CFfHhEQ7HkkIWpDHNmW">ModelRequest.override(messages=...)</code></td>
+    <td data-page-node-id="YeDuukxvFrCBnFF5V5q3oK">我们已在 <code data-page-node-id="dQ2QKZIGe1nXsCGQSzTch8">model.py:685</code> 使用</td><td data-page-node-id="m6JG65st4auOVbHnNEXXJK"><span class="tag t-grn" data-page-node-id="2U049rXjc0peOiL5mK3lkd">可用</span></td></tr>
+<tr data-page-node-id="sA2LWyaSdUHkWGOXnHePmw"><td data-page-node-id="ZpCTweeBvgF1fpjw9WAGJG"><code data-page-node-id="M2tsRqLMtjv43LNn91SrVI">@override</code> + <code data-page-node-id="2XJm0tISukjgyQHBAd6jRO">after_model</code>/<code data-page-node-id="ay008pXIvHzqxOt7NwhSKW">aafter_model</code></td>
+    <td data-page-node-id="dONKrklElMwDEsoBYRuX0b">我们已在 <code data-page-node-id="i4ZBROae52oeyN32MEBx3p">loop_detection.py:432,436</code> 使用</td><td data-page-node-id="7DaiaJ1zZr5iapCc7g5Dsi"><span class="tag t-grn" data-page-node-id="DRQZbZupu3pBjdvkFaMbzZ">可用</span></td></tr>
+<tr data-page-node-id="4TUTXEagE04ColeasI7ZkZ"><td data-page-node-id="g7dQh8sEkLXZDrVARefD6u"><code data-page-node-id="vzIYfqcvNSjWw2VeDmfMSV">get_stream_writer</code> / <code data-page-node-id="OlL29pbcnwrDaqckZXucmg">aemit_custom_event</code></td>
+    <td data-page-node-id="3LkzVDE4QtGy6XmlvcAHZ6"><code data-page-node-id="K44b4tQHD3A1jsckp87A6b">langgraph/config.py:126</code></td><td data-page-node-id="riHiqjxixZ42Ra0d1w3Z3K"><span class="tag t-grn" data-page-node-id="jE7YOMXQYQq8EX6Gog9ltl">可用</span></td></tr>
+<tr data-page-node-id="qgubWiKV9IZGOkha2apyoS"><td data-page-node-id="h6Hd5RTzVYJCjhFvfzcY4M"><code data-page-node-id="5ak1FBkroIFCTGGY65Lbsy">langchain.agents.factory</code> 的 <code data-page-node-id="fMt5HZZLrS1iEJfT46928K">after_model</code> 逆序接线</td>
+    <td data-page-node-id="VDUSh7CIB76zEZBsQ6n8QA">需运行期验证（见 1.2 warn）</td><td data-page-node-id="nbmLI4O5N6IcrwC7u5LeA3"><span class="tag t-amb" data-page-node-id="RGCHcn4jOEdnHiwXpOuiqt">待实测</span></td></tr>
+</tbody>
+</table>
+
+<h3 data-page-node-id="5Scv0j8UtJurM7ImeqMS2M">4.2 需要改动的接入点（两处，都很小）</h3>
+
+<div class="card" data-page-node-id="63bg2cgeV6D7AJkInZOIkm">
+<h4 data-page-node-id="vrkZwCETPGO4gMOnF87kZ5">差异 1：我们没传 <code data-page-node-id="UZrEgBGVGykVrWSDl5gHY0">context=</code>，deer-flow 的中间件依赖 <code data-page-node-id="pF4SAlkwHRRErR0Vl2OhFh">runtime.context</code></h4>
+<pre data-page-node-id="i6I67RFCnuaV7oOte0BEY8"><span class="cc" data-page-node-id="eUh2kPvBidCIFxjDTaE8Ei"># 我们现在的调用（chat.py:342、762）</span>
+graph_config = {"configurable": {"thread_id": thread_id}}
+_stream = agent.astream(..., {"configurable": {"thread_id": thread_id}})
+
+<span class="cc" data-page-node-id="3ZB8wM6afffhQzhmRPVfyD"># deer-flow 依赖的（terminal_response_middleware.py:93-98）</span>
+def _key(runtime: Runtime):
+    context = getattr(runtime, "context", None)
+    if isinstance(context, dict):
+        thread_id = str(context.get("thread_id") ...)
+</pre>
+<p data-page-node-id="wS091mpX1LwU3sJ3vMNptX"><b data-page-node-id="euYnymXMAFo5d1MND3FByu">影响</b>：<code data-page-node-id="Sx6p75ElTIrm2b3DTr4fkZ">runtime.context</code> 在我们这儿为 <code data-page-node-id="FYftZ5HHjAaXcM5dqHQf6d">None</code>，
+deer-flow 有防御性 fallback（<code data-page-node-id="VX9EUfmyluT6WYnDskJyEM">("unknown-thread", str(id(runtime)))</code>），
+所以<b data-page-node-id="G7zBWGENURoKnhBEmFiUay">不会崩，但 per-run 预算会退化成 per-runtime-object</b>，等价性下降。</p>
+<p data-page-node-id="5OyAo7JmAtVKqcxCx8gubo"><b data-page-node-id="NJSRLJcEGRIx7drUwwVxFD">两个选项</b>：<span class="tag t-grn" data-page-node-id="z05Ayq73JLlKdntmdabxFA">推荐</span>改用 <code data-page-node-id="A73x2ZUvxECI1ERLn1JuUy">langgraph.config.get_config()</code>
+读 <code data-page-node-id="LhGoEkCV7FslMCzvrnZBcM">configurable.thread_id</code>（零调用方改动，<code data-page-node-id="cWZHKjtYQEUeP2ZLqECYRP">config.py:17</code> 已确认可用）；
+或给 <code data-page-node-id="7zqqWzmekHlo2XrDO5HRiV">astream</code> 加 <code data-page-node-id="IN5FQTH8ta5lV30sjz9X0h">context={"thread_id": ...}</code>（需改 2 处调用点）。</p>
+</div>
+
+<div class="card" data-page-node-id="CluwfXA8DWhrTBkqVsK1Hc">
+<h4 data-page-node-id="2YkYvRlMhPVMCHuUaMBLnk">差异 2：我们的 <code data-page-node-id="HBESF9pa1K04DMnE63rwMu">reasoning_content</code> 存在 <code data-page-node-id="wMgi5yqkJqgBxDxODyPFur">additional_kwargs</code>，不在 content 里</h4>
+<pre data-page-node-id="7YY9zaMQS4lIQIGfVX8Dwa"><span class="cc" data-page-node-id="Vpggu2cnO6Rsqo8NReMeAQ"># 我们的 ReasoningChatOpenAI 写入位置（model.py:299、333）</span>
+msg.additional_kwargs["reasoning_content"] = rc</pre>
+<p data-page-node-id="xfbqWRhVjT3XY5z84OoG6T"><b data-page-node-id="kHColXAimENmhlVo8QfC6y">好消息</b>：这意味着 deer-flow 的 <code data-page-node-id="GRK8NkSA14Sq3A0o8psct2">content_is_blank</code> 判定<b data-page-node-id="3i18kZa5NYnia63CG8WesL">天然正确</b>——
+「只思考无正文」时 <code data-page-node-id="YsME20sGlFAAqBaCyUXlll">content</code> 确实为空、<code data-page-node-id="x1fWFf2IncEmpJ3vj7lbqz">additional_kwargs</code> 里有思考文本，
+两者分离，正好可以据此做<b data-page-node-id="eOFGY9nEwAc11puAFNBZLr">更精细的判定</b>：</p>
+<pre data-page-node-id="eza6WdcrccpyM6z3LNeKvx">if 无 content 且 无 tool_calls:
+    if additional_kwargs.get("reasoning_content"):
+        → <span class="rc" data-page-node-id="DDbwfGB3R4tcrHTgKLYtyn">"思考截断"</span>：提高重试提示的针对性（提示收敛/直接输出），
+          并检查 finish_reason == "length" 以决定是否调大输出预算
+    else:
+        → <span class="grn" data-page-node-id="cZOstEbIiOQMUE2r1NdtG3">"完全空响应"</span>：按 EMPTY_RESPONSE 语义重试
+</pre>
+<p data-page-node-id="TWNAbNh9tuJnS4cuArACA9">这个三分支判定是两个参考项目<b data-page-node-id="bZGCl1PPVAoAjfNsJVpRJn">都没有</b>的，但我们的数据结构支持它——是我们的信息优势。</p>
+</div>
+
+<h2 data-page-node-id="G87aSJjEIZhsqYM0lwtej1">五、可借鉴清单（分级 + 采纳理由）</h2>
+
+<div class="verdict" data-page-node-id="y3akOJwjDDgBpj3oaLomwS">
+<b data-page-node-id="BgeaDxuuUowXuQgsOaVuWc">直接回答「能借鉴吗、兼容吗」：能，且全部兼容。</b>
+API 层零缺口（第四章逐项实测），接入点仅 2 处小改动，且我们的
+<code data-page-node-id="FWzLRbzBcV74zHmGQL0pmr">ReasoningChatOpenAI</code> 数据结构恰好支持做一个比两者都更准的判定。
+</div>
+
+<table data-page-node-id="1CQywUFGnLzrBHQRcy81xb">
+<thead data-page-node-id="zBn4WRjwrJJn1AHOPqKf8P"><tr data-page-node-id="DS4DljeIVRmsYQfuzCXNva"><th style="width:46px" data-page-node-id="ldurnCPPz3qHjCyvnieRdu">编号</th><th data-page-node-id="V12fApEsLzP6yW8OAjt6lq">借鉴项</th><th data-page-node-id="swmV78zgtpcJ5H4PrIEXho">来源</th><th data-page-node-id="QwRB30Qbi8I3Wi4BBY6tEI">改动位置</th><th data-page-node-id="wab0jADRFhZCAWPidZrf2i">优先级</th></tr></thead>
+<tbody data-page-node-id="UAN4JkBVj8WasGvwvEGh76">
+<tr data-page-node-id="8amKfhHG2QZv02yeuZcfhA">
+<td data-page-node-id="5YFeM2LMEBINtJ6USx8UM1"><span class="tag t-grn" data-page-node-id="iAESGpZFJx43CFOwTng0LE">A</span></td>
+<td data-page-node-id="qM5dGfVa4nstH8T2v35Cwt"><b data-page-node-id="5pq17xV8EsquTwTIZwTIGG">新增 <code data-page-node-id="FXIskRT9mR5NRrewGPHldN">TerminalResponseMiddleware</code>（终点响应守卫）</b><br data-page-node-id="nnOOH3L28UPAoFG3ZA6V9B">
+空响应 → 删空消息 + <code data-page-node-id="2mAqiyMCVaBKg6uL4KJ7x7">jump_to="model"</code> 重试 1~2 次 → 仍空则写可读降级文案</td>
+<td data-page-node-id="gkte1rN2VDPPfv5EDDEezo">deer-flow</td>
+<td data-page-node-id="7d1tn7DPtcO47j8HJuOHfq">新增 <code data-page-node-id="gOOTWtfryEOHjoiTfs4xRW">src/core/terminal_response.py</code><br data-page-node-id="21Cs7IHPkzBp8srKnqVA7r">注册于 <code data-page-node-id="GBOxzX5iom99pBVrIyCcfT">agent.py:842</code> 中间件列表<b data-page-node-id="pBUkJp6oGpLFBrCpBpA2MC">末尾</b>
+（须在 <code data-page-node-id="rWQOv2OM4Sszv95buP1uAW">LoopDetectionMiddleware</code> 之后，见 §8.2）<br data-page-node-id="dd1wEAEhzc03xX0zjUv7Y7">
+<b data-page-node-id="ijQEETgXELLQCNBLDvzunN">sync/async 两个 <code data-page-node-id="dwKiDsdaWalcm2fuqFkr5T">after_model</code> 都要加 <code data-page-node-id="5dsrOxRrzxFJ9ZDZW6Cper">@hook_config(can_jump_to=["model"])</code></b>（见 §8.3）</td>
+<td data-page-node-id="CCePlp1KYcnwHwaiZQACiv"><span class="tag t-red" data-page-node-id="kMJC1QjDYUvnBcqzdMrHV3">P0 治本</span></td>
+</tr>
+<tr data-page-node-id="b3FdvVespf6bOQE0Lgjji4">
+<td data-page-node-id="xrpzK9WZbK7J5YRohnLqoF"><span class="tag t-grn" data-page-node-id="XpgHPDLywQFOCgCKitTFQx">B</span></td>
+<td data-page-node-id="rDux8mfjB6je4fuhSAG2rC"><b data-page-node-id="8jeOuB64olz8bASYDTYGay">恢复提示改用 <code data-page-node-id="x4BdgX2WdqZdRitTmjgBcq">HumanMessage</code> + 隐藏标记</b><br data-page-node-id="MZrJt8hv1nbkzejuj8oMA3">
+替代 <code data-page-node-id="mH9HbxaOgLafDyKC8sVCap">chat.py:1379</code> 的 <code data-page-node-id="VOJINpoCuz3SbXIsfKtMVw">SystemMessage</code>，规避 vLLM 400 且不污染 UI</td>
+<td data-page-node-id="htP0pnIhKXFwhCClqCQKVB">deer-flow</td>
+<td data-page-node-id="4Ad8KLhUaWdMRWNnPol7oc"><code data-page-node-id="lMxHxhDSkH4AnBOfKQedDH">chat.py:1379</code>、<code data-page-node-id="SckTbuXe24CQLHKAOSf8E4">1347</code></td>
+<td data-page-node-id="chDo5S8IFnFGeUTs7skraO"><span class="tag t-red" data-page-node-id="CRMNRGCGVSMdO7KrLCxd12">P0 已踩过坑</span></td>
+</tr>
+<tr data-page-node-id="KAorMFLVWkxYZ54IiB0S7x">
+<td data-page-node-id="oPHgx1tZlMWHPfVxvDPs1b"><span class="tag t-grn" data-page-node-id="cSqRjppidabvf5UiZKNF6P">C</span></td>
+<td data-page-node-id="ywut7eNavngC2vCQ5lRZDT"><b data-page-node-id="LBRFshQyPSECyKdyEkjKGP">完成门归因三态化</b><br data-page-node-id="PFh0VYXwA0wBmyHl94Jy7n">
+<code data-page-node-id="dhcKx4p7h5hncFcwtkyUmu">not_started</code>（零产出）/ <code data-page-node-id="NprXQNLJ1UwXJGd9eYqoWJ">mismatched</code>（产出了没呈现）/ <code data-page-node-id="whmMNOAMPLlXEXfxsx0m8m">presented</code>，
+文案随之分流</td>
+<td data-page-node-id="zH8PjMlCqyBmRnaQsbECyP">deer-flow</td>
+<td data-page-node-id="X2HosE4Vr3G5AveMKO6JAX"><code data-page-node-id="u3QZezoOUf7Fl8oumhLJ83">chat.py:1367-1372</code> 的 <code data-page-node-id="gvlyyYjnoL3MQ85TYPYsmK">completion_blocked</code> 事件</td>
+<td data-page-node-id="GGDwQE62pVHix9B5t3EPRz"><span class="tag t-amb" data-page-node-id="lg5M1lEHu4qG7eL0BKFqkM">P1 消除误导</span></td>
+</tr>
+<tr data-page-node-id="4vFPwMyCx5UrS6NpdN3xKh">
+<td data-page-node-id="poHNW09LAFx9ndp2YiGNay"><span class="tag t-amb" data-page-node-id="Kdw6yZgjdw3hSWZpuHOyAa">D</span></td>
+<td data-page-node-id="bnBSGmLk2Elg3GFdK8XsvD"><b data-page-node-id="OeVyJsNoo8hMhz4y2ixTJK">识别 <code data-page-node-id="qBV3QRmAJKxA8wSGDDx0Mj">finish_reason='length'</code> 并据此分流</b><br data-page-node-id="7RP1uOmFfFm1DCeN9sBfYr">
+length + 空正文 → 明确提示「输出预算被截断」，
+length + 有正文 → 打 <code data-page-node-id="zQRnkavlf8EBljFudOo0WM">stop_reason</code> 标记</td>
+<td data-page-node-id="dXlL5DFg0PMxkBX54947yJ">两者互补<br data-page-node-id="tisQvxEYqd47n5EWq2cM6U">（deer-flow 有标记但漏空内容；dsh 有归一化但漏 reasoning）</td>
+<td data-page-node-id="OOGo6z0jFpOF81BqPD3SNJ">新增中间件或并入 A</td>
+<td data-page-node-id="pyA7vkILEhkiSq9BLlKnz1"><span class="tag t-amb" data-page-node-id="789YSHMpBQbfexvRCcPmPz">P1 定位精准</span></td>
+</tr>
+<tr data-page-node-id="4EFB9472KphhwCK7ZpCmEd">
+<td data-page-node-id="tD94XhYLWigAhmPBxwR8Zi"><span class="tag t-blu" data-page-node-id="k5gckJq2goUIO712oRDMRm">E</span></td>
+<td data-page-node-id="DFWflVhX2n9l7jNCLXQKwY"><b data-page-node-id="WWgnk8aCKLqcOzDzhGmEoH">Reasoning 感知空判定（我们独有）</b><br data-page-node-id="bKpQg6T39lwVzbpdwFlOAu">
+区分「思考截断」与「完全空响应」，前者提示收敛、后者按 EMPTY_RESPONSE 重试</td>
+<td data-page-node-id="cQjK8WClKzxRqypFDeLfoH">自研<br data-page-node-id="QVyzk6TIBYXfCYa5qaEkwh">（依托 <code data-page-node-id="8rAGNqzYEuJzfjAqHlEew3">additional_kwargs.reasoning_content</code>）</td>
+<td data-page-node-id="ZEQRaSXeRFEGkn7SM3r7OJ">并入 A</td>
+<td data-page-node-id="d1dEcwrbrGVMlig67zz6Vy"><span class="tag t-red" data-page-node-id="uLU7moGQsz0pNKxdPDnzCA">P0</span></td>
+</tr>
+<tr data-page-node-id="AEBhJUIKw1IKA5lgR0DHaG">
+<td data-page-node-id="roOc9AaLkKxnfdZAoX7yFU"><span class="tag t-blu" data-page-node-id="MkYfihENwCyP1J6DCMjfAX">F</span></td>
+<td data-page-node-id="QyofYe7O1MDgSEchtJm9OE"><b data-page-node-id="DkSFtfzjKYETfecmBWOqua">重试可见事件</b><br data-page-node-id="AE0YdjPur9zk9DAIPVBhoB">
+重试/静默等待时向前端发状态事件，消除「336 秒无反馈」观感</td>
+<td data-page-node-id="YqUB3CacIYnLpyfhKkNIxg">deepseek-harness</td>
+<td data-page-node-id="nJELXqOfTgCwkyHv2vuvtT"><code data-page-node-id="2SDsr3C61FPVFVw47p1U8X">chat.py</code> SSE 事件（我们已有心跳机制，扩展为带语义状态）</td>
+<td data-page-node-id="DYWsKMos8DlIRT3DEvrfI8"><span class="tag t-amb" data-page-node-id="LQfdUslK9ABwWl3j2AaA9Y">P2 体验</span></td>
+</tr>
+<tr data-page-node-id="adflP8xaiNj6Ad508KVUzA">
+<td data-page-node-id="WLQbebCjHFg0NuCsniHJcv"><span class="tag t-amb" data-page-node-id="SAQuHieJ73sxlL0xRu9xeS">G</span></td>
+<td data-page-node-id="If8I2RY9qIzyu9Rc7F4M5d"><b data-page-node-id="Ai6I6k13l1LsIYKGggQkZR">per-run 重试预算（而非 per-message）</b><br data-page-node-id="EDSKSpZv3tvl0fsGvJKPgN">
+防「空 → 重试 → 调工具 → 又空」无界循环</td>
+<td data-page-node-id="Dt0FL0Vg7icAFmSgomQDf5">deer-flow</td>
+<td data-page-node-id="5PbSi3iTtsJCvoZBbjTDbG">并入 A</td>
+<td data-page-node-id="GHFF2J2ICtV3P8GXCLcdEW"><span class="tag t-amb" data-page-node-id="11tGiK6BgqOl94bP8t8Jdn">P1 防回归</span></td>
+</tr>
+</tbody>
+</table>
+
+<div class="warn" data-page-node-id="7sOwCMNgekAXURtzHbafgC">
+<b data-page-node-id="7e0GdAEisrMdDB6X9tkldO">不建议照抄的部分（避免过度工程）：</b>
+<ul data-page-node-id="n79uMXLT2fPk90PFa16o5c">
+<li data-page-node-id="XcuTBCMkZpjC7NzVT9QctQ"><b data-page-node-id="l40D95TTGmAhJS8oErFqBM">不引入 <code data-page-node-id="BkFvvedUMWEQPLC9QzbcnY">SafetyFinishReasonMiddleware</code></b>——它解决的是
+    <code data-page-node-id="ExAFBfapdkY3ePb0F9zL0Y">content_filter</code>/<code data-page-node-id="eAFw0nqPICA9QTTZzQwh47">refusal</code> 场景，内网 vLLM 无此信号；
+    且它自陈的顺序契约在我们栈里存疑（1.2 已述）。</li>
+<li data-page-node-id="MM6L3u282EuYcAEFuOVQP0"><b data-page-node-id="6w2HFtxw9xxU8JJkam9CH3">不引入 deepseek-harness 的完整 <code data-page-node-id="6vxFGWNrFjE4GF3Zj8uBdY">llm-retry</code> 插件体系</b>——它是 TS 实现、
+    挂在自有 <code data-page-node-id="PLKw7Zv9s9dbBPoF20DFo5">agent/request-error</code> 协议上，与 LangChain 栈不同源；
+    5 次指数退避对「模型已思考 336 秒」的场景也偏重（重试一次就是又一个 336 秒）。
+    <b data-page-node-id="9bpygdCTkw9bqJzvIfP2oF">取它的思想（EMPTY_RESPONSE 归一化 + 可见事件），不取它的实现。</b></li>
+<li data-page-node-id="KGaudRclV5yBsHsLcwmX7X"><b data-page-node-id="EzaCiuK4ICnJSWnYTCK6sX">不引入 <code data-page-node-id="szCMbx25GnHzdeq9ZB965u">BoundedDict(1000)</code> 这种内存态预算</b>——我们单实例部署，
+    用 <code data-page-node-id="hIqB1gEOLLm7PJvFH5xohM">get_config()</code> 读 thread_id + 一个轻量 dict 即可，无需引入有界容器。</li>
+</ul>
+</div>
+
+<h2 data-page-node-id="K9qJWC2YOGUQbnZGB3Kk43">六、关键差异提醒：我们的 M3 比 deer-flow 的 delivery 更严</h2>
+<div class="danger" data-page-node-id="JpCUxvC90VLJ0sYGvWg12a">
+deer-flow 的 delivery 校验<b data-page-node-id="zQpGpZLzudjopzkvYNzVso">只在「本轮真的产出了 output 但没 present」时失败</b>
+（<code data-page-node-id="KqexZ8t8ISqaHfB6r6tAub">_delivery_error</code> 先判 <code data-page-node-id="5tnHMrdeT4atUL6boAdlRS">if not content.get("produced_paths"): return None</code>）；
+而我们<b data-page-node-id="P8ssnpVY7nJs4vpq5RBjVb">把「零产出」本身</b>判成失败并对交付类任务强制拦截。<br data-page-node-id="fhTd0xZRvm0b4PIaVxSsdd"><br data-page-node-id="znCgCUkFDBHdZHyVHJAlnu">
+这是个<b data-page-node-id="FReLCjh0nButFoLDnPmmeZ">有意的强化</b>（用户要求交付物就必须有交付物），本身合理；
+但代价就是<b data-page-node-id="SOSwVJ3yTh5k34DqJCGPR6">必须配套一个「模型确实回答了」的守卫</b>，否则模型侧任何异常
+都会以「你没交作业」的口吻呈现给用户。<br data-page-node-id="P8iY1gZYlhfEh5Hsrw5F1P"><br data-page-node-id="RQFs1LHiw74Pf438Kj5HK2">
+<b data-page-node-id="Yrx4rK4XWhFjfUCANX7AyF">所以 A（终点响应守卫）不是可选优化，而是 C 与现有 M3 能否自洽的前提。</b>
+</div>
+
+<h2 data-page-node-id="sCkY4IrZaMkUmGmHzz1AGk">七、说人话：那四个名词分别是什么</h2>
+<div class="info" data-page-node-id="VBX9pf9XLKfYh0Kdc9aR4t">
+先给一个统一心智模型：<b data-page-node-id="T5YnHmOrQPK9BiyMLtWAxP">deer-flow 把「一轮对话的收尾」拆成了四道哨卡</b>，每道只管一件事，
+互不越权。下面逐个翻译成人话。
+</div>
+
+<h3 data-page-node-id="Te4HxJiToKkMCR6EuPITxj">7.1 TerminalResponseMiddleware —— 「话说到一半突然闭嘴」的兜底</h3>
+<div class="card" data-page-node-id="sdeEd88rpFhb6HBS2I8aPs">
+<b data-page-node-id="HeFmhFCKnEjjPlHKsB33xL">它解决的问题</b>：模型调了一堆工具、工具也都跑完了，轮到它说最后一句总结的时候，
+它<b data-page-node-id="6Hipg7QJbN5voWLUk6VWjl">吐了一个空白</b>（content 空、也没有 tool_calls）。前端就显示一片空白，用户一脸懵。<br data-page-node-id="kJvsMKwztPLafxxI1u0LK5"><br data-page-node-id="TipuFqCbK5nMpAxUDGOsCR">
+<b data-page-node-id="PmR4Dok4ouZW24hk1k90KY">它的做法（两步，且只重试一次）</b>：
+<ol data-page-node-id="YL8Dmw3hrRZdacl8f5OVCu">
+<li data-page-node-id="TQZoPr8oFqvQo07y1Uog93"><b data-page-node-id="EiRHY7urfVFIm0ZgoZcCgD">第一次</b>发现空白：把这条空白消息<b data-page-node-id="RS4QoB1mOgQB7ffdnIXmGU">删掉</b>（<code data-page-node-id="c5GUwDKagtHVCUYjGPSNm8">RemoveMessage</code>，免得它留在历史里污染后续上下文），
+    然后<b data-page-node-id="iPRuNcWRFfDDKbXHl95OTW">把球踢回给模型</b>（<code data-page-node-id="Fc86ntD5V3g2xWMBmRKjQm">jump_to="model"</code>），同时偷偷塞一句话进去：
+    「你上一轮工具跑完之后没说话，请根据已有工具结果给个简洁的最终答复，别再调工具了。」
+    —— 这句话用 <code data-page-node-id="jqzJJvamnCOEnA1fKnv6YI">HumanMessage</code> + <code data-page-node-id="tGvfRQv74tYmILwH98G8T3">hide_from_ui: True</code> 包装，<b data-page-node-id="ZHJ0dAb11FpzPMxZawaugu">用户看不见</b>。</li>
+<li data-page-node-id="NybCv9qnbhHAYwwQQG2mVM"><b data-page-node-id="oFtgBAY15HCF7ahSVYzffe">第二次</b>还是空白：认输，把这条消息的 content <b data-page-node-id="VtAs1cV0hra2BUOdrpgzAy">改写成一句人话</b>：
+    「模型跑完了工具但没给最终回复（自动重试一次也没用），请重试或换个模型。」
+    并在 <code data-page-node-id="qTSHf2QDerQ6l16t9XU9bH">additional_kwargs</code> 里打标记 <code data-page-node-id="sZkk1vJXOPWpqngGHLEeNR">deerflow_error_fallback: True</code> 方便排查。</li>
+</ol>
+<b data-page-node-id="qYFvSKVB6E1t010Ho7EPor">关键设计（也是它比我们成熟的地方）</b>：重试预算是 <b data-page-node-id="ju18HmYRC5ZuN6MmiAJChw">「每次 run 只给 1 次」</b>，不是「每条空消息给 1 次」。
+代码注释写得很直白——<i data-page-node-id="YYZlWbfTEu1hXiUY07U5Uj">"A retry that calls another tool must not refresh the budget and create
+an unbounded empty -&gt; retry -&gt; tool loop"</i>，
+防止模型陷入「空 → 重试 → 调工具 → 又空 → 再重试」的无限循环。<br data-page-node-id="qnC5gpVZpOgu7C2IaezWDL"><br data-page-node-id="6tPxmEOFWTL2nVp99qFPuB">
+<b data-page-node-id="QP0aCuHBwRMAU1kcSpvwuE">三个前置判定（不是所有空响应都该触发）</b>：
+<code data-page-node-id="QmpyGK5djCqlnB7e4rxlCF">_has_visible_content()</code>（真的没可见正文）+
+<code data-page-node-id="POytJnPgi9LwUzMcPFZKxA">_has_tool_call_intent_or_error()</code>（也没有 tool_call 意图或畸形调用）+
+<code data-page-node-id="RmqGBUYyLegDu3rj4TDMku">_tool_result_in_current_turn()</code>（本轮确实有过工具结果——否则这是另一种失败，不该由它管）。
+</div>
+
+<h3 data-page-node-id="GJZp0Z1y68BD37yZYDXQu9">7.2 ModelLengthFinishReasonMiddleware —— 「不是模型不想说，是它被掐断了」</h3>
+<div class="card" data-page-node-id="J9dNwmziw9gfR9dzbfFLcv">
+<b data-page-node-id="g7bqya4XzOj68baclCQ2Ax">它解决的问题</b>：模型其实说了一半正常内容，但<b data-page-node-id="8d6PYKl1srzBzcad6E5Lnp">输出预算用完了</b>，被硬生生截断
+（provider 用 <code data-page-node-id="XJvihos26kngx9rH4LWTXP">finish_reason='length'</code> 告诉你）。这时候如果什么都不做，
+系统会当成「正常结束」，用户拿到半截答案还以为说完了——<b data-page-node-id="9Ncm6FCfZo3xGCl6Gsx0yL">这是最危险的一种静默失败</b>。<br data-page-node-id="pSB3tqmoXb8atPDA7WsETQ"><br data-page-node-id="DKMxYOdnwDgow9T0J54Mkt">
+<b data-page-node-id="Bl1CHIP0Zt7jreeCXC8mlV">它的做法</b>：不打补丁、不改内容、不假装能修复，只是<b data-page-node-id="i0DBUXpscFkNd48f9RKxk4">盖一个章</b>：
+在运行上下文里写 <code data-page-node-id="TFQeMBXy9OtNZHpf8KzIh1">stop_reason = 'model_length_capped'</code>，
+让上层（日志、trace、UI）知道「这次是被长度掐断的」。<br data-page-node-id="DMwvRunjn563NXyYhrdTCz"><br data-page-node-id="rTqKXYOZhaVFGOl4lwO9GF">
+<b data-page-node-id="AgFffDA90oFxr5VHGCAJjw">它的自我克制（划重点）</b>：只在「<b data-page-node-id="b9XuK6VOUa3D6wUL9IR6gn">有可见内容 + 被标记 length</b>」时才盖章。
+代码里明确写着 <code data-page-node-id="UNVNrKa3zTgm71DWgepZ4O">if not _has_visible_content(last): return None</code> ——
+<b data-page-node-id="zpqTsgkDCstxYb6jaRGSB2">空 content 它不管</b>，因为那种情况归 7.1 管、或者归安全类问题管。
+这种「各管一段、绝不越界」的边界感，正是它这套东西好维护的原因。
+</div>
+
+<h3 data-page-node-id="75M4ywkRFoKGpfaLATPVop">7.3 SafetyFinishReasonMiddleware —— 「模型被安全策略当场捂嘴」</h3>
+<div class="card" data-page-node-id="B4lCfsHpWpulnfFasvgzSt">
+<b data-page-node-id="IfOVvJElwpYlCChBu8hQfB">它解决的问题（两个，都很脏）</b>：
+<ul data-page-node-id="XDWvRC1HFDY5CBAGcwFiaz">
+<li data-page-node-id="XU8SmFEIkP6HhtedWcXMgJ"><b data-page-node-id="1ouiXSsRAvfgl2BxkAjOzM">#3028 半截的 tool_call 被当真执行了</b>：模型正要 <code data-page-node-id="Zf96zcj5nYtB1vqw3HhLN5">write_file</code>，写到一半被安全策略掐断，
+    参数是残的（比如 markdown 正文断在半句话中间）。但 LangChain 的工具路由只要看到
+    <code data-page-node-id="Ejlsbb3kYLB6ICLEtDtA1S">tool_calls</code> 非空就认为「去执行吧」→ 于是<b data-page-node-id="gxGaavVSFkutP5tKm9mCoZ">残缺文件被真的写进了磁盘</b>，
+    模型看到写残了的文件又想修，修的时候又被过滤……死循环。</li>
+<li data-page-node-id="vMU7MKARR72psEmClqUamK"><b data-page-node-id="a1UlzsUNBhSyqGHgxDEZJL">#4393 空响应污染整个 thread</b>：模型被安全终止后留下一条空的 assistant 消息。
+    之后每次请求，严格的 OpenAI 兼容 provider 都会报
+    <i data-page-node-id="KsRke9M7vXSr66TxWUfxpH">"message ... with role 'assistant' must not be empty"</i> ——
+    <b data-page-node-id="JTTuYD7C83uaSkQUmBvDd6">这个会话就废了</b>，用户只能新开一个聊天。</li>
+</ul>
+<b data-page-node-id="lc5AxCPJHwzyBgPYzWjyW0">它的做法</b>：在 <code data-page-node-id="9z5hyhSkOD6vJJp0R5ODXW">after_model</code> 拦下来，分两种情况处理——
+<ul data-page-node-id="okwFZVfJKyar3106uQtCSO">
+<li data-page-node-id="vyFwEFRXV6phAi8vO5phaP">如果是<b data-page-node-id="yXkDB137CVW9Qi2xr9HiHI">带 tool_call 的截断</b>：把 tool_call 连根拔掉（结构化的和 provider 原始 payload 都清），
+    防止残参被执行；</li>
+<li data-page-node-id="pR3xmrIqlCf72EiFeF5Qmi">如果是<b data-page-node-id="hxzXGb5v2HMGUlOSDLag66">完全空白</b>：塞一句面向用户的解释进去，别让空消息落盘；</li>
+<li data-page-node-id="GLwxkyvV6UgQEVbmPNkhh6">如果<b data-page-node-id="62cJ5nbCgAgHOUJC228hqI">有正文但没 tool_call</b>：<b data-page-node-id="6IdbGRWcY7rATFpl8VYEsh">原样放行</b>——半截答案也比没有强，让用户自己判断。</li>
+</ul>
+并把处置详情塞进 <code data-page-node-id="3Jj7WJOIAqX1mg4ygTfbNg">additional_kwargs.safety_termination</code> 供日志/trace/SSE 消费。<br data-page-node-id="we0FkmkFFdoocGZPx7lMqL"><br data-page-node-id="RIN6bZvBdTQsFMmGkTVfaM">
+<b data-page-node-id="ARxJn1mCApCt9BzzhgVzAr">它的注册位置有讲究</b>：docstring 明说要注册在 <code data-page-node-id="QDkudtWwKKShSLQ3uZTQOA">LoopDetectionMiddleware</code> <b data-page-node-id="9S3tz2vxIntMueS0BkEf4H">之后</b>，
+因为「最后注册的中间件最先看到模型输出」→ Safety 先拿到<b data-page-node-id="RSipYCFTZnDL6JdqaHdWOg">原始</b>响应、先清 tool_call，
+Loop 再基于清理后的消息做计数，<b data-page-node-id="q0c11wzxvUHKbQCfPwaB5N">顺序反了就会算错</b>。
+</div>
+
+<h3 data-page-node-id="vJbDIfkMWRvqkjrCkVtJgD">7.4 结构化交付回执 —— 「到底交没交作业，别靠嘴上说」</h3>
+<div class="info" data-page-node-id="Q5H1bLUMTs0Yr03FGe6ilm">
+这个和上面三个不是一层的东西：上面三个是<b data-page-node-id="GS2UbrpWMOLIwX1GxAIE61">拦截器</b>，这个是<b data-page-node-id="Fc4tisi1JtYLxELBZJYWCL">一次性运行的结案报告</b>。
+代码在 <code data-page-node-id="oBedpImtAA38XPO02d8Ni4">runtime/runs/worker.py:183-221</code> 的 <code data-page-node-id="xMibalEAsgA2u7ayYiWEB6">_delivery_content_with_outputs()</code>。
+</div>
+<div class="card" data-page-node-id="uP2bTj61SLodJ1ORC98axA">
+<b data-page-node-id="zn77ydu7wbWtV1jladbouB">它解决的问题</b>：agent 说「我做好了」并不等于真的产出了文件，更不等于用户真的拿到了文件。
+需要一个<b data-page-node-id="tH135RX1GR1lDJAKDYJ2SZ">客观核对</b>，而且要能区分「没做」「做了但没交付」「交付了」三种情况。<br data-page-node-id="p6GldNuOi8uEZzaTkywCzm"><br data-page-node-id="sPDEj8PDGid7qUurE9b8NG">
+<b data-page-node-id="OxDE4RZKE6EuqpdJrJFxko">它的做法</b>：一次 run 结束后，比对本轮<b data-page-node-id="hdf8nXSSO0AK4mPxtjLCE2">实际改动的工作区文件</b>（<code data-page-node-id="vZeCA9xEhwKg2Vf9mQfcaH">produced_paths</code>）
+和 agent <b data-page-node-id="YEGWBjP1BDBmB9zecuqhM5">声称交付给用户的文件</b>（<code data-page-node-id="B9cif9XwhzXFIOuSRFMWKO">presented_paths</code>，来自
+<code data-page-node-id="GiZEKyMXH2ma9NUNCVs94d">present_files</code> 工具调用记录），算出交集 <code data-page-node-id="thVOp8WViik1wr3LaGg1yr">matched_paths</code>，
+然后给一个三元 <code data-page-node-id="W1OFCXM3vPMhtj9vCWCNs5">stage</code>：
+<table data-page-node-id="eCu9B3zuyN8zmTgxclJ4CT">
+<thead data-page-node-id="7FP3rpVZCVXYeV1SnCZ9pS"><tr data-page-node-id="hetnS6LDY1O0ndcukfq9ES"><th data-page-node-id="ALfKpJBvxe6se8OmAAh0nB">stage</th><th data-page-node-id="zSdNtBAEe9RVyiFD6yNK3P">含义</th><th data-page-node-id="86ALesNf3rKZ3ih8k3X8qb">人话</th></tr></thead>
+<tbody data-page-node-id="yOEjICidIe7lJfDszVRDBG">
+<tr data-page-node-id="jiMJe7zNYwEWo6AiD8BFMF"><td data-page-node-id="eMjk2hBr0z5SDB40e0xLBu"><code data-page-node-id="GmaEkaRIeFr4goNrtGO8fc">not_started</code></td><td data-page-node-id="Hw4enLHcLbgEu8jatl0KL0"><code data-page-node-id="RXVJIc5SaLOGzJ9UAsOn0y">produced_paths</code> 有，但 <code data-page-node-id="Lnj8AyttwNg2ezK83B8ZLq">presented_paths</code> 空</td>
+    <td data-page-node-id="ztfo0U7sq1odZoNQXB6pZc"><b data-page-node-id="65UWAJlL9p7yE2IjzNfqJX">做了但压根没交</b>——文件躺在工作区，用户没拿到（<span class="hl-red" data-page-node-id="S0x770bVAfBvBlTQrwkv9S">我们这次就是这个情况的极端版：连 produced 都没有</span>）</td></tr>
+<tr data-page-node-id="DO2YbELvO4ljHzL2VIefs9"><td data-page-node-id="3ZsO92R5Kd7D5yNKN8YwBr"><code data-page-node-id="q7i2cwlIQTKB5HXW1BRFGc">mismatched</code></td><td data-page-node-id="bY8zQ9gTXhTFfw4NmoA84e">两边都有，但没有一个对得上</td>
+    <td data-page-node-id="ewUHWBz2sVVGaoUJcHwVcg"><b data-page-node-id="X2ltH9K2X3ERZvyfWL1dOc">交错了东西</b>——交付的文件不在本轮产出里（可能是旧文件，或路径写错）</td></tr>
+<tr data-page-node-id="uphg5f53c8Nm0H7ahyHNVj"><td data-page-node-id="Qg52dyEGKUSruiSL0XedjD"><code data-page-node-id="oDYpuYGyvWBHDZNv6O3PUu">presented</code></td><td data-page-node-id="yu16i76VpP6aJzFLqV906X">至少有一个产出路径被交付覆盖</td>
+    <td data-page-node-id="M5LkHE6GMLiwP3fFlC6jlF"><b data-page-node-id="Kdf60nGHFB6DdEbaTFR5QG">正常交作业</b>，<code data-page-node-id="fB8cwYiJFXG5FgT76PLgDO">satisfied = true</code></td></tr>
+</tbody>
+</table>
+配套还有一个 <code data-page-node-id="GHOkkC3InRrNOPj3HUW6fb">satisfied: bool</code> 布尔位和 <code data-page-node-id="mVA2S6FdnKuRKQtGCEzXIL">verification.source = "outputs_changed"</code>
+用来声明「我这个判定是基于工作区 diff 算出来的」，可追溯、可质疑。<br data-page-node-id="NaWlatz5WTHjLejPcUxGq8"><br data-page-node-id="Ik43ipMxDqgJRn8DioNdIm">
+<b data-page-node-id="8NwJMjaTJXpcgfdBUgPiAM">它还顺手修了一个容易踩的坑</b>：<code data-page-node-id="x9YaO4ZiERgzVJ05670Z5s">workspace_changes/scanner.py</code> 里有个
+<code data-page-node-id="UbzkWqD0GjjGGkDRr2LSyH">EXCLUDED_DIR_NAMES</code>，把 <code data-page-node-id="pP0eBn86AAo2rqtdU1jb0w">.tool-results</code>（工具输出超长时外置的暂存目录）、
+<code data-page-node-id="ZiDdm5iRtI6nggL1jbO9WU">.git</code>、<code data-page-node-id="mP063qnACW8Cnze7pyI8vh">.venv</code>、<code data-page-node-id="owKDT3rVy8cENZKO5TSFBN">browser-frames</code> 等排除在「交付物」之外。
+否则 agent 随手读了几个大文件、系统把工具输出落盘到 <code data-page-node-id="pdeIjDSfoCnjKSoRIImsXF">.tool-results</code>，
+就会被误判成「产出了交付物」。<br data-page-node-id="H2v1Y5fbgYBoDwXBhOcYFm"><br data-page-node-id="8aiFR5YKefbDonKBCp4u1E">
+<b data-page-node-id="idhOIAzp2fEgXevmWShGSc">为什么说这个对我们最关键</b>：我们现在的 M3 只有「<code data-page-node-id="80A9TEMcEGX1Z966ItGLBF">/reports</code> 有没有文件」这个二元判断，
+所以当模型<b data-page-node-id="Aw9RVE8S2iyAS9jrS0h0o6">一个 tool_call 都没发出</b>时，我们只能说「你没交作业」，
+然后把责任推给模型（「请检查是否遗漏 download_from_sandbox / write_file 步骤」）。
+deer-flow 这套东西的价值就在于<b data-page-node-id="AykFeqOPDAKkGS4JazMn34">把「没交作业」拆成了三种不同原因</b>，
+每种原因对应不同的处置和不同的话术——这才是它比我们成熟的核心。
+</div>
+
+<h2 data-page-node-id="jPUg0CrtrI0Fej62vvXuVt">八、中间件顺序契约：已实测裁决（原第七章第 1 条）</h2>
+<div class="verdict" data-page-node-id="lcrx0HBHCB4YHZhJ6PY2U7">
+<b data-page-node-id="Y87pS8GWA5EwVZYPDeflZD">结论：deer-flow 的 docstring 是对的，<code data-page-node-id="daKq0NHBTtCyYxerutHKbC">after_model</code> 逆序执行——最后注册的最先看到模型输出。</b><br data-page-node-id="glPWzbrR76KRA0fNtkfFUF">
+不再是「两种说法矛盾、需实测」，已用两轮 spike 在 langchain 1.3.13 上跑实。
+<b data-page-node-id="i2OAsNqqpT7IBrgpgl1tcQ">但实测同时挖出了两个 deer-flow 没说、我们也必须处理的问题（见 8.3 / 8.4）。</b>
+</div>
+
+<h3 data-page-node-id="hWGSzSIGo5zfzOflPuflce">8.1 Spike 实测结果</h3>
+<div class="card" data-page-node-id="wcI9cYVy4jTq6DCE5KPSOP">
+Spike 位置：<code data-page-node-id="Yjgov3nFTkjexHvhQBGCTL">.workbuddy/spikes/middleware_order_spike.py</code>、
+<code data-page-node-id="V7lEZh7XHQrbNIQi7eIkrf">.workbuddy/spikes/jump_config_spike.py</code>；
+环境：Windows venv，<b data-page-node-id="FVkWSNS8diAwZ9KRPpKvzO">langchain 1.3.13 / langchain-core 1.4.9 / langgraph 1.2.9</b>（与本机 <code data-page-node-id="y3t1OuLQmQppRbX5zWBGZa">.venv</code> 完全同版本）。
+<pre data-page-node-id="vY0BovoYgkBox7Sg4BGAkv">【实验 A】注册顺序 [A, B, C, D]，四者都实现 after_model
+   after_model 实际调用顺序 = ['D', 'C', 'B', 'A']   <span class="rc" data-page-node-id="yjqHvqIV0rF1ibuCYcMTaT">← 逆序</span>
+   wrap_model_call 实际顺序 = ['A', 'B', 'C', 'D']   <span class="gc" data-page-node-id="aEF5ZyJDNzgrPyyBHO5RX0">← 正序，与 after_model 相反</span>
+
+【实验 B】注册顺序 [D, C, B, A]（反转）
+   after_model 实际调用顺序 = ['A', 'B', 'C', 'D']   <span class="gc" data-page-node-id="IB7PtybY0xoBLlEI5iTnR6">← 再次确认：总是「后注册的先跑」</span>
+
+【实验 C】空响应 + jump_to="model"，带 @hook_config(can_jump_to=["model","end"])
+   边结构 = after_model -> model (条件边) / -> __end__ (条件边) / -> tools (条件边)
+   after_model 触发=1 | model 调用=2 | 末条消息='recovered'
+   消息 id = ['&lt;新 uuid&gt;', 'ok1']   <span class="gc" data-page-node-id="jtcXlZP7C5YAD0cO2pnQB3">← 空消息 id 已从历史中消失（RemoveMessage 生效）</span></pre>
+源码侧印证：<code data-page-node-id="8asPSTwLxlFjlPeEoAGToh">langchain/agents/factory.py:1738</code>
+<code data-page-node-id="OJaDBCExsiWkw7dKunuyKU">graph.add_edge("model", f"{middleware_w_after_model[-1].name}.after_model")</code>
+—— 从<b data-page-node-id="moDLVNCL81Ttw7jBavy2LE">列表最后一个</b>接进 model 节点，然后
+<code data-page-node-id="1xCcQCDzzrycVJdeHzOkm7">for idx in range(len-1, 0, -1)</code> 逐个往前串。所以：
+<pre data-page-node-id="1IVTWuP6ihW81zwRgHhBxp">注册列表 [ M1, M2, M3, ..., Mn ]
+model -&gt; <span class="rc" data-page-node-id="Cn2GAfLTYkV4p1Go4aDvtP">Mn</span> -&gt; M(n-1) -&gt; ... -&gt; <span class="gc" data-page-node-id="7CjDYPhSvPvVRXKKWBmOgX">M2 -&gt; M1</span> -&gt; (tools | end)</pre>
+</div>
+
+<h3 data-page-node-id="ehSB5FPKztBcjGBFX8mJVy">8.2 这条结论对我们的直接指导</h3>
+<div class="card" data-page-node-id="6zmUhv89AddDMBvGzZahee">
+我们 <code data-page-node-id="GHZk3GrS4AIIwET7GW2Yqt">agent.py:822-842</code> 的注册顺序是
+<code data-page-node-id="X8LDs0fLE4ZBzbDS8FLL3I">[_FreshSkillsMiddleware, switch_model, file_to_image, summarization_mw, model_call_guard, LoopDetectionMiddleware]</code>，
+上游 deepagents 还会在<b data-page-node-id="GuRLQZwuOcS01X0c6vC3kt">我们之前</b>追加 base stack，在我们<b data-page-node-id="pYeaYKtmUXdvVmpY5gKlDx">之后</b>追加 tail stack。
+按逆序规则，<b data-page-node-id="yEHzpPXqnBjctf6YFCnqTL">真正最先看到模型输出的是「最后注册的那个」</b>。把整条链按「观察顺序」展开：
+
+<table data-page-node-id="SDArkm1wPsxVarXQBiuMSY">
+<thead data-page-node-id="Vhsc6eBAnaGWC1bHPWLCvc"><tr data-page-node-id="yjnAKRuppDGJbp1m8WHkDq"><th data-page-node-id="xHE71ff2pl3XqECmgcj8vJ">观察顺序</th><th data-page-node-id="WOw4AgzYyRQ2Mj3jBPvoHe">中间件</th><th data-page-node-id="0ZNOMP7flcjq9t75fBi63d">有无 after_model</th><th data-page-node-id="osCe7XAAzc0Ck1TKTNEAw1">对空响应的影响</th></tr></thead>
+<tbody data-page-node-id="c4RtjUsrwRHn3sYVw18jHI">
+<tr data-page-node-id="O5ZElmKDWaWFknFRV6ufMo"><td data-page-node-id="cOTx2yLbokXIfcWpXQEcvf">1</td><td data-page-node-id="QqIuNyUOZ3APINJsODHyhQ"><code data-page-node-id="hlwrSRVEtDYja2uLtvSZqq">HumanInTheLoopMiddleware</code>（tail 最末）</td><td data-page-node-id="gVOhAcfKCY5ABgx8Cu4y3w"><b data-page-node-id="eRG1YD14SNBkjdgr1OYdSa">有</b></td>
+    <td data-page-node-id="gjyM7uI1sZzTKIVriFgmzC"><code data-page-node-id="N9DYBKI9yq8RsIr1zMy6CE">human_in_the_loop.py:405</code> 首个判断就是 <code data-page-node-id="dIcs2zMcNtBLPVXchApemv">if not last_ai_msg or not last_ai_msg.tool_calls: return None</code> → <b data-page-node-id="HA0UvLF8ZPctCDULDu9Wj1">空响应它直接放行</b>，不干扰</td></tr>
+<tr data-page-node-id="sEPEy6ICP21H7ZQfA6A8aV"><td data-page-node-id="zuY49hiLAwiDmN0TlidjjB">2</td><td data-page-node-id="DwZgzWdFRG1EopMeN1eX5m"><code data-page-node-id="l7HLkDslmBnZ7FEPKqNPw5">MemoryMiddleware</code> / prompt-caching / <code data-page-node-id="SincuGFhOdlBOIf3SMeHwB">_ToolExclusionMiddleware</code></td><td data-page-node-id="fwSBrrR36wVCC0X5DtYv5H">无</td><td data-page-node-id="L6yeklHCmFgKW3dlz7F5Jc">不影响</td></tr>
+<tr data-page-node-id="jGSJUSx19eT3sFTMR4t7CC"><td data-page-node-id="LmWDTw8VPeKcG0IBbkQpxd">3</td><td data-page-node-id="sAPMD2sxj28Wl6Bcaskt9k"><b data-page-node-id="FKCsGub97yITekkFoKrMLi">我们的 <code data-page-node-id="U5rvvNsYLgcfLS0QWFRzA7">LoopDetectionMiddleware</code></b></td><td data-page-node-id="HCTBvepMkRJvSkRVnlcuA4"><b data-page-node-id="DBlw15CmtPu5lBjO6ejegi">有</b></td>
+    <td data-page-node-id="MaypUFncxRait1BDzOMB2D">只做重复计数 + 硬剥 tool_calls；空响应无 tool_calls 可剥，<b data-page-node-id="nlnDbm3chViMlNhf9bTifF">不会改消息</b></td></tr>
+<tr data-page-node-id="yJ16qafpMGAYkwTc4Y61jp"><td data-page-node-id="oiqmKrMrPGupsmy8HZwN0C">4</td><td data-page-node-id="PQcPofNycFtOtoe5uBzqIw">我们的 <code data-page-node-id="Bp2HYWboya1xACvSnGWbG3">model_call_guard</code> / <code data-page-node-id="LK1ITlj5QBeWfnlPbCrRkP">summarization_mw</code> / <code data-page-node-id="Q5JBMaEImS0DkkUN16s8b2">file_to_image</code> / <code data-page-node-id="rh5zFbqudT44tVMez1Igg9">switch_model</code></td><td data-page-node-id="K7gfYA6S0bhfadmbNO52EJ">无</td><td data-page-node-id="qDw894tZFscK1iCYjVfEV4">不影响</td></tr>
+<tr data-page-node-id="4hguMqcpCKf5SGg4EhnJGP"><td data-page-node-id="HErLnb5SnN8GbIpAd3AfNj">5</td><td data-page-node-id="1SjFdzLIbc4JJWvNsU5xaC"><code data-page-node-id="UDvOZzTD85EsrTiJIAee3n">_FreshSkillsMiddleware</code>（我们最前 = 最后观察）</td><td data-page-node-id="ZR0FOkl3WFiQssGa9w6Wuu">无（只有 before_agent）</td><td data-page-node-id="xcECOcmyBoOc4goKwGTh8X">不影响</td></tr>
+<tr data-page-node-id="BGOZ7A8pdHQ0FZZg8kfHsF"><td data-page-node-id="OChcqwgPaMe5T6fKRVekyx">6</td><td data-page-node-id="heJaljU0PmgCRDiHXQQ63j">deepagents base stack（<code data-page-node-id="hTAFWLgEX0vjRZRppnr8N8">PatchToolCalls</code> / <code data-page-node-id="f9fhtlS2OiwGgZjqUAJBN4">Summarization</code> / <code data-page-node-id="IN2a8TU0HmexFMv8CJjyTH">SubAgent</code> / <code data-page-node-id="rLwRjlZhx4t2H5T1d5qXsn">Filesystem</code> / <code data-page-node-id="Qf4VALjnyRTjhhAZqhS644">Skills</code>）</td>
+    <td data-page-node-id="fBvoGAJaFY7LHXp20nz686">仅 <code data-page-node-id="WmFx2Atw73TC0UUCjRVsY9">TodoListMiddleware</code> 有</td><td data-page-node-id="ZEFhWtMJCX8E3NtTrmZAGL">依据 <code data-page-node-id="fSPSYyvkh9LR14UouwOYog">agent.py:836</code> 已实现「只补不改」，需 spike 复核（见 8.5）</td></tr>
+</tbody>
+</table>
+
+<b data-page-node-id="4gTsCGa3KAIpiFHVJ2Jm07">推论：如果我们把 A（TerminalResponseMiddleware）追加在 <code data-page-node-id="tsRvTQTVunKsgXYFP09TkG">agent.py</code> middleware 列表的最后
+（即 <code data-page-node-id="Jtw9l5ACtAaDEyLy3N7wxP">LoopDetectionMiddleware</code> 之后），它会在 HumanInTheLoop 之后、LoopDetection 之前拿到输出。</b>
+这个位置是<b data-page-node-id="KDWxQJdM7t5p0wXYY4VEXx">安全</b>的：HumanInTheLoop 不会改空消息、LoopDetection 也不会改空消息，
+所以 A 看到的 <code data-page-node-id="RAxnqBOkvECLNLzJtl9UCl">state["messages"][-1]</code> 就是模型原始输出，判定条件成立。<br data-page-node-id="SMvEO3upS1TtpB9x24AI3y"><br data-page-node-id="muVHy4vPXn2sqotnLJFDFq">
+<b data-page-node-id="QvQTGsJ0bAoEllBe6HBWG3">但顺序不能随便放</b>：如果放到 <code data-page-node-id="DUmZQqIN7wo2V6aAE6283E">LoopDetectionMiddleware</code> <b data-page-node-id="IEbD3MBmSYHYIBrNDReSO2">之前</b>（观察顺序更靠后），
+理论上 LoopDetection 有可能先给消息追加了软提醒文本或硬停文案——那时 A 的
+<code data-page-node-id="B9Y64IgFuSVcOCZPGyTMQj">_has_visible_content()</code> 可能被「LoopDetection 追加的提示文本」骗成「有内容」，
+从而<b data-page-node-id="7SKgdlhtaxyEkZca63SivW">错过真正的空响应</b>。
+<b data-page-node-id="U9d06E09fhfCKpVBj8mmGF">所以 A 必须注册在 LoopDetection 之后（列表末尾）</b>，与 deer-flow「Safety 注册在 Loop 之后」的做法同构。
+</div>
+
+<h3 data-page-node-id="mf5ixO5PYFwAxRNCD4kSUD">8.3 实测意外发现之一：<code data-page-node-id="wMkxAEh7IX55iSDdE0Mrr7">jump_to</code> 缺 <code data-page-node-id="l08neLXmxHFyF3x6Ep5Qbu">hook_config</code> 会被<b data-page-node-id="kXCCaf9vlkOoIm0BaaM8vm">静默忽略</b></h3>
+<div class="danger" data-page-node-id="1kQMd6n4dUTQB7JUhZtC3B">
+<b data-page-node-id="pHlH5wHawzti2oI1x7r1ur">这是个坑，deer-flow 没提，但如果我们照抄代码时漏了装饰器，症状会非常隐蔽。</b>
+</div>
+<div class="card" data-page-node-id="NHB9SW1FJuEmPSPVNSYbQJ">
+试验 D 一开始出现了「假阳性」：没加 <code data-page-node-id="lKU0nKKUQxEE2jFEz839fG">@hook_config</code> 也跑通了恢复。
+深挖后发现是<b data-page-node-id="rDCnCTx7e6rFiewJ9DwUJL">巧合</b>——那次场景里 <code data-page-node-id="N30KvwoUyLcHsN8u8gFAMW">tools -&gt; model</code> 本来就是条件边，
+删掉空消息后 LangGraph 自然又跑了一次 model，<b data-page-node-id="XQUbdUCWFNQ1VGXX9A3eFE">跟 <code data-page-node-id="nTKJVFRjKih9MQEQzYSnI6">jump_to</code> 毫无关系</b>。<br data-page-node-id="eyr0NF3uvUSMKoHI1as0wN"><br data-page-node-id="SkAy78mboWTGDvoMrT9GAh">
+于是重设计了试验 E（让「默认去向」不是 model），并直接探查运行时真值：
+<pre data-page-node-id="6Oj92rCyH5xan1C2fVD3oB">_get_can_jump_to(NoHook(),    "after_model")  -&gt;  <span class="rc" data-page-node-id="nLx4pBLik33HrxHBw3Q24p">[]</span>
+_get_can_jump_to(WithHook(),  "after_model")  -&gt;  <span class="gc" data-page-node-id="83EVHQBQEhWIpKu9EFHr7G">['model']</span>
+hasattr(NoHook.after_model, "__can_jump_to__")  -&gt;  <span class="rc" data-page-node-id="qHMFl0vZlMTF84JzZSEBEN">False</span>
+
+【实验 E】无 hook_config + jump_to="model"（默认去向应为 tools）
+   工具是否真的执行了 = []   ← <span class="rc" data-page-node-id="pDKKQOPhHkrXlKFdeOPtvI">jump_to 被忽略，但也没有报错</span>
+   model 调用次数 = 2</pre>
+源码机制（<code data-page-node-id="qcSKD2AHA82MC9YPhreQth">factory.py:1978-2002</code>）：<code data-page-node-id="FMajhPKAczD7XUW95BgZz0">_add_middleware_edge</code> 里
+<code data-page-node-id="8fiOhFFfQucnCn7nihfWNU">if can_jump_to:</code> 为假时，走的是 <code data-page-node-id="9HWh3q5p5VmOD96ie9mc7p">graph.add_edge(name, default_destination)</code>
+—— <b data-page-node-id="QhUYrn7biU8TvlFKKjHkZd">静态边，根本不读 <code data-page-node-id="BHlhlk05hxQB34g4vpKadU">state["jump_to"]</code></b>。
+<code data-page-node-id="rL9TjCvmh5u7A5gfq4ncER">_get_can_jump_to</code> 只在 <b data-page-node-id="xMNjmmWv8YFSFvMFBqNjHK">sync 或 async 的 after_model 上带 <code data-page-node-id="NgKBUDz3lmnUcKBGs6s9Jb">__can_jump_to__</code> 属性</b>时才返回非空，
+否则静默返回 <code data-page-node-id="hEi4lJprC2tdQhubp9L9yq">[]</code>（<code data-page-node-id="IBrXAOxiNsGYGucGIFsDiw">factory.py:525</code>）。<br data-page-node-id="50LsshXs0cBJL19rCljyIv"><br data-page-node-id="KgLFH4zQaW0Fzw58iO4uS3">
+<b data-page-node-id="KAXRspBjbkgBuUQ8IL3Qso">对我们的要求</b>：A 的 <code data-page-node-id="430dhixHzEGDxe47bXPTdG">after_model</code> <b data-page-node-id="jskfiMkI9o4Z7bHpySb5e5">和</b> <code data-page-node-id="lZrtpt0HWWWnqldrRg5mle">aafter_model</code> <b data-page-node-id="fYzp7MADMNptOloA0FpOpw">两个都要</b>加
+<code data-page-node-id="fFHYljLXvwL7TfVXBrAp2A">@hook_config(can_jump_to=["model"])</code>。只给 sync 加、async 漏掉的话，
+我们走 <code data-page-node-id="bE7efGEswATZJnGbwDD6Zc">astream</code>（异步路径）时就会命中这个静默失效 ——
+<b data-page-node-id="rdk2WMI5EsRuErBxv4yoVK">表现为「空响应被删了但模型没重跑，直接结束」</b>，比不修还糟。
+</div>
+
+<h3 data-page-node-id="0Rq56rlOjrbkFaRJUZirB6">8.4 实测意外发现之二：中间件 <code data-page-node-id="v1Do46LVpljQBVaZlOOndE">name</code> 必须全局唯一</h3>
+<div class="card" data-page-node-id="8pHWXSRM94y5RojQA9GCEH">
+Spike 第一版直接 <code data-page-node-id="AIa8vlOGdi9kQ4WRglZBwc">AssertionError: Please remove duplicate middleware instances.</code>
+（<code data-page-node-id="gZksMoWyQeFQIQnntHeS54">factory.py:1080</code>：<code data-page-node-id="sgVu4W35JEYiwuVSHxKWwC">if len({m.name for m in middleware}) != len(middleware)</code>）。<br data-page-node-id="PqIWuwecph4WCEewZKQZyH"><br data-page-node-id="qaemg3NSSe2NvsBniW7pvi">
+<b data-page-node-id="T7w07BfGN4DnTV6UAlH16n">对我们有两条实际约束</b>：
+<ol data-page-node-id="0NIqOtdICMbdLoDFBfSEWe">
+<li data-page-node-id="xWHyVM90mKsbNV45cmO80f"><b data-page-node-id="NEAZRCMevQvzMwcNvRLEEG">测试/回归环境里不能塞两个同类探针中间件</b>（比如两个 TerminalResponseMiddleware 实例做 A/B）——
+    要动态建不同子类，或给实例改 <code data-page-node-id="Y3lJjNJ4hNGCDxZTYICHpT">name</code>。</li>
+<li data-page-node-id="q19dNx8ZFzASvVEi0HkTPw">更实际的一条：deer-flow 的做法是<b data-page-node-id="YSICVhvwJbfOdwVqVIcqp4">同一实例跨 run 复用</b>（用 <code data-page-node-id="4Icj3raZoQzRKhspnUZcLk">BoundedDict</code> 按
+    <code data-page-node-id="2inVB6hqkdaDQx5xCr5Hoz">(thread_id, run_id)</code> 存重试预算）。如果我们将来想「按用户/会话装两个守卫中间件」，会直接撞这个断言。
+    <b data-page-node-id="DxdFZAww9QaFdl7BaPCz2F">结论：保持单实例 + 内部按 key 分桶</b>，别走「多实例」路线。</li>
+</ol>
+</div>
+
+<h3 data-page-node-id="J7X6MNVOd8aSAsg64uv8cD">8.5 仍需在 67 环境复核的一点（不能省）</h3>
+<div class="warn" data-page-node-id="uqm9p7eNV3t7qZpFfUH2Jn">
+上表第 6 行 deepagents base stack 里的 <code data-page-node-id="rcCP0IDIACTERkWUgC0PDZ">TodoListMiddleware</code> 也有 <code data-page-node-id="iUJUO8UFn70mvunse6mBDH">after_model</code>。
+按逆序它是<b data-page-node-id="h0cuTR1l8VQhwbK6v2Dj5A">最后</b>被调用的（离 model 最远），但它的 <code data-page-node-id="9GqwyHZ3qqFRpjaXRR6y3B">_apply</code> 会往 state 里写 todo 列表。
+需要确认：<b data-page-node-id="Cyt1XEkJCt2aUyvgHSkYUV">它是否可能在本轮末尾改动 <code data-page-node-id="8BmU1UKxV3d3MGz3DJ5sQw">messages[-1]</code></b>。
+</div>
+<div class="card" data-page-node-id="Y0W9lnYU2ATH5pHcN33iou">
+做法：在 67 上用真实 deepagents（含 base stack）跑一次「人为构造空响应」的用例，
+打印每个中间件 <code data-page-node-id="RpFLofPc3iIZagFMxrXYkW">after_model</code> 入口处的 <code data-page-node-id="IMsjhPRkx05PIzfnCqT0pt">messages[-1]</code> 快照，确认 A 拿到的仍是原始空消息。
+<b data-page-node-id="hcU1Kbp8Nps8kezpdbCvFr">这是 8.2 表格里唯一未能本地闭环的一项</b>，其余均为实测结论。
+</div>
+
+<h2 data-page-node-id="J0lGc3ciKojMHFmCFZDTCo">九、遗留待确认（动手前需要你拍板）</h2>
+<div class="card" data-page-node-id="OzGP8hOiQsqL8cIb0I990I">
+<ol data-page-node-id="YKgDeUnv5NGhvY7hIDlr5C">
+<li data-page-node-id="JYhDCDITBHZL58s3kmCtXF"><b data-page-node-id="kVhZn9xyVMt4A31BXHauoG">本次故障的 <code data-page-node-id="MiDdsBwjojbg8h3txHhzjy">finish_reason</code> 仍是假设</b>：需要恢复 trace 导出（<code data-page-node-id="30b4BOe9pucDXFZneiW6CX">tracing.py</code> 三处 exporter）
+    才能在 Phoenix 拿到。若确认是 <code data-page-node-id="Y6M8orW99XSPC5ZUrU97rH">length</code>，则 D 的优先级应升到 P0。</li>
+<li data-page-node-id="AgFCIE07rUPPy7OGaUub7I"><b data-page-node-id="23INeLQ4WtwypBDOY9LtW8">重试次数取值</b>：deer-flow 用 1 次，dsh 用 5 次。
+    考虑我们单次调用可能 336 秒，建议 <b data-page-node-id="UMpJSY8a0DLZnBEnySpyj9">1 次</b>并配合「截断识别」精准化——
+    但这需要你确认可接受的单轮最长耗时。</li>
+<li data-page-node-id="uHxApHGZwer0RWVuO8zFJz"><b data-page-node-id="ccJBkYQZ2Cz82rx0osYqhz">空响应重试是否计入 <code data-page-node-id="wgJCHAO7HGswZu9UxEcO9Y">recursion_limit</code> 与前端步数</b>：一次隐藏重试会多消耗一次 model 步。
+    需要确认 <code data-page-node-id="ilu7bJDFo4Qar5hQbJmtZd">jump_to="model"</code> 的额外一轮是否要在 SSE 里对用户可见（deer-flow 用 <code data-page-node-id="GFxwY2SIs0vswSsuxpqrDZ">hide_from_ui</code> 完全隐藏）。</li>
+</ol>
+</div>
+
+<div class="foot" data-page-node-id="Ys2IzCqoeV1BfuPAKezApe">
+分析依据：<code data-page-node-id="DIlYfGon0e7WgxeFP0uxqX">D:\github\deer-flow</code>（<code data-page-node-id="UNfOSkXIGliSgorCPcFaZV">backend/packages/harness/deerflow/</code>，
+含 middlewares/ 41 个中间件、runtime/runs/worker.py、workspace_changes/scanner.py）·
+<code data-page-node-id="wJ3X2ylVXIERsgg02voJiC">D:\github\deepseek-harness</code>（<code data-page-node-id="pqqn1WJbSfZgQkkTzJh3F5">packages/llm/</code>，含 llm-deepseek/src/translate.ts、
+llm/src/retry-policy.ts、llm/README.md，及 <code data-page-node-id="gvbbi2lmihE5wrjmrsukb6">.agents/notes/</code> 架构笔记）·
+本地 <code data-page-node-id="8L2iHrDWvpX6Mrr5uUcfD6">D:\workspace\geesun_agent</code>@<code data-page-node-id="fOEY3cCpOkQWVqjl91FMyj">c7bf560</code>；
+运行环境：独立 Windows venv，
+<b data-page-node-id="7wSRAs6fvgjJDoTjUScACB">langchain 1.3.13 / langchain-core 1.4.9 / langgraph 1.2.9 / langchain-openai 1.2.1</b>（与本机 <code data-page-node-id="0TSlrTCvA356bImjtAJN8C">.venv</code> 同版本）。<br data-page-node-id="TkH2bH70X9wg5CJtzGcmdQ">
+所有引用均标注实际文件与行号；<b data-page-node-id="tQZhtPIDfw92e1YaWKDP65">第八章的顺序契约与路径结论均为实测结果（非推断）</b>；
+仅 8.5 的 <code data-page-node-id="PS1T1b36m2w2B4SNSChti3">TodoListMiddleware</code> 一项标注为需在 67 环境复核。
+<b data-page-node-id="tUxkPhgCoN30qf62HsGCOs">未改动任何生产代码</b>（仅新增 <code data-page-node-id="NsatXH8hoKpsmaXc8lxzO0">.workbuddy/spikes/</code> 下两个实验脚本）。
+</div>
+
+</div>
+</body>
+</html>

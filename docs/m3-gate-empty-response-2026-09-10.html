@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="HrfPdGF24A0x60EiavRmT9">
+<head data-page-node-id="DAk2exPx7B2Pux0rczxq6Q">
+<meta charset="UTF-8" data-page-node-id="cad4wCiGGEmMnGHvygi9yJ">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="6eHVRMoBvPoDfQWU8RYJU4">
+<title>排查报告：M3 完成门「本轮未产出交付物」误报 — 2026-09-10</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2328; --ink2:#5b6471;
+    --line:#e3e6ea; --red:#c62828; --redbg:#fdecea; --grn:#1b7f4b; --grnbg:#e8f5ee;
+    --amb:#a05a00; --ambbg:#fff5e5; --blu:#1a5fb4; --blubg:#eaf2fd;
+    --mono:"Cascadia Mono","JetBrains Mono",Consolas,Monaco,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px 24px 64px;background:var(--bg);color:var(--ink);
+       font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:25px;margin:0 0 6px;letter-spacing:-.2px}
+  .sub{color:var(--ink2);font-size:13.5px;margin-bottom:24px}
+  h2{font-size:18px;margin:34px 0 12px;padding-left:11px;border-left:4px solid var(--blu)}
+  h3{font-size:15.5px;margin:22px 0 8px;color:#2c3138}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:18px 20px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  .verdict{background:var(--redbg);border:1px solid #f3c4c0;border-left:4px solid var(--red);
+           border-radius:8px;padding:15px 18px;margin:16px 0}
+  .verdict b{color:var(--red)}
+  .ok{background:var(--grnbg);border:1px solid #bfe3ce;border-left:4px solid var(--grn);
+      border-radius:8px;padding:13px 17px;margin:14px 0}
+  .warn{background:var(--ambbg);border:1px solid #f0d9b0;border-left:4px solid var(--amb);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  .info{background:var(--blubg);border:1px solid #c9dcf5;border-left:4px solid var(--blu);
+        border-radius:8px;padding:13px 17px;margin:14px 0}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  th{background:#f0f2f5;text-align:left;padding:9px 11px;border:1px solid var(--line);
+     font-weight:600;white-space:nowrap}
+  td{padding:8px 11px;border:1px solid var(--line);vertical-align:top}
+  tbody tr:nth-child(even){background:#fafbfc}
+  code{font-family:var(--mono);font-size:12.5px;background:#f1f3f5;
+       padding:1.5px 5px;border-radius:4px;color:#b3261e;word-break:break-all}
+  pre{font-family:var(--mono);font-size:12.5px;background:#fbfbfc;border:1px solid var(--line);
+      border-radius:7px;padding:12px 14px;overflow-x:auto;line-height:1.55;margin:10px 0}
+  pre .rc{color:var(--red);font-weight:600}
+  pre .gc{color:var(--grn);font-weight:600}
+  .hl-red{background:var(--redbg);color:var(--red);font-weight:600;padding:0 3px;border-radius:3px}
+  .hl-grn{background:var(--grnbg);color:var(--grn);font-weight:600;padding:0 3px;border-radius:3px}
+  .tag{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:99px;
+       border:1px solid;margin-right:6px;white-space:nowrap}
+  .t-red{color:var(--red);border-color:#f0b8b4;background:var(--redbg)}
+  .t-grn{color:var(--grn);border-color:#bfe3ce;background:var(--grnbg)}
+  .t-amb{color:var(--amb);border-color:#f0d9b0;background:var(--ambbg)}
+  .t-blu{color:var(--blu);border-color:#c9dcf5;background:var(--blubg)}
+  ul,ol{margin:8px 0 8px 22px;padding:0}
+  li{margin:5px 0}
+  .kv{display:grid;grid-template-columns:190px 1fr;gap:6px 14px;font-size:13.5px}
+  .kv dt{color:var(--ink2)}
+  .kv dd{margin:0;font-family:var(--mono);font-size:12.5px;word-break:break-all}
+  .bar{height:26px;border-radius:5px;background:#eef0f3;position:relative;overflow:hidden;margin:6px 0}
+  .bar span{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,#e57373,#c62828)}
+  .bar em{position:absolute;right:8px;top:0;line-height:26px;font-style:normal;font-size:12px;color:#fff;font-weight:600}
+  .foot{margin-top:40px;padding-top:14px;border-top:1px solid var(--line);color:var(--ink2);font-size:12.5px}
+</style>
+</head>
+<body data-page-node-id="4RAik3EDK14eqdHLLDW2ES">
+<div class="wrap" data-page-node-id="AnQhDLe0iBOD781pVanWRu">
+
+<h1 data-page-node-id="VDx8FRJz6zTSJPYXWQjXFA">排查报告：M3 完成门「本轮未产出交付物」误报</h1>
+<div class="sub" data-page-node-id="OhvcHeCDISvsgAilDzytAl">
+  目标环境 <code data-page-node-id="cdpMpDvQa8Fdq6TQvj2q5k">10.10.10.67</code> · 服务 <code data-page-node-id="KSSoPkEPqF6xiULfVp49p6">geesun_geesun-agent</code> · 镜像 <code data-page-node-id="67PydiEPYPVsGH73A8Aa0L">geesun_ai/geesun-agent:1.0.6</code><br data-page-node-id="YcfHCvRqyoKtFCNjGKfLXX">
+  故障会话 <code data-page-node-id="ws1rcZtTwXexh1dA8AmEwG">GY24428:0f6d781d</code> · 时间窗 <code data-page-node-id="oVqmn5EvbMmq2dezfpE2gu">2026-09-10 17:33 ~ 17:40</code> · 报告生成 2026-09-10
+</div>
+
+<div class="verdict" data-page-node-id="N70cEhdPTdInIr1xEtEtez">
+  <b data-page-node-id="Hk6MAdbopGi2ZD55zhoUHZ">结论：用户判断正确，这是一次误报。</b>
+  Agent 并未「遗漏 <code data-page-node-id="TWc0yazNdPPBRYiQn7E31Z">download_from_sandbox</code> / <code data-page-node-id="hsSWw0Wl6OUSyqWMPHAdqr">write_file</code> 步骤」——它在最后一次 LLM 调用中
+  <b data-page-node-id="IEMonAYYGsPtDUMd5iPFmK">根本没有机会产出任何 tool_calls</b>。真正发生的是：一次历时 <b data-page-node-id="SUJfGLPlq1ZFz22zP9oSDU">336 秒</b>的模型调用返回了
+  <b data-page-node-id="2SBF0uePmBBJ8HBswK14BY">完全空响应</b>（content 空 + tool_calls 空），而 M3 完成门在 <code data-page-node-id="2cGuZ0TBEg38niHHvTCSIy">auto_continue=false</code> 配置下
+  <b data-page-node-id="GfQEDZzDJ5adaSOyDILeVr">没有任何自愈能力</b>，把这一次模型瞬时异常直接判成终局失败，并把归因文案错指到「漏了下载步骤」。
+</div>
+
+<h2 data-page-node-id="iDitge8kwv9jaJrRT3YFED">一、取证方法说明（代码 + 日志 + 配置 三源交叉）</h2>
+
+<div class="card" data-page-node-id="kFDp4OWVpOuUpFCZ9YXmf2">
+<h3 data-page-node-id="iRxGHx3TRKroLPn0wTSpwj">日志从哪里读的</h3>
+<p data-page-node-id="qHACmhPLFVCkju9IwEBpKK">链路：<b data-page-node-id="qV1vqgSVR6QbmmB14VkCYW">本机 Python(paramiko) → SSH <code data-page-node-id="D0WBgdx3f2uSnav5pml69B">10.10.10.67</code> → <code data-page-node-id="eDdJGPKyq1xi0LFAEtkjEa">docker logs</code> → 容器 stdout(JSON 行)</b></p>
+<div class="kv" data-page-node-id="zoM7EBDKCOdkz3MDOLzDMu">
+  <dt data-page-node-id="UBSwXzSDpPzKQ69E4mprZ1">SSH 目标</dt><dd data-page-node-id="gdNChRdOQXDJ1d82im3ewy">root@10.10.10.67</dd>
+  <dt data-page-node-id="HB314ioT1nzl0TZ7HoDy7d">容器（swarm task）</dt><dd data-page-node-id="gggp4FLveY0DouyezAoO9z">geesun_geesun-agent.1.dxz23vw0ag97y3cjgaaif2z3y</dd>
+  <dt data-page-node-id="13CU5dxhtYS6lQ2gkYntJ4">读取命令</dt><dd data-page-node-id="Ms2Nq1ITLDF241bOZHEjIJ">docker logs --since 2026-09-10T17:33:00 --until 2026-09-10T17:41:30 &lt;容器&gt;</dd>
+  <dt data-page-node-id="HFRLKSRmTGIhjNZDNDeOR5">过滤</dt><dd data-page-node-id="qJiw6Wch8g4vnyf8e1DELi">grep -v '"GET /docs' | grep -v 'uvicorn.access'（剔除 15s 一次的健康探针噪声）</dd>
+</div>
+<div class="info" data-page-node-id="DxSOGyhSO0wpq4pYtvI7LO">
+  该 stdout <b data-page-node-id="unrxvQBMCedvBFCWbYohnt">同时就是 Alloy → Loki 的数据源</b>（<code data-page-node-id="Ry3dLhXUv7ahx7kqFV3ivC">loki.source.docker</code>）。本次直接读
+  <code data-page-node-id="L9E1Hk4dMY8CBM2TQWShEI">docker logs</code> 而非查 Loki，原因是：① <code data-page-node-id="k3cE38SNyyTGb7b6dLoFNe">--since/--until</code> 窗口精确到秒，不受 Loki 纳秒时间戳换算影响；
+  ② 免去 <code data-page-node-id="D64hv0ZdSrwX4gwKBWXLIw">docker exec grafana</code> 跳板与 LogQL 多层转义。两者内容一致，只是读取路径不同。
+</div>
+</div>
+
+<div class="card" data-page-node-id="tYyKBhPNGsOIO5kc2MYTGb">
+<h3 data-page-node-id="UVrtXIhdlnfHJzLyBUGLKR">代码从哪里读的</h3>
+<div class="kv" data-page-node-id="0aZE2Xwf1dWHvYUSGaAR1O">
+  <dt data-page-node-id="qz7qUPjBwAdEyCZIbfwPr5">本地仓库</dt><dd data-page-node-id="IxQNxnV3peWVEppmnVlwJL">D:\workspace\geesun_agent</dd>
+  <dt data-page-node-id="9BJazh7slNdBk8dNo2eM6P">HEAD</dt><dd data-page-node-id="BQ1b91oVxEcybCCC1jvHvE">c7bf560 （git describe = v1.0.5-19-gc7bf560）</dd>
+</div>
+<p style="margin-top:10px" data-page-node-id="oS0Smbm5kbCzR35FwY1MZH"><b data-page-node-id="88WHDl95xtwgQ2E9fTmsHY">部署版与本地版是否一致？</b>用「日志字面量 ↔ 源码格式串逐字比对」锚定，
+两条关键日志与本地源码完全一致，故本次代码结论适用于线上 1.0.6：</p>
+<table data-page-node-id="4ZePZUA1zJjKdJXCJ2bDbo">
+<thead data-page-node-id="03Cudy4GM3j04HlSjheE8i"><tr data-page-node-id="ltXdX5M1ZZMjK9L3hoRsaK"><th data-page-node-id="cCeW1DSkZA7UmlbyhgEt5N">线上日志字面量</th><th data-page-node-id="1oyARLjKIK6APFYCxTkOzQ">本地源码</th><th data-page-node-id="e0nYcLZBvkecVwR4CMzC2X">判定</th></tr></thead>
+<tbody data-page-node-id="KyLbXD6Z4je3JKGucwTBD7">
+<tr data-page-node-id="FW3t3laHVL2NHN1n6S2LK4"><td data-page-node-id="jCBjbBi376xJMNhJNeXrZ6"><code data-page-node-id="RPE7BPDrV2D6sfrXaoRzcS">[M3] 完成门拦截（本轮零产出）: user=..., session=..., generated=0, new_files=0, retries=0</code></td>
+    <td data-page-node-id="n3nm6nKGVekLYuWV3eMVRd"><code data-page-node-id="8VICtuV9FWWwCxOukaWbjD">chat.py:1364</code> 格式串 5 个占位符完全一致</td><td data-page-node-id="FLjNzKdvbR5xnunirFHEeW"><span class="tag t-grn" data-page-node-id="qMCJXoGRHnf9DROdlbuq7T">匹配</span></td></tr>
+<tr data-page-node-id="wFRFJBP8Wcq9YUZrFzFWSP"><td data-page-node-id="r4ijdzdFpTz7yrlaoysUNn"><code data-page-node-id="nKAwVDLyScH6pam0AVYt8S">[DIAG] model: content=(空) tool_calls=[]</code></td>
+    <td data-page-node-id="xuR31CNUuRJwyUfVsIbw3A"><code data-page-node-id="Kk0dMcwtFOMLf3L8ByB1q2">chat.py:898</code> + <code data-page-node-id="Mwk8AClx3kt2IvDCB6xbHa">(_ai_content or "(空)")[:150]</code></td><td data-page-node-id="08SAx8zN93rOnKLGqLReMF"><span class="tag t-grn" data-page-node-id="RhG460Evao8dzYcFrEyb56">匹配</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="card" data-page-node-id="KOVHDXDM6gU1YTdI9SoCtz">
+<h3 data-page-node-id="FvJlXIWXSp9lF1MX0EYY4E">配置从哪里读的</h3>
+<div class="kv" data-page-node-id="gv7TNYV2uUTj7Oy3WIHNsD">
+  <dt data-page-node-id="KzQq6H3Cn00TAsdDnB6AI0">宿主机 .env</dt><dd data-page-node-id="yuEhm1jAaVmp5Tibe2GwvD">/opt/geesun/deploy/.env （grep 关键键实际值）</dd>
+  <dt data-page-node-id="Du6CF2oOM7CXv1xesXjLTD">容器内真值</dt><dd data-page-node-id="qy9TqA9IxuoH0DcadIRuBw">docker exec &lt;容器&gt; env （确认渲染进进程的值）</dd>
+</div>
+</div>
+
+<h2 data-page-node-id="FKFHaVNLqPtXjbRN0H7Zjd">二、证据链：从用户提问到误报的完整时间线</h2>
+
+<table data-page-node-id="IUngJ81wOitFrfiPC2uCD8">
+<thead data-page-node-id="2HbzAvVWcCztYwE7C7WFqM"><tr data-page-node-id="cReLLx6sPeDoDsgiaImw8z"><th style="width:88px" data-page-node-id="EdWhnAwrXAF20Yk6DmQw05">时刻 (CST)</th><th data-page-node-id="8n4mOk873pW8jLzlIJFe52">事件</th><th style="width:290px" data-page-node-id="7MJW0PwGHZjL4nK94iFjAJ">日志/来源</th></tr></thead>
+<tbody data-page-node-id="v03xtPA4ybF6dGIuOHN578">
+<tr data-page-node-id="YkEWZlRG6DW6FLCZNetPf5"><td data-page-node-id="FPyQSS4tT7zRFPKUGC2Gzm">17:33:09</td><td data-page-node-id="JRsEqQakRuCoNuTldhS3sl">新建会话 <code data-page-node-id="p2ArS9zzDRTQJnBW0rH8wc">0f6d781d</code>，<code data-page-node-id="W5BA1qQmS7x4QfVWYlwz5c">POST /upload</code> 上传输入文件</td><td data-page-node-id="eYJlR57EqFQBUCNjeNCJJ7">uvicorn.access</td></tr>
+<tr data-page-node-id="vfuqcag3ZfyZcz91htyXBD"><td data-page-node-id="HtnidtDLMPBZcvstNHIL17">17:34:09</td><td data-page-node-id="OuO63OBVc9SJoC1xUhB6Fq">创建沙箱 <code data-page-node-id="1PyukSB0w8NyHzLc6DfJba">135d7e02cfa2…</code>（Cube API <code data-page-node-id="Kg0bGVR3cdEPVG2hmdcC9C">172.16.66.13:6000</code>）</td><td data-page-node-id="XWFKGVCLwaJyaplGqtGdXl">httpx 201 Created</td></tr>
+<tr data-page-node-id="XfwY7cwl3Jme18ruYRlELY"><td data-page-node-id="zPvJe4peAnctuoCOOukw0k">17:34:10</td><td data-page-node-id="DpA2ORiZg6F0rrGWGOnVkJ">上传 <code data-page-node-id="izAHwmgz168F5y6cD8qHN9">机器视觉产品手册中文版V20260513.pdf</code>（<b data-page-node-id="tK05tHypQCwQ5NA8tqAExM">13.9 MB</b>）到沙箱</td><td data-page-node-id="nahPmeMAk9Ggyzq9izG3mL">tool upload_to_sandbox → OK</td></tr>
+<tr data-page-node-id="Rfdy5eNhmt002gJuBsoP5c"><td data-page-node-id="gEV4eyB3o7LQeqTG5ixaZz">17:34:12<br data-page-node-id="6Ezr4asgYMcULj9g2Kzftl">~17:35:09</td><td data-page-node-id="e3bHyJZHef2xQd1gMeozDH"><code data-page-node-id="gT3H2pMeJcyya34R3v8nXg">execute</code> × 4：pymupdf / pdfplumber 逐页读取，逐步定位「小面阵相机」参数页<br data-page-node-id="BjpCvC8VamPIgYTZ60m7av">
+    messages 1 → 13，chars 452 → <b data-page-node-id="bGRGoCWH6zNYbzz3gGfoie">33555</b></td><td data-page-node-id="F08S8CjT3HLZtT4Kwxf33f">[DIAG] model_call_guard</td></tr>
+<tr data-page-node-id="IXoEXCMySv38XzOM1qDdIt"><td data-page-node-id="sRQw2WlaIH2jhkhvsaUjEb"><b data-page-node-id="3c9OvzFKJaHBib0C87ifhn">17:35:09.42</b></td><td data-page-node-id="jeAzt0ZZvleEDpaxdniX4e"><span class="hl-red" data-page-node-id="ktO6dEzJ2pc9eQFwHRJDaa">最后一次请求模型</span>：messages=13, chars=33555（≈16776 tokens）→ <code data-page-node-id="zy4kiJJJqeVYDzHhYR6tzt">POST /v1/chat/completions</code> 200</td><td data-page-node-id="vGIk9XXXkQimERLruwUElY">[DIAG] model_call_guard</td></tr>
+<tr data-page-node-id="b3uWlcXMDoZRLQSUuug1tS"><td colspan="3" style="padding:0" data-page-node-id="O60nszuVjC6HKGqvlFz6Y4">
+  <div class="bar" style="margin:0;border-radius:0;border-left:1px solid var(--line);border-right:1px solid var(--line)" data-page-node-id="TEbvv11pivwb1lbwdTjgj2">
+    <span style="width:100%" data-page-node-id="GHnM7mhsI2h8jM68TF5YKb"></span><em data-page-node-id="cFx5olqVrFkfvYcEPlD6A8">静默 336 秒 · 期间无任何 model / tool 日志，仅 15s 一次 /docs 健康探针</em>
+  </div>
+</td></tr>
+<tr data-page-node-id="Fc8rWFiuYXujfOJkZyizof"><td data-page-node-id="oR0DSAnwAfSRmbx2UqNB9D"><b data-page-node-id="IJfS0daAJaQY8qOVnnoLEB">17:40:45.35</b></td><td data-page-node-id="r2Hi0JmKocuG1ChjrjdTmE"><span class="hl-red" data-page-node-id="nBRm5BNt6McXGOKqLk2lUv">模型返回空响应</span>：<code data-page-node-id="CBXqkEtv7AdFyK9KLW8FS8">content=(空) tool_calls=[]</code> —— 既无正文，也无任何工具调用</td><td data-page-node-id="WsTuzLGPzTICbM9lZjigBZ"><code data-page-node-id="zwcEo5MJBIQo5OvbCzC5R4">chat.py:898</code></td></tr>
+<tr data-page-node-id="179q32i1c17ycdNAe88gHC"><td data-page-node-id="Gn82wLHNbc9eXVec4ggqTL">17:40:45.37</td><td data-page-node-id="GYjvhSMgq0wAbLCkcUiqRU"><span class="hl-red" data-page-node-id="c6cZp81XlV8GUV2vEsSkgz">M3 完成门拦截</span>：<code data-page-node-id="UZwjCAxqiCZF8d0do5yiAf">generated=0, new_files=0, retries=0</code></td><td data-page-node-id="IXTBkoUctTSmySNmM7H5PU"><code data-page-node-id="ocTBDg4EyEFWyqI370pTCa">chat.py:1364</code></td></tr>
+<tr data-page-node-id="u2s2vUGPAQrnHhydvpAwME"><td data-page-node-id="47AgdDFjop9Jr2Nhi9OyJh">17:40:45.41</td><td data-page-node-id="P9DERy2jbUDK8cezKSXHjt">SSE 结束，会话保存 <code data-page-node-id="zoh9JIQbrudNNYgZsfuyoF">msgs=14</code>；前端收到 <code data-page-node-id="EXaBdnHUOinjEFGaVtSgxs">completion_blocked</code> → 展示「本轮未产出交付物」</td><td data-page-node-id="3S0GnHTqrg9G0UZ79dXMhg">chat.py</td></tr>
+</tbody>
+</table>
+
+<div class="warn" data-page-node-id="2mvwMIlaAgHEJRSR2SzpUk">
+<b data-page-node-id="FHd4b6GfLJo9cRhRcdAe9C">关键补证：</b>磁盘上 <code data-page-node-id="sToZTDrFYcof6z4CIJofpW">/data/reports/GY24428/0f6d781d/</code> <b data-page-node-id="A42HJiY8aIGaDU1GkEkHtW">目录本身都不存在</b>
+（同级只有 <code data-page-node-id="kLlF65swBosCNTnTE8TByg">64ae1504/</code>、<code data-page-node-id="IDztMbi2jsWuTLotwj8snZ">b5589a78/</code>）。即本会话从头到尾<b data-page-node-id="ZafYRd4q2Gwq1PN2VNeGqd">没有任何文件产出</b>，
+<code data-page-node-id="WDXCXCx9ARx9LpNPQjKEZU">_generated_files</code> 与磁盘差集 <code data-page-node-id="TPnYigpDfHBSBdhnkUCKNF">_new_files</code> 双双为 0 —— 这个判定在<b data-page-node-id="9UmALb0y3ySodaeCUnRQEe">事实层面没错</b>，
+错的是<b data-page-node-id="XiGMXr6l1p2rxeY9ORn8VV">归因与处置</b>。
+</div>
+
+<h2 data-page-node-id="Eek4ksXDEgudzGCYvmwFed">三、根因分析：两层，一层是模型异常，一层是门控放大</h2>
+
+<h3 data-page-node-id="CDlVYQsveeQdX3Nyh6sBot">第 1 层（直接原因）：模型返回空响应，且代码全程无兜底</h3>
+<div class="card" data-page-node-id="06vbI0RMUg7HKcwGXCPRZR">
+<p data-page-node-id="NTbZo3Nd7oMzlSCIZlfjwA">最后一次调用耗时 <b data-page-node-id="BpBHEZbvKBuEWfGd2YxHbR">336 秒</b>后返回 content 空 + tool_calls 空。全仓 grep 确认：
+<b data-page-node-id="Mn1kNdHIuYb46u6zB0rUUQ">不存在任何针对「空响应 / 零 tool_calls」的检测与重试逻辑</b>（<code data-page-node-id="HHWvqwcI2F9PV8wlqUmW7p">grep 空响应|empty_retry</code> 零命中）。</p>
+<p data-page-node-id="xMmiufeoZUQmuCeCuRHHPC">空 AIMessage 进入 deepagents 的 agent loop 后，因为没有 tool_calls，循环直接判定「结束」，
+连一次纠偏机会都没有 —— 这与 <code data-page-node-id="rYFA8rWWFUBFovf9XMmjdI">model.py:517</code> 注释里记录过的历史事故是同一类失效模式：</p>
+<pre data-page-node-id="lVmcZyH1J0E6jmh5swbPvo"># effective_max 被 floor 到 1 → max_tokens=1 → 模型几乎零产出（截断在"用户"后无输出）
+# → <span class="rc" data-page-node-id="XKSGEMrhcsYXjtQFByAkcF">无 AIMessage → agent 永不结束 → 反复空转</span>。现改为超预算时砍输入（优先图片块）、
+# 保底 1024 输出空间，杜绝 floor=1 死循环（见 docs/context-window-fix-draft.md v2）。</pre>
+<p data-page-node-id="WMRED6B0gQ3ooTMIFWeDHC">说明这一失效模式此前已被识别过一次，但只修了「floor=1」这条触发路径，<b data-page-node-id="sHFz6ySVbLfrG6Tj7v18YG">没有加通用兜底</b>。</p>
+</div>
+
+<h3 data-page-node-id="SDWaPV0GBKmYgRZZPPiMFC">第 2 层（放大原因）：<code data-page-node-id="ov8veENAayzssRJ77M9Cka">auto_continue=false</code> 让完成门退化成「一次空输出 = 终局」</h3>
+<div class="card" data-page-node-id="JIjWnDpBYFJtACQojQqHyb">
+<p data-page-node-id="TEhE4NiyE4zP7GYCLfECbN">完成门的判定与处置分支在 <code data-page-node-id="c8FoG9qefM7sQ32Gc0Fo13">chat.py:1358-1373</code>：</p>
+<pre data-page-node-id="jtUN9vfIFAMCtsY0AaQKX4">if (_completion_retries &gt;= settings.sandbox_completion_gate_max_retries
+        or <span class="rc" data-page-node-id="nY8KFHbfG09SVSjLnuEQSV">not settings.sandbox_completion_gate_auto_continue</span>):
+    _completion_blocked = True
+    logger.warning("[M3] 完成门拦截（本轮零产出）: ... retries=%d", ...)
+    yield completion_blocked  →  break</pre>
+<p data-page-node-id="UdHzlL7q6bgdH4MQ7eyNps">线上配置（<code data-page-node-id="cigdVYPfDGACSbCVeNLr75">/opt/geesun/deploy/.env:78</code> 与容器内 env 双确认）：</p>
+<table data-page-node-id="De9wX1f8whPBa9AQSNpGVY">
+<thead data-page-node-id="HMHUOzYwYoQqyAdf9dLTJ1"><tr data-page-node-id="NSwh12GWG4iThZOKJFy6Kj"><th data-page-node-id="1ZsVcYFM4CVkEo3WhroN0M">配置键</th><th data-page-node-id="pZs4dgZK6i3ypBfAr9eDKF">线上值</th><th data-page-node-id="7HiNO0rWaz1HGsro2cw9rZ">含义</th></tr></thead>
+<tbody data-page-node-id="KM9z7GLPsuNJGPzP03JYxL">
+<tr data-page-node-id="mY18y6hwWPSaEvuv6eObvE"><td data-page-node-id="RJmlb6NZFjcEbXJLw97oAt"><code data-page-node-id="1loSZel0rvqidjtQb06ZmC">sandbox_completion_gate_enabled</code></td><td data-page-node-id="ZU6tJ7qesrwv5DHkJ0g1ML"><span class="hl-grn" data-page-node-id="XcgufE7Jhfa8rpwJ7VJMF9">true</span></td><td data-page-node-id="oDW50boJzJGPPveKuoYFDh">完成门开启</td></tr>
+<tr data-page-node-id="4ZH197zorulZMSjBxsNSu1"><td data-page-node-id="QiXt6CEzDdMW07HkaEqBFq"><code data-page-node-id="xHAotWvllGxzyrKPtIcrBu">sandbox_completion_gate_auto_continue</code></td><td data-page-node-id="hjLizd5VfD2b8QA7bp8LCw"><span class="hl-red" data-page-node-id="efDRWvCeJl7a0m88lITd59">false</span></td><td data-page-node-id="11bGwHm9lAIIKb76Lr3ahl"><b data-page-node-id="8bk98Ch26chRblSHDQaTCK">零产出时不注入继续轮 → 立即判失败</b></td></tr>
+<tr data-page-node-id="PIKjMZwBwdXPHTMUDhIspG"><td data-page-node-id="S4t8xQ74EVWblKrdxeVP0v"><code data-page-node-id="tkKp5Mn7Gxmz2jEKJPOFkT">sandbox_completion_gate_max_retries</code></td><td data-page-node-id="F2OREH1JkRHAhkaWgEVMfS">2</td><td data-page-node-id="WwxMD13jGF22lEO7IOsFA1">本可重试 2 轮（但被上一行短路，形同虚设）</td></tr>
+</tbody>
+</table>
+<p data-page-node-id="dsoH9kZVxFyONkXC5iY7GV">因为 <code data-page-node-id="55xoUTt3BUpTdPGeaFRo20">not auto_continue</code> 恒为真，判定在第 <b data-page-node-id="5yG6FD8n7msC06srg9c7F3">0</b> 次就命中拦截 —— 这正是日志里
+<code data-page-node-id="KF0U7LBHWsfAgeX0LytabR">retries=0</code> 的含义：<span class="hl-red" data-page-node-id="cdRxpQMp0dT0T3NLlE6cMQ">一次继续轮都没试过</span>。
+<code data-page-node-id="FfzhgIh0ddMKtCGcXe7poE">max_retries=2</code> 与「注入 SystemMessage 自动继续」这段能力<b data-page-node-id="lXLaKFUFD0T0GW6VCUaKAC">被配置直接短路成了死代码</b>。</p>
+</div>
+
+<div class="verdict" data-page-node-id="uDv8S61bAkgrzOC85nnKgH">
+<b data-page-node-id="Gfc20Bsm8KzsW3pHCWUSoS">因果合并：</b>模型的<b data-page-node-id="zsPpdcpqKtlDgzvBaaEuYb">一次瞬时异常</b>（336s 空响应）＋ 门控的<b data-page-node-id="CYbS6jm2GtEeOUeGsSzlQ3">零自愈配置</b> ＝ 用户看到终局失败。
+两者缺一不会产生这个结果。若 <code data-page-node-id="cb3JN6Tmr7x2YtF0ET222X">auto_continue=true</code>，本例极可能在第 1 轮继续轮自愈（重放该次调用即大概率正常返回）。
+</div>
+
+<h3 data-page-node-id="pBGiJrun2Y7wCG6y5ZCFcF">可疑点深挖：336 秒这个数字本身很可疑</h3>
+<div class="card" data-page-node-id="DKUSbZC8UXYMwwr4DkJEX0">
+<p align="left" data-page-node-id="HELZDTVI9Wi8GIrCWb3Lm3">时长与输出上限的数值巧合值得警惕：</p>
+<pre data-page-node-id="T4teuFuhxG7DaPJRFXzWCE">336 s  ×  ≈195 tok/s（Qwen3.6-35B-A3B 合理吞吐）  ≈  <span class="rc" data-page-node-id="4UZ4PCsMO8y49Vpnbu45GN">65.5k tokens</span>   ≈   model_max_tokens = <span class="rc" data-page-node-id="mwTJHgDsBvxroyVgaPCowI">65536</span></pre>
+<p data-page-node-id="L194fK1jyojjgvmUS4n7uz"><b data-page-node-id="nPECZVsqVmGKsNe0ah1UAi">假设 A（可能性最高）：thinking 吃光输出预算，被 <code data-page-node-id="80NgXDkguSGxjS5qxMDNJ1">finish_reason=length</code> 截断在思考段内。</b></p>
+<ul data-page-node-id="neuzGBYkbCextabieZcFZn">
+<li data-page-node-id="J8A19MFH2GpVtIOBALKkpJ">本项目用 <code data-page-node-id="iCvfLZqtBC0kOUtDlMaHga">--reasoning-parser qwen3</code>，思考走 <code data-page-node-id="SWhwRhJCbQMq1kFlw7Hx12">delta.reasoning</code>、正文走 <code data-page-node-id="I5GhvAMGEubj4ZsDrofdWT">delta.content</code>，二者完全分离
+    （见 <code data-page-node-id="ZUXNHUePWICOjHUGLHXX8M">model.py:251-282</code> 的 <code data-page-node-id="k4XK6r92WWYxO4wCYIoFjJ">ReasoningChatOpenAI</code> 注释与实测：680 个 reasoning chunk / 2045 字符 vs 46 个 content chunk）。</li>
+<li data-page-node-id="GDdB9SiHGz9d3kevB48yaY">若模型在 <b data-page-node-id="eCZR4S71KlsjyfNQUGPM4u">think 段内跑满 max_tokens</b>，parser <b data-page-node-id="unKk0TbSl71kfBb4jhxy1F">始终没遇到思考闭合标签</b> → 全部生成 token 落在 reasoning 字段 →
+    <code data-page-node-id="mCWe0cjvd5umXdkQ6RF50p">content</code> 恒为空；同时思考未结束，自然也不会发 tool_calls。</li>
+<li data-page-node-id="TIPvAEI7mNywc0tAhQ8rgq">这完美解释「336 秒长思考 + 最终 content 空 + tool_calls 空」三者同时出现。</li>
+</ul>
+<p data-page-node-id="L8Ji2qOc6xZKZTfUvZu5av"><b data-page-node-id="Qbl4LtgZsB2aAxLGxyiS5K">假设 B：模型自身空转/异常。</b>可能性低于 A，但同样无法用现有日志证伪。</p>
+<div class="warn" style="margin-top:14px" data-page-node-id="8I2Mee45pVDDl9GH0HPt5A">
+<b data-page-node-id="FSeoubJuODKRW6IgVyY4sT">无法定论的原因（重要）：</b>定论需要该次调用的 <code data-page-node-id="CDjNuHCGjbQtqK19P5dfyT">finish_reason</code> / <code data-page-node-id="gc6wdRQ3UnImrZmeguJEJN">completion_tokens</code> / reasoning 全文。
+但 <code data-page-node-id="1Hyw47k52togzTAkjvydtC">ea303fe</code>（2026-09-09）已把 <code data-page-node-id="keGsAWZHHByHF9QgvGE2jF">src/core/tracing.py</code> 的 Phoenix / Langfuse / metrics
+三处 exporter 全部注释 —— 实测查询 Phoenix <code data-page-node-id="ZR6M7TqfcIdUNCWOECTpwN">spans</code> 表在 17:33~17:41 窗口
+<b data-page-node-id="VFxZ4ZzYSuH3ZjnCESqovi">返回 0 行</b>，trace 侧证据链已断。这就是「排查时拿不到模型侧判决」的直接原因。
+</div>
+</div>
+
+<h2 data-page-node-id="45CKDNA5k3VcJebeyVKDyu">四、为什么说不合理（用户判断成立）</h2>
+<div class="card" data-page-node-id="Y6DEOJecZAGNDsTPbeUDoM">
+<ol data-page-node-id="3dI1A0VCO81TtccrtS2Q4K">
+<li data-page-node-id="zkkX0hhM7RAXZSIjrcVriz"><b data-page-node-id="znVbWM7UuzIQcvWzgEXWmS">归因文案是错的、且会误导排障。</b>提示让用户「检查是否遗漏 <code data-page-node-id="3HOG78m26lmRpYHR3HbAaU">download_from_sandbox</code> / <code data-page-node-id="KE8bRtvQkXfIpaDImfeRGr">write_file</code>」，
+    但本例 agent <b data-page-node-id="q9vwgyPtkt39mpyxw21nJ8">连一次 tool_call 都没发出</b>，压根没走到下载环节。文案把「模型异常」伪装成「流程漏步」，
+    会把排障方向带偏（<code data-page-node-id="eXHlA7XEQGWOELQUkh0v35">chat.py:1369-1370</code>）。</li>
+<li data-page-node-id="cfpu1TXvBrOYfuY5PhD1eZ"><b data-page-node-id="7RPrv3mDGRuG63iAV0yVWZ">零自愈 + 终局判定。</b>一次瞬时异常即判死，<code data-page-node-id="hhxTnB5xiGr1p4UepZXYus">max_retries=2</code> 形同虚设，用户需手工重发，
+    且重发后会话历史里已留下「失败」标记。</li>
+<li data-page-node-id="thwsRtWZwlpj0Gm2bllKH8"><b data-page-node-id="RH1TfRlYPz6zTXPKP3e2jQ"><code data-page-node-id="0N5hexT7Iu8N5xmWXiGaLe">retries=0</code> 说明系统连「确认一次」都没有做</b>，与完成门「不信任模型自陈、系统校验」的设计意图相悖 ——
+    它校验了产出，却没校验「模型是否真的回答了」。</li>
+<li data-page-node-id="dgTGlpppL4N6mOFnGwAGIt"><b data-page-node-id="XBq3WYDIGjxRlwqZtPfB8N">偶发但被放大。</b>24h 全量日志 grep 显示这是<b data-page-node-id="pB7kQY9Z0AIKJp9FbcyOlm">唯一一次</b>完成门拦截，说明不是高频缺陷；
+    正因为低频，它在生产里会以「偶发、无法复现、用户困惑」的形态反复出现，成本高于修一次。</li>
+</ol>
+</div>
+
+<h2 data-page-node-id="MsQqwpscL0cOhS4AAjYeR6">五、修复方案（待确认，未改动任何代码）</h2>
+
+<table data-page-node-id="5FTQWaOR4QzqUc4E730AYY">
+<thead data-page-node-id="kGfmj182pVoLVxBOtssfXR"><tr data-page-node-id="ayts0X4ymFr5aMFHH1riDC"><th style="width:56px" data-page-node-id="LzdXKYUBVyu4sb6Nks01vO">编号</th><th data-page-node-id="vyEHfovkXvdsrgIdnvBGh6">方案</th><th data-page-node-id="xEROJcZ7r1qk4IE2apZcmV">改动点</th><th data-page-node-id="obGSYKyTYpQOS2EjODiWND">代价 / 风险</th></tr></thead>
+<tbody data-page-node-id="WwsGgQHfUQoCuzGYkfkSxo">
+<tr data-page-node-id="9nxMOo52YSlopFIrmuHeFR">
+<td data-page-node-id="q6MQUDBMmMF1FW3zq9fgHj"><span class="tag t-blu" data-page-node-id="bM2QhH8yH2kYCgMBe2JJm4">A</span></td>
+<td data-page-node-id="3nwBG8MmFiMl8XO4tkQDtW"><b data-page-node-id="XyupuTc81oAvlZfoQUHzoi">空响应兜底重试（治本）</b><br data-page-node-id="v8CRjDx3QtUHcZub6ifdOV">在 <code data-page-node-id="dT7gEHDFoGZvmKAisbUpJ3">model_call_guard</code> 或 <code data-page-node-id="VYIk6pL4kUH65xfeerKjEt">_drain_astream</code> 收口处检测
+    「content 空 && 无 tool_calls」，判定为无效响应 → 原样重发 1~2 次；仍失败则向上报
+    <b data-page-node-id="UhKqNASmCUGtNVMyIwqKAA">明确的模型异常</b>（而非「漏了下载步骤」）</td>
+<td data-page-node-id="VGAjafBwwls9Sm7NxGpiID"><code data-page-node-id="koSVnYnIUEPt5FUrUR961b">src/core/model.py</code> 尾部<br data-page-node-id="EYNcYpBaDrGp86HZKSqv7E"><code data-page-node-id="YQICcYEhTjDF8oJuChvkEo">src/api/endpoints/chat.py</code> model 节点处理</td>
+<td data-page-node-id="soQ2wepp1uEsxq9Fq0jX5s">低。重发不改变语义，只增加一次耗时。<b data-page-node-id="FOHBVkWY85sVuV4yUrYZKr">建议同时按 <code data-page-node-id="UiUSwyvMPi9CmGohQMhWHY">finish_reason=length</code> 区分</b>：
+    length 截断应记录并提示调大输出预算/收敛思考，而非无脑重试</td>
+</tr>
+<tr data-page-node-id="9Ek6Uv4snEIrI2T7UOpvdL">
+<td data-page-node-id="CvJorKJBeTKE1W7fYtGhhn"><span class="tag t-amb" data-page-node-id="CN8M7LARa0BaxeVMHHdicQ">B</span></td>
+<td data-page-node-id="2A8EPgxFv2SOd7jrh9KR5E"><b data-page-node-id="RasJ2maH8azRV6PxxhYYWK">打开 auto_continue（低成本即时缓解）</b><br data-page-node-id="mfmKtAu3AUDxB16DtOtha2"><code data-page-node-id="p8KhV7E7QL1erOSDCYoq9e">sandbox_completion_gate_auto_continue=true</code></td>
+<td data-page-node-id="1FwROBXbZNxQ8vqeYOEdps"><code data-page-node-id="jnm0ywIzbAABxcg2n17YZg">/opt/geesun/deploy/.env:78</code></td>
+<td data-page-node-id="tJVrJZw8J8gxh3YGwFFu4v">低。仅「要求文件交付物」的任务触发（<code data-page-node-id="uZNBjTs4SofFkuoLGSi8CU">_is_deliverable</code> 已过滤内容型任务），
+    最多 2 轮继续轮；能为瞬时异常提供自愈。<b data-page-node-id="KicGLB0THk44021jYgcxRN">但不解决空响应本身</b>，属治标</td>
+</tr>
+<tr data-page-node-id="cDyPs3MWB9GVkbfOHAYdJu">
+<td data-page-node-id="zK6rO1VbnypKcs535Mt33B"><span class="tag t-red" data-page-node-id="3HnbGyLgTwXos0VKCK3Bbu">C</span></td>
+<td data-page-node-id="ElGSCJsltwo0PLC3fMD8KD"><b data-page-node-id="BaMWGuuVRk1Y6OGRpzHlDs">修归因文案</b><br data-page-node-id="5yHmxSPw7FRxeiv6W07cwF">完成门拦截时区分两种情形：本轮有 tool_call 活动 → 提示「漏了下载」；
+    本轮完全空响应 → 提示「模型未返回有效内容」</td>
+<td data-page-node-id="QphLDBSQFUnq34ZYO4H9XL"><code data-page-node-id="jOJRFjiYFmGxsFXmDlfrkR">chat.py:1369-1370</code></td>
+<td data-page-node-id="yLTA67eK496Cp4DkdDsOK6">极低。直接消除误导</td>
+</tr>
+<tr data-page-node-id="xb4yrsf9yqbvGXR7kkgqmk">
+<td data-page-node-id="EYLnUZgnqTyukaquqxBXza"><span class="tag t-red" data-page-node-id="pWOvyUGJm8c6JIEDGS7zC9">D</span></td>
+<td data-page-node-id="DEKltoQIceXw9EO9pBw97r"><b data-page-node-id="0kMaXBSQWQkfnFqMfzmlb3">恢复 trace 导出（排障基建）</b><br data-page-node-id="bg07b3CpdmmmNAzyQOBiI3"><code data-page-node-id="3Ig9J9kCLH9z16VpK2TKLM">ea303fe</code> 注释掉的 Phoenix / Langfuse /
+    metrics 三块全部取消注释</td>
+<td data-page-node-id="2QDoYYHdxqijYvvfbytiJB"><code data-page-node-id="dsr3AOmBXA33gOGR0ywi8i">src/core/tracing.py</code>（3 处，按 <code data-page-node-id="Aii30GJlCFkzFEnMvpkGJN">[2026-09-09]</code> 关键字）</td>
+<td data-page-node-id="tuwMVN8gr1EDn7NejIUXCF">低。但需按既定方案<b data-page-node-id="gNRDJR1yr0SONGE2pHEGbC">同时加 LLM-spан 过滤器</b>，否则会重演
+    「healthcheck HTTP span 灌满 Phoenix（98.3%）」的老问题。<b data-page-node-id="gBE3W52EzoYkwYNyaCrm9U">三块缺一不可</b>，只恢复 trace 会漏 metrics</td>
+</tr>
+</tbody>
+</table>
+
+<div class="info" data-page-node-id="UIFsMDXBD2LlS8Yh8hwEJ4">
+<b data-page-node-id="cetEXsEWWzDpmZIak7vLdr">建议组合：</b>A（治本）+ C（消除误导）为主，B 作为即时缓解先上线，
+D 单独排期（涉及 span 过滤，需配套验证）。
+</div>
+
+<h2 data-page-node-id="I0LYBU5W4G69H2o5vnH6An">六、遗留待补证据（SSH 通道被安全策略拦截）</h2>
+<div class="card" data-page-node-id="gXyO2bd39pwF3erFaZBdtD">
+<p data-page-node-id="AfdiddSBCZSHUEbDrj0q0h">取证过程中安全策略拦截了 SSH 会话（阻断 <code data-page-node-id="vV4r3N5Lv9oitinDVgyWQf">~/.ssh</code> 访问），故以下<b data-page-node-id="jPCR7Hq62BEKqF9XgEQ35b">三项尚未拿到</b>，补上即可对假设 A/B 定性：</p>
+<ol data-page-node-id="qzK8zSYRT9mqlfq4Kk5BsF">
+<li data-page-node-id="5Fg2NEGqywsVLgj3qRVK0M">该次调用对应的 <b data-page-node-id="nIxuYr4gasIQaKUy7C4qJd"><code data-page-node-id="K4IGej3Qmf4eVnkyyvC6jK">finish_reason</code></b>（<code data-page-node-id="ZA7A5sDvpBzXYOkg70zsHB">length</code> = 坐实假设 A；<code data-page-node-id="8gfZdWqdVcJDZ5QcvdHNPm">stop</code> = 指向假设 B）</li>
+<li data-page-node-id="FlxwmssYR32IM0eF1KZ5X8"><b data-page-node-id="seopK8GnWkxw6eGJiRWELs"><code data-page-node-id="FtE0gYhIem0VfPf1u0DS8Q">completion_tokens</code></b> 是否 ≈65536，以及 reasoning 全文长度</li>
+<li data-page-node-id="1dNEAcmebRmUk5j2aJ07CK">vLLM 侧（<code data-page-node-id="BCyknOMb9WNpGigTPVCxyu">172.16.66.13:8003</code>）该请求的 KVCache 与 abort 记录</li>
+</ol>
+<pre data-page-node-id="6KW3ywV0OI3luHSg5A4vpX">补证路径：恢复 D（trace）后在 Phoenix spans 查 attributes-&gt;&gt;'llm.finish_reason'
+      或 短期在 model_call_guard 增加一行 finish_reason / usage 的 WARNING 日志</pre>
+</div>
+
+<div class="foot" data-page-node-id="Q3Ohbz82bh0Z3lTcdnmvXg">
+报告依据：<code data-page-node-id="JGKDDUp1L1FMtRFSZRDutO">docker logs</code>（67 容器 stdout，17:33:00–17:41:30 精确窗口）+ 本地源码
+<code data-page-node-id="YF4QDm4gqGkv2dgzUhxhBt">D:\workspace\geesun_agent</code>@<code data-page-node-id="avCtCt8XX9amEUOZ6how09">c7bf560</code> + <code data-page-node-id="WLLyQe7RWcnIhSKl9IjnlV">/opt/geesun/deploy/.env</code> 与容器内 env。<br data-page-node-id="jGWakodDNa0mmm9g6LaGQf">
+所有行号引用均来自实际读取的源码；所有时间戳均来自日志原文。未改动任何代码或配置。
+</div>
+
+</div>
+</body>
+</html>
