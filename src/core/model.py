@@ -38,27 +38,47 @@ def get_engine_prompt_tokens(session_id: str) -> int | None:
     return _session_prompt_tokens.get(session_id)
 
 
-_no_usage_warned = False  # 防字段漂移：usage_metadata 缺失仅告警一次（避免刷屏）
+_usage_ok_count = 0    # 成功取到引擎真实 token 的次数
+_usage_miss_count = 0  # 取不到的次数（用于判影响面：是偶发还是 100% 失效）
+_USAGE_MISS_LOG_EVERY = 50  # 周期性汇总日志间隔（首次必打，不刷屏）
 
 
 def _extract_tokens(resp) -> tuple[int | None, int | None]:
     """从模型响应稳健提取真实 token 数，兼容多种 provider 返回结构。
 
     优先级（与 geesun_agent 长期踩坑的 vLLM 真实计数同源）：
-    0) langchain 1.0 middleware 路径返回 ModelResponse(result=AIMessage)，先解包
-       —— model_call_guard 的 handler(request) 经 middleware 链返回的是 ModelResponse，
-       真实 AIMessage 在 .result 下；直接 ainvoke() 走非 middleware 返回 AIMessage。
-       2026-09-07 实测：解包缺失导致 middleware 路径 usage_metadata/usage/response_metadata
-       三层全 None → token 系列永不落库（而 operation_duration 有 3 次成功），探针走
-       ainvoke 直调反而绕过该 bug 全绿——探针验证与真实路径分叉的盲点。
+    0) langchain 1.0 middleware 路径返回 ModelResponse，真实消息在其 `.result` 下。
+       ⚠️ `.result` 的真实类型是 **list[BaseMessage]**（langchain.agents.middleware.
+       types.ModelResponse 是 @dataclass，非 pydantic），**不是**单条消息。
+       2026-09-07 首次修的是"完全没解包"，方向对但只剥了一层（把 resp 换成整个
+       list）→ 仍取不到。2026-09-11 生产实证定位：handler 返回
+       ModelResponse(result=[AIMessage(usage_metadata=...)])，而
+       `getattr(list, "usage_metadata")` 恒为 None → 三种来源全 None。
+       （当时探针走 ainvoke 直调 = 裸 AIMessage 形态，反而全绿——探针与真实
+       路径分叉的盲点，与本文件其他处同源教训。）
+       取法：按"谁带 usage"挑，不按下标挑——结构化输出场景 result 可能含
+       ToolMessage（官方 docstring："usually contain a single AIMessage, but may
+       include an additional ToolMessage"），位置不保证，盲取 [0] 不稳。
     1) usage_metadata（标准 OTel 键 input_tokens/output_tokens）
     2) OpenAI 兼容 usage 对象（prompt_tokens/completion_tokens）—— vLLM 走这条
     3) response_metadata.usage（部分 provider 把真实 usage 落在这里）
     取不到返回 (None, None)，调用方据此决定是否记 token 维度（避免记 0 污染指标）。
     """
-    # 0) ModelResponse → AIMessage 解包（防御：无 .result 或 .result 为 None 时原样用）
+    # 0) ModelResponse → 挑出承载 usage 的消息
     inner = getattr(resp, "result", None)
-    if inner is not None and inner is not resp:
+    if isinstance(inner, list):
+        # ① 从后往前找第一个真带 usage_metadata 的（最稳）
+        # ② 退一步：最后一个 AIMessage（usage 只可能挂在 AI 消息上）
+        # ③ 再退：列表最后一项；列表为空则保持原样，绝不因结构异常抛错
+        resp = next(
+            (m for m in reversed(inner) if getattr(m, "usage_metadata", None)),
+            next(
+                (m for m in reversed(inner) if isinstance(m, AIMessage)),
+                inner[-1] if inner else resp,
+            ),
+        )
+    elif inner is not None and inner is not resp:
+        # 兼容旧形态 / 非 middleware 路径：单条消息直接取用
         resp = inner
     # 1) 标准 OTel 键（OpenInference 0.1.67+ 会把 usage 映射成 usage_metadata）
     um = getattr(resp, "usage_metadata", None)
@@ -83,27 +103,39 @@ def _extract_tokens(resp) -> tuple[int | None, int | None]:
 
 
 def _capture_usage(resp, request) -> None:
-    """每次模型成功回复后，把引擎真实 prompt_tokens 存进每会话缓存（含视觉 token）。"""
-    global _no_usage_warned
+    """每次模型成功回复后，把引擎真实 prompt_tokens 存进每会话缓存（含视觉 token）。
+
+    告警策略（2026-09-11 改）：原实现用 `_no_usage_warned` 全局只打一次 WARNING，
+    **会把 100% 失败伪装成偶发**——实测生产一条警告、成功分支 0 条，极易被误读成
+    "抖动一下"。现改为：首次必打 + 每 `_USAGE_MISS_LOG_EVERY` 次汇总一条（仍不刷屏），
+    **且成功分支也有周期性痕迹**，让"到底通没通"看日志就能判。
+    """
+    global _usage_ok_count, _usage_miss_count
     sid = getattr(request.model, "_session_id", None)
     if not sid:
         return
     real_in, _ = _extract_tokens(resp)
     if not real_in:
-        # 三种来源(usage_metadata/usage/response_metadata)都没拿到 → 引擎真实计数没接上
-        # （stream_usage 未生效 / 响应层字段漂移）→ 计数退化本地估算。
-        if not _no_usage_warned:
-            _no_usage_warned = True
+        _usage_miss_count += 1
+        if _usage_miss_count == 1 or _usage_miss_count % _USAGE_MISS_LOG_EVERY == 0:
             logger.warning(
-                "[DIAG] 引擎真实 prompt_tokens 三种来源(usage_metadata/usage/response_metadata)"
-                "均缺失；本次及后续退化本地估算，引擎真实计数不可用"
+                "[DIAG] 引擎真实 prompt_tokens 三种来源(usage_metadata/usage/"
+                "response_metadata)均缺失：累计 %d 次缺失 / %d 次成功"
+                "（累计缺失>0 且成功=0 → 整条链路失效，非偶发）",
+                _usage_miss_count, _usage_ok_count,
             )
         return
+    _usage_ok_count += 1
     _session_prompt_tokens[sid] = real_in
     # 简单防泄漏：长驻服务会话数不会过千，超限清一次（仅少量会话退化 cold，可接受）
     if len(_session_prompt_tokens) > 2000:
         _session_prompt_tokens.clear()
-    logger.warning("[DIAG] 引擎真实 prompt_tokens=%d (session=%s)", real_in, sid)
+    # 首次成功必打（确认链路通），之后每 N 次打一条，避免刷屏
+    if _usage_ok_count == 1 or _usage_ok_count % _USAGE_MISS_LOG_EVERY == 0:
+        logger.warning(
+            "[DIAG] 引擎真实 prompt_tokens=%d (session=%s, 累计成功=%d/缺失=%d)",
+            real_in, sid, _usage_ok_count, _usage_miss_count,
+        )
 
 
 # ─── GenAI OTLP metrics 打点（2026-09-03 新增，标准 semconv 命名）───
