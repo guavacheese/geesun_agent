@@ -30,6 +30,7 @@ from deepagents.middleware.skills import (
     _list_skills_with_errors,
 )
 from src.core.loop_detection import LoopDetectionMiddleware
+from src.core.terminal_response import TerminalResponseMiddleware
 
 
 def _strip_system_messages(request):
@@ -838,6 +839,27 @@ async def create_agent(
                 hard_limit=settings.loop_detect_hard_limit,
                 tool_freq_warn=settings.loop_detect_tool_freq_warn,
                 tool_freq_hard_limit=settings.loop_detect_tool_freq_hard,
+            ),
+            # ★★ 必须在**列表末尾**（LoopDetection 之后）。2026-09-11 新增，
+            # 堵「模型吐空响应但流程当正常结束」——生产会话 GY24428:0f6d781d
+            # 末次调用 336s 后返回完全空响应（content 空 + tool_calls 空），
+            # loop 直接判结束，M3 完成门看到 /reports 为空 → 输出「本轮任务未产出
+            # 任何交付物…请检查是否遗漏 download_from_sandbox / write_file 步骤」，
+            # 把「模型没说话」误报成「你没下载作业」。详见 src/core/terminal_response.py。
+            #
+            # 为什么必须在末尾（非风格问题，是正确性前提）：
+            # langchain 1.3.13 factory.py:1738 `add_edge("model", w_after_model[-1].name)`
+            # + `range(len-1, 0, -1)` → **after_model 逆序执行，最后注册的最先看到模型输出**。
+            # 若注册在 LoopDetection 之前，LoopDetection 会先给消息追加软提醒/硬停文案
+            # （loop_detection.py:410-412 同款注入），使其 content 非空，
+            # 本中间件的判空即被绕过 → **反而漏掉真正的空响应**。
+            #
+            # 代价（已实测确认可接受）：`jump_to="model"` 会短路 after_model 静态链，
+            # 被判空的那一条消息不会再流经 LoopDetection（实测模型调用 2 次、
+            # LoopDetection 仅 1 次）。两者职责天然不重叠——空响应轮次没有 tool_calls
+            # 参与循环判定，交给本中间件独立处置更干净。
+            TerminalResponseMiddleware(
+                max_retries=settings.terminal_response_max_retries,
             ),
         ],
         interrupt_on={

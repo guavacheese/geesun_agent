@@ -109,6 +109,26 @@ class Settings(BaseSettings):
     loop_detect_tool_freq_warn: int = 12
     # Layer 2 硬剥阈值：同工具名高频达 N 次后剥离 tool_calls
     loop_detect_tool_freq_hard: int = 20
+    # ─── TerminalResponseMiddleware（2026-09-11 新增，堵「空响应被当正常结束」）───
+    # 已写码并通过单测：src/core/terminal_response.py + tests/spikes/terminal_response_guard.py
+    # 背景：生产会话 GY24428:0f6d781d 末次模型调用耗时 336s 后返回**完全空响应**
+    #   （content 空 + tool_calls 空），deepagents loop 直接判结束，M3 完成门看到
+    #   /reports 为空 → 输出「本轮任务未产出任何交付物…请检查是否遗漏
+    #   download_from_sandbox / write_file 步骤」——**归因错误**，模型连一个
+    #   tool_call 都没发出，却把责任推给「是不是漏了下载步骤」。
+    # 机制：四分支判定（正常 / thinking 截断 / 思考完没说 / 彻底空），命中则
+    #   删掉空 AIMessage + jump_to="model" 重跑一轮，并注入用户不可见的恢复提示
+    #   （request.override，不写 state）；重试仍空则落盘可读降级文案。
+    # 取值：每次 run 的自动重试次数。1 = 沿用 deer-flow（其源码注释明确写了
+    #   "A retry that calls another tool must not refresh the budget and create
+    #   an unbounded empty -> retry -> tool loop."）；deepseek-harness 用 5，但
+    #   我们单次调用最坏 336s，5 次超 28 分钟用户无法接受（2026-09-11 用户拍板）。
+    #   0 = 关闭重试，仅落降级文案。
+    # 注意：settings 在模块导入时实例化，改 .env 需重启容器（stack deploy /
+    #   service update）才生效，与 loop_detect_* 同——不是真正意义上的热加载。
+    #   pydantic-settings 大小写不敏感（实测 2.14.0，case_sensitive 默认 False），
+    #   但两种大小写**同时存在时 UPPERCASE 优先**，故勿在同一 .env 里混写同一键。
+    terminal_response_max_retries: int = 1
     # ─── model 调用灾难性总时长超时（兜底中的兜底，2026-08-28 由 600 上调至 1800）───
     # openai SDK 的 timeout 是"字节间隔超时"（httpx read timeout），vLLM 慢速流式时
     # 永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时）；
