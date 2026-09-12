@@ -195,7 +195,19 @@ def set_disabled(name: str, disabled: bool) -> dict:
 
 # 客户端+工具缓存：key = frozenset(启用的 server 名集合)
 # value = (MultiServerMCPClient, tools 列表) — 复用 client 避免重复握手/泄漏
+# ⚠️ 只缓存**全部成功**的加载结果：有失败就不写缓存（见 get_mcp_tools 末尾），
+#    否则一次瞬态故障（如 stack 重启时 swarm DNS 竞态）会被缓存成
+#    "该 server 在容器生命周期内永久不可用"——2026-09-12 生产实测
+#    （16:15:44 decrypt-file DNS 解析失败 → 此后每轮 chat 都拿不到工具，
+#    agent 被迫走 base64 绕路导出 Excel）。
 _tools_cache: dict[frozenset, tuple[object, list[BaseTool]]] = {}
+# 连接重试（2026-09-12）：stack 重新发布时 agent 与 geesun-mcp 同批重启，
+# agent 先就绪时 mcp 的 swarm DNS 名还没注册（"Temporary failure in name
+# resolution"），单次连接必败。退避重试 2 次覆盖这个几秒级的竞态窗口；
+# mcp 真宕机时最坏每轮多花 ~12s（5s 超时 + 2s 退避 + 5s 超时），可接受。
+_MCP_CONNECT_RETRIES = 2
+_MCP_CONNECT_BACKOFF = 2.0
+_MCP_CONNECT_TIMEOUT = 5
 # 工具信息缓存：{server_name: {"ts": 探测时间戳, "tools": [{name, description}]}}
 # 30 分钟 TTL，配置变更（invalidate_cache）后立即失效
 _tool_info_cache: dict[str, dict] = {}
@@ -430,24 +442,41 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
     failed: list[str] = []
 
     async def connect_one(name: str, entry: dict) -> None:
-        try:
-            client = MultiServerMCPClient({name: _to_client_config(entry)})
-            tools = await asyncio.wait_for(client.get_tools(), timeout=10)
-            results.extend(tools)
-        except Exception as e:  # noqa: BLE001
-            failed.append(name)
-            # TaskGroup/ExceptionGroup 的 str() 只显示 "unhandled errors in a TaskGroup
-            # (N sub-exception)"，真实原因（连接拒绝/超时/协议错）被吞在子异常里——
-            # 递归展开到最内层首个异常，日志一眼可见真因（2026-08-19 实测踩坑：
-            # decrypt-file 加载失败但日志无任何可诊断信息，只能靠外部探测端口）。
-            inner = _first_exception(e)
-            if inner is not None and inner is not e:
-                logger.warning(
-                    "MCP server [%s] 加载工具失败: %s（子异常: %s）",
-                    name, e, inner,
+        last_exc: Exception | None = None
+        for attempt in range(_MCP_CONNECT_RETRIES + 1):
+            try:
+                client = MultiServerMCPClient({name: _to_client_config(entry)})
+                tools = await asyncio.wait_for(
+                    client.get_tools(), timeout=_MCP_CONNECT_TIMEOUT
                 )
-            else:
-                logger.warning("MCP server [%s] 加载工具失败: %s", name, e)
+                results.extend(tools)
+                return
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if attempt < _MCP_CONNECT_RETRIES:
+                    logger.warning(
+                        "MCP server [%s] 第 %d/%d 次连接失败（%s），%.0fs 后重试",
+                        name, attempt + 1, _MCP_CONNECT_RETRIES + 1,
+                        _first_exception(e) or e, _MCP_CONNECT_BACKOFF,
+                    )
+                    await asyncio.sleep(_MCP_CONNECT_BACKOFF)
+        failed.append(name)
+        # TaskGroup/ExceptionGroup 的 str() 只显示 "unhandled errors in a TaskGroup
+        # (N sub-exception)"，真实原因（连接拒绝/超时/协议错）被吞在子异常里——
+        # 递归展开到最内层首个异常，日志一眼可见真因（2026-08-19 实测踩坑：
+        # decrypt-file 加载失败但日志无任何可诊断信息，只能靠外部探测端口）。
+        e = last_exc  # 必然非 None（重试耗尽才会到这里）
+        inner = _first_exception(e)
+        if inner is not None and inner is not e:
+            logger.warning(
+                "MCP server [%s] 加载工具失败（已重试 %d 次）: %s（子异常: %s）",
+                name, _MCP_CONNECT_RETRIES + 1, e, inner,
+            )
+        else:
+            logger.warning(
+                "MCP server [%s] 加载工具失败（已重试 %d 次）: %s",
+                name, _MCP_CONNECT_RETRIES + 1, e,
+            )
 
     await asyncio.gather(
         *[connect_one(name, entry) for name, entry in entries.items()]
@@ -455,11 +484,16 @@ async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
 
     if failed:
         logger.warning(
-            "MCP 工具加载完成，%d/%d 个服务失败: %s",
+            "MCP 工具加载完成，%d/%d 个服务失败: %s（本轮不缓存失败结果，"
+            "下一轮 chat 将自动重连）",
             len(failed),
             len(entries),
             ", ".join(failed),
         )
+        # 失败不写缓存：get_mcp_tools 每轮 chat 都会被调用（chat.py:354），
+        # 不缓存意味着下一轮自动重试——瞬态故障（DNS 竞态、mcp 滚动更新）
+        # 下一轮自愈。成功 server 的重连成本只是一次 HTTP 握手（≤5s 超时）。
+        return _shield_tools(_guard_download_tool(results))
 
     _tools_cache[cache_key] = (None, _shield_tools(_guard_download_tool(results)))
     return _tools_cache[cache_key][1]
