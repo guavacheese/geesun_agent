@@ -445,19 +445,10 @@ async def delete_session(
     if item is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # 删除会话元数据（aput(None) 在 langgraph 内部走 DELETE）
-    await store.aput(namespace, session_id, None)
-
-    # 删除消息：一条 DELETE ... WHERE prefix = %s 搞定。
-    # 旧实现是 `aput(ns, "messages", None)`（单行格式下删一行）；增量格式下条目数为
-    # N 条，若还按"先读全量再逐条置 None"来删，既多一次往返，也会因读取分页上限漏删。
-    try:
-        msg_prefix = _ns_text(_messages_namespace(user_id, session_id))
-        await store.adelete_prefix(msg_prefix)
-    except Exception as e:
-        logger.error("删除会话 %s 的消息失败: %s", session_id, e, exc_info=True)
-
-    # 清理磁盘文件（非关键，失败不影响会话删除）
+    # ─── ② 先删磁盘文件（尽力删，失败仅告警）───
+    # 文件在 DB 事务之外。放在 DB 事务**之前**的理由：若 DB 事务失败，会话仍
+    # 完整可见、可直接重试删除；反之"先 DB 后文件"一旦文件删失败，会留下不可见
+    # 的孤儿目录（会话没了、入口也没了），只能人工清扫。
     try:
         for root in [settings.report_root, settings.upload_root]:
             session_dir = os.path.join(root, user_id, session_id)
@@ -465,9 +456,31 @@ async def delete_session(
                 shutil.rmtree(session_dir)
                 logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, session_dir)
     except Exception as e:
-        logger.warning("清理会话文件失败（非关键错误）: %s", e)
+        logger.warning("清理会话文件失败（非关键，残留目录可人工清扫）: %s", e)
 
-    return {"deleted": True, "session_id": session_id}
+    # ─── ③ 单事务原子删除数据库全部痕迹（2026-09-12 方案 A）───
+    # 同一个事务删 5 处：sessions 元数据行 + messages 台账前缀 + checkpointer
+    # 三表（checkpoints / checkpoint_blobs / checkpoint_writes，thread_id =
+    # "{user}:{sid}"）。改前三个问题：会话行与消息分属两次独立写、checkpointer
+    # 三表根本没删（单会话残留 171+46+217 行）、中途失败=半删除状态。
+    try:
+        counts = await store.adelete_session_atomic(
+            session_prefix=_ns_text(namespace),
+            session_key=session_id,
+            messages_prefix=_ns_text(_messages_namespace(user_id, session_id)),
+            thread_id=f"{user_id}:{session_id}",
+        )
+        logger.info(
+            "已原子删除会话: user=%s, session=%s, counts=%s", user_id, session_id, counts
+        )
+    except Exception as e:
+        logger.error(
+            "原子删除会话 %s 失败（数据库痕迹保留，会话仍可见可重试）: %s",
+            session_id, e, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="删除会话失败，请重试")
+
+    return {"deleted": True, "session_id": session_id, "counts": counts}
 
 
 # ─── 获取消息 ───

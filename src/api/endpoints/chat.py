@@ -350,6 +350,15 @@ async def chat(
     session_id = body.session_id
     thread_id = f"{user_id}:{session_id}"
 
+    # ─── 并发护栏快照（2026-09-12）：会话在本轮开跑前是否存在？───
+    # 用途见 _persist_session 开头的防复活守卫：若用户在轮次进行中删除会话，
+    # 轮次结束时不得把刚删的 sessions 行 / messages 台账写回来（复活成孤儿）。
+    # 快照=False（直连 /chat 且无 POST /sessions 的新会话）则保留"不存在则创建"
+    # 的兼容路径。单行 store 读（store_pkey btree），每轮一次，成本可忽略。
+    session_existed_at_start = (
+        await store.aget(("sessions", user_id), session_id) is not None
+    )
+
     # 按本轮透传的 mcp_servers 过滤 MCP 工具（缺省 = 全部 enabled）
     tools = await get_mcp_tools(body.mcp_servers)
     sandbox = create_sandbox(thread_id)
@@ -507,6 +516,18 @@ async def chat(
                 generated_files, disk_files,
                 settings.report_root, user_id, session_id,
             )
+        # ─── 并发护栏：会话在本轮进行中被删除 → 本轮不持久化（2026-09-12）───
+        # session_existed_at_start 是 chat 端点在 agent 开跑前的快照（闭包变量）：
+        # 快照=True 且现在行没了 → 用户在轮次进行中删除了会话。此时写台账会把
+        # 刚被原子删除的 sessions 行 + messages 复活成孤儿（删了又回来，且
+        # checkpoint 里的旧上下文也被重建）。快照=False（直连 /chat 的新会话）
+        # 则照常走下方"不存在则创建"的兼容路径，不受影响。
+        if session_existed_at_start:
+            if await store.aget(("sessions", user_id), session_id) is None:
+                logger.info(
+                    "会话 %s 在本轮进行中被删除，跳过持久化（防复活护栏）", session_id
+                )
+                return 0
         try:
             # 读取最终状态中的消息（断连兜底路径下 agent 图可能仍在写 checkpoint，
             # 用带重试的读取防御瞬时争用导致的 "another command is already in progress"）

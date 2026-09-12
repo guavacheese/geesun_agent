@@ -472,6 +472,65 @@ class ReconnectingAsyncPostgresStore:
 
         return await self._call_with("adelete_prefix", _run)
 
+    async def adelete_session_atomic(
+        self,
+        session_prefix: str,
+        session_key: str,
+        messages_prefix: str,
+        thread_id: str,
+    ) -> dict[str, int]:
+        """单事务原子删除一个会话在数据库里的**全部**痕迹（2026-09-12 方案 A）。
+
+        store 与 checkpointer 指向同一个库（agent_mem_prod），因此 5 处删除可以
+        放进同一个事务，要么全删要么全不删：
+
+          1. store.sessions.{user} 的会话元数据行（prefix + key 精确删）
+          2. store.messages.{user}.{sid} 的消息台账（prefix 全删，走 store_pkey）
+          3. checkpoints / checkpoint_blobs / checkpoint_writes（按 thread_id，
+             thread_id 格式 = "{user_id}:{session_id}"，含全部 checkpoint_ns）
+
+        改前：会话行 aput(None)、消息 adelete_prefix 各自独立连接，checkpointer
+        三表**根本没删**（单会话残留 171+46+217 行，checkpoint_blobs 还存着
+        channel 大对象）；中途失败 = 半删除状态（行没了消息还在，或反之）。
+
+        checkpointer 三表无外键（langgraph base.py MIGRATIONS 纯 PK 表，生产
+        pg_constraint 实测一致），DELETE 顺序无关；子表在前只是习惯。
+        磁盘文件（uploads/reports）不进事务（磁盘无法参与 DB 事务），由调用方
+        在事务**之前**尽力删除。
+
+        返回各表实际删除行数（诊断/验收用）。
+        """
+        if not session_prefix or not messages_prefix or not session_key:
+            raise ValueError("adelete_session_atomic 拒绝空 prefix/key（会误删全表）")
+        if not thread_id or ":" not in thread_id:
+            raise ValueError(f"adelete_session_atomic 非法 thread_id: {thread_id!r}")
+
+        async def _run(store: AsyncPostgresStore) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            async with _acquire(store.conn) as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "DELETE FROM store WHERE prefix = %s AND key = %s",
+                            (session_prefix, session_key),
+                        )
+                        counts["session_row"] = cur.rowcount or 0
+                        await cur.execute(
+                            "DELETE FROM store WHERE prefix = %s",
+                            (messages_prefix,),
+                        )
+                        counts["message_rows"] = cur.rowcount or 0
+                        # 表名来自固定元组字面量（非用户输入），无注入面
+                        for _table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                            await cur.execute(
+                                f"DELETE FROM {_table} WHERE thread_id = %s",
+                                (thread_id,),
+                            )
+                            counts[_table] = cur.rowcount or 0
+            return counts
+
+        return await self._call_with("adelete_session_atomic", _run)
+
     async def awrite_messages(
         self,
         namespace: tuple,
