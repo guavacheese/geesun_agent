@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.parse import quote_plus
 
 import psycopg
@@ -9,6 +9,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.base import PutOp
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 from src.core.config import settings
@@ -79,6 +80,69 @@ def _build_keyset_query(*, with_cursor: bool, pinned: Optional[bool]) -> str:
         ORDER BY {_SORT_KEY_EXPR} DESC, key DESC
         LIMIT %s
     """
+
+
+# ─── messages.* 增量存储（一条消息一行，key = 零填充序号） ───
+#
+# 改增量的理由（生产实测，2026-09-12）：
+#   原先每轮把**整份** history 当一个 value 覆盖写单个 key。最大会话 259 条 / 1.32 MB
+#   挤在一行里，三个后果：
+#     ① 单点故障爆炸半径 = 整个会话——这一行写失败（TOAST 上限 / jsonb 解析异常 /
+#        序列化 OOM）就是整份历史全丢；
+#     ② 写放大 130×——每轮重写整行，累计约 171 MB 只为最终存下 1.32 MB；
+#     ③ 摘要裁剪会传导——SummarizationMiddleware 触发时 checkpoint 被
+#        `RemoveMessage(REMOVE_ALL_MESSAGES)` 裁掉早期消息，下一轮按快照重建的
+#        history 缩水，全量覆盖把这份缩水写进 store，早期对话在任何一层都找不回。
+#   改增量后：① 爆炸半径缩到"一条"；② 写放大变 O(新增)；③ 按**序号**追加，
+#   checkpoint 变短不影响已归档条目。
+#
+# key 用零填充序号，不用 msg.id：`chat.py` 取的是 `getattr(msg, "id", None)`
+# （可能为 None，且 LangChain 的 message id 是 uuid、与顺序无关），且文本序下
+# "10" < "9" 会错序，必须定长。序号**从 1 开始**，与 `history[i]` 的 `i+1` 对齐。
+#
+# 读取 `WHERE prefix = %s ORDER BY key` 正好命中 store 自带的
+# `store_pkey (prefix, key)` btree → **零新建索引成本**（与会话列表必须自建
+# `store_sessions_order_idx` 相反）。分页语义对齐 deer-flow
+# `runtime/events/store/base.py:102` 的 `list_messages(before_seq=...)`：
+# 无游标取最新 limit 条，有游标取 key < before_key 的最新 limit 条，返回时统一升序。
+_MESSAGE_KEY_WIDTH = 8
+
+
+def message_key(index: int) -> str:
+    """第 index 条消息（**从 1 开始**）的 store key。"""
+    if index < 1:
+        raise ValueError(f"消息序号从 1 开始，收到 {index}")
+    return f"{index:0{_MESSAGE_KEY_WIDTH}d}"
+
+
+def message_key_to_index(key: str) -> Optional[int]:
+    """`message_key` 的逆：解析失败（脏数据 / 旧格式）返回 None。"""
+    if not key or not key.isdigit():
+        return None
+    return int(key)
+
+
+def _build_message_tail_query(*, with_cursor: bool) -> str:
+    """取"最新"一页：`ORDER BY key DESC`（走 PK），调用方负责 reverse 回升序。"""
+    cursor_clause = "AND key < %s" if with_cursor else ""
+    return f"""
+        SELECT key, value
+        FROM store
+        WHERE prefix = %s
+          {cursor_clause}
+        ORDER BY key DESC
+        LIMIT %s
+    """
+
+
+# 单次读取消息条数（`persist_message_page_size` 覆盖）。生产实测最大会话 259 条，
+# 1000 有 3.9× 余量 → 绝大多数会话行为与改造前"全量返回"完全一致，仅在超长会话
+# 上退化为"最新 1000 条 + 更早页游标"，避免一次拉出上兆 payload。
+_MESSAGE_PAGE_DEFAULT = 1000
+
+# "取全"的上限（`alist_all_messages`）。仅用于 `continue_from_state` 这类必须重建
+# **整段**图状态的场景；生产实测最大会话 259 条 → 10000 有 38× 余量。
+_MESSAGE_ALL_MAX = 10_000
 
 
 @asynccontextmanager
@@ -261,6 +325,176 @@ class ReconnectingAsyncPostgresStore:
             return [(r["key"], r["value"]) for r in rows]
 
         return await self._call_with("asearch_keyset", _run)
+
+    # ── messages.* 增量存储 ──
+
+    async def abatch(self, ops):
+        """批量操作转发（走重连重试）。
+
+        用于消息增量写入——复用框架的 `abatch` 而不是自写 upsert SQL：
+        框架在 `store/postgres/base.py` 里对 PutOp 的处理已经兼顾
+        「冲突时保留原 created_at、只更新 value/updated_at」等语义，
+        自写 INSERT ... ON CONFLICT 容易漏掉细节。
+        另外 `PutOp(value=None)` 会被编译成 DELETE（`base.py:325`），
+        所以「截断」「删指定消息」也能走同一条路径，一次往返完成。
+        """
+        return await self._call("abatch", ops)
+
+    async def aget_message_watermark(self, prefix: str) -> tuple[int, Optional[str], int]:
+        """增量写入的水印：`(已存最大序号, 该条目的 id, 旧格式残留条数)`。
+
+        序号走 `store_pkey (prefix, key)` btree，`ORDER BY key DESC LIMIT 1` 是 O(log n)。
+
+        为什么要连 id 一起返回（2026-09-12 设计要点）：
+        增量追加的朴素前提是"history 只在尾部增长"，但 `SummarizationMiddleware` 触发时
+        会返回 `[RemoveMessage(REMOVE_ALL_MESSAGES), 摘要, *保留的尾部]` —— **history 会变短**。
+        此时按"长度"定位增量起点会错位：压缩后 history 里第 10 条其实是 store 里第 250 条，
+        按 history 下标算 key 会**覆盖已归档条目**（把历史改写掉，正是要避免的）。
+        带上 id 就能在 history 里按内容定位"最后一条已存条目"，从它之后开始追加，
+        且序号继续用**store 的**序号（不是 history 下标）—— 两头都不重叠。
+
+        第三个返回值 `legacy_rows` 是**部署顺序防线**：若 store 里还有旧格式条目
+        （单行 `key="messages"`，部署新版后、迁移脚本跑之前会短暂存在），则
+          · 它文本序排在数字之后（'0' < 'm'），会污染水位查询 → 必须用 `key ~ '^[0-9]+$'` 排除；
+          · 此时**调用方不得写入**：写进去会让新旧格式并存，之后迁移脚本的前置守卫会拒绝
+            执行，留下需要人工对账的中间态。调用方应跳过本轮写入并打 error。
+        可见 langgraph 层面的 `asearch` 风格"前缀 LIKE"在这里同样不认边界，精确 `prefix =` + 正则才是对的。
+
+        id 可能为 None（老数据 / 部分构造路径），此时调用方退化为按长度判断。
+        """
+        async def _run(store: AsyncPostgresStore):
+            async with _acquire(store.conn) as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    # 三个标量子查询合并成一次往返（各自都是单前缀上的索引查找）：
+                    # 即使没有任何数字 key，这条 SQL 也一定返回 1 行（不会让调用方见到 None 行）
+                    await cur.execute(
+                        "SELECT "
+                        "(SELECT count(*) FROM store WHERE prefix = %s AND key !~ '^[0-9]+$') "
+                        "  AS legacy_rows, "
+                        "(SELECT key FROM store WHERE prefix = %s AND key ~ '^[0-9]+$' "
+                        "  ORDER BY key DESC LIMIT 1) AS top_key, "
+                        "(SELECT value FROM store WHERE prefix = %s AND key ~ '^[0-9]+$' "
+                        "  ORDER BY key DESC LIMIT 1) AS top_value",
+                        (prefix, prefix, prefix),
+                    )
+                    row = await cur.fetchone()
+            return row
+
+        row = await self._call_with("aget_message_watermark", _run)
+        if not row:
+            return 0, None, 0
+        legacy_rows = int(row.get("legacy_rows") or 0)
+        if row.get("top_key") is None:
+            return 0, None, legacy_rows
+        idx = message_key_to_index(row["top_key"])
+        if idx is None:
+            # 理论上不会到（SQL 已用正则过滤），留作防御：返回 0 让调用方走按长度兜底
+            logger.error(
+                "会话 %s 的水位 key=%r 无法解析为序号", prefix, row["top_key"],
+            )
+            return 0, None, legacy_rows
+        value = row["top_value"]
+        last_id = value.get("id") if isinstance(value, dict) else None
+        return idx, last_id, legacy_rows
+
+    async def alist_messages(
+        self,
+        prefix: str,
+        *,
+        limit: int = _MESSAGE_PAGE_DEFAULT,
+        before_key: Optional[str] = None,
+    ) -> tuple[list[tuple[str, Any]], bool]:
+        """按 key **升序**返回一页消息，附 `has_more`（是否还有更早的）。
+
+        语义对齐 deer-flow `list_messages(before_seq=...)`：无游标取**最新** limit 条；
+        带 `before_key` 取 key < before_key 的最新 limit 条。内部 `ORDER BY key DESC`
+        借 PK 序直接取尾部（不必先排序全表），返回前 reverse 回升序（阅读顺序）。
+
+        `has_more` 由"本页是否取满"推断——多取一条的代价大于收益（这条 SQL 已是
+        索引上的 LIMIT 扫描），取满即认为可能还有，前端据此决定是否显示"加载更早"。
+        """
+        if limit <= 0:
+            raise ValueError(f"limit 必须为正整数，收到 {limit}")
+
+        async def _run(store: AsyncPostgresStore):
+            sql = _build_message_tail_query(with_cursor=before_key is not None)
+            params: list[Any] = [prefix]
+            if before_key is not None:
+                params.append(before_key)
+            params.append(limit)
+            async with _acquire(store.conn) as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(sql, params)
+                    rows = await cur.fetchall()
+            rows.reverse()  # DESC 取尾 → 升序返回
+            return [(r["key"], r["value"]) for r in rows]
+
+        rows = await self._call_with("alist_messages", _run)
+        return rows, len(rows) >= limit
+
+    async def alist_all_messages(
+        self, prefix: str, *, max_items: int = _MESSAGE_ALL_MAX,
+    ) -> list[tuple[str, Any]]:
+        """按序取回该会话的**全部**消息（升序），用于重建整段图状态。
+
+        与会话列表的场景差异：`continue_from_state` 要把 store 里的历史灌回图，
+        只取"最新一页"会**静默把图状态截短**（用户点"编辑后重发"会丢掉早期上下文）。
+        所以这里取全，但仍有硬上限：超过 `max_items` 时打 error 并按序返回前 N 条
+        （不是丢弃尾部——返回的是**最早的** N 条，让调用方看到从头发起的历史）。
+
+        为什么不做逐页循环：单次 `ORDER BY key DESC LIMIT N` 走 PK 就是一次索引扫描，
+        页循环只是把同一次扫描拆成多次往返。生产实测最大会话 259 条，上限 10000 有 38× 余量。
+        """
+        rows, has_more = await self.alist_messages(prefix, limit=max_items)
+        if has_more:
+            logger.error(
+                "会话 %s 消息数超过取全上限 %d，本次只返回最早的 %d 条"
+                "（重建图状态可能不完整）",
+                prefix, max_items, len(rows),
+            )
+        return rows
+
+    async def adelete_prefix(self, prefix: str) -> int:
+        """删除该 prefix 下**所有**条目，返回删除行数。
+
+        用来删整个会话的消息。比"先读全量再逐条置 None"少一次往返，也不会因为
+        读取时的分页上限而漏删（旧实现若按页读再删，超出单页的部分会残留）。
+        调用方须保证 prefix 是完整的 `".".join(namespace)`，否则会误删。
+        """
+        if not prefix:
+            raise ValueError("adelete_prefix 拒绝空 prefix（会删全表）")
+
+        async def _run(store: AsyncPostgresStore):
+            async with _acquire(store.conn) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("DELETE FROM store WHERE prefix = %s", (prefix,))
+                    return cur.rowcount or 0
+
+        return await self._call_with("adelete_prefix", _run)
+
+    async def awrite_messages(
+        self,
+        namespace: tuple,
+        items: list[tuple[str, Any]],
+        *,
+        delete_keys: Sequence[str] = (),
+    ) -> None:
+        """一次往返完成"写若干条 + 删若干条"（key, value）。
+
+        用一个 `abatch` 而非两次调用，是因为 `edit` 截断要"改写第 N 条 + 删除其后全部"
+        ——分两次会留下中间态（改写已生效、尾部尚未删），此时若进程中断，会话会变成
+        "新内容 + 旧后续"，比截断失败更糟。合并在一个 batch 里由框架一次提交。
+
+        用框架 `abatch` + `PutOp` 而非自写 SQL：框架对 PutOp 的处理已兼顾
+        「冲突时保留原 created_at、只更新 value/updated_at」等语义，自写
+        INSERT ... ON CONFLICT 容易漏细节；且 `PutOp(value=None)` 会编译成 DELETE
+        （`store/postgres/base.py:325`），删除走同一条路径。
+        """
+        if not items and not delete_keys:
+            return
+        ops: list[PutOp] = [PutOp(namespace, key, value) for key, value in items]
+        ops.extend(PutOp(namespace, key, None) for key in delete_keys)
+        await self.abatch(ops)
 
     async def setup(self):
         store = await self._ensure()

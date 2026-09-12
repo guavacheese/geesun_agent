@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from src.api.deps import get_store, get_current_user
 from src.core.config import settings
+from src.infra.database import message_key_to_index
 from src.infra.reports import snapshot_report_files
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,66 @@ def _cursor_of(batch: list[tuple[str, dict]]) -> tuple[str, str]:
 
 def _messages_namespace(user_id: str, session_id: str) -> tuple:
     return ("messages", user_id, session_id)
+
+
+# ─── 消息存储：增量格式（一条消息一行，key = 零填充序号）───
+# 旧格式是单行 `key="messages"` + `value={"items":[...]}`，每轮**全量覆盖写**。
+# 三个后果（2026-09-12 生产实测）：① 爆炸半径=整个会话（最大会话 259 条/1.32 MB 挤一行，
+# 写失败即全丢）；② 写放大 130×（累计约 171 MB 只为存 1.32 MB）；③ 摘要裁剪传导
+# （checkpoint 被 RemoveMessage 裁短 → 快照缩水被写进 store，早期对话在任何一层都找不回）。
+# 改增量后：读走 `store_pkey (prefix,key)` btree（零新建索引），写只写新增部分。
+# 读取游标直接用条目 key，语义对齐 deer-flow `runtime/events/store/base.py:102` 的
+# `list_messages(before_seq=...)`：无游标取最新 limit 条，带游标取更早的 limit 条。
+_MESSAGE_PAGE_LIMIT = 5000   # HTTP 分页模式允许的最大 limit
+
+
+def _encode_message_cursor(key: str) -> str:
+    return base64.urlsafe_b64encode(key.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_message_cursor(cursor: str) -> str:
+    """游标是不透明串；解不开或不是序号形态 → 400（不能当成"从最新开始"）。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        key = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"cursor 非法: {e}") from e
+    if message_key_to_index(key) is None:
+        raise HTTPException(status_code=400, detail="cursor 非法: 不是消息序号 key")
+    return key
+
+
+async def _alist_messages(store, prefix: str, *, limit: int, before: str | None):
+    """读一页消息，返回 `(升序消息列表, next_cursor|None)`。
+
+    两类脏条目会被跳过并告警（前端拿到非 dict / 非消息结构会渲染异常）：
+    · 非 dict；
+    · 没有 `role` 字段——**旧格式残留**（`{"items":[...]}` 包装）就是这样。它的 key
+      是 'messages'，文本序排在数字之后，会被当作"最新一条"塞进首页；部署新版后、
+      迁移脚本执行前会短暂存在，所以这里必须挡掉（否则前端凭空多出一条乱码消息）。
+    """
+    before_key = _decode_message_cursor(before) if before else None
+    rows, has_more = await store.alist_messages(
+        prefix, limit=limit, before_key=before_key,
+    )
+    messages: list[dict] = []
+    for key, value in rows:
+        if not isinstance(value, dict):
+            logger.warning(
+                "会话 %s 的消息条目 %s 不是 dict，已跳过: %r", prefix, key, type(value)
+            )
+            continue
+        if not value.get("role"):
+            logger.warning(
+                "会话 %s 的消息条目 %s 缺 role（疑似旧格式残留），已跳过；"
+                "请执行 migrate_messages_incremental.py 展开存量",
+                prefix, key,
+            )
+            continue
+        messages.append(value)
+    # 游标取本页**最早**那条的 key（rows 已升序）——下一页要的是"比它更早的"
+    next_cursor = _encode_message_cursor(rows[0][0]) if (has_more and rows) else None
+    return messages, next_cursor
 
 
 def _now() -> str:
@@ -387,10 +448,12 @@ async def delete_session(
     # 删除会话元数据（aput(None) 在 langgraph 内部走 DELETE）
     await store.aput(namespace, session_id, None)
 
-    # 删除消息
+    # 删除消息：一条 DELETE ... WHERE prefix = %s 搞定。
+    # 旧实现是 `aput(ns, "messages", None)`（单行格式下删一行）；增量格式下条目数为
+    # N 条，若还按"先读全量再逐条置 None"来删，既多一次往返，也会因读取分页上限漏删。
     try:
-        msg_namespace = _messages_namespace(user_id, session_id)
-        await store.aput(msg_namespace, "messages", None)
+        msg_prefix = _ns_text(_messages_namespace(user_id, session_id))
+        await store.adelete_prefix(msg_prefix)
     except Exception as e:
         logger.error("删除会话 %s 的消息失败: %s", session_id, e, exc_info=True)
 
@@ -413,10 +476,21 @@ async def delete_session(
 @router.get("/sessions/{session_id}/messages")
 async def get_session_messages(
     session_id: str,
+    limit: int | None = Query(default=None, ge=1, le=_MESSAGE_PAGE_LIMIT),
+    before: str | None = Query(default=None),
     store=Depends(get_store),
     current_user: dict = Depends(get_current_user),
 ):
-    """获取某会话的所有消息。
+    """获取某会话的消息（默认最新一页，带 `next_cursor` 可取更早）。
+
+    行为对齐改造前的"全量返回"：页大小默认 `persist_message_page_size`（1000），
+    覆盖生产最大会话（实测 259 条），所以绝大多数会话拿到的就是全部消息且
+    `has_more=False`；仅超长会话返回"最新 N 条 + next_cursor"，前端按需拉更早。
+
+    **分页语义（前端接入必读）**：每页内部是**升序**（阅读顺序，最新在最后），
+    而第 1 页取的是**最新**的一段 → 续页拿到的更早消息要**前插**（prepend）
+    到已渲染列表之前，不是 append。`next_cursor` 指向前一页最早那条，取尽后为 null。
+    与既有 `GET /sessions` 的游标一样是不透明串，非法值一律 400。
 
     兼容老数据：AI 消息没有 generated_files 时，扫描 content 自动
     补 /uploads/.../file.ext 或 /reports/.../file.ext 路径的文件信息，
@@ -424,12 +498,18 @@ async def get_session_messages(
     """
     import re
     user_id = current_user["user_id"]
-    msg_namespace = _messages_namespace(user_id, session_id)
+    msg_prefix = _ns_text(_messages_namespace(user_id, session_id))
 
+    next_cursor: str | None = None
     try:
-        item = await store.aget(msg_namespace, "messages")
-        msg_data = item.value if item else {}
-        messages = msg_data.get("items", []) if isinstance(msg_data, dict) else []
+        messages, next_cursor = await _alist_messages(
+            store,
+            msg_prefix,
+            limit=limit or settings.persist_message_page_size,
+            before=before,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("获取会话消息失败: session_id=%s, error=%s", session_id, e, exc_info=True)
         messages = []
@@ -475,7 +555,12 @@ async def get_session_messages(
     # 前端 deriveGeneratedFiles 从各组 tool_calls 派生（write_file/download_from_sandbox
     # 路径），不再依赖后端全量兜底。
 
-    return {"session_id": session_id, "messages": messages}
+    return {
+        "session_id": session_id,
+        "messages": messages,
+        "has_more": next_cursor is not None,
+        "next_cursor": next_cursor,
+    }
 
 
 # ─── 编辑历史消息并截断后续消息 ───
@@ -500,28 +585,40 @@ async def edit_session_message(
     只更新 PostgresStore 中的消息列表（get_session_messages 从此读取）。
     后续 /chat 的 continue_from_state 模式从存储消息重建 graph 输入，
     避免 LangGraph add_messages reducer 将截断视为追加导致旧消息残留。
+
+    增量格式下的两个要点：
+    · `from_index` 是**消息顺序下标**，不是 key——edit 可能已使 key 稀疏（截断留下的
+      空洞不会再被填充），所以必须用读到的真实 key，不能用 `message_key(i+1)` 推算。
+    · "改写第 N 条 + 删除其后全部"必须在**同一个 batch** 里提交（见 `awrite_messages`），
+      否则中断会留下"新内容 + 旧后续"的中间态。
     """
     user_id = current_user["user_id"]
-
-    # 更新 PostgresStore 中的消息列表
     msg_namespace = _messages_namespace(user_id, session_id)
+    msg_prefix = _ns_text(msg_namespace)
+
     try:
-        item = await store.aget(msg_namespace, "messages")
-        stored = item.value if item else {"items": []}
-        stored_items = stored.get("items", []) if isinstance(stored, dict) else []
+        rows = await store.alist_all_messages(msg_prefix)
+        items = [(k, v) for k, v in rows if isinstance(v, dict)]
+        if not items:
+            raise HTTPException(status_code=400, detail="会话没有可编辑的消息")
 
-        if body.from_index < 0 or body.from_index >= len(stored_items):
-            raise HTTPException(status_code=400, detail=f"from_index {body.from_index} 越界，消息总数 {len(stored_items)}")
+        if body.from_index < 0 or body.from_index >= len(items):
+            raise HTTPException(
+                status_code=400,
+                detail=f"from_index {body.from_index} 越界，消息总数 {len(items)}",
+            )
 
-        # 截断并替换
-        stored_items = stored_items[: body.from_index + 1]
-        stored_items[body.from_index] = {
-            **stored_items[body.from_index],
-            "content": body.new_message,
-            "edited": True,
-        }
-        await store.aput(msg_namespace, "messages", {"items": stored_items})
-        logger.info("edit: truncate to index %d done, new count=%d", body.from_index, len(stored_items))
+        target_key, target = items[body.from_index]
+        updated = {**target, "content": body.new_message, "edited": True}
+        drop_keys = [k for k, _ in items[body.from_index + 1:]]
+
+        await store.awrite_messages(
+            msg_namespace, [(target_key, updated)], delete_keys=drop_keys,
+        )
+        logger.info(
+            "edit: truncate to index %d done, kept=%d removed=%d",
+            body.from_index, body.from_index + 1, len(drop_keys),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -552,18 +649,23 @@ async def repair_session_files(
     """
     user_id = current_user["user_id"]
     msg_namespace = _messages_namespace(user_id, session_id)
+    msg_prefix = _ns_text(msg_namespace)
 
     try:
-        item = await store.aget(msg_namespace, "messages")
-        msg_data = item.value if item else {}
-        messages = msg_data.get("items", []) if isinstance(msg_data, dict) else []
+        rows = await store.alist_all_messages(msg_prefix)
     except Exception as e:
         logger.error("修复会话消息失败（读取）: session_id=%s, error=%s", session_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"读取消息失败: {e}")
 
+    # 保留 key：增量格式下"局部更新"要按 key 精确回写，而不是把整份列表覆盖一遍
+    # （全量覆盖正是旧 bug 的形态——一次写入等于把整个会话重写，爆炸半径=整个会话）。
+    items = [(k, v) for k, v in rows if isinstance(v, dict)]
+    messages = [v for _, v in items]
+    changed: dict[str, dict] = {}   # key → 新值，只装真正被改动的条目
+
     # 1. 清洗脏条目（file_name 空 / file_path 空或尾斜杠）
     removed = 0
-    for msg in messages:
+    for key, msg in items:
         gfs = msg.get("generated_files")
         if not gfs:
             continue
@@ -572,11 +674,15 @@ async def repair_session_files(
             if g.get("file_name") and g.get("file_path")
             and not str(g["file_path"]).endswith("/")
         ]
-        removed += len(gfs) - len(cleaned)
+        n_removed = len(gfs) - len(cleaned)
+        if not n_removed:
+            continue
+        removed += n_removed
         if cleaned:
             msg["generated_files"] = cleaned
         else:
             msg.pop("generated_files", None)
+        changed[key] = msg
 
     # 2. 磁盘全量文件补全（挂到最后一条 AI 消息）
     existing_fps = set()
@@ -606,23 +712,23 @@ async def repair_session_files(
 
     added = len(new_entries)
     if new_entries:
-        target = None
-        for msg in reversed(messages):
+        for key, msg in reversed(items):
             if msg.get("role") == "ai":
-                target = msg
+                # items 里的 msg 与 messages 中同一个 dict 对象，原地改再按 key 登记
+                msg["generated_files"] = list(msg.get("generated_files") or []) + new_entries
+                changed[key] = dict(msg)
                 break
-        if target is not None:
-            target["generated_files"] = list(target.get("generated_files") or []) + new_entries
         else:
             logger.warning("修复会话文件：无 AI 消息可挂载，跳过补全: session=%s", session_id)
             added = 0
 
-    # 3. 写回
-    try:
-        await store.aput(msg_namespace, "messages", {"items": messages})
-    except Exception as e:
-        logger.error("修复会话消息失败（写回）: session_id=%s, error=%s", session_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"写回失败: {e}")
+    # 3. 写回：只写被改动的条目（一个都没改就不写，保持幂等且不多一次往返）
+    if changed:
+        try:
+            await store.awrite_messages(msg_namespace, list(changed.items()))
+        except Exception as e:
+            logger.error("修复会话消息失败（写回）: session_id=%s, error=%s", session_id, e, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"写回失败: {e}")
 
     logger.info(
         "修复会话文件: user=%s, session=%s, cleaned=%d, added=%d",

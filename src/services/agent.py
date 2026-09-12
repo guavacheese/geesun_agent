@@ -142,11 +142,49 @@ class _SummarizationAccurate(SummarizationMiddleware):
     ② 摘要生成后注入"当前会话真实资源清单"，避免 agent 恢复后 read_file 猜路径。
     """
 
-    def __init__(self, *args, inventory_provider=None, **kwargs):
+    def __init__(self, *args, inventory_provider=None, partial_token_counter=None, **kwargs):
         super().__init__(*args, **kwargs)
         # 回调返回"当前会话真实资源清单"文本（uploads/reports 文件 + 沙箱状态），
         # 由 create_agent 注入闭包（持有 user_id/session_id/sandbox 上下文）
         self._inventory_provider = inventory_provider
+        self._install_partial_token_counter(partial_token_counter)
+
+    def _install_partial_token_counter(self, partial_token_counter) -> None:
+        """补上框架只在"默认 counter 分支"才做的语义拆分（keep 用 fraction 的前提）。
+
+        langchain `agents/middleware/summarization.py:344-352` 把计数分成两个语义：
+
+        | 调用点 | 传入的 messages | 需要的语义 |
+        |---|---|---|
+        | `_should_summarize`（trigger 判断） | **整个请求**的完整列表 | 这个请求占多少 token |
+        | `_find_token_based_cutoff`（保留预算二分） | `messages[mid:]` **任意切片** | 这个子集占多少 token |
+
+        框架知情，但**只在 `token_counter is count_tokens_approximately` 时**自动拆分
+        （给 partial 加 `use_usage_metadata_scaling=False`）；一旦传自定义 counter，
+        它直接 `self._partial_token_counter = token_counter`（同一函数）。
+
+        本项目的 `_engine_grounded_counter` 是**为 trigger 语义写的**——命中每会话缓存时
+        直接返回引擎真实 prompt_tokens，**忽略 messages 入参**。若 keep 用 fraction/tokens，
+        二分每步都拿到同一个数 → 全部走 `left = mid + 1` → `cutoff_candidate` 被顶到
+        `len(messages) - 1` → **压缩后只保留最后 1 条消息**。
+
+        2026-09-12 实测（`tests/spikes/summarization_keep_semantics.py`，ast 提取 langchain
+        真实方法执行）：30 条消息 / 窗口 262144 / keep fraction 0.10 下，
+        未拆分 → cutoff 29（保留 1 条）；拆分后 → cutoff 22（保留 8 条，符合预算）。
+
+        拆分后的语义是安全的：trigger 仍用引擎真值（准确度不丢），只有"保留多少"的二分
+        用子集感知的本地估算——它只决定切在哪，多留几条不会 400，而少留才会丢上下文。
+        """
+        if partial_token_counter is None:
+            return
+        helper = getattr(self, "_lc_helper", None)
+        if helper is None:
+            logger.warning(
+                "[DIAG] 未找到 _lc_helper，_partial_token_counter 未替换；"
+                "keep 若为 fraction/tokens 会退化，请检查 deepagents 版本",
+            )
+            return
+        helper._partial_token_counter = partial_token_counter
 
     def _partition_messages(self, conversation_messages, cutoff_index):
         """防御：checkpoint 恢复时 cutoff_index 可能超过当前消息数（实测 404 > 21），
@@ -804,12 +842,27 @@ async def create_agent(
 
     # 触发用 fraction（见下），不再需要 tokens 阈值推导；summarization_trigger_tokens
     # 仅作为无 profile 时的下限保护（config 值）。
+    #
+    # keep 用 fraction 而非条数（2026-09-12 改）：
+    #   ① 框架默认就是这个形态（deepagents summarization.py:282 `("fraction", 0.10)`，
+    #      仅在模型无 profile 的退化分支才用 `("messages", 6)`）。本项目有 profile，
+    #      原先写 `("messages", 10)` 是 2026-08-12 随 trigger=("tokens", 200000) 一起引入的
+    #      （a885849）；8-28 trigger 改成 fraction 时 keep 未同步审视。
+    #   ② 条数没有硬上界：窗口 262144 下，生产单条最大 278 KB ≈ 8 万 token →
+    #      "保留 10 条"在该会话上等于保留约 80 万 token，压缩后仍然超窗口。
+    #      fraction 0.10 = 26214 token 是硬上界（按平均 2.4k token/条 ≈ 11 条，
+    #      与原值均值几乎一致，等于白拿上界）。参照：deepagents 默认 0.10、
+    #      deepseek-harness compaction-basic 默认 retainRatio 0.16（面向单条小的
+    #      coding session，本项目单条偏大，故取 0.10 而非 0.16）。
+    #   ③ ⚠ 必须同时传 partial_token_counter，否则二分退化（详见
+    #      _install_partial_token_counter 与 tests/spikes/summarization_keep_semantics.py）。
     summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
         trigger=("fraction", 0.8),  # 按 model.profile["max_input_tokens"] 的 0.8 触发，多模型自动适配
-        keep=("messages", 10),
-        token_counter=_engine_grounded_counter,  # 引擎真实 prompt_tokens 优先，cold 才退化估算
+        keep=("fraction", 0.10),    # 最近 10% 窗口原样保留（有硬上界，见上）
+        token_counter=_engine_grounded_counter,  # trigger：引擎真实 prompt_tokens 优先，cold 才退化估算
+        partial_token_counter=_safe_token_counter,  # keep 二分：必须子集感知，不可沿用引擎值
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
     )
 

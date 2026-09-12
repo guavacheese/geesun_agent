@@ -179,6 +179,19 @@ class Settings(BaseSettings):
     persist_max_tool_result_chars: int = 8000
     # SSE tool_result 事件的 error 文本上限（错误摘要本来就短，维持原值不放大）。
     persist_max_error_chars: int = 500
+    # ─── store 增量写入的单条体积观测闸（2026-09-12 方案 B）───
+    # 只观测不处置：超限打 warn 日志，**绝不**截断/丢弃（持久化层截断＝不可逆删除，
+    # 5df629e 已吃过一次）。依据：生产实测单条最大 278 KB（AI 正文 272833 字符）→ 3.6× 余量。
+    # 为什么只有"单条"、没有"每会话条数上限"：对照 deer-flow（events 表 append-only）与
+    #   deepseek-harness（session-persistence："Flushed events are never rewritten"）
+    #   两家**都不设**条数上限——条数与真实上下文压力无相关性（259 条短消息与 259 条长消息
+    #   可差 100 倍），真正的压力闸在上下文层（agent.py trigger=("fraction", 0.8)）。
+    #   且本项是 per-item（不累积），而 per-session 阈值会累积触发，极易被误用成"超了删谁"。
+    persist_max_item_bytes: int = 1_048_576
+    # 单次读取消息条数（`GET /sessions/{id}/messages`）。生产实测最大会话 259 条，
+    # 1000 有 3.9× 余量 → 绝大多数会话与改造前的"全量返回"行为一致，
+    # 仅超长会话退化为"最新 N 条 + 更早页游标"，避免一次拉出上兆 payload。
+    persist_message_page_size: int = 1000
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

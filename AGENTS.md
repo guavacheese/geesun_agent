@@ -390,3 +390,73 @@ ast 提取两个文件的真实函数执行。含：跨 3 页取全不重不漏�
 与排序键同源）。生产库（agent_mem_prod）用代码生成的 SQL 端到端验证：
 首页 5 条 + 第二页 5 条与全量排序前 10 条完全一致，计数 15 与旧实现相同。
 
+### 2026-09-12（三）：`messages.*` 改增量存储（一行一条，key = 零填充序号）
+
+**问题**：`messages.<user>.<session>` 一直用单行 `key="messages"` + `value={"items":[...]}`，
+每轮把**整份 history** 覆盖写。生产实测（agent_mem_prod）三个后果：
+
+| 后果 | 实测数据 |
+|---|---|
+| ① 爆炸半径 = 整个会话 | 最大会话 259 条 / 1.32 MB 挤一行；这一行写失败（TOAST 上限 / jsonb 解析异常 / 序列化 OOM）就是整份历史全丢 |
+| ② 写放大 130× | 每轮重写整行，累计约 171 MB 只为最终存下 1.32 MB |
+| ③ **摘要裁剪传导** | `SummarizationMiddleware` 触发时 checkpoint 被 `RemoveMessage(REMOVE_ALL_MESSAGES)` 裁短 → 下一轮按快照重建的 history 缩水 → 全量覆盖把这份缩水写进 store → 早期对话在任何一层都找不回 |
+
+**改法**：一条消息一行，`key = f"{i:08d}"`（`i` 从 1 开始）。读取
+`WHERE prefix = %s ORDER BY key` 正好命中 store 自带的 `store_pkey (prefix, key)`
+btree → **零新建索引成本**（与会话列表必须自建 `store_sessions_order_idx` 相反）。
+写入只写新增部分。
+
+**经验**：
+- **"增量追加"的朴素前提（history 只在尾部增长）在摘要场景不成立**。压缩后
+  history = `[摘要, *保留的尾部]`，长度**变短**：按长度判断会判为"无新增"（此后再也写不进去），
+  按 history 下标算 key 会**覆盖已归档条目**。正确做法是**内容 id 定位**——取 store 里
+  最大序号那条的 `id`，在 history 里反查它的位置，从其后追加，序号继续用 **store 的**
+  序号（不是 history 下标）。id 缺失时退化为按长度，且**长度未增长就不写**（宁可少写
+  一轮，不可改写已归档内容）。摘要消息本身**不写入** store（它是喂模型的面，不是回放副本）。
+- **水位查询必须过滤非序号 key**：`ORDER BY key DESC LIMIT 1` 在文本序下，
+  旧 key `'messages'` 排在数字之后（`'0'` 0x30 < `'m'` 0x6d）→ 会污染水位。
+  查询加 `AND key ~ '^[0-9]+$'`，并**单独统计**非序号条目数返回给调用方。
+- **格式变更必须让新代码对旧格式"拒绝写入"（loud），而不是静默兼容**。静默兼容的两个
+  下场：写进去让新旧格式并存 → 迁移脚本的前置守卫拒绝执行 → 留下需人工对账的中间态；
+  或按 0 水位从第 1 条重写 → 与旧行重复。**相反方向的坑同样致命**：迁移在旧代码仍在
+  服务时执行，旧代码的写路径会把旧格式行**重新写回来**。所以顺序是
+  **停写 → 迁移 → 切新镜像 → 放开**，中间那段窗口新代码只会打 error 不写数据。
+- **"改一行一值"本身就比任何阈值更兜底**：故障爆炸半径从"整个会话"缩到"一条"。
+  由此**不要**在存储层加"每会话条数上限"——对照 deer-flow（events append-only）
+  与 deepseek-harness（`session-persistence/README.md`："Flushed events are never rewritten"）
+  两家都不设该维度；条数与真实上下文压力无关（259 条短消息与 259 条长消息可差 100 倍）。
+  真正的压力闸在上下文层：三家一致的 `fraction 0.8`。写入侧只留 per-item 体积观测闸
+  （`persist_max_item_bytes`，实测单条最大 278 KB → 1 MB 留 3.6× 余量），**只 warn 不截断**。
+- **`keep=("messages", 10)` 是个真 bug，但直接改回 `("fraction", 0.10)` 会更糟**：
+  框架的 `token_counter` 在两处需要不同语义（trigger 要"整个请求占多少"，keep 的二分要
+  "`messages[mid:]` 子集占多少"），而**只在用默认 counter 时才自动拆分**。本项目的
+  `_engine_grounded_counter` 命中缓存时忽略 `messages` 入参 → 二分每步拿到同一个数 →
+  `cutoff` 被顶到 `len-1` → **压缩后只剩最后 1 条**。必须同时把 `_lc_helper._partial_token_counter`
+  换成子集感知的 `_safe_token_counter`（见下面验证脚本；实测 30 条消息下 cutoff 29 → 22）。
+- **"改完没报错"不等于对**：`_partial_token_counter` 挂在 `deepagents` 的 `_lc_helper` 上
+  （`_determine_cutoff_index` 走 `self._lc_helper._partial_token_counter`），挂到子类自身
+  等于没拆。凡"改框架私有属性"的接线，断言必须落到**赋值目标对象**上。
+- **小表上看不出索引会不会被用**：42 行的 store 表上 EXPLAIN 一律 `Seq Scan + Sort`，
+  必须 `SET enable_seqscan = off` 才能验证 `Index Scan Backward using store_pkey`。
+- **分页方向要写进接口文档**：第 1 页取的是**最新**的一段且页内升序 → 续页必须
+  **前插**（prepend），不是 append。不写清楚前端一定会接错。
+
+**验证**：
+- `python tests/spikes/store_incremental_messages.py` —— **63 断言 ALL PASS**。含：
+  首次写全量、幂等（重复保存零新增、store 逐字节不变）、追加一轮只写 2 条、
+  **压缩场景 history 变短仍零新增且已归档条目零改写**、压缩后从 store 序号接续
+  （不是 history 下标）、病态路径（最新已存条目被裁掉 → 什么都不写）、
+  旧格式残留 → 整轮不写 + error、读侧跳过旧格式条目、分页前插拼接不重不漏、
+  非法游标 400、L1 体积闸只 warn 不截断，以及源码级断言（SQL 不含 `LIKE`/`OFFSET`、
+  `awrite_messages` 单次 batch、旧格式读写点已清零）。
+- `python tests/spikes/summarization_keep_semantics.py` —— **17 断言 ALL PASS**，
+  用 ast 提取 langchain 真实方法执行，量化了"未拆 counter → cutoff 29（保留 1 条）"
+  与"拆分后 → cutoff 22（保留 8 条）"的差别。
+- 生产库只读验证：三条消息查询（首页 / 续页 / 水位）EXPLAIN 全部为
+  `Index Scan Backward using store_pkey` 且**无 Sort 节点**；存量形态 21 会话 / 639 条
+  item / **100% 带 `id`** / 0 条结构异常 → `by_id` 水印迁移后即可用。
+- 存量迁移脚本 `migrate_messages_incremental.py`（同库备份表 + 单事务 + 三条闭环校验：
+  条目数守恒、content 与 id 序列逐条一致、时间戳未被改写）。**预演已通过**
+  （21 会话 / 639 条 / 0 数字 key），**尚未 apply**——必须在应用停写窗口内、与新镜像
+  切换同批执行（见上"顺序是停写 → 迁移 → 切新镜像 → 放开"）。
+

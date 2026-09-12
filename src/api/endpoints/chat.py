@@ -31,6 +31,82 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
+def _plan_message_append(
+    history: list[dict],
+    prev_count: int,
+    last_stored_id: str | None,
+) -> tuple[int, list[dict], str]:
+    """算出增量追加的起始序号与待写条目（纯函数，便于 spike 直接断言）。
+
+    返回 `(next_seq, new_items, mode)`：
+      next_seq   本条消息的起始 store 序号（= 已存最大序号 + 1）
+      new_items  本次要写的新条目（可能为空）
+      mode       定位方式，仅用于日志与断言：`by_id` / `by_length` / `none`
+
+    ## 为什么需要"按 id 定位"而不是"按长度"
+
+    增量追加的朴素前提是"history 只在尾部增长"。但 `SummarizationMiddleware` 触发时
+    返回 `[RemoveMessage(REMOVE_ALL_MESSAGES), 摘要, *保留的尾部]`——**history 会变短**。
+    此时若仍按 `len(history) > prev_count` 判断，压缩后 len 反而更小 → 判为"无新增"，
+    当轮之后的新消息**永远写不进去**；反过来若按 history 下标算 key，压缩后 history
+    里第 10 条其实是 store 里第 250 条 → **覆盖已归档条目**。
+
+    所以用 store 里最大序号那条的 `id`，在 history 里反查它的位置，从其后开始追加；
+    序号继续沿用 **store 的**序号（不是 history 下标），两头都不会重叠。
+    摘要消息本身**不写入 store**：store 是给人看的回放副本，已保留完整原文，
+    摘要只是"喂给模型的面"的产物，写进来反而会把原文挤掉（正是旧 bug 的形态）。
+
+    ## 退化路径
+
+    `last_stored_id` 为 None（老数据 / 无 id 构造路径）或 id 在 history 里找不到
+    （历史被改写、条目无 id）→ 退回按长度判断。此时若 history 没有更长，
+    本次什么都不写并交由调用方打 warn——**宁可少写一轮，不可改写已归档内容**。
+    """
+    next_seq = prev_count + 1
+
+    start: int | None = None
+    mode = "none"
+    if last_stored_id:
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("id") == last_stored_id:
+                start = i + 1
+                mode = "by_id"
+                break
+
+    if start is None:
+        if len(history) > prev_count:
+            start = prev_count
+            mode = "by_length"
+        else:
+            start = len(history)
+            mode = "none"
+
+    return next_seq, history[start:], mode
+
+
+def _warn_oversized_items(items: list[dict], *, prefix: str) -> None:
+    """单条 entry 体积观测闸——**只打日志，不截断、不丢弃**（2026-09-12 方案 B）。
+
+    持久化层截断 = 不可逆删除（5df629e 的教训），所以这里只做信号。
+    依据：生产实测单条最大 278 KB（AI 正文 272833 字符）→ 阈值 1 MB 留 3.6× 余量。
+    """
+    limit = settings.persist_max_item_bytes
+    if limit <= 0:
+        return
+    for entry in items:
+        try:
+            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError) as e:
+            logger.warning("[DIAG] 单条 entry 无法序列化度量: %s (prefix=%s)", e, prefix)
+            continue
+        if size > limit:
+            logger.warning(
+                "[DIAG] 单条消息体积 %d 字节超过观测阈值 %d（未截断，仅告警）: "
+                "prefix=%s role=%s id=%s",
+                size, limit, prefix, entry.get("role"), entry.get("id"),
+            )
+
+
 async def _aget_state_with_retry(agent, thread_id: str, max_attempts: int = 3):
     """带重试地读取 agent 最终状态（防御性）。
 
@@ -359,9 +435,11 @@ async def chat(
     if body.continue_from_state:
         try:
             msg_namespace = ("messages", user_id, session_id)
-            item = await store.aget(msg_namespace, "messages")
-            stored = item.value if item else {"items": []}
-            stored_items = stored.get("items", []) if isinstance(stored, dict) else []
+            msg_prefix = ".".join(msg_namespace)
+            # 取全（而非只取最新一页）：这里要把历史**整段**灌回图，截短即丢上下文。
+            # 增量格式下每个条目就是一条消息（旧格式是单行 {"items": [...]}）。
+            _rows = await store.alist_all_messages(msg_prefix)
+            stored_items = [v for _k, v in _rows if isinstance(v, dict)]
             lc_msgs = []
             for m in stored_items:
                 if m.get("role") == "user":
@@ -589,9 +667,64 @@ async def chat(
                             history[i]["completion"] = "blocked_no_output"
                             break
 
-                # 存入 store（用 dict 包裹列表，避免 LangGraph PostgresStore 的 json.loads bug）
+                # ─── 存入 store：增量追加（2026-09-12 方案 B，替代全量覆盖写）───
+                # 改前：`aput(ns, "messages", {"items": history})` —— 每轮把整份 history
+                # 当一个 value 覆盖写单行。三个后果（生产实测）：
+                #   ① 爆炸半径=整个会话：最大会话 259 条 / 1.32 MB 挤一行，写失败即全丢；
+                #   ② 写放大 130×：累计约 171 MB 只为存下 1.32 MB；
+                #   ③ 摘要裁剪传导：checkpoint 被 RemoveMessage 裁短 → 下一轮快照缩水
+                #      → 全量覆盖把缩水写进 store，早期对话在任何一层都找不回。
+                # 改后：一条消息一行（key = 零填充序号），只写新增部分。
+                #   `created_at` 顺带修掉一个隐性 bug：改前每轮给**所有**历史消息重写
+                #   `created_at = now()`，前端看到的每条历史消息时间其实是"最后一次保存
+                #   时刻"；增量下已归档条目不再被触碰。
                 msg_namespace = ("messages", user_id, session_id)
-                await store.aput(msg_namespace, "messages", {"items": history})
+                msg_prefix = ".".join(msg_namespace)
+                # 第三个返回值是"旧格式残留条数"——部署顺序防线，见 aget_message_watermark
+                prev_count, last_stored_id, legacy_rows = await store.aget_message_watermark(
+                    msg_prefix
+                )
+                stored_message_count: int | None = None
+                if legacy_rows:
+                    # 存量还是旧格式（新版已上线、迁移脚本尚未执行）：**本轮不写**。
+                    # 写了会让新旧格式并存，迁移脚本的前置守卫随即拒绝执行 → 需要人工对账。
+                    # 代价仅限于"这一轮的回放副本"（checkpoint 不受影响，对话照常继续）。
+                    logger.error(
+                        "[DIAG] 会话 %s 存量仍为旧格式（%d 条非序号条目），本轮跳过 "
+                        "store 写入；请先执行 migrate_messages_incremental.py 展开存量",
+                        session_id, legacy_rows,
+                    )
+                else:
+                    next_seq, new_items, append_mode = _plan_message_append(
+                        history, prev_count, last_stored_id,
+                    )
+                    _warn_oversized_items(new_items, prefix=msg_prefix)
+
+                    if new_items:
+                        await store.awrite_messages(
+                            msg_namespace,
+                            [
+                                (message_key(next_seq + offset), entry)
+                                for offset, entry in enumerate(new_items)
+                            ],
+                        )
+                    elif append_mode == "none" and prev_count > 0:
+                        # 既没按 id 定位到，history 也不比已存的长 → 本轮无法安全追加。
+                        # 不写是安全方向（宁可少写一轮，不可改写已归档内容），但要可见。
+                        logger.warning(
+                            "[DIAG] 增量追加跳过：无法定位水印且 history(%d) 未超过已存(%d)，"
+                            "session=%s last_stored_id=%r",
+                            len(history), prev_count, session_id, last_stored_id,
+                        )
+
+                    # 会话内实际可见条数 = 已存条数 + 本次新增（压缩后 history 会变短，
+                    # 但 store 保留全部原文，元数据应与 store 实际条目一致而非 history 长度）
+                    stored_message_count = prev_count + len(new_items)
+                    logger.warning(
+                        "[DIAG] %s: session=%s 增量追加 prev=%d new=%d mode=%s",
+                        "会话保存完成" if reason == "normal" else "断连强制保存完成",
+                        session_id, prev_count, len(new_items), append_mode,
+                    )
 
                 # 更新会话元数据（标题、消息数、时间）
                 session_ns = ("sessions", user_id)
@@ -607,7 +740,10 @@ async def chat(
 
                 if item is not None:
                     data = item.value
-                    data["message_count"] = len(history)
+                    # 旧格式残留时 stored_message_count 为 None → 保持原值不动
+                    # （若写 0 会把会话列表的条数徽标清零，属于额外伤害）
+                    if stored_message_count is not None:
+                        data["message_count"] = stored_message_count
                     data["updated_at"] = now_ts
                     old_title = data.get("title", "")
                     # 覆盖旧的 path_hint 标题，或首次设置标题
@@ -623,20 +759,20 @@ async def chat(
                         "title": title,
                         "created_at": now_ts,
                         "updated_at": now_ts,
-                        "message_count": len(history),
+                        "message_count": stored_message_count or 0,
                     }
 
                 # 会话条目即唯一数据源：GET /sessions 按 namespace 前缀直接检索，
                 # 不再需要维护 __index__ 手工索引（少一次非原子写，消除数据/索引分叉面）。
                 await store.aput(session_ns, session_id, data)
                 logger.warning(
-                    "[DIAG] %s: user=%s, session=%s, msgs=%d",
+                    "[DIAG] %s: user=%s, session=%s, msgs=%s(stored)",
                     "会话保存完成" if reason == "normal" else "断连强制保存完成",
                     user_id,
                     session_id,
-                    len(history),
+                    stored_message_count,
                 )
-                return len(history)
+                return stored_message_count or 0
         except Exception as e:
             logger.error(
                 "保存会话消息失败（关键错误，本轮消息可能丢失）: %s", e, exc_info=True
