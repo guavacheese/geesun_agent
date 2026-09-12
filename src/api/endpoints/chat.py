@@ -626,26 +626,8 @@ async def chat(
                         "message_count": len(history),
                     }
 
-                # 确保会话在索引中（新增或已有都要维护）
-                # 注意：__index__ 必须以 dict 存储（{"items": [...]}），
-                # 因为 LangGraph PostgresStore 的 _row_to_item 对非 dict 值
-                # 会调用 json.loads()，导致列表类型报错
-                try:
-                    idx_item = await store.aget(session_ns, "__index__")
-                    idx_data = idx_item.value if idx_item else {}
-                    ids = (
-                        idx_data.get("items", []) if isinstance(idx_data, dict) else []
-                    )
-                except Exception as e:
-                    logger.warning("[DIAG] 索引读取失败，重新初始化: %s", e)
-                    ids = []
-                try:
-                    if session_id not in ids:
-                        ids.append(session_id)
-                    await store.aput(session_ns, "__index__", {"items": ids})
-                except Exception as e:
-                    logger.warning("[DIAG] 索引更新失败: %s", e)
-
+                # 会话条目即唯一数据源：GET /sessions 按 namespace 前缀直接检索，
+                # 不再需要维护 __index__ 手工索引（少一次非原子写，消除数据/索引分叉面）。
                 await store.aput(session_ns, session_id, data)
                 logger.warning(
                     "[DIAG] %s: user=%s, session=%s, msgs=%d",

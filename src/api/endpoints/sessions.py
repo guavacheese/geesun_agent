@@ -48,6 +48,58 @@ def _session_namespace(user_id: str) -> tuple:
     return ("sessions", user_id)
 
 
+# 单次拉取条数上限。asearch 的 limit 默认值是 10，会静默截断，必须显式放大。
+# 为什么不做 offset 翻页：langgraph 的 Postgres 实现在无向量索引时按
+# `ORDER BY store.updated_at DESC` 排序（store/postgres/base.py:533），该列
+# 非唯一且会被业务持续改写——翻页期间任何条目 updated_at 变化都会导致
+# 漏条或重复。会话元数据极小（每条约百字节），一次取全最稳。
+_SESSION_MAX_ITEMS = 1000
+# 历史遗留的手工索引 key：它不是会话条目，读取时要跳过。
+_LEGACY_INDEX_KEY = "__index__"
+
+
+async def _alist_sessions(store, namespace: tuple) -> list[dict]:
+    """按 namespace 前缀列出会话条目。
+
+    替代原先手工维护的 `__index__` 索引列表：直接让 store 按 prefix 检索
+    （Postgres 侧有 `store_prefix_idx ... text_pattern_ops` 支持），
+    避免"数据与索引两次独立写、任一失败即分叉"的一致性风险。
+
+    三处必须做的防御：
+    1. 显式传 limit：langgraph 默认 10 会**静默截断**，且不做 offset 翻页
+       （见 _SESSION_MAX_ITEMS 注释：updated_at 排序下翻页不稳）。
+    2. `asearch` 走 `prefix LIKE 'sessions.<user>%'`，不认命名空间边界——
+       用户 GY2442 会把 GY24428 的会话一并捞出来。因此按 `Item.namespace`
+       精确相等过滤，防止串用户（越权）。
+    3. 跳过历史遗留的 `__index__` 条目：它没有 title 等业务字段，
+       混进列表会让前端渲染异常。
+    """
+    batch = await store.asearch(namespace, limit=_SESSION_MAX_ITEMS)
+    if len(batch) >= _SESSION_MAX_ITEMS:
+        logger.warning(
+            "会话列表达到拉取上限 %d，可能未取全: namespace=%s",
+            _SESSION_MAX_ITEMS, namespace,
+        )
+
+    rows: list[dict] = []
+    for item in batch:
+        if item.key == _LEGACY_INDEX_KEY:
+            continue
+        if tuple(item.namespace) != tuple(namespace):
+            logger.warning(
+                "会话列表跳过命名空间不匹配的条目: expected=%s actual=%s key=%s",
+                namespace, item.namespace, item.key,
+            )
+            continue
+        if not isinstance(item.value, dict):
+            logger.warning(
+                "会话 %s 的元数据不是 dict，已跳过: %r", item.key, type(item.value)
+            )
+            continue
+        rows.append({"session_id": item.key, **item.value})
+    return rows
+
+
 def _messages_namespace(user_id: str, session_id: str) -> tuple:
     return ("messages", user_id, session_id)
 
@@ -79,37 +131,12 @@ async def list_sessions(
     user_id = current_user["user_id"]
     namespace = _session_namespace(user_id)
 
-    # 遍历 store 中该 namespace 下的所有 session
-    sessions = []
+    # 直接按 namespace 前缀遍历，不再依赖手工维护的 __index__ 索引
     try:
-        # 用 store 的 list 方法，或者通过 get 单个 key 的方式
-        # 由于 store 不直接支持遍历 namespace，我们用约定：
-        # 每个 session 存为 key = session_id
-        # 通过维护一个 index key 来记录所有 session_id
-        index_key = "__index__"
-        try:
-            index_item = await store.aget(namespace, index_key)
-            idx_data = index_item.value if index_item else {}
-            session_ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
-        except Exception as e:
-            logger.error("获取会话索引失败: %s", e, exc_info=True)
-            session_ids = []
+        sessions = await _alist_sessions(store, namespace)
     except Exception as e:
-        logger.error("获取会话索引失败(外层): %s", e, exc_info=True)
-        session_ids = []
-
-    for sid in session_ids:
-        try:
-            item = await store.aget(namespace, sid)
-            if item is None:
-                continue
-            sessions.append({
-                "session_id": sid,
-                **item.value,
-            })
-        except Exception as e:
-            logger.error("获取会话 %s 的元数据失败: %s", sid, e, exc_info=True)
-            continue
+        logger.error("遍历会话失败: %s", e, exc_info=True)
+        sessions = []
 
     # 先按更新时间倒序，再稳定排序让 pinned 置顶（同一组内保持倒序）
     sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
@@ -144,10 +171,9 @@ async def create_session(
         "message_count": 0,
     }
 
+    # 会话条目本身即为唯一数据源：列表接口按 namespace 前缀直接检索，
+    # 不再需要维护 __index__ 索引（旧索引写入已移除，见 _alist_sessions 注释）。
     await store.aput(namespace, session_id, session_data)
-
-    # 更新索引
-    await _update_session_index(store, namespace, session_id, add=True)
 
     return {
         "session_id": session_id,
@@ -249,11 +275,8 @@ async def delete_session(
     if item is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # 删除会话元数据
+    # 删除会话元数据（aput(None) 在 langgraph 内部走 DELETE）
     await store.aput(namespace, session_id, None)
-
-    # 从索引移除
-    await _update_session_index(store, namespace, session_id, add=False)
 
     # 删除消息
     try:
@@ -344,35 +367,6 @@ async def get_session_messages(
     # 路径），不再依赖后端全量兜底。
 
     return {"session_id": session_id, "messages": messages}
-
-
-# ─── 工具函数 ───
-
-
-async def _update_session_index(
-    store, namespace: tuple, session_id: str, add: bool
-):
-    """维护 session_id 索引列表。
-    
-    注意：__index__ 必须以 dict 存储（{"items": [...]}），
-    因为 LangGraph PostgresStore 的 _row_to_item 对非 dict 值
-    会调用 json.loads()，导致列表类型报错。
-    """
-    index_key = "__index__"
-    try:
-        item = await store.aget(namespace, index_key)
-        idx_data = item.value if item else {}
-        ids = idx_data.get("items", []) if isinstance(idx_data, dict) else []
-    except Exception as e:
-        logger.error("读取会话索引失败: %s", e, exc_info=True)
-        ids = []
-
-    if add and session_id not in ids:
-        ids.append(session_id)
-    elif not add and session_id in ids:
-        ids.remove(session_id)
-
-    await store.aput(namespace, index_key, {"items": ids})
 
 
 # ─── 编辑历史消息并截断后续消息 ───

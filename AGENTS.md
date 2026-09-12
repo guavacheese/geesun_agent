@@ -284,3 +284,48 @@ raw 收到 6 条（OI 3 + HTTP 3），kept 收到 3 条（OI 3 + HTTP **0**）�
 完整复盘见 `docs/tracing-span-pollution-postmortem.md`。
 注意 `.venv` 是 Linux 布局、Windows 本机 Python 用不了，spike 需在生产同款镜像内运行
 （命令见该文档第 6 节）。
+
+### 2026-09-12：会话列表从手工 `__index__` 索引切到 `store.asearch` 前缀遍历
+
+**问题**：`GET /sessions` 依赖手工维护的 `__index__` key（存 session_id 列表）。
+生产实测当前一致（GY24428 15/15、wanglei1 3/3、GY18008 2/2、lvxiaojian 1/1，
+无脏残留、无漏登记），但结构上是「数据行 + 索引行」**两次独立写、非原子**，
+任一失败即分叉——这正是历史 "GET /sessions 返空" 类 bug 的来源。
+
+**根因**：`list_sessions` 的注释写着「由于 store 不直接支持遍历 namespace，我们用约定：
+维护一个 index key」。**该前提是错的**：`BaseStore.asearch(namespace_prefix, /, *,
+query=None, filter=None, limit=10, offset=0, refresh_ttl=None)`
+（`langgraph/store/base/__init__.py:1021`）本就支持前缀检索，Postgres 实现走
+`prefix LIKE`（`store/postgres/base.py:446`），DDL 里还专门建了
+`store_prefix_idx ... text_pattern_ops`（注释即 "For faster lookups by prefix"）。
+
+**`asearch` 三个"框架不管、调用方必须管"的坑（都不报错，只静默出错）**：
+1. **`limit` 默认 10，会静默截断** —— 必须显式传，否则列表莫名其妙只出 10 条。
+2. **前缀匹配不认命名空间边界**：`sessions.GY2442` 会同时命中 `sessions.GY24428`
+   → **串用户（越权）**。必须按 `Item.namespace` 精确相等过滤。生产当前无前缀包含
+   关系的用户（实测 0 行），但新建短用户名就会踩。
+3. **不能 offset 翻页**：Postgres 非向量路径是 `ORDER BY store.updated_at DESC`
+   （`store/postgres/base.py:533`），该列**非唯一且被业务持续改写** → 翻页期间任何
+   条目 updated_at 变化都会导致漏条或重复。会话元数据极小，一次 `limit=1000` 取全最稳。
+
+**修复**：
+① `src/infra/database.py`：`ReconnectingAsyncPostgresStore` 暴露 `asearch`（走 `_call` 重试代理）；
+② `src/api/endpoints/sessions.py`：新增 `_alist_sessions`（含上述三条防御），
+   `list_sessions` 切过去；删除 `_update_session_index` 函数及 create/delete 两处调用；
+③ `src/api/endpoints/chat.py`：删除 `_persist_session` 里的 `__index__` 读写块；
+④ 历史 `__index__` 条目**保留不删**（读取时按 `_LEGACY_INDEX_KEY` 跳过），不动生产数据。
+
+**经验**：
+- **"框架不支持 X" 是高风险断言**，写下它之前必须去源码里找一遍。这一条注释让手工索引
+  多活了很久，而 store 的前缀检索**既有公开 API 又有专用索引**。
+- **换底层 API 时先盘它没帮你做的事**：`asearch` 不管 limit 截断、不管 namespace 边界、
+  排序键不稳定——三条都不抛异常。与 09-09 那条（解析层类型假设过强）同源：
+  **静默失败比显式报错危险得多**。
+- `SearchItem` 继承 `Item`，`.key` / `.namespace` / `.value` 可直接用。
+
+**验证**：`python tests/spikes/asearch_session_list.py` —— ast 提取真实
+`_alist_sessions` 执行，**23 断言 ALL PASS**。含越权对照（`sessions.GY2442` 前缀捞到
+`GY24428` 条目必须被过滤并告警）、单次取全、上限告警、以及「不得出现 `offset=` 实参」
+的源码级断言。生产库 SQL 等价验证：`prefix LIKE 'sessions.GY24428%'` 一次取全 16 行
+（含 `__index__`，新代码跳过 → 15 条真实会话），与旧索引内容一致。
+

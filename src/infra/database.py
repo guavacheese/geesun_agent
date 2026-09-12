@@ -44,7 +44,12 @@ class ReconnectingAsyncPostgresStore:
 
     当 PostgreSQL 连接因网络中断、服务重启等原因断开时，
     自动关闭旧连接池并创建新实例，对调用方透明。
-    支持方法：aget / aput（覆盖当前代码中的全部使用场景）。
+    支持方法：aget / aput / asearch（覆盖当前代码中的全部使用场景）。
+
+    注意：`aput(namespace, key, None)` 在 langgraph 内部会被翻译成
+    `DELETE FROM store WHERE prefix=... AND key=...`（见
+    `langgraph/store/postgres/base.py` 的 `_prepare_batch_PUT_queries`），
+    即 None 表示删除而非写入 null，因此本包装器无需额外暴露 adelete。
     """
 
     def __init__(self, dsn: str):
@@ -120,6 +125,17 @@ class ReconnectingAsyncPostgresStore:
 
     async def aput(self, namespace, key, value):
         return await self._call("aput", namespace, key, value)
+
+    async def asearch(self, namespace, **kwargs):
+        """按 namespace 前缀搜索条目（Postgres 侧走 `prefix LIKE 'ns%'`）。
+
+        两个必须由调用方承担的约束：
+        1. langgraph 的 limit 默认值是 10，会**静默截断**结果，调用方必须显式传 limit，
+           并在需要全量时自行分页（offset）。
+        2. 前缀匹配不认命名空间边界：`sessions.GY2442` 会同时匹配到 `sessions.GY24428`，
+           因此调用方必须按 `Item.namespace` 做精确相等过滤，否则会串用户数据。
+        """
+        return await self._call("asearch", namespace, **kwargs)
 
     async def setup(self):
         store = await self._ensure()
