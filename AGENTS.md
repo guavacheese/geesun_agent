@@ -460,3 +460,27 @@ btree → **零新建索引成本**（与会话列表必须自建 `store_session
   （21 会话 / 639 条 / 0 数字 key），**尚未 apply**——必须在应用停写窗口内、与新镜像
   切换同批执行（见上"顺序是停写 → 迁移 → 切新镜像 → 放开"）。
 
+
+## 2026-09-12 追加：增量写入上线即 NameError（message_key 漏 import）
+
+**问题**：1.0.10 部署后每一轮对话结束时台账写入全部失败——`_persist_session`
+抛 `NameError: name 'message_key' is not defined`（`chat.py:707`），store 零追加
+（用户发新消息后实测 16 行一动不动）。checkpoint 完好，数据未丢，但"本轮消息可能
+丢失"的 error 每轮必现。
+
+**根因**：`26faf9d` 在 chat.py 新增了对 `database.message_key` 的调用，但没加
+`from src.infra.database import message_key`。**为什么 63 断言的 spike 没测出来**：
+ast 提取 exec 的方式会把 `message_key` 绑进 exec globals（spike 自己从 database.py
+提取后注入），恰好掩盖了真实模块里缺失的 import——**ast 提取式测试天然测不出
+"模块接线"层面的错误**（import 缺失、循环导入、名字遮蔽）。且部署后只验证了读
+路径（GET /messages），写路径只有真实对话走到轮次结束才触发。
+
+**修复**：chat.py 补 1 行 import；spike 新增**用例 12「import 完整性」**——
+用 ast 对比"chat.py / sessions.py 实际引用的 database 模块级符号"与"显式导入的
+符号"，缺失即 FAIL（63 → 65 断言）。这一类"名字从哪来"的接线错误今后都归它管。
+
+**教训**：
+- 每个源码级新断言要问一句：**它测的是代码文本还是模块行为？** 若符号是被
+  spike 自己注入 globals 的，等于绕过了真实模块的命名空间——必须另立断言核对导入。
+- 部署后验证必须覆盖**写入路径**，不能只测读。写路径的真实触发点是"一轮对话
+  正常结束"，验证清单里要有一条"发一条消息 → 看台账追加"。

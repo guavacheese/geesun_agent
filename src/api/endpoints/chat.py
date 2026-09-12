@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from src.infra.database import message_key
 from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent

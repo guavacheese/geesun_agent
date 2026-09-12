@@ -496,6 +496,25 @@ check("awrite_messages" in _sess_src and "delete_keys=" in _sess_src,
 check('changed[target_key] = items_dict' not in _sess_src,
       "repair 不再回写整份列表（只写被改动的条目）")
 
+# ── 用例 12：import 完整性（NameError 回归防线）──
+# 2026-09-12 生产事故：chat.py 用了 message_key 但漏 import → 每轮对话结束时
+# _persist_session 抛 NameError，台账写入全部失败（ast 提取 exec 时把符号绑进
+# globals，掩盖了缺失，常规 spike 测不出来）。此断言专门堵这一类漏洞。
+print("\n[12] import 完整性（database 模块级符号必须被显式导入）")
+_db_public = {
+    n.name for n in ast.parse(DATABASE_PY.read_text(encoding="utf-8")).body
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+}
+for _label, _path, _src in (("chat.py", CHAT_PY, _chat_src), ("sessions.py", SESSIONS_PY, _sess_src)):
+    _tree = ast.parse(_src)
+    _imported: set[str] = set()
+    for _node in _tree.body:
+        if isinstance(_node, ast.ImportFrom) and _node.module and _node.module.endswith("infra.database"):
+            _imported |= {a.name for a in _node.names}
+    _used = {n.id for n in ast.walk(_tree) if isinstance(n, ast.Name)}
+    _missing = (_db_public & _used) - _imported
+    check(not _missing, f"{_label} 引用的 database 模块级符号已全部导入（缺: {_missing}）")
+
 print("\n" + "=" * 78)
 _total = len(_FAILS) + _passed_count
 print(f"PASS {_passed_count} / FAIL {len(_FAILS)}")
