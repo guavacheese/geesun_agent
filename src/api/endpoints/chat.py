@@ -20,6 +20,17 @@ from src.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _clip(text: str, limit: int) -> str:
+    """按配置上限裁剪文本；limit <= 0 表示不限制（2026-09-12 新增）。
+
+    store 回放副本与 SSE tool_result 的长度上限统一走此函数，
+    替代此前散落在 _persist_session / 事件流里的 [:2000] 硬编码。
+    """
+    if limit and limit > 0 and len(text) > limit:
+        return text[:limit]
+    return text
+
+
 async def _aget_state_with_retry(agent, thread_id: str, max_attempts: int = 3):
     """带重试地读取 agent 最终状态（防御性）。
 
@@ -470,9 +481,19 @@ async def chat(
                                 reasoning = thinking_part
                             content = remaining
 
-                    # 3. 截断长度
-                    content = content[:2000]
-                    reasoning = reasoning[:2000]
+                    # 3. 长度上限（2026-09-12 修：原为 content[:2000]/reasoning[:2000]）
+                    #    截断写在持久化层＝写入即不可逆删除，方向错了层（且引入提交
+                    #    4a92447 未说明原因）。正文/推理是用户要看的交付物本体，默认不限制；
+                    #    tool 消息正文属中间过程走中间上限。
+                    #    ⚠ 本循环遍历**所有角色**，role=tool 的独立条目同样命中此处，
+                    #    故必须按 role 分流，否则工具输出会被一并放开。
+                    content = _clip(
+                        content,
+                        settings.persist_max_tool_result_chars
+                        if role == "tool"
+                        else settings.persist_max_content_chars,
+                    )
+                    reasoning = _clip(reasoning, settings.persist_max_content_chars)
 
                     # 4. 去掉 user 消息中的 path_hint 前缀
                     if role == "user" and "\n\n" in content:
@@ -504,7 +525,10 @@ async def chat(
                                 "tool": tc["name"],
                                 "args": tc["args"],
                                 "status": "success",
-                                "result": (tool_results.get(tc.get("id", "")) or "")[:2000],
+                                "result": _clip(
+                                    tool_results.get(tc.get("id", "")) or "",
+                                    settings.persist_max_tool_result_chars,
+                                ),
                             }
                             for i, tc in enumerate(msg.tool_calls)
                         ]
@@ -1003,10 +1027,18 @@ async def chat(
                                             'tool': tool_name,
                                             'id': tool_call_id,
                                             'success': not is_error,
-                                            'error': content_str[:500]
+                                            # 2026-09-12：result 与持久化副本对齐同一上限，
+                                            # 否则会出现「当轮看 2000、刷新后看 8000」的不一致。
+                                            'error': _clip(
+                                                content_str,
+                                                settings.persist_max_error_chars,
+                                            )
                                             if is_error
                                             else None,
-                                            'result': content_str[:2000]
+                                            'result': _clip(
+                                                content_str,
+                                                settings.persist_max_tool_result_chars,
+                                            )
                                             if content_str
                                             else None,
                                         },

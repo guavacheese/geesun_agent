@@ -165,6 +165,20 @@ class Settings(BaseSettings):
     # 2026-08-28 起触发改用 fraction（0.8 × model.profile["max_input_tokens"]），不再推导
     # effective_trigger；本值仅当模型 profile 缺失（fraction 退化）时作为下限保护。
     summarization_trigger_tokens: int = 20000
+    # ─── store 回放副本长度上限（2026-09-12 新增，修 20808→2000 截断 bug）───
+    # 背景：生产会话 GY24428:0f6d781d 的 AI 正文被 content[:2000] 砍掉 90.4%
+    #   （store 存 2000 / checkpoint 存 20808，程序化验证为严格前缀），用户刷新后
+    #   只剩半张相机参数表。截断写在**持久化层**＝写入即不可逆删除，方向错了层。
+    # 原则（对齐 deer-flow / deepseek-harness）：压缩只能发生在「喂给模型的上下文
+    #   投影」层，回放原文一律全量存。前端需要收敛展示就用折叠，不让后端做减法。
+    # 取值：0 = 不限制。AI 正文 / reasoning 是用户真正要看的交付物本体，默认不截。
+    persist_max_content_chars: int = 0
+    # 工具结果属中间过程（常是几十 KB 日志噪音），前端折叠查看即可，给中间上限。
+    # 全库实测 737 条工具结果最大 39758 字符，8000 覆盖 93.8% 的原始需求场景；
+    # 注意此值同时用于 SSE tool_result 事件，保证「当轮看到」与「刷新看到」一致。
+    persist_max_tool_result_chars: int = 8000
+    # SSE tool_result 事件的 error 文本上限（错误摘要本来就短，维持原值不放大）。
+    persist_max_error_chars: int = 500
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)
