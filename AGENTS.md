@@ -307,6 +307,8 @@ query=None, filter=None, limit=10, offset=0, refresh_ttl=None)`
 3. **不能 offset 翻页**：Postgres 非向量路径是 `ORDER BY store.updated_at DESC`
    （`store/postgres/base.py:533`），该列**非唯一且被业务持续改写** → 翻页期间任何
    条目 updated_at 变化都会导致漏条或重复。会话元数据极小，一次 `limit=1000` 取全最稳。
+   ⚠️ **该结论已被下一条取代**：`limit=1000` 只是把静默截断抬高了水位，超过仍会丢；
+   真正的修法是自建 keyset 游标（见下方「会话列表改走自建 keyset 游标分页」）。
 
 **修复**：
 ① `src/infra/database.py`：`ReconnectingAsyncPostgresStore` 暴露 `asearch`（走 `_call` 重试代理）；
@@ -328,4 +330,63 @@ query=None, filter=None, limit=10, offset=0, refresh_ttl=None)`
 `GY24428` 条目必须被过滤并告警）、单次取全、上限告警、以及「不得出现 `offset=` 实参」
 的源码级断言。生产库 SQL 等价验证：`prefix LIKE 'sessions.GY24428%'` 一次取全 16 行
 （含 `__index__`，新代码跳过 → 15 条真实会话），与旧索引内容一致。
+
+### 2026-09-12（续）：会话列表改走自建 keyset 游标分页，弃用 `asearch`
+
+**问题**：上一条把「不能翻页」记成了既定事实，用 `limit=1000` 一次取全绕过。
+但那只把静默截断抬到 1000 条水位——**超过就丢，且只打 warning、前端无感**。
+用户追问"翻页能不能彻底修"，核查后结论是：**能，但必须离开 `asearch`**。
+
+**根因（三条都是框架层结构限制，应用层绕不开）**：
+
+1. `ORDER BY store.updated_at DESC` 只有**一列且非唯一**，PK `(prefix, key)` 不参与排序
+   → 没有全序，而 OFFSET 语义要求稳定全序（`store/postgres/base.py:526-534`）。
+2. namespace 条件**只生成 `prefix LIKE %s`，没有 `prefix = %s` 分支**
+   （`base.py:446-449`）→ 越权过滤只能放应用层，而 OFFSET 的偏移量是**数据库端**算的
+   → **只要用 LIKE 前缀 + 应用层过滤，分页在结构上就不可能正确**（不是"可能漏"，
+   是数学上无解）。这条比"排序不稳"更硬，是决定性的。
+3. `filter` 的比较操作符（`$lt/$gt/...`，`base.py:622-637`）只作用于 **value 字段文本**，
+   **没有 key 列、没有元组、没有 OR** → 表达不了 `(updated_at, key) < (c1, c2)` 稳定游标。
+
+补充：`updated_at` 由框架 UPSERT 时 `CURRENT_TIMESTAMP` 写入（`base.py:388-393`），
+**每次 aput 都变（含重命名/pin）**，天生不适合当排序键。store 表只有 3 个索引
+（`store_pkey` / `store_prefix_idx text_pattern_ops` / `idx_store_expires_at`），
+**没有任何排序用索引**。
+
+**修复**：
+① `src/infra/database.py` 新增 `asearch_keyset(prefix, *, limit, cursor, pinned)`：
+   `prefix = %s` 精确匹配（越权问题从根上消失，调用方不再需要 namespace 相等过滤）
+   + `(COALESCE(value->>'updated_at',''), key) < (%s::text, %s::text)` 元组游标
+   + `ORDER BY <排序键> DESC, key DESC` 全序。走 `store.conn`（**公开属性**）借连接，
+   复用 `_call_with` 的重连重试语义；
+② 自建复合索引 `store_sessions_order_idx ON store (prefix, (<排序键>) DESC, key DESC)`，
+   在 `setup()` 里幂等创建（失败只影响性能、不阻断启动，但打 error）；
+③ `sessions.py`：`_alist_sessions` 改成游标驱动。**默认取全**（逐页 200 推进，
+   防呆上限 50 页 = 10000 条，触顶打 error 而不是静默截断）+ 两处防死循环断言
+   （游标必须严格递减）；新增**可选** `?limit=&cursor=` 分页模式
+   （置顶会话单独返回 `pinned_sessions`——置顶是应用层第二段排序，留在页内会散落各页）；
+④ 读取路径换血，**写入路径不动**（仍走 aput）。
+
+**经验**：
+- **"框架不支持 X" 与 "框架支持 X 但做不对 Y" 是两回事**。上一条把后者误当成了
+  "只能绕过"，于是留下了静默截断。判断依据要落到 SQL 文本本身，而不是 API 文档的
+  参数列表——`asearch` 有 `offset` 参数，看起来支持翻页，实际结构上做不到。
+- **排序键必须来自业务字段，不要借框架的写入时间列**。`store.updated_at` 由框架维护、
+  每次写都变，与业务排序（`value.updated_at`）不同源，用它会引入"翻页序 ≠ 列表序"。
+- **文本排序键必须显式 `COLLATE "C"`**。ISO-8601 UTC 时间串的文本序 ≡ 时间序，
+  但只在字节序下成立；库 collation（本生产为 `en_US.utf8`）一变就可能漂。
+  生产实测两种 collation 对本数据集结果相同，但**不能依赖这个巧合**。
+- **表达式索引必须与查询的排序键是同一个表达式**（本实现用同一常量 `_SORT_KEY_EXPR`
+  拼装两处），差一个 `COALESCE` 就用不上索引。验证方式：临时表 + `SET enable_seqscan=off`
+  看 EXPLAIN 是否为 `Index Scan`（生产实测：无 Sort 节点，索引序即输出序）。
+- **取全要有防呆上限 + 显式告警**：无界循环遇上排序键脏数据就是死循环。本实现两条保险：
+  游标严格递减断言（不满足即 break + error）、页数上限（触顶 error）。
+
+**验证**：`python tests/spikes/asearch_session_list.py` —— **55 断言 ALL PASS**，
+ast 提取两个文件的真实函数执行。含：跨 3 页取全不重不漏、**全表同一 updated_at
+（每个页边界都是 tie）不漏不重**、分页拼接 == 取全、缺 updated_at 排末尾、
+游标不推进时停止、触顶告警、非法 cursor 报 400，以及源码级断言
+（sessions.py 不再出现 `.asearch(` 调用、SQL 不含 `LIKE`/`OFFSET`、索引表达式
+与排序键同源）。生产库（agent_mem_prod）用代码生成的 SQL 端到端验证：
+首页 5 条 + 第二页 5 条与全量排序前 10 条完全一致，计数 15 与旧实现相同。
 

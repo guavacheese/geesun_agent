@@ -1,132 +1,168 @@
-"""Spike: 验证会话列表从 __index__ 手工索引切换到 store.asearch 前缀遍历（2026-09-12）。
+"""Spike: 会话列表走稳定 keyset 游标分页（2026-09-12 二次改造）。
 
 不依赖 pytest，直接：python tests/spikes/asearch_session_list.py
 
-与既有 spike 一致的取向：**不做逻辑复刻**。用 ast 从 sessions.py 真实源码中
-提取 `_alist_sessions` 与相关常量并 exec 执行——测的是真实代码。若将来有人
-把越权过滤删掉、或把 limit 去掉（退回默认 10 静默截断），本脚本立刻失败。
+与既有 spike 一致的取向：**不做逻辑复刻**。用 ast 从 `sessions.py` / `database.py`
+真实源码里提取被改造的函数与常量并 exec 执行——测的是真实代码，不是副本。
+若将来有人把 keyset 换回 `asearch`、把游标去掉、或退回 offset 翻页，本脚本立刻失败。
 
-背景：`list_sessions` 原实现维护一个 `__index__` key 作为会话 id 列表，
-注释理由是「store 不直接支持遍历 namespace」。该前提错误：`BaseStore`
-有 `asearch(namespace_prefix, *, limit=10, offset=0, ...)`
-（langgraph/store/base/__init__.py:1021），Postgres 侧走 `prefix LIKE`
-并有 `store_prefix_idx ... text_pattern_ops` 支撑。
-代价是数据与索引两次独立写、非原子，任一失败即分叉（历史 bug 来源）。
-
-改用 asearch 后必须自己承担两个 langgraph 不管的约束，本脚本就是钉这两条：
-  1. `limit` 默认 10，会**静默截断** → 必须显式传，且分页时偏移正确
-  2. 前缀匹配**不认命名空间边界**：`sessions.GY2442` 会捞到 `sessions.GY24428`
-     的数据 → 必须按 `Item.namespace` 精确过滤，否则串用户（越权）
+演进脉络：
+  ① 原实现维护 `__index__` key 作会话 id 列表（数据+索引两次非原子写 → 分叉隐患）
+  ② 改为 `asearch` 前缀遍历 + `limit=1000` 一次取全（消掉了分叉，但留下静默截断）
+  ③ 本次：`asearch_keyset` —— `prefix = %s` 精确匹配 + `(updated_at, key)` 元组游标
+     + 全序排序。彻底消掉 asearch 的三个坑：
+       - `ORDER BY store.updated_at DESC` 单列非唯一 → 无全序，OFFSET 翻页漏条/重复
+       - `prefix LIKE` 不认命名空间边界 → 越权过滤只能放应用层，与数据库端 OFFSET
+         计数错位 → **分页在结构上不可能正确**
+       - `limit` 默认 10 → 不显式传就静默截断
 
 覆盖：
-  1. 正常：3 个会话全部返回，字段透传
-  2. 越权：GY2442 检索时混入 GY24428 条目 → 必须被过滤，且不泄漏
-  3. 历史遗留 `__index__` 条目被跳过
-  4. 非 dict 的 value 被跳过（不抛异常）
-  5. 分页：> 单页条数时能翻页取全，且不重不漏
-  6. 源码级断言：asearch 调用必须显式传 limit；必须存在 namespace 相等过滤
+  1. 取全：跨多页推进，不重不漏
+  2. 跨页边界上的 tie（同 updated_at）不漏不重（key 破平局）
+  3. 分页模式：next_cursor 续页拼接 == 取全结果
+  4. 缺 updated_at 的脏条目排末尾，且不破坏游标推进
+  5. 历史遗留 `__index__` 被跳过；非 dict 的 value 被跳过
+  6. 游标未推进（排序键错乱）→ 停止并打 error，不进入死循环
+  7. 取全触达防呆页数上限 → 打 error（不是静默截断）
+  8. 非法 cursor → HTTPException（不能当成"从头发"）
+  9. 源码级断言：sessions.py 不再调用 asearch；SQL 不含 LIKE / OFFSET
 """
 
 from __future__ import annotations
 
 import ast
+import base64
 import pathlib
 import sys
-from datetime import datetime, timezone
-from types import SimpleNamespace
 
-SESSIONS_PY = (
-    pathlib.Path(__file__).resolve().parents[2] / "src" / "api" / "endpoints" / "sessions.py"
-)
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+SESSIONS_PY = ROOT / "src" / "api" / "endpoints" / "sessions.py"
+DATABASE_PY = ROOT / "src" / "infra" / "database.py"
 
-# ── 从真实源码提取 _alist_sessions + 相关常量（不 import 模块，避开 fastapi 依赖）──
-_src = SESSIONS_PY.read_text(encoding="utf-8")
-_tree = ast.parse(_src)
 
-_WANTED_CONSTS = {"_SESSION_MAX_ITEMS", "_LEGACY_INDEX_KEY"}
-_WANTED_FUNCS = {"_alist_sessions"}
+# ─── 通用：ast 提取指定常量 / 函数并 exec ───
+def extract(path: pathlib.Path, consts: set[str], funcs: set[str]) -> tuple[dict, str, ast.Module]:
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    nodes: list[ast.stmt] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id in consts:
+                    nodes.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in funcs:
+            nodes.append(node)
+    missing = funcs - {
+        n.name for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    found_consts = {
+        t.id for n in nodes if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Name)
+    }
+    assert not missing, f"{path.name} 中找不到这些函数: {missing}"
+    assert not (consts - found_consts), f"{path.name} 中找不到这些常量: {consts - found_consts}"
 
-_nodes: list[ast.stmt] = []
-for node in _tree.body:
-    if isinstance(node, ast.Assign):
-        for tgt in node.targets:
-            if isinstance(tgt, ast.Name) and tgt.id in _WANTED_CONSTS:
-                _nodes.append(node)
-    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _WANTED_FUNCS:
-        _nodes.append(node)
+    ns: dict = {
+        "base64": base64, "str": str, "int": int, "len": len, "list": list,
+        "dict": dict, "tuple": tuple, "range": range, "type": type,
+        "isinstance": isinstance, "Exception": Exception,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+            f"<{path.name}>",
+            "exec",
+        ),
+        ns,
+    )
+    return ns, src, tree
 
-_missing = _WANTED_FUNCS - {
-    n.name for n in _nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-}
-assert not _missing, f"sessions.py 中找不到这些定义: {_missing}"
 
-# 记录 warning 调用，验证越权时会告警
-_warnings: list[str] = []
+# ─── 记录日志调用（验证告警/错误确实打了） ───
+_logs: list[str] = []
 
 
 class _Logger:
-    def warning(self, fmt, *args, **kwargs):
+    def _rec(self, level: str, fmt, args) -> None:
         try:
-            _warnings.append(fmt % args)
-        except Exception:
-            _warnings.append(str(fmt))
+            _logs.append(f"{level}: {fmt % args}")
+        except Exception:  # noqa: BLE001
+            _logs.append(f"{level}: {fmt}")
 
-    def error(self, fmt, *args, **kwargs):
-        _warnings.append("ERROR: " + str(fmt))
+    def warning(self, fmt, *args, **kwargs) -> None:
+        self._rec("WARN", fmt, args)
+
+    def error(self, fmt, *args, **kwargs) -> None:
+        self._rec("ERROR", fmt, args)
+
+    def info(self, fmt, *args, **kwargs) -> None:
+        self._rec("INFO", fmt, args)
 
 
-_ns: dict = {"logger": _Logger(), "list": list, "dict": dict, "tuple": tuple,
-             "len": len, "isinstance": isinstance, "logger_warn": _warnings}
-exec(
-    compile(
-        ast.fix_missing_locations(ast.Module(body=_nodes, type_ignores=[])),
-        "<sessions.py::_alist_sessions>",
-        "exec",
-    ),
-    _ns,
+class HTTPException(Exception):
+    def __init__(self, status_code: int | None = None, detail=None) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+# ─── 提取 sessions.py 的被测单元 ───
+_sess_ns, _sess_src, _sess_tree = extract(
+    SESSIONS_PY,
+    consts={"_SESSION_PAGE_SIZE", "_SESSION_MAX_PAGES", "_SESSION_PAGE_LIMIT",
+            "_LEGACY_INDEX_KEY", "_CURSOR_SEP"},
+    funcs={"_ns_text", "_session_namespace", "_encode_cursor", "_decode_cursor",
+           "_to_session_row", "_alist_sessions", "_cursor_of"},
 )
-alist_sessions = _ns["_alist_sessions"]
-MAXI = _ns["_SESSION_MAX_ITEMS"]
-LEGACY = _ns["_LEGACY_INDEX_KEY"]
+_sess_ns["logger"] = _Logger()
+_sess_ns["HTTPException"] = HTTPException
+# 再 exec 一遍，让函数闭包看到注入的 logger / HTTPException
+_bootstrap = _sess_ns["_alist_sessions"].__globals__
+_bootstrap["logger"] = _sess_ns["logger"]
+_bootstrap["HTTPException"] = HTTPException
 
-print(f"提取成功: MAX={MAXI} LEGACY={LEGACY!r}")
+alist_sessions = _sess_ns["_alist_sessions"]
+PAGE_SIZE = _sess_ns["_SESSION_PAGE_SIZE"]
+MAX_PAGES = _sess_ns["_SESSION_MAX_PAGES"]
+LEGACY = _sess_ns["_LEGACY_INDEX_KEY"]
+ns_text = _sess_ns["_ns_text"]
+session_namespace = _sess_ns["_session_namespace"]
 
-
-# ── 假 store：忠实模拟 Postgres 的 `prefix LIKE 'ns%'` 语义 ──
-def _ns_text(ns: tuple) -> str:
-    return ".".join(ns)
-
-
-def make_item(namespace: tuple, key: str, value):
-    return SimpleNamespace(
-        namespace=tuple(namespace),
-        key=key,
-        value=value,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
-    )
+print(f"提取成功: PAGE_SIZE={PAGE_SIZE} MAX_PAGES={MAX_PAGES} LEGACY={LEGACY!r}")
 
 
+# ─── 假 store：忠实模拟 asearch_keyset 的 SQL 语义 ───
 class FakeStore:
-    """按 prefix LIKE 检索，故意实现 langgraph 的 limit=10 默认值截断行为。"""
+    """精确 prefix 匹配（非 LIKE）+ (updated_at, key) 全序 + 元组游标 + pinned 过滤。
 
-    def __init__(self, items: list):
+    `broken=True` 时忽略游标、永远返回同一页 —— 模拟排序键错乱的脏数据，
+    用来验证调用方的"游标未推进"保护真的会触发。
+    """
+
+    def __init__(self, items: list[tuple[str, str, object]], broken: bool = False):
         self.items = items
+        self.broken = broken
         self.calls: list[dict] = []
 
-    async def asearch(self, namespace, **kwargs):
-        limit = kwargs.get("limit", 10)          # ← 与 langgraph 默认值一致
-        offset = kwargs.get("offset", 0)
-        # 记录调用方**实际传入**的实参，用于断言 offset 有没有被用到
-        self.calls.append({"namespace": namespace, "limit": limit, "offset": offset,
-                           "raw_kwargs": dict(kwargs)})
-        prefix = _ns_text(namespace)
-        # 关键：LIKE 'prefix%' 会把更长的同前缀 namespace 一并命中
-        matched = [
-            it for it in self.items
-            if _ns_text(it.namespace).startswith(prefix)
-        ]
-        return matched[offset: offset + limit]
+    @staticmethod
+    def _sk(value) -> str:
+        return value.get("updated_at", "") if isinstance(value, dict) else ""
+
+    async def asearch_keyset(self, prefix, *, limit, cursor=None, pinned=None):
+        self.calls.append(
+            {"prefix": prefix, "limit": limit, "cursor": cursor, "pinned": pinned}
+        )
+        rows = [(k, v) for (p, k, v) in self.items if p == prefix]  # ← 精确相等
+        if pinned is True:
+            rows = [(k, v) for k, v in rows
+                    if isinstance(v, dict) and v.get("pinned") is True]
+        elif pinned is False:
+            rows = [(k, v) for k, v in rows
+                    if not (isinstance(v, dict) and v.get("pinned") is True)]
+        rows.sort(key=lambda kv: (self._sk(kv[1]), kv[0]), reverse=True)
+        if cursor is not None and not self.broken:
+            rows = [kv for kv in rows if (self._sk(kv[1]), kv[0]) < cursor]
+        return rows[:limit]
 
 
 _FAILS: list[str] = []
@@ -145,101 +181,205 @@ def run(coro):
     return asyncio.run(coro)
 
 
-# ── 用例 1：正常返回 ──
-print("\n[1] 正常：3 个会话全部返回，字段透传")
-ns_a = ("sessions", "GY24428")
-store = FakeStore([
-    make_item(ns_a, "s1", {"title": "会话一", "updated_at": "2026-09-01", "pinned": False}),
-    make_item(ns_a, "s2", {"title": "会话二", "updated_at": "2026-09-02", "pinned": True}),
-    make_item(ns_a, "s3", {"title": "会话三", "updated_at": "2026-09-03"}),
-])
-rows = run(alist_sessions(store, ns_a))
-check(len(rows) == 3, f"返回 3 条（实际 {len(rows)}）")
-check({r["session_id"] for r in rows} == {"s1", "s2", "s3"}, "session_id 正确注入")
-check(any(r.get("title") == "会话二" for r in rows), "title 字段透传")
-check(all(c["limit"] != 10 for c in store.calls),
-      f"limit 显式传入且不等于默认 10（实际 {[c['limit'] for c in store.calls]}）")
+NS = ("sessions", "GY24428")
+PFX = ns_text(NS)
 
-# ── 用例 2：越权防护（本 spike 的核心）──
-print("\n[2] 越权：GY2442 检索捞到 GY24428 的条目 → 必须过滤")
-_warnings.clear()
-ns_short = ("sessions", "GY2442")
-store = FakeStore([
-    make_item(ns_short, "mine", {"title": "我自己的会话"}),
-    # 下面这条会被 prefix LIKE 'sessions.GY2442%' 命中，但属于别人
-    make_item(("sessions", "GY24428"), "victim", {"title": "别人的机密会话"}),
-])
-rows = run(alist_sessions(store, ns_short))
-ids = {r["session_id"] for r in rows}
-check(ids == {"mine"}, f"只返回本人会话（实际 {ids}）")
-check("victim" not in ids, "未泄漏 GY24428 的会话（串用户防护生效）")
-check(any("命名空间不匹配" in w for w in _warnings), "越权命中时打出 warning 日志")
 
-# ── 用例 3：历史遗留 __index__ 被跳过 ──
-print("\n[3] 历史遗留 __index__ 条目被跳过")
-store = FakeStore([
-    make_item(ns_a, LEGACY, {"items": ["s1", "s2"]}),   # 老索引，无业务字段
-    make_item(ns_a, "s1", {"title": "会话一"}),
-])
-rows = run(alist_sessions(store, ns_a))
-check(len(rows) == 1 and rows[0]["session_id"] == "s1",
-      f"只返回真实会话，跳过 __index__（实际 {[r['session_id'] for r in rows]}）")
+def ts_of(i: int) -> str:
+    """第 i 条的时间戳：单调递增且**字面量长度恒定**。
 
-# ── 用例 4：非 dict value 被跳过且不抛异常 ──
-print("\n[4] 非 dict 的 value 被跳过（不抛异常）")
-store = FakeStore([
-    make_item(ns_a, "bad", ["not", "a", "dict"]),
-    make_item(ns_a, "good", {"title": "正常"}),
-])
-try:
-    rows = run(alist_sessions(store, ns_a))
-    check(len(rows) == 1 and rows[0]["session_id"] == "good",
-          f"跳过脏数据后仍返回正常条目（实际 {[r['session_id'] for r in rows]}）")
-except Exception as e:  # noqa: BLE001
-    check(False, f"不应抛异常，但抛出 {type(e).__name__}: {e}")
+    直接用 `f"{i:02d}"` 会踩坑——i=100 时变成 "100"（3 位），
+    字符串序在 "00:99" 与 "00:100" 之间反转，测出的"顺序不对"是造数的错，
+    不是被测代码的错。
+    """
+    h, rem = divmod(i, 3600)
+    m, s = divmod(rem, 60)
+    return f"2026-09-01T{h:02d}:{m:02d}:{s:02d}.000000+00:00"
 
-# ── 用例 5：单次取全（不再 offset 翻页）──
-print("\n[5] 单次取全：造 120 条（超过 langgraph 默认 limit 10）→ 一次调用全取回")
-n = 120
-store = FakeStore([make_item(ns_a, f"s{i:04d}", {"title": f"会话{i}"}) for i in range(n)])
-rows = run(alist_sessions(store, ns_a))
+
+def mk(n: int, *, prefix: str = PFX) -> list[tuple[str, str, dict]]:
+    """造 n 条会话，updated_at 单调递增（编号越大越新），便于断言顺序。"""
+    return [
+        (prefix, f"s{i:05d}", {"title": f"会话{i}", "updated_at": ts_of(i)})
+        for i in range(n)
+    ]
+
+
+# ── 用例 1：取全（跨多页）──
+print("\n[1] 取全：450 条（跨 3 页 200/200/50）→ 不重不漏")
+n = 450
+store = FakeStore(mk(n))
+rows, next_cursor = run(alist_sessions(store, PFX))
 ids = [r["session_id"] for r in rows]
 check(len(rows) == n, f"取全 {n} 条（实际 {len(rows)}）")
 check(len(set(ids)) == n, f"无重复（去重后 {len(set(ids))}）")
-check(len(store.calls) == 1, f"只调用一次 asearch（实际 {len(store.calls)} 次）")
-check(store.calls[0]["limit"] == MAXI,
-      f"显式传 limit={MAXI}（实际 {store.calls[0]['limit']}）")
-check("offset" not in store.calls[0]["raw_kwargs"],
-      f"未向 asearch 传 offset（实参 {sorted(store.calls[0]['raw_kwargs'])}）")
+check(len(store.calls) == 3, f"分 3 页拉取（实际 {len(store.calls)} 次）")
+check(all(c["limit"] == PAGE_SIZE for c in store.calls),
+      f"每页 limit 都是显式 {PAGE_SIZE}（实际 {[c['limit'] for c in store.calls]}）")
+check(store.calls[0]["cursor"] is None, "首页不带 cursor")
+check(all(c["cursor"] is not None for c in store.calls[1:]), "后续页都带 cursor")
+check(ids == sorted(ids, reverse=True), "结果按 updated_at+key 降序（编号大的在前）")
+check(next_cursor is None, "取全模式不返回 next_cursor")
+check(store.calls[0]["prefix"] == PFX, f"传的是精确 prefix（{store.calls[0]['prefix']}）")
 
-# ── 用例 6：拉取上限生效 ──
-print(f"\n[6] 拉取上限：造 {MAXI + 50} 条 → 最多取 {MAXI} 条并告警")
-_warnings.clear()
-store = FakeStore([make_item(ns_a, f"x{i:05d}", {"title": "t"}) for i in range(MAXI + 50)])
-rows = run(alist_sessions(store, ns_a))
-check(len(rows) <= MAXI, f"不超过上限 {MAXI}（实际 {len(rows)}）")
-check(any("上限" in w for w in _warnings), "达到上限时打出 warning")
+# ── 用例 2：全表同一 updated_at → 每个页边界都是 tie ──
+print("\n[2] 全部同 updated_at（每个页边界都是 tie）→ 不漏不重，退化为按 key 降序")
+_same_ts = ts_of(0)
+items = [(PFX, f"t{i:05d}", {"title": "t", "updated_at": _same_ts}) for i in range(n)]
+store = FakeStore(items)
+rows, _ = run(alist_sessions(store, PFX))
+ids = [r["session_id"] for r in rows]
+check(len(rows) == n, f"取全 {n} 条（实际 {len(rows)}）")
+check(len(set(ids)) == n, f"tie 未导致重复（去重后 {len(set(ids))}）")
+check(set(ids) == {f"t{i:05d}" for i in range(n)}, "tie 未导致漏条")
+check(ids == sorted(ids, reverse=True), "同时间戳时退化为 key 降序（全序仍成立）")
+check(store.calls[1]["cursor"][0] == _same_ts,
+      "第 2 页游标确实落在 tie 组内（页边界就是 tie）")
 
-# ── 用例 7：源码级断言（防止改回默认 limit / 删掉越权过滤）──
-print("\n[7] 源码级断言")
-fn_src = ast.get_source_segment(_src, next(
-    n for n in _tree.body
-    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_alist_sessions"
-))
-check("limit=" in fn_src, "asearch 调用显式传入 limit（否则退回默认 10 静默截断）")
-check("offset=" not in fn_src,
-      "代码中未使用 offset= 实参（Postgres 按 updated_at 排序，翻页会漏条/重复）")
-check("item.namespace" in fn_src, "存在按 Item.namespace 的过滤（越权防护）")
-check("_LEGACY_INDEX_KEY" in fn_src, "跳过历史 __index__ 条目")
+# ── 用例 3：分页模式，续页拼接收敛到取全 ──
+print("\n[3] 分页模式：limit=7 逐页续拉 == 取全结果")
+mk_items = mk(53)
+full_rows, _ = run(alist_sessions(FakeStore(list(mk_items)), PFX))
+full_ids = [r["session_id"] for r in full_rows]
 
-# 全文件：不应再有索引写入
-check('"__index__"' not in _src.replace('_LEGACY_INDEX_KEY = "__index__"', ""),
-      "sessions.py 中不再有 __index__ 字符串字面量写入点")
-chat_src = (SESSIONS_PY.parent / "chat.py").read_text(encoding="utf-8")
-check('aput(session_ns, "__index__"' not in chat_src,
-      "chat.py 中不再写 __index__ 索引")
-check("_update_session_index" not in _src,
-      "sessions.py 中 _update_session_index 函数已移除")
+paged_ids, cursor, pages = [], None, 0
+while True:
+    store = FakeStore(list(mk_items))
+    page, cursor = run(alist_sessions(store, PFX, limit=7, cursor=cursor))
+    paged_ids.extend(r["session_id"] for r in page)
+    pages += 1
+    if cursor is None:
+        break
+    check(store.calls[0]["limit"] == 7, f"第 {pages} 页 limit=7")
+check(paged_ids == full_ids, f"分页拼接 == 取全（{len(paged_ids)} 条，{pages} 页）")
+check(len(paged_ids) == len(set(paged_ids)), "分页无重复")
+
+# 末尾页不满 → next_cursor 必须为 None（否则前端会无限翻）
+store = FakeStore(mk(5))
+page, cursor = run(alist_sessions(store, PFX, limit=7))
+check(len(page) == 5 and cursor is None, "不足一页时 next_cursor=None")
+
+# ── 用例 4：缺 updated_at 的脏条目排末尾 ──
+print("\n[4] 缺 updated_at 的条目：排末尾且不破坏游标")
+items = mk(3) + [(PFX, "no_ts_1", {"title": "缺时间"}), (PFX, "no_ts_2", {"title": "缺时间2"})]
+store = FakeStore(items)
+rows, _ = run(alist_sessions(store, PFX))
+ids = [r["session_id"] for r in rows]
+check(len(rows) == 5, f"5 条全部返回（实际 {len(rows)}）")
+check(ids[-2:] == ["no_ts_2", "no_ts_1"], f"缺时间的排在末尾（实际 {ids[-2:]}）")
+# 分页穿越末尾脏条目
+paged, cursor2 = [], None
+while True:
+    st = FakeStore(list(items))
+    page, cursor2 = run(alist_sessions(st, PFX, limit=2, cursor=cursor2))
+    paged.extend(r["session_id"] for r in page)
+    if cursor2 is None:
+        break
+check(len(paged) == 5 and len(set(paged)) == 5, f"分页同样不重不漏（{paged}）")
+
+# ── 用例 5：__index__ 与非 dict 被跳过 ──
+print("\n[5] 历史 __index__ 与非 dict value 被跳过")
+store = FakeStore([
+    (PFX, LEGACY, {"items": ["s1", "s2"]}),
+    (PFX, "s1", {"title": "会话一"}),
+    (PFX, "bad", ["not", "a", "dict"]),
+])
+_logs.clear()
+rows, _ = run(alist_sessions(store, PFX))
+ids = [r["session_id"] for r in rows]
+check(ids == ["s1"], f"只返回可用条目（实际 {ids}）")
+check(any("不是 dict" in w for w in _logs), "非 dict 时打 warning")
+
+# ── 用例 6：游标未推进 → 停止 + error（不死循环）──
+print("\n[6] 排序键错乱（游标不推进）→ 停止并打 error")
+_logs.clear()
+store = FakeStore(mk(300), broken=True)
+rows, _ = run(alist_sessions(store, PFX))
+check(len(rows) == 2 * PAGE_SIZE, f"拉满 2 页后停止（实际 {len(rows)} 条）")
+check(any("游标未推进" in w for w in _logs), "打出「游标未推进」error")
+check(len(store.calls) == 2, f"只请求了 2 次（实际 {len(store.calls)}）")
+
+# ── 用例 7：取全触达防呆上限 ──
+print(f"\n[7] 触达防呆上限 {MAX_PAGES} 页 → 打 error（非静默截断）")
+total = PAGE_SIZE * MAX_PAGES + 137      # 比上限多，必然触顶
+_logs.clear()
+store = FakeStore(mk(total))
+rows, _ = run(alist_sessions(store, PFX))
+check(len(rows) == PAGE_SIZE * MAX_PAGES, f"取到上限条数（实际 {len(rows)}）")
+check(any("防呆上限" in w for w in _logs), "打出「防呆上限」error")
+check(len(rows) < total, f"确实少于总数 {total}（说明触顶被显式告警，而非静默）")
+
+# ── 用例 8：非法 cursor ──
+print("\n[8] 非法 cursor → HTTPException（400）")
+for bad in ("!!!not-base64!!!", base64.urlsafe_b64encode(b"noseparator").decode().rstrip("=")):
+    try:
+        run(alist_sessions(FakeStore(mk(3)), PFX, limit=2, cursor=bad))
+        check(False, f"非法 cursor 应报错: {bad[:16]}...")
+    except HTTPException as e:
+        check(e.status_code == 400, f"非法 cursor 报 400（{bad[:16]}...）")
+
+# ── 用例 9：源码级断言 ──
+print("\n[9] 源码级断言")
+
+# sessions.py：不得再调用 .asearch(（ast 精确判断，避开注释里提到的 asearch）
+_asearch_calls = [
+    node for node in ast.walk(_sess_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "asearch"
+]
+check(not _asearch_calls, "sessions.py 不再调用 store.asearch（避免其三个坑）")
+
+_keyset_calls = [
+    node for node in ast.walk(_sess_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "asearch_keyset"
+]
+check(len(_keyset_calls) >= 2, f"取全与分页两条路径都走 asearch_keyset（{len(_keyset_calls)} 处）")
+
+_offset_kwargs = [
+    kw for node in ast.walk(_sess_tree)
+    if isinstance(node, ast.Call)
+    for kw in node.keywords if kw.arg == "offset"
+]
+check(not _offset_kwargs, "代码中没有任何 offset= 实参")
+check("_encode_cursor" in _sess_src and "_decode_cursor" in _sess_src, "游标编解码存在")
+
+# database.py：SQL 形状不得退回 LIKE / OFFSET
+_db_ns, _db_src, _db_tree = extract(
+    DATABASE_PY,
+    consts={"_SORT_KEY_EXPR", "_SESSIONS_ORDER_INDEX", "_SESSIONS_ORDER_INDEX_DDL"},
+    funcs={"_build_keyset_query"},
+)
+build_sql = _db_ns["_build_keyset_query"]
+_sort_expr = _db_ns["_SORT_KEY_EXPR"]
+_index_ddl = _db_ns["_SESSIONS_ORDER_INDEX_DDL"]
+sql_first = build_sql(with_cursor=False, pinned=None)
+sql_cursor = build_sql(with_cursor=True, pinned=False)
+sql_pinned = build_sql(with_cursor=False, pinned=True)
+check("prefix = %s" in sql_first, "SQL 用 prefix = %s 精确匹配（越权问题从根上消失）")
+check("LIKE" not in sql_first.upper(), "SQL 不含 LIKE")
+check("OFFSET" not in sql_cursor.upper(), "SQL 不含 OFFSET（改用元组游标）")
+check("(%s::text, %s::text)" in sql_cursor, "游标是元组比较 (ts, key) < (c1, c2)")
+check(sql_first.count("ORDER BY") == 1 and ", key DESC" in sql_first,
+      "ORDER BY 是两列全序（updated_at DESC, key DESC）")
+check("COLLATE" in sql_first, "排序键显式 COLLATE（不随库 collation 漂移）")
+check("COALESCE" in sql_first, "NULL 排序键被 COALESCE 兜住")
+check(sql_first.count(_sort_expr) == 1, "排序键表达式在 ORDER BY 中只出现一次")
+check("IS DISTINCT FROM 'true'" in sql_cursor, "非置顶过滤使用 NULL 安全比较")
+check("value->>'pinned' = 'true'" in sql_pinned, "置顶过滤存在")
+
+# database.py：索引表达式必须与查询排序键**是同一个表达式**（否则索引用不上）
+check(_db_ns["_SESSIONS_ORDER_INDEX"] == "store_sessions_order_idx",
+      "索引名常量为 store_sessions_order_idx")
+check(_sort_expr in _index_ddl,
+      "索引表达式与查询排序键是同一个表达式（用同一常量拼装）")
+check("prefix" in _index_ddl and _index_ddl.rstrip().endswith("key DESC)"),
+      f"索引列为 (prefix, <排序键> DESC, key DESC)：{_index_ddl}")
+
+# 写入路径未被动过：aput 仍是唯一写入口
+check("store.aput" in _sess_src, "写入路径仍走 aput（本改造只换读路径）")
 
 # ── 汇总 ──
 print("\n" + "=" * 62)

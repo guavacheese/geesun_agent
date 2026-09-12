@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 from urllib.parse import quote_plus
 
@@ -23,6 +24,77 @@ logger = logging.getLogger(__name__)
 # 进而导致已完成的会话刷新空白、进行中任务消息静默丢失。
 # 改用连接池后每条操作各自拿独立连接，从根本上消除该碰撞。
 POSTGRES_POOL_MAX_SIZE = 20
+
+
+# ─── 稳定 keyset 分页（供会话列表使用，绕过 BaseStore.asearch） ───
+#
+# 为什么不能用 asearch 翻页（langgraph-checkpoint-postgres 3.1.0 源码实测）：
+#   base.py:526-534 的非向量搜索 SQL 是
+#     SELECT ... WHERE prefix LIKE %s ORDER BY store.updated_at DESC LIMIT %s OFFSET %s
+#   ① ORDER BY 只有 updated_at 一列且**非唯一**（PK 是 (prefix,key)，不参与排序）
+#      → 没有全序，OFFSET 翻页必然漏条/重复；
+#   ② namespace 条件只生成 `prefix LIKE %s`（base.py:446-449），没有 `prefix = %s`
+#      分支 → 越权过滤只能放应用层，而 OFFSET 的偏移量是**数据库端**算的
+#      → 只要用 LIKE 前缀 + 应用层过滤，分页在结构上不可能正确；
+#   ③ filter 的比较操作符（base.py:622-637）只作用于 value 字段的**文本**，
+#      没有 key 列、没有元组、没有 OR → 表达不了 (updated_at, key) < (c1, c2)。
+# 本模块改用：`prefix = %s` 精确相等 + 元组游标 + 全序排序，三条一次性消掉。
+#
+# 排序键取**业务字段** value->>'updated_at' 而不是框架的 store.updated_at：
+# 后者每次 aput 都变（重命名/pin 也算，base.py:388-393），
+# 且与 list_sessions 的业务排序（应用层按 value.updated_at 排）不一致。
+#
+# COLLATE "C" 把比较语义钉死为字节序——ISO-8601 UTC 时间串在字节序下等价于时间序
+# （生产 agent_mem_prod 21/21 条实测），且不随库 collation（现为 en_US.utf8）漂移。
+# COALESCE 兜住缺 updated_at 的脏条目，使其稳定排在末尾而不是 NULLS FIRST 抢头名。
+_SORT_KEY_EXPR = "COALESCE(value->>'updated_at', '') COLLATE \"C\""
+
+# 支撑上述查询的复合索引（prefix 放最前，同时服务等值匹配）。
+# 不用 partial index：`prefix = 'sessions.x'` 无法被 planner 用
+# `prefix LIKE 'sessions.%'` 的部分谓词证明蕴含。
+# 生产实测：顺序扫描关闭后 EXPLAIN 为 `Index Scan using store_sessions_order_idx`，
+# 且**没有 Sort 节点**（索引序即输出序，LIMIT 可提前收敛）。
+_SESSIONS_ORDER_INDEX = "store_sessions_order_idx"
+_SESSIONS_ORDER_INDEX_DDL = (
+    f"CREATE INDEX IF NOT EXISTS {_SESSIONS_ORDER_INDEX} "
+    f"ON store (prefix, ({_SORT_KEY_EXPR}) DESC, key DESC)"
+)
+
+
+def _build_keyset_query(*, with_cursor: bool, pinned: Optional[bool]) -> str:
+    """拼 keyset 查询。三个分支全是内部常量，无外部输入参与拼接。"""
+    cursor_clause = f"AND ({_SORT_KEY_EXPR}, key) < (%s::text, %s::text)" if with_cursor else ""
+    if pinned is True:
+        pinned_clause = "AND value->>'pinned' = 'true'"
+    elif pinned is False:
+        pinned_clause = "AND value->>'pinned' IS DISTINCT FROM 'true'"
+    else:
+        pinned_clause = ""
+    return f"""
+        SELECT key, value
+        FROM store
+        WHERE prefix = %s
+          {cursor_clause}
+          {pinned_clause}
+        ORDER BY {_SORT_KEY_EXPR} DESC, key DESC
+        LIMIT %s
+    """
+
+
+@asynccontextmanager
+async def _acquire(conn):
+    """从 store 的 conn 取一条连接。
+
+    `AsyncPostgresStore.conn` 是**公开属性**，类型为 AsyncConnection 或
+    AsyncConnectionPool（aio.py:42/153 `self.conn = conn`）。本项目走
+    `from_conn_string(pool_config=...)`，拿到的是 AsyncConnectionPool，
+    用 psycopg_pool 的公开 `connection()` 借出连接。
+    """
+    if isinstance(conn, AsyncConnectionPool):
+        async with conn.connection() as c:
+            yield c
+    else:
+        yield conn
 
 
 def _build_dsn() -> str:
@@ -101,22 +173,32 @@ class ReconnectingAsyncPostgresStore:
 
     # ── 统一重试代理 ──
 
-    async def _call(self, method: str, *args, **kwargs):
+    async def _call_with(self, label: str, fn):
+        """在（必要时重建的）store 上执行 fn(store)，失败时重连重试一次。
+
+        `fn` 接收 store 实例并返回 awaitable——这样自写 SQL 的路径也能复用
+        同一套重连语义（`_call` 只能转发 store 自身的同名方法）。
+        """
         store = await self._ensure()
         for attempt in range(2):
             try:
-                return await getattr(store, method)(*args, **kwargs)
+                return await fn(store)
             except (psycopg.OperationalError, psycopg.InterfaceError) as e:
                 if attempt == 0:
                     logger.warning(
-                        "%s 失败（%s），尝试重连后重试...", method, e,
+                        "%s 失败（%s），尝试重连后重试...", label, e,
                     )
                     store = await self._reconnect()
                     continue
                 logger.error(
-                    "%s 重试后仍失败（%s），放弃", method, e,
+                    "%s 重试后仍失败（%s），放弃", label, e,
                 )
                 raise
+
+    async def _call(self, method: str, *args, **kwargs):
+        return await self._call_with(
+            method, lambda s: getattr(s, method)(*args, **kwargs)
+        )
 
     # ── 公开接口（与 AsyncPostgresStore 兼容） ──
 
@@ -134,12 +216,75 @@ class ReconnectingAsyncPostgresStore:
            并在需要全量时自行分页（offset）。
         2. 前缀匹配不认命名空间边界：`sessions.GY2442` 会同时匹配到 `sessions.GY24428`，
            因此调用方必须按 `Item.namespace` 做精确相等过滤，否则会串用户数据。
+
+        ⚠️ **不要用它做分页**——排序键 `store.updated_at` 非唯一（无全序），
+        且前缀 LIKE 与 OFFSET 的组合在结构上无法与越权过滤对齐。需要分页改用
+        `asearch_keyset`（见文件顶部该段的说明）。本方法保留给「按前缀捞少量条目」
+        这类不需要稳定序的场景。
         """
         return await self._call("asearch", namespace, **kwargs)
+
+    async def asearch_keyset(
+        self,
+        prefix: str,
+        *,
+        limit: int,
+        cursor: Optional[tuple[str, str]] = None,
+        pinned: Optional[bool] = None,
+    ) -> list[tuple[str, Any]]:
+        """在 store 表上按**精确 prefix** 做稳定 keyset 分页，返回 [(key, value)]。
+
+        参数：
+          prefix  命名空间文本（`".".join(namespace)`），走 `prefix = %s` 精确匹配，
+                  **不再有前缀越权问题**，调用方无需再做 namespace 相等过滤。
+          limit   本次取回条数（必传；没有"默认 10"这种隐式行为）。
+          cursor  上一页末条的 `(value->>'updated_at', key)`；None 表示取首页。
+                  元组比较保证同 updated_at 的多条不会漏也不会重。
+          pinned  仅筛选置顶/非置顶条目（`value->>'pinned'`）；None 表示不筛。
+
+        排序：`(value->>'updated_at' COLLATE "C") DESC, key DESC` —— 全序（key 破平局）。
+        `value` 由 psycopg 按 jsonb 自动解码成 dict，调用方不需要再反序列化。
+        """
+        if limit <= 0:
+            raise ValueError(f"limit 必须为正整数，收到 {limit}")
+
+        async def _run(store: AsyncPostgresStore):
+            sql = _build_keyset_query(with_cursor=cursor is not None, pinned=pinned)
+            params: list[Any] = [prefix]
+            if cursor is not None:
+                params.extend(cursor)
+            params.append(limit)
+            async with _acquire(store.conn) as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(sql, params)
+                    rows = await cur.fetchall()
+            return [(r["key"], r["value"]) for r in rows]
+
+        return await self._call_with("asearch_keyset", _run)
 
     async def setup(self):
         store = await self._ensure()
         await store.setup()
+        await self._ensure_sessions_order_index(store)
+
+    async def _ensure_sessions_order_index(self, store: AsyncPostgresStore) -> None:
+        """建立会话列表排序用的复合索引（幂等）。
+
+        这是**我们自己的 DDL**，挂在 langgraph 管理的 store 表上：ASearch 自带
+        `store_prefix_idx(prefix text_pattern_ops)` 只服务前缀 LIKE，不服务
+        `(updated_at, key)` 排序，所以必须自建。失败不阻断启动（索引只影响性能，
+        不影响正确性），但必须打 error 让运维可见。
+        """
+        try:
+            async with _acquire(store.conn) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(_SESSIONS_ORDER_INDEX_DDL)
+            logger.warning("会话列表排序索引已就绪: %s", _SESSIONS_ORDER_INDEX)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "创建会话列表排序索引 %s 失败（仅影响性能，不影响正确性）: %s",
+                _SESSIONS_ORDER_INDEX, e, exc_info=True,
+            )
 
     async def aclose(self):
         """关闭连接池，之后所有调用会抛出错误。"""

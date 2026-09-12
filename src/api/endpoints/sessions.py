@@ -1,9 +1,10 @@
+import base64
 import logging
 import os
 import shutil
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from src.api.deps import get_store, get_current_user
@@ -48,56 +49,131 @@ def _session_namespace(user_id: str) -> tuple:
     return ("sessions", user_id)
 
 
-# 单次拉取条数上限。asearch 的 limit 默认值是 10，会静默截断，必须显式放大。
-# 为什么不做 offset 翻页：langgraph 的 Postgres 实现在无向量索引时按
-# `ORDER BY store.updated_at DESC` 排序（store/postgres/base.py:533），该列
-# 非唯一且会被业务持续改写——翻页期间任何条目 updated_at 变化都会导致
-# 漏条或重复。会话元数据极小（每条约百字节），一次取全最稳。
-_SESSION_MAX_ITEMS = 1000
+def _ns_text(namespace: tuple) -> str:
+    """命名空间元组 → store 表里的 prefix 文本（与 langgraph 的约定一致）。"""
+    return ".".join(namespace)
+
+
+# ─── 会话列表读取：稳定 keyset 游标 ───
+# 不用 BaseStore.asearch 做列表/翻页，原因（langgraph-checkpoint-postgres 3.1.0 实测）：
+#   ① 它的排序键是 store.updated_at 单列、**非唯一**，PK (prefix,key) 不参与 → 无全序；
+#   ② namespace 条件只有 `prefix LIKE %s`，越权过滤只能放应用层，而 OFFSET 的偏移量
+#      是数据库端算的 → LIKE + 应用层过滤的组合在结构上无法分页；
+#   ③ limit 默认 10，不显式传就静默截断。
+# 改走 store.asearch_keyset（`prefix = %s` 精确 + 元组游标 + 全序），三条一次性消掉。
+# 排序键是**业务字段** value.updated_at，与下面的置顶排序一致（pin 不改 updated_at）。
+_SESSION_PAGE_SIZE = 200   # 逐页拉取的单页条数（取全模式下内部循环用它）
+_SESSION_MAX_PAGES = 50    # 取全模式的防呆上限（50×200=10000 条），触顶打 error 而非静默截断
+_SESSION_PAGE_LIMIT = 200  # HTTP 分页模式允许的最大 limit
 # 历史遗留的手工索引 key：它不是会话条目，读取时要跳过。
 _LEGACY_INDEX_KEY = "__index__"
 
+# 游标分隔符：unit separator，不会出现在 session_id（uuid 前 8 位）或 ISO 时间串里
+_CURSOR_SEP = "\x1f"
 
-async def _alist_sessions(store, namespace: tuple) -> list[dict]:
-    """按 namespace 前缀列出会话条目。
 
-    替代原先手工维护的 `__index__` 索引列表：直接让 store 按 prefix 检索
-    （Postgres 侧有 `store_prefix_idx ... text_pattern_ops` 支持），
-    避免"数据与索引两次独立写、任一失败即分叉"的一致性风险。
+def _encode_cursor(updated_at: str, session_id: str) -> str:
+    raw = f"{updated_at}{_CURSOR_SEP}{session_id}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-    三处必须做的防御：
-    1. 显式传 limit：langgraph 默认 10 会**静默截断**，且不做 offset 翻页
-       （见 _SESSION_MAX_ITEMS 注释：updated_at 排序下翻页不稳）。
-    2. `asearch` 走 `prefix LIKE 'sessions.<user>%'`，不认命名空间边界——
-       用户 GY2442 会把 GY24428 的会话一并捞出来。因此按 `Item.namespace`
-       精确相等过滤，防止串用户（越权）。
-    3. 跳过历史遗留的 `__index__` 条目：它没有 title 等业务字段，
-       混进列表会让前端渲染异常。
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    """游标是不透明串；解不开就是非法输入，直接 400（不能当成"从头发"）。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        updated_at, session_id = raw.split(_CURSOR_SEP, 1)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"cursor 非法: {e}") from e
+    if not session_id:
+        raise HTTPException(status_code=400, detail="cursor 非法: session_id 为空")
+    return updated_at, session_id
+
+
+def _to_session_row(key: str, value) -> dict | None:
+    """store 条目 → 会话行；不可用的条目返回 None（跳过）。"""
+    if key == _LEGACY_INDEX_KEY:
+        return None
+    if not isinstance(value, dict):
+        logger.warning("会话 %s 的元数据不是 dict，已跳过: %r", key, type(value))
+        return None
+    return {"session_id": key, **value}
+
+
+async def _alist_sessions(
+    store,
+    prefix: str,
+    *,
+    limit: int | None = None,
+    cursor: str | None = None,
+    pinned: bool | None = None,
+) -> tuple[list[dict], str | None]:
+    """按 prefix 列出会话条目，返回 (行列表, next_cursor)。
+
+    limit=None → **取全**：内部按 `_SESSION_PAGE_SIZE` 逐页推进游标直到取完。
+                 不再有旧实现的「1000 条静默截断」，触达防呆上限会打 error。
+    limit=N    → 取一页，返回下一页游标（None 表示已到底）。
+    cursor     → 上一页末条的游标串（仅分页模式使用）。
+    pinned     → True/False 只取置顶/非置顶；None 不筛。
     """
-    batch = await store.asearch(namespace, limit=_SESSION_MAX_ITEMS)
-    if len(batch) >= _SESSION_MAX_ITEMS:
-        logger.warning(
-            "会话列表达到拉取上限 %d，可能未取全: namespace=%s",
-            _SESSION_MAX_ITEMS, namespace,
+    ts_key: tuple[str, str] | None = _decode_cursor(cursor) if cursor else None
+    rows: list[dict] = []
+
+    if limit is not None:
+        batch = await store.asearch_keyset(
+            prefix, limit=limit, cursor=ts_key, pinned=pinned
+        )
+        for key, value in batch:
+            row = _to_session_row(key, value)
+            if row is not None:
+                rows.append(row)
+        next_cursor = (
+            _encode_cursor(*_cursor_of(batch)) if len(batch) == limit else None
+        )
+        return rows, next_cursor
+
+    # ── 取全模式 ──
+    for _ in range(_SESSION_MAX_PAGES):
+        batch = await store.asearch_keyset(
+            prefix, limit=_SESSION_PAGE_SIZE, cursor=ts_key, pinned=pinned
+        )
+        if not batch:
+            break
+        for key, value in batch:
+            row = _to_session_row(key, value)
+            if row is not None:
+                rows.append(row)
+
+        new_ts_key = _cursor_of(batch)
+        if ts_key is not None and new_ts_key >= ts_key:
+            # 游标没有严格递减 → 再循环就是死循环，必须停（说明排序键有脏数据）
+            logger.error(
+                "会话游标未推进，提前停止: prefix=%s %s → %s", prefix, ts_key, new_ts_key
+            )
+            break
+        ts_key = new_ts_key
+
+        if len(batch) < _SESSION_PAGE_SIZE:
+            break
+    else:
+        # for 正常跑完 = 每页都是满页且已达上限 → 结果不完整，必须显式告警
+        logger.error(
+            "会话列表取全达到防呆上限 %d 页（%d 条），结果可能不完整: prefix=%s",
+            _SESSION_MAX_PAGES, _SESSION_MAX_PAGES * _SESSION_PAGE_SIZE, prefix,
         )
 
-    rows: list[dict] = []
-    for item in batch:
-        if item.key == _LEGACY_INDEX_KEY:
-            continue
-        if tuple(item.namespace) != tuple(namespace):
-            logger.warning(
-                "会话列表跳过命名空间不匹配的条目: expected=%s actual=%s key=%s",
-                namespace, item.namespace, item.key,
-            )
-            continue
-        if not isinstance(item.value, dict):
-            logger.warning(
-                "会话 %s 的元数据不是 dict，已跳过: %r", item.key, type(item.value)
-            )
-            continue
-        rows.append({"session_id": item.key, **item.value})
-    return rows
+    return rows, None
+
+
+def _cursor_of(batch: list[tuple[str, dict]]) -> tuple[str, str]:
+    """取一页末条的 (updated_at, key) 作为下一页游标。
+
+    必须与 SQL 的排序键表达式一致：`COALESCE(value->>'updated_at','')` ——
+    缺 updated_at 的脏条目在 SQL 里按 '' 排到末尾，游标也要用 ''。
+    """
+    key, value = batch[-1]
+    updated_at = value.get("updated_at", "") if isinstance(value, dict) else ""
+    return str(updated_at or ""), key
 
 
 def _messages_namespace(user_id: str, session_id: str) -> tuple:
@@ -121,27 +197,60 @@ class UpdateSessionRequest(BaseModel):
 
 @router.get("/sessions")
 async def list_sessions(
+    limit: int | None = Query(
+        None, ge=1, le=_SESSION_PAGE_LIMIT,
+        description="分页模式：本页条数。不传则返回全部（现有前端行为）。",
+    ),
+    cursor: str | None = Query(
+        None, description="分页模式：上一页返回的 next_cursor，不透明串。",
+    ),
     store=Depends(get_store),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    获取当前用户的所有会话列表。
-    按 updated_at 倒序排列。
+    """获取当前用户的会话列表。
+
+    两种模式：
+    - **不传 limit（默认，现有前端走这条）**：返回全部会话，按 updated_at 倒序、
+      pinned 置顶。走 keyset 游标逐页取全，不再有旧实现的 1000 条静默截断。
+    - **传 limit**：返回一页非置顶会话 + 全量置顶会话 + next_cursor。
+      置顶单独返回是必须的——置顶是应用层的第二段排序，若留在页内，
+      置顶项会散落各页、且 pin/unpin 会打乱游标语义。
+      （前端尚未接入此模式；接入时用它实现"加载更多"。）
     """
     user_id = current_user["user_id"]
-    namespace = _session_namespace(user_id)
+    prefix = _ns_text(_session_namespace(user_id))
 
-    # 直接按 namespace 前缀遍历，不再依赖手工维护的 __index__ 索引
+    if limit is None:
+        try:
+            sessions, _ = await _alist_sessions(store, prefix)
+        except Exception as e:
+            logger.error("遍历会话失败: %s", e, exc_info=True)
+            sessions = []
+
+        # 先按更新时间倒序，再稳定排序让 pinned 置顶（同一组内保持倒序）
+        sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+        sessions.sort(key=lambda s: not s.get("pinned", False))
+        return {"sessions": sessions}
+
+    # ── 分页模式 ──
+    # 这里不能让异常退化成空页：调用方会把空页当成"已到底"，从而静默丢数据。
     try:
-        sessions = await _alist_sessions(store, namespace)
+        page, next_cursor = await _alist_sessions(
+            store, prefix, limit=limit, cursor=cursor, pinned=False
+        )
+        pinned_sessions, _ = await _alist_sessions(store, prefix, pinned=True)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("遍历会话失败: %s", e, exc_info=True)
-        sessions = []
+        logger.error("分页遍历会话失败: %s", e, exc_info=True)
+        raise HTTPException(status_code=503, detail="会话列表暂时不可用，请重试") from e
 
-    # 先按更新时间倒序，再稳定排序让 pinned 置顶（同一组内保持倒序）
-    sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
-    sessions.sort(key=lambda s: not s.get("pinned", False))
-    return {"sessions": sessions}
+    pinned_sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+    return {
+        "sessions": page,
+        "pinned_sessions": pinned_sessions,
+        "next_cursor": next_cursor,
+    }
 
 
 # ─── 创建 ───
