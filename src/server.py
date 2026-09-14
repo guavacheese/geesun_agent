@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .api.router import api_router
 from .infra.database import _build_dsn, ReconnectingAsyncPostgresStore, ReconnectingAsyncPostgresSaver
+from .infra import trash
 
 
 # ──────────────────────────────────────────────
@@ -51,6 +52,7 @@ _disable_langgraph_print()
 
 
 from src.core.config import settings
+import asyncio
 import os
 import logging
 
@@ -67,6 +69,28 @@ def _load_skills() -> list[str]:
     found = [f"{skills_root}/{d}" for d in dirs if os.path.isdir(f"{skills_root}/{d}")]
     logging.warning(f"[DIAG] _load_skills: found skills={found}")
     return found
+
+
+async def _trash_sweep_loop(interval_seconds: int) -> None:
+    """周期清扫 <root>/.trash 下的超期条目（lifespan 启动，退出时 cancel）。
+
+    - 走 asyncio.to_thread：rmtree 是阻塞 IO，大目录删除不能卡事件循环。
+    - 异常只告警不抛出：一次清扫失败不该杀掉循环（下一轮自然重试）。
+    - TTL 判定在 trash.sweep_trash 内部用目录名时间戳完成，与 mtime 无关。
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            for root in (settings.report_root, settings.upload_root):
+                res = await asyncio.to_thread(
+                    trash.sweep_trash, root, settings.trash_ttl_seconds
+                )
+                if res["removed"]:
+                    logging.warning("[trash] 周期清扫 %s: %s", root, res)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logging.warning("[trash] 周期清扫异常（下轮重试）: %s", e)
 
 
 @asynccontextmanager
@@ -107,9 +131,28 @@ async def lifespan(app: FastAPI):
 
     await get_mcp_tools()
 
+    # ─── .trash 清扫（2026-09-14）───
+    # 删除会话失败的路径已把文件还原（trash.move_back），正常不残留；这里兜底
+    # 两种残留：① 事务已提交但 remove_trash 失败；② 进程在提交后、清理前崩溃。
+    # 残留只是不可见的 <root>/.trash/<sid>_<ms> 目录，无数据风险。
+    # 启动即清一次历史残留（阻塞 IO 走 to_thread，别卡事件循环）：
+    for _root in (settings.report_root, settings.upload_root):
+        try:
+            _swept = await asyncio.to_thread(
+                trash.sweep_trash, _root, settings.trash_ttl_seconds
+            )
+            if _swept["scanned"]:
+                logging.warning("[trash] 启动清扫 %s: %s", _root, _swept)
+        except Exception as e:  # noqa: BLE001 — 清扫失败不该阻止服务启动
+            logging.warning("[trash] 启动清扫失败 %s: %s", _root, e)
+    _trash_sweeper = asyncio.create_task(
+        _trash_sweep_loop(settings.trash_sweep_interval_seconds)
+    )
+
     yield  # ← 服务运行期间停在这里
 
     # 服务退出时手动关闭连接池
+    _trash_sweeper.cancel()
     await store.aclose()
     await checkpointer.aclose()
     logging.warning("Store + Checkpointer 连接池已关闭，服务退出完成")

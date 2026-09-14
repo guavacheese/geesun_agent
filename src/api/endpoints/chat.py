@@ -14,6 +14,7 @@ from src.infra.database import message_key
 from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
+from src.core import turn_registry
 from src.core.mcp import get_mcp_tools
 from src.api.deps import get_store, get_checkpointer, get_current_user
 from src.core.config import settings
@@ -839,7 +840,7 @@ async def chat(
             _anext.cancel()
 
 
-    async def event_stream():
+    async def _event_stream_inner():
         invoke_kwargs = {}
         # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
         if body.model_override:
@@ -1602,6 +1603,25 @@ async def chat(
             reason="normal",
         )
         yield "data: [DONE]\n\n"
+
+    async def event_stream():
+        """外层包装：登记在跑轮次，供删除端点 409 拒绝并发删除（2026-09-14）。
+
+        acquire/release 与 beat 都在这一层，_event_stream_inner 函数体一行不动：
+        - release 放在 finally：正常结束、异常、以及客户端断连（内层 :1557 的
+          强制持久化 finally 先执行完）都会走到——**release 一定发生在"写台账"
+          之后**，否则删除请求可能趁持久化过程中插进来。
+        - beat 挂在每个 chunk 上：token/工具事件密集时刷新活跃时间；空转期间由
+          内层的心跳哨兵（::interval 秒一个 chunk）继续刷新。陈旧判定（
+          turn_registry.STALE_MS）兜底进程被杀等 release 未执行的路径。
+        """
+        turn_registry.acquire(thread_id)
+        try:
+            async for _chunk in _event_stream_inner():
+                turn_registry.beat(thread_id)
+                yield _chunk
+        finally:
+            turn_registry.release(thread_id)
 
     return StreamingResponse(
         event_stream(),

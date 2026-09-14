@@ -536,3 +536,45 @@ DB 事务一旦失败，会话仍可见但用户上传的附件已被物理销�
   前面的步骤必须可逆（rename/copy/标记）。
 - spike 位置断言（`rmtree 只出现在 DB 事务之后`）比文本断言更防回归——
   顺序约束用 ast 行号表达，不靠正则。
+
+## 2026-09-14 追加：删除会话的两道护栏（409 租约 + .trash TTL 清扫）
+
+### ① 409 并发护栏（src/core/turn_registry.py）
+**动机**：删除会话与"正在跑的轮次"并发时，轮次结束的 _persist_session 会把数据写回来
+（复活成孤儿）。此前只有快照守卫（chat.py 的 session_existed_at_start）兜底。
+
+**实现**：进程内登记表 + 心跳陈旧判定（STALE_MS=5min）；chat.py 把原 event_stream
+改名 _event_stream_inner，外包一层 acquire/beat/release（release 在 finally，且因为
+外层 finally 晚于内层 finally，**必然发生在断连强制持久化之后**）；sessions.py 删除
+端点最先检查 is_active → 409。
+
+**诚实边界**：这不是"数学零窗口"，而是**不安全结果归零**：
+- 轮次先登记、删除后到 → 409 拒绝（零副作用）
+- 删除先完成、轮次后登记 → 快照守卫整轮跳过持久化
+- 残余窗口 = "快照(L358) → 登记(生成器启动)"之间的微秒级缝隙，由守卫兜底
+严格互斥需把 acquire 提到端点同步块，但客户端中断时会漏 release、只能靠 STALE_MS
+兜底，收益不抵复杂度——**不要为了"零窗口"的措辞引入新的泄漏面**。
+
+**踩坑预见**：单副本前提（生产 19 个服务均 1/1）；扩容到多副本时进程内表失效，
+需换 DB 租约（sessions 行存 turn_lease_until，删除端点读会话行时顺带判断）。
+护栏与守卫是**两层**，删任何一层都会留下不安全交错——spike 里专门断言守卫仍在。
+
+### ② .trash TTL 清扫（src/infra/trash.py + server.py lifespan）
+**关键陷阱（务必牢记）**：`os.rename` **保留原目录的 mtime**。若用 mtime 判 TTL，
+一个"内容很旧、刚移进 trash 等待 DB 事务结果"的目录会立刻超期被清掉——此时事务
+失败要 move_back 还原就没有可还原的东西了，等于把 2026-09-12 刚修好的数据丢失
+风险从后门放回来。**TTL 判定只用目录名里的毫秒时间戳**（= move 时刻）；解析不出
+时间戳的条目跳过 + 告警（不猜不删）。spike `trash_ttl_sweep.py` 有专门的回归用例：
+造一个 mtime=3 天前的目录，移入 trash 后 sweep(24h) 必须保留。
+
+其它约束：不跟随符号链接（只 unlink 链接本身）、只遍历 .trash 一级、
+FileNotFoundError 容忍（与还原并发）、清扫走 asyncio.to_thread（rmtree 阻塞 IO
+不能卡事件循环）、周期任务异常只告警不杀循环、退出时 cancel。
+
+**TTL 取值原则**：必须**远大于**一次删除事务的耗时（秒级）——24h 有足够余量；
+取小了会把"正在等待事务结果"的条目误清（同 mtime 陷阱的后果）。
+
+### 前端教训：静默吞错 = 功能隐形失效
+geesun_agent_web/app/chat/page.tsx 的 handleDelete 原本是 `catch { /* ignore */ }`，
+后端任何删除失败（含新增的 409）用户都看不到，表现为"点了没反应"。凡新增会返回
+非 2xx 的后端语义，必须同步检查前端 catch 是否把错误透出给用户。

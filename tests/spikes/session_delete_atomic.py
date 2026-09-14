@@ -88,34 +88,36 @@ check('"counts": counts' in sess_src, "响应带各表删除行数（验收可�
 check("删除会话失败，请重试" in sess_src, "事务失败 → 500 + 可重试语义（不静默吞）")
 
 # rename-to-trash 语义（2026-09-12 追加：rmtree 先行会毁附件——DB 失败后
-# 会话仍可见但上传文件已被物理销毁，不可逆数据丢失）
-check('.trash' in sess_src and "os.rename(session_dir, trash_dir)" in sess_src,
-      "文件先 rename 到 .trash（原子、可逆的预备删除），不再直接 rmtree")
-check(sess_src.count("os.rename(trash, orig)") == 2,
-      "两条失败路径（预备阶段失败 / DB 事务失败）都有还原循环")
-check("os.makedirs(os.path.dirname(trash_dir), exist_ok=True)" in sess_src,
-      "trash 父目录创建有 exist_ok（重复删除不炸）")
-check("ts = int(time.time() * 1000)" in sess_src,
-      "trash 目录用毫秒时间戳后缀（同会话重复删除不冲突）")
+# 会话仍可见但上传文件已被物理销毁，不可逆数据丢失）。
+# 2026-09-14 起文件侧逻辑抽到 src/infra/trash.py（可直测纯函数），本 spike 只
+# 断言"删除端点确实经由该模块 + 顺序正确"，数值/边界细节见 trash_ttl_sweep.py。
+check("trash.move_to_trash(" in sess_src and "trash.remove_trash(" in sess_src,
+      "文件侧走 trash 模块（rename-to-trash + 提交后删除），不再直接 rmtree")
+check(sess_src.count("trash.move_back(") == 2,
+      "两条失败路径（预备阶段失败 / DB 事务失败）都还原")
+check("shutil" not in sess_src,
+      "sessions.py 不再直接操作文件删除原语（收口到 trash 模块，便于单测）")
 
-# 位置断言（ast 行号）：prepare(rename) → DB 事务 → rmtree(trash)
+# 位置断言（ast 行号）：prepare(rename) → DB 事务 → remove_trash
 sess_tree = ast.parse(sess_src)
-rename_linenos: list[int] = []
-rmtree_linenos: list[int] = []
+move_linenos: list[int] = []
+remove_linenos: list[int] = []
 atomic_call_lineno = None
 for n in ast.walk(sess_tree):
-    if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "rename":
-        rename_linenos.append(n.lineno)
-    if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "rmtree":
-        rmtree_linenos.append(n.lineno)
-    if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "adelete_session_atomic":
-        atomic_call_lineno = n.lineno
-check(atomic_call_lineno is not None
-      and rmtree_linenos and min(rmtree_linenos) > atomic_call_lineno,
-      f"rmtree 只出现在 DB 事务（L{atomic_call_lineno}）之后（L{min(rmtree_linenos)} 起）"
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+        full = f"{getattr(n.func.value, 'id', '')}.{n.func.attr}"
+        if full == "trash.move_to_trash":
+            move_linenos.append(n.lineno)
+        elif full == "trash.remove_trash":
+            remove_linenos.append(n.lineno)
+        elif full == "store.adelete_session_atomic":
+            atomic_call_lineno = n.lineno
+check(atomic_call_lineno is not None and remove_linenos
+      and min(remove_linenos) > atomic_call_lineno,
+      f"物理删除只出现在 DB 事务（L{atomic_call_lineno}）之后（L{min(remove_linenos)}）"
       "——提交前绝不物理删文件，失败路径全程可逆")
-check(len(rename_linenos) >= 3 and min(rename_linenos) < atomic_call_lineno,
-      f"rename（移入 1 + 两条还原路径，共 {len(rename_linenos)} 处）预备阶段在 DB 事务之前")
+check(move_linenos and min(move_linenos) < atomic_call_lineno,
+      "文件预备（move_to_trash）在 DB 事务之前")
 
 # ─── 3. chat.py：并发护栏 ───
 print("\n[3] 防复活护栏（chat.py）")

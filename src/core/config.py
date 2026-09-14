@@ -192,6 +192,14 @@ class Settings(BaseSettings):
     # 1000 有 3.9× 余量 → 绝大多数会话与改造前的"全量返回"行为一致，
     # 仅超长会话退化为"最新 N 条 + 更早页游标"，避免一次拉出上兆 payload。
     persist_message_page_size: int = 1000
+    # ─── 会话文件 .trash 清扫（2026-09-14）───
+    # 删除会话的文件侧是 rename-to-trash（可逆预备）→ DB 事务 → 删 trash。
+    # 失败路径都会把 trash 还原，正常不残留；本项只兜底"事务已提交但清理失败"
+    # 与"进程在提交后崩溃"两种残留。TTL 必须**远大于**一次删除事务的耗时
+    # （秒级），否则可能清掉尚在等待事务结果的 trash 条目——24h 有足够余量。
+    trash_ttl_seconds: int = 86_400
+    # 周期清扫间隔。残留条目不可见、无数据风险，小时级足够；启动时另有一次清扫。
+    trash_sweep_interval_seconds: int = 3_600
     # ─── 加密文件识别（v3.1 护栏）───
     # 判断"是否加密"不靠扩展名，靠文件头魔数（公司 DLP 加密软件特征头）
     dlp_header_signatures: tuple[str, ...] = ("%TSD-Header",)

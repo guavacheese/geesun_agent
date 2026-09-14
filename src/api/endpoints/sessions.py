@@ -1,15 +1,15 @@
 import base64
 import logging
 import os
-import shutil
-import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from src.api.deps import get_store, get_current_user
+from src.core import turn_registry
 from src.core.config import settings
+from src.infra import trash
 from src.infra.database import message_key_to_index
 from src.infra.reports import snapshot_report_files
 
@@ -446,6 +446,21 @@ async def delete_session(
     if item is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
+    # ─── ① 并发护栏：有对话轮在跑时直接拒绝（2026-09-14，deer-flow 式 409）───
+    # 不加护栏的后果：删除刚清完台账，正在跑的轮次结束时 _persist_session 又把
+    # 数据写回来（复活成孤儿）。此前只有 chat 侧的 session_existed_at_start
+    # 快照守卫兜底（覆盖"轮次先跑、删除后到"的交错），这里把常见情形变成显式
+    # 拒绝，用户得到明确反馈而不是"删了又回来了"。
+    # 检查放在最前面：拒绝时未动任何文件/数据库，零副作用。
+    if turn_registry.is_active(f"{user_id}:{session_id}"):
+        logger.info(
+            "拒绝删除会话（有对话轮在跑）: user=%s, session=%s", user_id, session_id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="该会话有对话正在进行，请等本轮结束后再删除",
+        )
+
     # ─── ② 文件侧"预备删除"：rename 到 .trash（原子、可逆）───
     # 跨"文件系统+DB"没有共同事务，能做到的最强一致是：把文件操作变成
     # **一个原子的 rename**（同文件系统内瞬间完成），失败即可逆——
@@ -453,25 +468,17 @@ async def delete_session(
     # 上传的附件已被物理销毁（不可再生，真数据丢失）。
     # rename 失败 → 把已移走的全部移回原位，return 500，零副作用；
     # DB 事务失败 → .trash 移回原位（含附件，完整恢复），return 500；
-    # DB 提交成功 → 尽力 rmtree .trash，失败仅告警（残留只是不可见的
-    # 隐藏目录，无数据风险，可随时清扫）。
+    # DB 提交成功 → 尽力删除 .trash，失败仅告警（残留只是不可见的隐藏
+    # 目录，由 trash.sweep_trash 按 TTL 兜底清扫）。
     trash_pairs: list[tuple[str, str]] = []  # (原目录, trash 目录)
     try:
-        ts = int(time.time() * 1000)
         for root in [settings.report_root, settings.upload_root]:
-            session_dir = os.path.join(root, user_id, session_id)
-            if os.path.isdir(session_dir):
-                trash_dir = os.path.join(root, ".trash", f"{session_id}_{ts}")
-                os.makedirs(os.path.dirname(trash_dir), exist_ok=True)
-                os.rename(session_dir, trash_dir)
-                trash_pairs.append((session_dir, trash_dir))
+            moved = trash.move_to_trash(root, user_id, session_id)
+            if moved is not None:
+                trash_pairs.append(moved)
     except Exception as e:
         # 预备阶段失败：把已移走的移回原位，整体零副作用
-        for orig, trash in trash_pairs:
-            try:
-                os.rename(trash, orig)
-            except OSError:
-                logger.error("恢复会话文件失败，需人工处理: %s -> %s", trash, orig)
+        trash.move_back(trash_pairs)
         logger.error(
             "会话 %s 文件预备删除失败（已还原，数据库未动，可重试）: %s",
             session_id, e, exc_info=True,
@@ -495,24 +502,18 @@ async def delete_session(
         )
     except Exception as e:
         # DB 失败：把 .trash 完整还原（附件无损，会话仍可见可重试）
-        for orig, trash in trash_pairs:
-            try:
-                os.rename(trash, orig)
-            except OSError:
-                logger.error("恢复会话文件失败，需人工处理: %s -> %s", trash, orig)
+        trash.move_back(trash_pairs)
         logger.error(
             "原子删除会话 %s 失败（数据库痕迹与文件均已还原，可重试）: %s",
             session_id, e, exc_info=True,
         )
         raise HTTPException(status_code=500, detail="删除会话失败，请重试")
 
-    # DB 已提交：清理 trash（尽力，失败只是留下不可见的 .trash 目录）
-    for orig, trash in trash_pairs:
-        try:
-            shutil.rmtree(trash)
+    # DB 已提交：删除 trash（尽力，失败只是留下不可见的 .trash 目录，
+    # 由 trash.sweep_trash 按 TTL 兜底清扫）
+    for orig, trash_path in trash_pairs:
+        if trash.remove_trash(trash_path):
             logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, orig)
-        except Exception as e:
-            logger.warning("清理 .trash 失败（非关键，可人工清扫 %s）: %s", trash, e)
 
     return {"deleted": True, "session_id": session_id, "counts": counts}
 
