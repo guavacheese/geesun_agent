@@ -578,3 +578,52 @@ FileNotFoundError 容忍（与还原并发）、清扫走 asyncio.to_thread（rm
 geesun_agent_web/app/chat/page.tsx 的 handleDelete 原本是 `catch { /* ignore */ }`，
 后端任何删除失败（含新增的 409）用户都看不到，表现为"点了没反应"。凡新增会返回
 非 2xx 的后端语义，必须同步检查前端 catch 是否把错误透出给用户。
+
+## 2026-09-14 追加：会话列表「运行状态指示器」（进行中 / 刚跑完）
+
+### 动机与调研
+用户切走再回来无法判断会话是否还在跑，唯一反馈是**点删除时撞 409**——护栏反倒
+暴露了信息缺口（本该提前知道"它在跑"，变成操作时才被拒绝）。
+
+参考调研（结论两极）：
+- **deer-flow 没做**：`recent-chat-list.tsx:306-371` renderItem 只渲染频道图标/
+  置顶/标题，无任何 status/spinner 字段；后端 `thread_meta.status` 与列表接口
+  `threads.py:1057` 回显都存在，但**前端从不读取**；
+  `_derive_thread_status`（threads.py:617，idle/error/interrupted）只在单条
+  `GET /{id}` 时推断；isStreaming 仅作用于已打开会话内部的消息。
+- **deepseek-harness 做了**（`packages/client/ui-primitives/src/StateDot.tsx`）：
+  ongoing（3×3 矩阵 8 像素追逐动画）/ done（绿点+光晕）/ warning（琥珀，待交互）/
+  error；**pendingInteraction 优先级高于 ongoing**（Rows.tsx:252）。
+  关键设计：**状态全部不持久化**——running 来自 host 实时帧（manager.ts:864），
+  completed 是前端内存集合 `completedNotifications`（manager.ts:122；非选中会话
+  running→idle 时置位，选中/再次运行即清）→ 刷新后冷会话不会残留陈旧动画。
+
+### 本实现的两条设计决定（都不是随便定的）
+1. **「刚跑完」用边沿语义，不用常驻标记**。静态"已完成"绿点等于"这个会话跑完过"
+   → 所有历史会话长期挂绿点，满屏标记＝零信息量。边沿语义（上一帧 running、
+   这一帧不 running、且非当前打开的会话）才承载"你不在看的时候它跑完了"。
+   **首次加载 prevRunning 为空 Set ⇒ justFinished 必为空**，历史会话不会被误标
+   ——这是边沿方案能成立的前提，spike 专门断言了初值。
+2. **running 从进程内租约表派生，不落库**。复用 turn_registry（409 护栏的同一张
+   表）：零新增存储、零查询开销、天然按 user 隔离（key=f"{user_id}:{sid}"）。
+   与 deepseek-harness"状态不持久化"是同一思路，但我们的真相源在服务端 →
+   跨标签页/刷新后仍准确（它只有当前 tab 准确）。代价同 409：多副本会漏报，
+   方向是 fail-safe（只会少显示"进行中"，不会错显示）。
+
+### 教训（写给未来的自己）
+- **新增"从 server list 派生"的前端状态时，必须先收敛出唯一落地入口**。本次把
+  三处 `setSessions(mergeSessions(list, prev))` 统一为 `applyServerList(list)`，
+  边沿检测才只有一处真相。**绕过它的任何一处直写都会让边沿漏检**——spike 用
+  "`mergeSessions(list, prev)` 全文只能出现 1 次 + `applyServerList(list)` 恰好
+  4 次"把覆盖完整性钉死。这类"多个调用点 + 一个账本"的改动，断言要盯着
+  **调用点数量**，不是盯着函数存在。
+- **轮询要带开关，别空转**：仅当列表中存在 running 项才 setInterval（无则零请求）；
+  后台标签的定时器会被浏览器节流到分钟级，故补 `visibilitychange` 立即对齐一次。
+- **动画用 CSS 不用 JS 定时器**（列表 N 项就是 N 个并发动画）；另需
+  `prefers-reduced-motion` 友好（参考 deepseek-harness 的 `css.visuallyHidden`
+  与动画包裹写法）。
+- 顺带核实并**否定**了一个隐患：曾担心"工具长时间无输出 → chunk 不刷新 beat →
+  STALE_MS 误判轮次结束"，实测不成立——内层有静默保活心跳（chat.py:806-830
+  每 interval 秒 yield `: ping`），照常刷新 beat。
+- 也顺带核实：**当前没有 human-in-the-loop 暂停语义**（agent.py:918
+  `interrupt_on` 三项全是 False）→ 不做"待交互"琥珀态，不是漏掉。

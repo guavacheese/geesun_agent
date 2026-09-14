@@ -102,6 +102,19 @@ def _to_session_row(key: str, value) -> dict | None:
     return {"session_id": key, **value}
 
 
+def _mark_running(rows: list[dict], user_id: str) -> None:
+    """给会话行标注「是否有对话轮次正在跑」（供前端列表显示"进行中"）。
+
+    数据源是进程内的 turn_registry（内存 dict，零查询开销、无需落库），
+    只标注当前用户自己的会话（key = f"{user_id}:{session_id}"，天然隔离）。
+    单副本前提与 409 护栏相同：多副本时会漏报「进行中」（方向是 fail-safe——
+    只会少显示，不会错显示）。
+    """
+    for row in rows:
+        sid = row.get("session_id")
+        row["running"] = bool(sid) and turn_registry.is_active(f"{user_id}:{sid}")
+
+
 async def _alist_sessions(
     store,
     prefix: str,
@@ -292,6 +305,7 @@ async def list_sessions(
         # 先按更新时间倒序，再稳定排序让 pinned 置顶（同一组内保持倒序）
         sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
         sessions.sort(key=lambda s: not s.get("pinned", False))
+        _mark_running(sessions, user_id)
         return {"sessions": sessions}
 
     # ── 分页模式 ──
@@ -308,6 +322,8 @@ async def list_sessions(
         raise HTTPException(status_code=503, detail="会话列表暂时不可用，请重试") from e
 
     pinned_sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
+    _mark_running(page, user_id)
+    _mark_running(pinned_sessions, user_id)
     return {
         "sessions": page,
         "pinned_sessions": pinned_sessions,
