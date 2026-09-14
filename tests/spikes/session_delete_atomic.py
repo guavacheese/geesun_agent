@@ -15,14 +15,22 @@
   3. 删除期间在跑的对话轮结束时 _persist_session 会把刚删的行**写回来**
      （"会话不存在则创建"兼容分支正是复活路径）→ 孤儿数据。
 
-目标语义（方案 A）：
-  ① 文件先删（尽力，失败可重试删除会话；反之留不可见孤儿目录）
+目标语义（方案 A，2026-09-12 追加 rename-to-trash）：
+  ① 文件侧预备删除：rename 到 <root>/.trash/<sid>_<ms>（同文件系统内原子、
+     可逆）——直接 rmtree 是不可逆的：DB 事务失败会毁掉已上传附件（真数据
+     丢失）。rename 失败 → 已移走的移回，零副作用；DB 失败 → trash 移回，
+     附件无损；DB 提交成功 → 才 rmtree trash（失败留不可见 .trash，可清扫）
   ② DB 单事务 5 删（store 和 checkpointer 同库 agent_mem_prod，psycopg
      transaction 包住：sessions 行 + messages 前缀 + checkpointer 三表）
   ③ 并发护栏：chat 端点在 agent 开跑前快照 session_existed_at_start；
      _persist_session 发现"快照=True 且行已没了"→ 整轮跳过持久化
   ④ checkpointer 三表无外键（langgraph base.py MIGRATIONS 纯 PK 表，生产
      pg_constraint 实测一致），DELETE 顺序无关
+
+参考：deer-flow 的删除是顺序 best-effort（checkpointer 失败仅 debug 日志），
+并发用 409 拒绝；deepseek-harness 会话=单 JSONL 文件，天然单资源原子。
+两者都没有（也不需要）跨文件+DB 的复合事务——本实现是二者思想的折中：
+每侧各自原子化（rename / transaction）+ 失败可逆。
 """
 
 from __future__ import annotations
@@ -79,18 +87,35 @@ check("adelete_prefix" not in sess_src,
 check('"counts": counts' in sess_src, "响应带各表删除行数（验收可观测）")
 check("删除会话失败，请重试" in sess_src, "事务失败 → 500 + 可重试语义（不静默吞）")
 
-# 位置断言：文件删除（rmtree）必须在原子删除调用之前
+# rename-to-trash 语义（2026-09-12 追加：rmtree 先行会毁附件——DB 失败后
+# 会话仍可见但上传文件已被物理销毁，不可逆数据丢失）
+check('.trash' in sess_src and "os.rename(session_dir, trash_dir)" in sess_src,
+      "文件先 rename 到 .trash（原子、可逆的预备删除），不再直接 rmtree")
+check(sess_src.count("os.rename(trash, orig)") == 2,
+      "两条失败路径（预备阶段失败 / DB 事务失败）都有还原循环")
+check("os.makedirs(os.path.dirname(trash_dir), exist_ok=True)" in sess_src,
+      "trash 父目录创建有 exist_ok（重复删除不炸）")
+check("ts = int(time.time() * 1000)" in sess_src,
+      "trash 目录用毫秒时间戳后缀（同会话重复删除不冲突）")
+
+# 位置断言（ast 行号）：prepare(rename) → DB 事务 → rmtree(trash)
 sess_tree = ast.parse(sess_src)
-rmtree_lineno = atomic_call_lineno = None
+rename_linenos: list[int] = []
+rmtree_linenos: list[int] = []
+atomic_call_lineno = None
 for n in ast.walk(sess_tree):
+    if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "rename":
+        rename_linenos.append(n.lineno)
     if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "rmtree":
-        rmtree_lineno = n.lineno
+        rmtree_linenos.append(n.lineno)
     if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "adelete_session_atomic":
         atomic_call_lineno = n.lineno
-check(rmtree_lineno is not None and atomic_call_lineno is not None
-      and rmtree_lineno < atomic_call_lineno,
-      f"文件删除（L{rmtree_lineno}）在 DB 事务（L{atomic_call_lineno}）之前"
-      "——事务失败时会话仍可见可重试，不留不可见孤儿目录")
+check(atomic_call_lineno is not None
+      and rmtree_linenos and min(rmtree_linenos) > atomic_call_lineno,
+      f"rmtree 只出现在 DB 事务（L{atomic_call_lineno}）之后（L{min(rmtree_linenos)} 起）"
+      "——提交前绝不物理删文件，失败路径全程可逆")
+check(len(rename_linenos) >= 3 and min(rename_linenos) < atomic_call_lineno,
+      f"rename（移入 1 + 两条还原路径，共 {len(rename_linenos)} 处）预备阶段在 DB 事务之前")
 
 # ─── 3. chat.py：并发护栏 ───
 print("\n[3] 防复活护栏（chat.py）")

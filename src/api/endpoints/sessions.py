@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import shutil
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -445,18 +446,37 @@ async def delete_session(
     if item is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # ─── ② 先删磁盘文件（尽力删，失败仅告警）───
-    # 文件在 DB 事务之外。放在 DB 事务**之前**的理由：若 DB 事务失败，会话仍
-    # 完整可见、可直接重试删除；反之"先 DB 后文件"一旦文件删失败，会留下不可见
-    # 的孤儿目录（会话没了、入口也没了），只能人工清扫。
+    # ─── ② 文件侧"预备删除"：rename 到 .trash（原子、可逆）───
+    # 跨"文件系统+DB"没有共同事务，能做到的最强一致是：把文件操作变成
+    # **一个原子的 rename**（同文件系统内瞬间完成），失败即可逆——
+    # 旧实现直接 rmtree 是不可逆的：DB 事务一旦失败，会话仍可见但用户
+    # 上传的附件已被物理销毁（不可再生，真数据丢失）。
+    # rename 失败 → 把已移走的全部移回原位，return 500，零副作用；
+    # DB 事务失败 → .trash 移回原位（含附件，完整恢复），return 500；
+    # DB 提交成功 → 尽力 rmtree .trash，失败仅告警（残留只是不可见的
+    # 隐藏目录，无数据风险，可随时清扫）。
+    trash_pairs: list[tuple[str, str]] = []  # (原目录, trash 目录)
     try:
+        ts = int(time.time() * 1000)
         for root in [settings.report_root, settings.upload_root]:
             session_dir = os.path.join(root, user_id, session_id)
             if os.path.isdir(session_dir):
-                shutil.rmtree(session_dir)
-                logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, session_dir)
+                trash_dir = os.path.join(root, ".trash", f"{session_id}_{ts}")
+                os.makedirs(os.path.dirname(trash_dir), exist_ok=True)
+                os.rename(session_dir, trash_dir)
+                trash_pairs.append((session_dir, trash_dir))
     except Exception as e:
-        logger.warning("清理会话文件失败（非关键，残留目录可人工清扫）: %s", e)
+        # 预备阶段失败：把已移走的移回原位，整体零副作用
+        for orig, trash in trash_pairs:
+            try:
+                os.rename(trash, orig)
+            except OSError:
+                logger.error("恢复会话文件失败，需人工处理: %s -> %s", trash, orig)
+        logger.error(
+            "会话 %s 文件预备删除失败（已还原，数据库未动，可重试）: %s",
+            session_id, e, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="删除会话失败，请重试")
 
     # ─── ③ 单事务原子删除数据库全部痕迹（2026-09-12 方案 A）───
     # 同一个事务删 5 处：sessions 元数据行 + messages 台账前缀 + checkpointer
@@ -474,11 +494,25 @@ async def delete_session(
             "已原子删除会话: user=%s, session=%s, counts=%s", user_id, session_id, counts
         )
     except Exception as e:
+        # DB 失败：把 .trash 完整还原（附件无损，会话仍可见可重试）
+        for orig, trash in trash_pairs:
+            try:
+                os.rename(trash, orig)
+            except OSError:
+                logger.error("恢复会话文件失败，需人工处理: %s -> %s", trash, orig)
         logger.error(
-            "原子删除会话 %s 失败（数据库痕迹保留，会话仍可见可重试）: %s",
+            "原子删除会话 %s 失败（数据库痕迹与文件均已还原，可重试）: %s",
             session_id, e, exc_info=True,
         )
         raise HTTPException(status_code=500, detail="删除会话失败，请重试")
+
+    # DB 已提交：清理 trash（尽力，失败只是留下不可见的 .trash 目录）
+    for orig, trash in trash_pairs:
+        try:
+            shutil.rmtree(trash)
+            logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, orig)
+        except Exception as e:
+            logger.warning("清理 .trash 失败（非关键，可人工清扫 %s）: %s", trash, e)
 
     return {"deleted": True, "session_id": session_id, "counts": counts}
 

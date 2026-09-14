@@ -507,3 +507,32 @@ ast 提取 exec 的方式会把 `message_key` 绑进 exec globals（spike 自己
   的函数，失败路径必须显式决定：要么不缓存（下次重试），要么带 TTL 短缓存。
 - 部署后的"自愈"要先问是**机制自愈**还是**运气**——本次 1.0.11 看似好了，
   实际竞态原样存在，只是重启顺序恰好换了。对照两次部署的启动日志差异才定位。
+
+## 2026-09-12 追加：跨"文件+DB"删除的原子性（rename-to-trash）
+
+**问题**：删除会话旧流程"文件 rmtree 先行 → DB 单事务"，rmtree **不可逆**——
+DB 事务一旦失败，会话仍可见但用户上传的附件已被物理销毁（不可再生，真数据
+丢失）。文件系统与 DB 无共同事务，"完全原子"做不到，但可以做"失败零副作用"。
+
+**参考实现调研**（结论：行业也不做复合原子删除）：
+- deer-flow `backend/app/gateway/routers/threads.py:676` 删除线程 = 顺序
+  best-effort（文件→checkpointer→thread_meta，后两者失败仅 debug "not
+  critical"），明确接受半删除；并发用 **409 Conflict 拒绝**在跑轮次。
+- deepseek-harness 会话 = 磁盘单个 JSONL 文件（`published events never
+  rewritten`），删会话=删一个文件，跨资源问题在架构上不存在；其原子发布用
+  `link()+unlink()` 而非 `rename()`（防并发物化互相覆盖，session-persistence-
+  jsonl/src/index.ts:544）。
+
+**我们的方案（rename-to-trash，两阶段提交轻量版）**：
+1. `os.rename(dir → <root>/.trash/<sid>_<ms>)` ——同文件系统内原子、瞬间；
+   失败 → 已移走的移回原位，零副作用，return 500
+2. DB 单事务 5 删；失败 → trash 移回原位（附件无损），return 500
+3. DB 提交成功 → 才 rmtree trash；失败仅告警（残留不可见 .trash，可清扫）
+
+**教训**：
+- 跨资源操作谈"原子性"先拆问：**哪一侧是事实源（source of truth）？**
+  可见性由 DB 决定 → DB 用真事务；文件是派生数据 → 用可逆预备 + 事后清理。
+- "先删不可逆资源"是数据丢失反模式——破坏性动作永远放最后一步，
+  前面的步骤必须可逆（rename/copy/标记）。
+- spike 位置断言（`rmtree 只出现在 DB 事务之后`）比文本断言更防回归——
+  顺序约束用 ast 行号表达，不靠正则。
