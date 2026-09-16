@@ -10,10 +10,11 @@
   A) 纯函数 classify_empty_response 的四分支（+ tool_call 豁免、content parts 兼容）
   B) 端到端：真实 create_agent + 脚本化模型，验证
      空响应 → 删消息 + jump_to=model → 模型重跑 → 恢复成功
+     （同场校验：注入的恢复提示不进入 state，即不污染历史）
   C) 端到端：两次都空 → 落盘降级文案
   D) 无工具结果时不介入（对齐 deer-flow 的 _tool_result_in_current_turn）
-  E) 注入的恢复提示不进入 state（不污染历史）
-  F) hook_config 生效（jump_to 不是静默失效）
+  E) hook_config 生效（jump_to 不是静默失效）+ 图上存在 after_model → model 条件边
+  F) 降级信号登记表 + 诚实文案（A 方案：让 API 层跳过 M3 的"漏了下载步骤"误归因）
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ from src.core.terminal_response import (
     BRANCH_THINKING_TRUNCATED,
     TerminalResponseMiddleware,
     classify_empty_response,
+    fallback_notice,
+    pop_fallback_signal,
 )
 
 PASS = 0
@@ -352,6 +355,75 @@ def scenario_e() -> None:
     print(f"    边: {sorted(f'{s}->{t}' for s, t in edge_targets if 'Terminal' in s or 'model' in s)}")
 
 
+# ─────────────────────────────────────────────────────────────
+# F) 降级信号登记表 + 面向用户的诚实文案（2026-09-16 新增，A 方案回归位）
+# ─────────────────────────────────────────────────────────────
+def scenario_f() -> None:
+    """回归会话 de18ad37 的误归因链：守卫落降级文案时**必须**留下可被 API 层消费的信号，
+    且上报文案只讲模型层事实，不再出现「是不是漏了 download_from_sandbox」这类推测。
+
+    反向验证：若把 _record_fallback_signal 那一行删掉，F2/F3 立刻 FAIL。
+
+    生命周期契约（由 chat.py 保证，本 spike 只测登记表语义）：
+      开轮 `pop_fallback_signal(thread_id)` 清残留 → 轮内登记 → 轮末消费；
+      断连兜底路径（finally）也会取走，避免残留信号被下一轮误当自己的。
+    """
+    print("\n=== F) 降级信号 + 诚实文案（A 方案回归位）===")
+
+    THREAD = "spike:fallback"
+    check("F1 未降级时取不到信号", pop_fallback_signal(THREAD), None)
+
+    model = ScriptedModel(replies=[empty_ai("f1", "length"), empty_ai("f2", "length")])
+    mw = TerminalResponseMiddleware()
+    agent = create_agent(model=model, tools=[ping], middleware=[mw])
+    result = agent.invoke(
+        _seed_with_tool_result(agent, model),
+        config={"configurable": {"thread_id": THREAD}},
+    )
+    check("F2 两次都空 → 预算用尽", model.cursor, 2)
+    check_true(
+        "F3 末条为降级文案",
+        "没有产出可用的回复内容" in str(result["messages"][-1].content),
+    )
+
+    sig = pop_fallback_signal(THREAD)
+    check_true("F4 降级后登记了信号", isinstance(sig, dict))
+    check("F5 信号 branch", (sig or {}).get("branch"), BRANCH_THINKING_TRUNCATED)
+    check("F6 信号 finish_reason", (sig or {}).get("finish_reason"), "length")
+    check("F7 信号 retries", (sig or {}).get("retries"), 1)
+    check_true("F8 信号含 reasoning_len", int((sig or {}).get("reasoning_len") or 0) > 0)
+    check("F9 取走即清（不重复上报）", pop_fallback_signal(THREAD), None)
+    check("F10 未降级的 thread 仍为空", pop_fallback_signal("spike:other"), None)
+
+    reason, hint = fallback_notice(BRANCH_THINKING_TRUNCATED, 1)
+    check_true("F11 reason 说清截断形态", "输出上限" in reason and "finish_reason=length" in reason)
+    check_true("F12 reason 带重试次数", "已自动重试 1 次" in reason)
+    check_true("F13 hint 给可执行动作", "拆小" in hint)
+    for label, blob in (("F14 reason", reason), ("F15 hint", hint)):
+        check_true(
+            f"{label} 不含'漏了下载步骤'式推测",
+            ("download_from_sandbox" not in blob) and ("漏" not in blob),
+        )
+
+    # 各分支文案必须互不相同（否则又变成"一句话盖所有情况"）
+    notices = {
+        b: fallback_notice(b, 1)[0]
+        for b in (BRANCH_THINKING_TRUNCATED, BRANCH_THINKING_ONLY, BRANCH_FULLY_EMPTY)
+    }
+    check("F16 三个非 OK 分支都有专属文案", len(set(notices.values())), 3)
+    check(
+        "F17 未知 branch 退化为 fully_empty 文案",
+        fallback_notice("nonsense", 0)[0],
+        fallback_notice(BRANCH_FULLY_EMPTY, 0)[0],
+    )
+    check_true(
+        "F18 retries=0 时不谎称重试过",
+        "重试" not in fallback_notice(BRANCH_THINKING_ONLY, 0)[0],
+    )
+    print(f"    reason: {reason}")
+    print(f"    hint  : {hint}")
+
+
 if __name__ == "__main__":
     print("=" * 74)
     print("TerminalResponseMiddleware spike")
@@ -361,6 +433,7 @@ if __name__ == "__main__":
     scenario_c()
     scenario_d()
     scenario_e()
+    scenario_f()
 
     print("\n" + "=" * 74)
     print(f"结果: {PASS} PASS / {FAIL} FAIL")

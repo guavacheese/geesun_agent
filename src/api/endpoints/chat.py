@@ -16,6 +16,7 @@ from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
 from src.core import turn_registry
 from src.core.mcp import get_mcp_tools
+from src.core.terminal_response import fallback_notice, pop_fallback_signal
 from src.api.deps import get_store, get_checkpointer, get_current_user
 from src.core.config import settings
 
@@ -303,22 +304,44 @@ _DELIVERABLE_STRONG = (
     "工作簿", "交付物", "产物", "附件",
     "xlsx", "excel", "word", "pdf", "csv", "pptx", "zip", "docx",
 )
-_DELIVERABLE_VERBS = ("对比", "差异", "diff", "分析", "总结", "汇总", "整理", "生成", "制作", "创建", "输出")
+# ⚠ 不含裸"输出"（2026-09-16 移除）：它在指令型/规则型提示里几乎都是"模型应当输出
+#   （文字）"的意思，是**内容生成**的动词而非**文件交付**的动词。文件交付义已由强信号
+#   「输出文件」「生成文件」「导出」覆盖。实测误伤见 _is_deliverable_task docstring。
+_DELIVERABLE_VERBS = ("对比", "差异", "diff", "分析", "总结", "汇总", "整理", "生成", "制作", "创建")
 # 组合式名词仅保留明确「产出物」语义的词；纪要/清单/大纲等常是输入材料或口头回复，
 # 命中会把口头总结误判为交付任务（2026-08-26 实测"总结一下会议纪要"误伤）
 _DELIVERABLE_NOUNS = ("报告", "报表", "表格", "文档", "文件", "工作簿")
+# 子句切分：动词与名词必须落在**同一子句**才算组合命中（2026-09-16 新增）。
+# 长提示/规范文档里动词与名词天然大量散落，跨句拼凑会稳定误命中（见 docstring）。
+_CLAUSE_SPLIT = re.compile(r"[。！？；;\n]")
 
 
 def _is_deliverable_task(text: str) -> bool:
     """判断用户请求是否要求文件交付物（决定是否启用 M3 零产出拦截）。
 
-    启发式：强信号词（出现即判定）或「产出类动词 × 文件类名词」组合。
+    启发式：强信号词（出现即判定）或「产出类动词 × 文件类名词」**同子句**共现。
     组合式避免"分析一下这个方案"这类口头任务误判——它命中动词但无数词。
+
+    2026-09-16 两次收紧（会话 GY24428:de18ad37 生产实证）：
+      1. 移除裸"输出"：该会话用户消息里的「严禁输出缺失位置的速度/位置设定」是**规则
+         约束**，却让启发式命中；结果是纯视觉标注任务被当成文件交付任务，完成门在
+         模型因输出超限截断后误报「未产出交付物 / 请检查是否遗漏 download_from_sandbox」。
+      2. 改为同子句共现：原文里"输出"与"表格"（【表格/矩阵布局专属规则】）分处不同段落，
+         跨句拼凑是这类长规范提示的稳定误命中源。收紧后真实会话判定 False，
+         而"对比两份协议生成报告""整理成表格"等真实交付请求仍为 True。
+
+    ⚠ 刻意保留的方向性偏差：收紧后可能漏判（如"帮我写个文档说明这个模块"——"写"不在
+    动词表内）。漏判 = 完成门不介入 = 退回旧行为（零产出时只是不提示），而误判 =
+    给用户一条归因错误的指控。两害相权取其轻（2026-09-16 用户拍板 A+C）。
     """
     t = (text or "").lower()
     if any(k in t for k in _DELIVERABLE_STRONG):
         return True
-    return any(v in t for v in _DELIVERABLE_VERBS) and any(n in t for n in _DELIVERABLE_NOUNS)
+    return any(
+        any(v in clause for v in _DELIVERABLE_VERBS)
+        and any(n in clause for n in _DELIVERABLE_NOUNS)
+        for clause in _CLAUSE_SPLIT.split(t)
+    )
 
 
 class ChatRequest(BaseModel):
@@ -488,6 +511,7 @@ async def chat(
         generated_files: list | None = None,
         disk_files: frozenset[str] | None = None,
         completion_blocked: bool = False,
+        terminal_fallback: dict | None = None,
         reasoning_started_at_ms: int | None = None,
         reasoning_ended_at_ms: int | None = None,
         turn_started_at_ms: int | None = None,
@@ -690,6 +714,16 @@ async def chat(
                             history[i]["completion"] = "blocked_no_output"
                             break
 
+                # 空响应降级（2026-09-16）：失败点在**模型层**（思考吃满输出上限被截断），
+                # 不是"产物没拉回来"，故不与上面共用 blocked_no_output 标记——两者在
+                # 复盘/取证时要能一眼分开（旧实现会把 de18ad37 这类截断也标成"零交付物"）。
+                if terminal_fallback:
+                    for i in range(len(history) - 1, -1, -1):
+                        if history[i].get("role") == "ai":
+                            history[i]["completion"] = "model_output_truncated"
+                            history[i]["stop_reason"] = terminal_fallback.get("branch")
+                            break
+
                 # ─── 存入 store：增量追加（2026-09-12 方案 B，替代全量覆盖写）───
                 # 改前：`aput(ns, "messages", {"items": history})` —— 每轮把整份 history
                 # 当一个 value 覆盖写单行。三个后果（生产实测）：
@@ -875,6 +909,16 @@ async def chat(
         # 故在循环前初始化，避免 GeneratorExit 早抛时 NameError（2026-08-21）
         _new_files: frozenset[str] = frozenset()
         _completion_blocked = False
+        # TerminalResponseMiddleware 降级信号（2026-09-16）：本轮以「空响应降级」收尾时
+        # 由中间件登记、这里取走。命中即说明**模型层没有产出**（而非下游漏了文件步骤），
+        # 故跳过 M3 完成门的零产出拦截，改发 fallback_notice() 的诚实文案，避免归因错位。
+        # 见 src/core/terminal_response.py 模块头「与 M3 完成门的分工」。
+        #
+        # 生命周期铁律：信号的有效期 = 一轮 SSE。开轮先清残留（上一轮若在守卫登记后
+        # 立刻断连、没走到消费点，它不会自己消失——留着会被**下一轮**当成自己的信号，
+        # 把一轮正常的回复误报成"模型未产出"）。断连兜底路径同样要取走，见下方 finally。
+        pop_fallback_signal(thread_id)
+        _terminal_fallback: dict | None = None
         # M3 任务类型感知（方案 A）：仅"要求文件交付物"的任务启用零产出拦截，
         # 内容型任务（散文/问答）交付物即回复本身，零产出直接放行。
         _is_deliverable = _is_deliverable_task(body.message)
@@ -1481,6 +1525,34 @@ async def chat(
                     yield _ev
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
                 _new_files = _after_files - _before_files
+                # ─── 空响应降级优先于 M3 零产出拦截（2026-09-16）───
+                # 模型层一个字都没产出时，「/reports 为空」只是它的**后果**，
+                # 不能按"漏了 download_from_sandbox / write_file"归因（de18ad37 实锤）。
+                # 命中即上报真实原因并结束本轮——此时再多跑一轮完成门重试也无意义
+                #（上游产出为空，重试同样拿不到交付物；auto_continue 开启时同理，
+                #  因为根因是单次输出预算，不是"模型忘了下一步"）。
+                _fallback = pop_fallback_signal(thread_id)
+                if _fallback is not None:
+                    _terminal_fallback = _fallback
+                    _ft_reason, _ft_hint = fallback_notice(
+                        str(_fallback.get("branch", "")),
+                        int(_fallback.get("retries", 0) or 0),
+                    )
+                    logger.warning(
+                        "[M3] 空响应降级收尾 → 跳过零产出拦截并直报模型层原因: "
+                        "user=%s, session=%s, branch=%s, finish_reason=%s, reasoning_len=%d",
+                        user_id, session_id, _fallback.get("branch"),
+                        _fallback.get("finish_reason"), int(_fallback.get("reasoning_len", 0) or 0),
+                    )
+                    yield f"data: {json.dumps({
+                        'type': 'completion_blocked',
+                        'code': 'model_output_truncated',
+                        'title': '模型本轮未产出内容',
+                        'reason': _ft_reason,
+                        'hint': _ft_hint,
+                        'terminated': False,
+                    }, ensure_ascii=False)}\n\n"
+                    break
                 if _no_progress_triggered:
                     # 收敛轮：跳过零产出拦截，直接继续下一轮（_graph_input 已换成收敛提示）
                     _no_progress_triggered = False
@@ -1507,6 +1579,8 @@ async def chat(
                         )
                         yield f"data: {json.dumps({
                             'type': 'completion_blocked',
+                            'code': 'skill_artifact_missing',
+                            'title': 'skill 工作流产物缺失',
                             'reason': f'skill 工作流产物缺失: {_missing}',
                             'hint': '请检查是否遗漏 download_from_sandbox 拉回产物',
                             'terminated': True,
@@ -1539,8 +1613,14 @@ async def chat(
                     )
                     yield f"data: {json.dumps({
                         'type': 'completion_blocked',
+                        'code': 'no_artifact_in_reports',
+                        'title': '本轮未产出交付物',
                         'reason': '本轮任务未产出任何交付物（/reports 为空）',
-                        'hint': '请检查是否遗漏 download_from_sandbox / write_file 步骤',
+                        # 措辞只描述事实 + 条件式建议：本门只看得到磁盘差集，看不到
+                        # 模型是否漏了哪一步，原文"请检查是否遗漏 ..."是无据推测
+                        #（2026-09-16 会话 de18ad37 因"输出"×"表格"顺带词误命中而错报）。
+                        # 模型层真没产出的情况已由 terminal_response 降级信号在更早处分流。
+                        'hint': '若任务本应产出文件，请检查是否遗漏 download_from_sandbox / write_file 步骤',
                         'terminated': _completion_retries >= settings.sandbox_completion_gate_max_retries,
                     }, ensure_ascii=False)}\n\n"
                     break
@@ -1563,6 +1643,10 @@ async def chat(
                         "[DIAG] SSE 流中断（断连/取消），强制保存当前会话: user=%s, session=%s",
                         user_id, session_id,
                     )
+                    # 断连路径也要取走降级信号（若守卫已登记但本轮没走到消费点）：
+                    # 否则它会以 thread_id 为键留在登记表里被下一轮消费，造成误报。
+                    if _terminal_fallback is None:
+                        _terminal_fallback = pop_fallback_signal(thread_id)
                     # 断连路径：turn_ended 兜底取 now（持久化时刻作为 turn 终点）
                     interrupted_turn_end = _turn_ended_at_ms if _turn_ended_at_ms is not None else int(time.time() * 1000)
                     await _persist_session(
@@ -1570,6 +1654,7 @@ async def chat(
                         generated_files=_generated_files,
                         disk_files=_new_files,
                         completion_blocked=_completion_blocked,
+                        terminal_fallback=_terminal_fallback,
                         reasoning_started_at_ms=_reasoning_started_at_ms,
                         reasoning_ended_at_ms=_reasoning_ended_at_ms,
                         turn_started_at_ms=_turn_started_at_ms,
@@ -1596,6 +1681,7 @@ async def chat(
             generated_files=_generated_files,
             disk_files=_new_files,
             completion_blocked=_completion_blocked,
+            terminal_fallback=_terminal_fallback,
             reasoning_started_at_ms=_reasoning_started_at_ms,
             reasoning_ended_at_ms=_reasoning_ended_at_ms,
             turn_started_at_ms=_turn_started_at_ms,

@@ -57,6 +57,13 @@ deer-flow 源码注释明确写了这个陷阱：
      an unbounded empty -> retry -> tool loop."
 1 次而非 dsh 的 5 次：我们单次调用最坏 336s，1 次重试最坏 ~11 分钟；
 5 次将超过 28 分钟，用户无法接受（2026-09-11 用户拍板）。
+
+**与 M3 完成门的分工（2026-09-16 新增）**：本中间件只管到「模型层」，
+下游的 M3 完成门按 `/reports` 磁盘差集判零产出——两者若各说各话，
+就会出现「模型压根没产出」+「是不是漏了下载步骤」这种**归因错位**的重复提示
+（生产会话 de18ad37 实锤）。故本中间件落降级文案时登记 `_FALLBACK_SIGNALS`，
+API 层 `pop_fallback_signal(thread_id)` 命中即**让完成门闭嘴**，
+改发 `fallback_notice()` 的诚实文案。
 """
 
 from __future__ import annotations
@@ -146,6 +153,87 @@ BRANCH_OK = "ok"
 BRANCH_THINKING_TRUNCATED = "thinking_truncated"
 BRANCH_THINKING_ONLY = "thinking_only"
 BRANCH_FULLY_EMPTY = "fully_empty"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 降级信号登记表（2026-09-16 新增）——把「真实原因」交给 API 层
+# ══════════════════════════════════════════════════════════════════
+#
+# 背景（生产会话 GY24428:de18ad37 实测）：
+#   17:30:07 本中间件落盘降级文案（reasoning 吃满 65536 输出上限被截断）；
+#   **同一秒** M3 完成门（chat.py）按 `/reports` 磁盘差集反推，又输出
+#   「本轮任务未产出任何交付物（/reports 为空）/ 请检查是否遗漏 download_from_sandbox /
+#   write_file 步骤」——**归因错误**：模型一个字都没产出，谈不上"漏了哪一步"。
+#   两条消息重复出现，且都指向错误方向，用户拿不到可行动信息。
+#
+# 修法：本中间件在「预算用尽 → 落盘降级文案」时，顺手登记一条**结构化信号**；
+#   API 层（chat.py）在本轮 stream 结束后 `pop_fallback_signal(thread_id)` 取走，
+#   若存在则**跳过 M3 完成门的零产出拦截**，改发描述真实原因的完成事件。
+#   读取方是唯一消费者，故用 pop（取走即清，避免上一轮信号在下一轮重复上报）。
+#
+# 为什么不用 runtime.context 传递（deer-flow 的做法）：`invoke_kwargs["context"]`
+#   只在 `body.model_override` 存在时才构造（chat.py:844-847），无 override 的常态
+#   路径上 context 未必是我们能写的 dict；而本中间件已用 `_key(runtime)`（thread_id）
+#   做重试预算隔离，复用同一把键最省心，也不依赖调用方要不要传 context。
+_FALLBACK_SIGNALS: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+#: 信号表容量上限（长驻服务防泄漏；thread_id 语义与重试预算一致）
+_FALLBACK_SIGNAL_WINDOW = 500
+
+_fallback_lock = threading.Lock()
+
+
+def _record_fallback_signal(
+    key: str, branch: str, finish_reason: str, reasoning_len: int, retries: int
+) -> None:
+    with _fallback_lock:
+        _FALLBACK_SIGNALS[key] = {
+            "branch": branch,
+            "finish_reason": finish_reason,
+            "reasoning_len": reasoning_len,
+            "retries": retries,
+        }
+        _FALLBACK_SIGNALS.move_to_end(key)
+        while len(_FALLBACK_SIGNALS) > _FALLBACK_SIGNAL_WINDOW:
+            _FALLBACK_SIGNALS.popitem(last=False)
+
+
+def pop_fallback_signal(thread_id: str) -> dict[str, Any] | None:
+    """取走并清除该 thread 最近一次「空响应降级」信号（无则 None）。
+
+    返回：``{"branch", "finish_reason", "reasoning_len", "retries"}``。
+    thread_id 用与 chat.py 相同的 ``f"{user_id}:{session_id}"``。
+    """
+    with _fallback_lock:
+        return _FALLBACK_SIGNALS.pop(str(thread_id), None)
+
+
+#: 分支 → 「模型层真实发生了什么」的一句话（不猜下游、不谈磁盘）
+_NOTICE_REASON = {
+    BRANCH_THINKING_TRUNCATED: (
+        "模型本轮的思考过程占满了单次输出上限被截断（finish_reason=length），"
+        "没有产出任何面向用户的正文。"
+    ),
+    BRANCH_THINKING_ONLY: "模型本轮只完成了思考，没有输出面向用户的正文内容。",
+    BRANCH_FULLY_EMPTY: "模型本轮返回了完全空响应（正文与思考均为空）。",
+}
+
+
+def fallback_notice(branch: str, retries: int) -> tuple[str, str]:
+    """返回 ``(reason, hint)``，供 API 层在完成门之外单独上报空响应降级。
+
+    与 `_fallback_content` 的分工：那个写进**对话气泡**（用户必然看到，说明"没内容"），
+    这个用于**状态条**（说明"为什么没内容" + 给动作），两者文案不重复。
+    hint 只给用户能执行的动作，不再出现「是不是漏了某一步」这类无据推测。
+    """
+    reason = _NOTICE_REASON.get(branch, _NOTICE_REASON[BRANCH_FULLY_EMPTY])
+    if retries > 0:
+        reason += f"系统已自动重试 {retries} 次仍未成功。"
+    if branch == BRANCH_THINKING_TRUNCATED:
+        hint = "建议把任务拆小后重发（如分批处理），或改用输出上限更高的模型。"
+    else:
+        hint = "建议重发一次；若反复出现，请把会话 ID 反馈给模型服务维护方。"
+    return reason, hint
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -402,6 +490,8 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
             return {"messages": message_updates, "jump_to": "model"}
 
         # 预算用尽：写可读降级文案（不再抛异常，SSE 不中断）
+        finish_reason = _finish_reason(last)
+        reasoning_len = len(_reasoning_text(last))
         additional_kwargs = dict(getattr(last, "additional_kwargs", None) or {})
         additional_kwargs.update(
             {
@@ -418,10 +508,13 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
                 "invalid_tool_calls": [],
             }
         )
+        # 登记结构化信号：让 API 层能跳过 M3 完成门的「零产出 → 猜漏了下载步骤」
+        # 误归因路径，改由 fallback_notice 输出模型层的真实原因（见模块头注释）。
+        _record_fallback_signal(key, branch, finish_reason, reasoning_len, self.max_retries)
         logger.error(
-            "[Guard] 空响应自动重试已用尽，落盘降级文案: branch=%s finish_reason=%r "
-            "reasoning_len=%d thread=%s",
-            branch, _finish_reason(last), len(_reasoning_text(last)), key,
+            "[Guard] 空响应自动重试已用尽，落盘降级文案并登记降级信号: branch=%s "
+            "finish_reason=%r reasoning_len=%d thread=%s",
+            branch, finish_reason, reasoning_len, key,
         )
         return {"messages": [fallback]}
 
