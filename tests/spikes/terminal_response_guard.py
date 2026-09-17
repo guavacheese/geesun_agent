@@ -40,6 +40,7 @@ from src.core.terminal_response import (
     classify_empty_response,
     fallback_notice,
     pop_fallback_signal,
+    quick_mode_notice,
 )
 
 PASS = 0
@@ -196,6 +197,12 @@ class ScriptedModel(BaseChatModel):
     replies: list[AIMessage] = []
     cursor: int = 0
     seen: list[list[str]] = []
+    #: 每次 _generate 收到的 kwargs（含 factory 经 bind/bind_tools 透传的 model_settings）
+    seen_kwargs: list[dict] = []
+    #: 最近一次 bind_tools 透传的 kwargs —— 生产用的 ChatOpenAI 会把它们 bind 进请求，
+    #: 此处如实留存，供断言「关思考参数（extra_body）是否真的下达」。**每次覆盖而非累积**，
+    #: 才能反映"本轮"的绑定参数（累积会让第 3 轮关过思考后，第 4 轮仍看到 extra_body）。
+    bound_kwargs: dict = {}
 
     @property
     def _llm_type(self) -> str:
@@ -203,11 +210,13 @@ class ScriptedModel(BaseChatModel):
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         self.seen.append([type(m).__name__ for m in messages])
+        self.seen_kwargs.append({**dict(self.bound_kwargs), **kwargs})
         idx = min(self.cursor, len(self.replies) - 1)
         object.__setattr__(self, "cursor", self.cursor + 1)
         return ChatResult(generations=[ChatGeneration(message=self.replies[idx])])
 
     def bind_tools(self, tools, **kwargs):  # noqa: ANN001
+        object.__setattr__(self, "bound_kwargs", dict(kwargs))
         return self
 
 
@@ -287,14 +296,18 @@ def scenario_b() -> None:
 # ─────────────────────────────────────────────────────────────
 def scenario_c() -> None:
     print("\n=== C) 端到端：重试后仍空 → 落盘降级文案 ===")
-    model = ScriptedModel(replies=[empty_ai("e1", "length"), empty_ai("e2", "length")])
+    # max_retries=2（2026-09-17 方案 A 起）：两次重试都试过才落降级文案。
+    # 注意第 1 次重试是无损的（仅注入提示），第 2 次才关思考 —— 两者都救不回来才降级。
+    model = ScriptedModel(replies=[
+        empty_ai("e1", "length"), empty_ai("e2", "length"), empty_ai("e3", "length"),
+    ])
     mw = TerminalResponseMiddleware()
     agent = create_agent(model=model, tools=[ping], middleware=[mw])
 
     result = agent.invoke(_seed_with_tool_result(agent, model))
     last = result["messages"][-1]
 
-    check("模型被调用 2 次（预算 1 次重试用尽）", model.cursor, 2)
+    check("模型被调用 3 次（首轮 + 2 次重试用尽）", model.cursor, 3)
     check_true("末条是降级文案（非空）", bool(str(last.content).strip()))
     check_true("降级文案提到「已自动重试」", "自动重试" in str(last.content))
     check(
@@ -422,14 +435,16 @@ def scenario_f() -> None:
     THREAD = "spike:fallback"
     check("F1 未降级时取不到信号", pop_fallback_signal(THREAD), None)
 
-    model = ScriptedModel(replies=[empty_ai("f1", "length"), empty_ai("f2", "length")])
+    model = ScriptedModel(replies=[
+        empty_ai("f1", "length"), empty_ai("f2", "length"), empty_ai("f3", "length"),
+    ])
     mw = TerminalResponseMiddleware()
     agent = create_agent(model=model, tools=[ping], middleware=[mw])
     result = agent.invoke(
         _seed_with_tool_result(agent, model),
         config={"configurable": {"thread_id": THREAD}},
     )
-    check("F2 两次都空 → 预算用尽", model.cursor, 2)
+    check("F2 三次都空 → 预算用尽", model.cursor, 3)
     check_true(
         "F3 末条为降级文案",
         "没有产出可用的回复内容" in str(result["messages"][-1].content),
@@ -439,7 +454,7 @@ def scenario_f() -> None:
     check_true("F4 降级后登记了信号", isinstance(sig, dict))
     check("F5 信号 branch", (sig or {}).get("branch"), BRANCH_THINKING_TRUNCATED)
     check("F6 信号 finish_reason", (sig or {}).get("finish_reason"), "length")
-    check("F7 信号 retries", (sig or {}).get("retries"), 1)
+    check("F7 信号 retries", (sig or {}).get("retries"), 2)
     check_true("F8 信号含 reasoning_len", int((sig or {}).get("reasoning_len") or 0) > 0)
     check("F9 取走即清（不重复上报）", pop_fallback_signal(THREAD), None)
     check("F10 未降级的 thread 仍为空", pop_fallback_signal("spike:other"), None)
@@ -473,6 +488,128 @@ def scenario_f() -> None:
     print(f"    hint  : {hint}")
 
 
+# ─────────────────────────────────────────────────────────────
+# G) 方案 A：重试顺序（无损 → 有损）+ 快速模式标记（2026-09-17 新增）
+# ─────────────────────────────────────────────────────────────
+def scenario_g() -> None:
+    """验证「有损的那一招只在最后一次出手」这条顺序约束，在真实 chain 上成立。
+
+    方案 A 的两个子目标：
+      ① **顺序**：第 1 次重试无损（只注入恢复提示，模型仍在思考模式，推理能力不受损）；
+                 第 2 次重试有损（关闭思考 `enable_thinking=false` 兜底）。
+         ——「省 token」不等于「该先上」：无损的先跑，救不回来再上有损的。
+         生产实证支持这个顺序：恢复提示在 8000 / 65536 预算下都能成功
+         （e9c77ce9 第一轮「6 秒出正文」），只有 2000 紧预算才失败。
+      ② **留痕**：关思考的产出与正常回复**外观完全一致**，必须登记「快速模式」信号
+                （供 API 层提示用户），否则用户会把快速模式的结果当完整答案用
+                —— 隐性失败比空白气泡（显性失败）更危险。
+
+    反向验证：把 `_should_disable_thinking` 改成恒 False ⇒ G12 立刻 FAIL；
+              删掉 `_record_quick_mode_signal` 那一行 ⇒ G14 立刻 FAIL。
+    """
+    print("\n=== G) 方案 A：重试顺序（无损 → 有损）与快速模式标记 ===")
+    from src.core.terminal_response import _should_disable_thinking
+
+    T, O, F = BRANCH_THINKING_TRUNCATED, BRANCH_THINKING_ONLY, BRANCH_FULLY_EMPTY
+
+    # ── G1-G8 纯策略矩阵 ──
+    check("G1 截断分支 第1/2次 → 不关思考（无损）", _should_disable_thinking(T, 1, 2), False)
+    check("G2 截断分支 第2/2次 → 关思考（有损兜底）", _should_disable_thinking(T, 2, 2), True)
+    check("G3 截断分支 第1/3次 → 不关", _should_disable_thinking(T, 1, 3), False)
+    check("G4 截断分支 第2/3次 → 不关", _should_disable_thinking(T, 2, 3), False)
+    check("G5 截断分支 第3/3次 → 关", _should_disable_thinking(T, 3, 3), True)
+    check(
+        "G6 预算为 1 时唯一那次直接关（预算不足的退化语义，非死代码）",
+        _should_disable_thinking(T, 1, 1), True,
+    )
+    check(
+        "G7 thinking_only 永不关（思考是正常收尾的，关掉只损不益）",
+        _should_disable_thinking(O, 5, 5), False,
+    )
+    check("G8 fully_empty 永不关", _should_disable_thinking(F, 5, 5), False)
+
+    # ── G9-G13 端到端：首轮空 → 重试①空 → 重试②出正文 ──
+    model = ScriptedModel(replies=[
+        empty_ai("g1", "length"),
+        empty_ai("g2", "length"),
+        AIMessage(content="快速模式产出的正文。", id="g_ok"),
+    ])
+    mw = TerminalResponseMiddleware()          # 默认 max_retries=2
+    agent = create_agent(model=model, tools=[ping], middleware=[mw])
+    THREAD = "spike:quickmode"
+    result = agent.invoke(
+        _seed_with_tool_result(agent, model),
+        config={"configurable": {"thread_id": THREAD}},
+    )
+
+    check("G9 模型被调用 3 次（首轮 + 2 次重试）", model.cursor, 3)
+    k = model.seen_kwargs
+    check("G10 首轮不带 extra_body", (k[0] if k else {}).get("extra_body"), None)
+    check(
+        "G11 重试①（无损）也不带 extra_body（模型仍在思考模式）",
+        (k[1] if len(k) > 1 else {}).get("extra_body"), None,
+    )
+    check(
+        "G12 重试②（有损）带 enable_thinking=false",
+        ((k[2] if len(k) > 2 else {}).get("extra_body") or {}).get("chat_template_kwargs"),
+        {"enable_thinking": False},
+    )
+    check_true(
+        "G13 重试①②都注入了恢复提示（提示与关思考是两个正交动作）",
+        len(model.seen) >= 3 and all(len(model.seen[i]) > 3 for i in (1, 2)),
+    )
+
+    # ── G14-G18 快速模式信号与结构化标记 ──
+    sig = pop_fallback_signal(THREAD)
+    check_true("G14 登记了快速模式信号", bool((sig or {}).get("quick_mode")))
+    check("G15 信号记录了是第几次重试", (sig or {}).get("attempt"), 2)
+    check("G16 取走即清（不重复上报）", pop_fallback_signal(THREAD), None)
+
+    last = result["messages"][-1]
+    check(
+        "G17 正文打了 terminal_response_quick_mode 标记（供前端识别）",
+        (last.additional_kwargs or {}).get("terminal_response_quick_mode"),
+        True,
+    )
+    check(
+        "G18 正文未被重复追加（model_copy 按 id 覆盖而非新增）",
+        sum(1 for m in result["messages"] if getattr(m, "id", None) == "g_ok"),
+        1,
+    )
+
+    # ── G19-G21 快速模式文案 ──
+    reason_qm, _hint_qm = quick_mode_notice(2)
+    check_true(
+        "G19 文案说清「关闭了深度思考」",
+        "快速模式" in reason_qm and "关闭深度思考" in reason_qm,
+    )
+    check_true(
+        "G20 文案明确提示深度可能不足（防用户误当完整答案）",
+        "可能不如常规模式完整" in reason_qm,
+    )
+    check_true("G21 文案不谎称失败（它是成功产出）", "没有产出" not in reason_qm)
+    print(f"    quick_mode reason: {reason_qm}")
+
+    # ── G22-G23 反向：没关思考的普通成功产出不得误标 ──
+    model2 = ScriptedModel(replies=[
+        empty_ai("h1", "length"),
+        AIMessage(content="常规模式恢复的正文。", id="h_ok"),
+    ])
+    mw2 = TerminalResponseMiddleware()
+    agent2 = create_agent(model=model2, tools=[ping], middleware=[mw2])
+    THREAD2 = "spike:normalmode"
+    r2 = agent2.invoke(
+        _seed_with_tool_result(agent2, model2),
+        config={"configurable": {"thread_id": THREAD2}},
+    )
+    check("G22 第 1 次重试就成功 → 无快速模式信号", pop_fallback_signal(THREAD2), None)
+    check(
+        "G23 该正文没有快速模式标记（不误标）",
+        (r2["messages"][-1].additional_kwargs or {}).get("terminal_response_quick_mode"),
+        None,
+    )
+
+
 if __name__ == "__main__":
     print("=" * 74)
     print("TerminalResponseMiddleware spike")
@@ -483,6 +620,7 @@ if __name__ == "__main__":
     scenario_d()
     scenario_e()
     scenario_f()
+    scenario_g()
 
     print("\n" + "=" * 74)
     print(f"结果: {PASS} PASS / {FAIL} FAIL")

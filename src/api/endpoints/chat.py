@@ -16,7 +16,7 @@ from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
 from src.core import turn_registry
 from src.core.mcp import get_mcp_tools
-from src.core.terminal_response import fallback_notice, pop_fallback_signal
+from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
 from src.api.deps import get_store, get_checkpointer, get_current_user
 from src.core.config import settings
 
@@ -1532,6 +1532,29 @@ async def chat(
                 #（上游产出为空，重试同样拿不到交付物；auto_continue 开启时同理，
                 #  因为根因是单次输出预算，不是"模型忘了下一步"）。
                 _fallback = pop_fallback_signal(thread_id)
+                if _fallback is not None and _fallback.get("quick_mode"):
+                    # 关思考兜底**成功**：本轮有正文产出，绝不能走下面的完成门拦截
+                    # （那会把一条正常回复误判成「模型未产出」）。只需告知用户这条是
+                    # 「快速模式」产物 —— 关思考的产出与正常回复外观完全一致，不留痕
+                    # 用户会当完整答案用（隐性失败比空白气泡更危险）。
+                    # 注意：**不设** `_terminal_fallback` —— 那不是「降级收尾」，
+                    # 设了会污染落库标记与断连路径的判断。
+                    _qm_attempt = int(_fallback.get("attempt", 1) or 1)
+                    _qm_reason, _qm_hint = quick_mode_notice(_qm_attempt)
+                    logger.warning(
+                        "[Guard] 本轮为关思考兜底产出（快速模式，第 %d 次重试）"
+                        "→ 提示用户: user=%s, session=%s",
+                        _qm_attempt, user_id, session_id,
+                    )
+                    yield f"data: {json.dumps({
+                        'type': 'quick_mode_notice',
+                        'code': 'thinking_disabled_fallback',
+                        'title': '本轮为快速模式产出',
+                        'reason': _qm_reason,
+                        'hint': _qm_hint,
+                        'terminated': False,
+                    }, ensure_ascii=False)}\n\n"
+                    _fallback = None
                 if _fallback is not None:
                     _terminal_fallback = _fallback
                     _ft_reason, _ft_hint = fallback_notice(

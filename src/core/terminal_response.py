@@ -88,6 +88,7 @@ import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, override
 
 from langchain.agents import AgentState
@@ -108,8 +109,21 @@ logger = logging.getLogger(__name__)
 # ─── 分支配额 ───
 
 #: 每次 run 允许的自动重试次数（deer-flow 用 1，deepseek-harness 用 5）
-#: 取 1 的理由：单次调用最坏 336s，1 次重试最坏 ~11 分钟；5 次超 28 分钟不可接受。
-_MAX_RETRIES_PER_RUN = 1
+#:
+#: 2026-09-17 由 1 上调至 2（方案 A）。关键点：两次重试承担**不同性质**的恢复动作，
+#: 而不是把同一招重复两次 ——
+#:   第 1 次（无损）：注入恢复提示。模型仍在思考模式，只是被要求「别光想、直接写结论」，
+#:              推理能力不受损。生产实证有效：e9c77ce9 同会话第一轮实测「6 秒就产出了正文」。
+#:   第 2 次（有损）：关闭思考模式兜底（`enable_thinking=false`），保证一定有正文产出，
+#:              代价是丢掉推理链 ⇒ 产出必须向用户标注为「快速模式」（见 quick_mode_notice）。
+#: 顺序不可颠倒 —— 「省 token」不等于「该先上」：先用无损的，无损救不回来再上有损的。
+#: （若本值被调回 1，`_should_disable_thinking` 会让唯一那次直接关思考，
+#:  语义退化为「预算不够时直接上有损招」，不会出现「无损用完、有损没机会上」的空转。）
+#:
+#: 耗时上限（如实更新；2026-09-11 拍板「最坏 ~11 分钟」时 max_retries=1）：
+#:   理论最坏 = 首轮 336s + 重试① 336s + 重试②（关思考后只写正文，通常远小于 336s）≈ 17 分钟；
+#:   典型路径 = 首轮 336s + 重试①「6 秒出正文」≈ 5.7 分钟（绝大多数情况第 1 次就结束）。
+_MAX_RETRIES_PER_RUN = 2
 
 #: 重试仍空时落盘的降级文案（面向用户，必须说人话且不误导）。
 #: 做成函数而非常量：max_retries 现在是可配置项（settings.terminal_response_max_retries），
@@ -133,6 +147,52 @@ _FALLBACK_CONTENT = _fallback_content(_MAX_RETRIES_PER_RUN)
 
 #: 窗口大小：只保留最近 N 个 run 的预算，防长驻服务内存泄漏
 _BUDGET_WINDOW = 500
+
+
+@dataclass(frozen=True)
+class _PendingRecovery:
+    """排队中的一次恢复重试（下一轮 wrap_model_call 消费后即清）。"""
+
+    #: 注入给模型的恢复提示正文（用户不可见）
+    prompt: str
+    #: 本次重试是否关闭思考模式（有损兜底）；False = 只注入提示（无损）
+    disable_thinking: bool
+    #: 第几次重试（从 1 起），用于日志与「快速模式」文案
+    attempt: int
+
+
+def _should_disable_thinking(branch: str, attempt: int, max_retries: int) -> bool:
+    """本次恢复重试是否关闭思考模式 —— **有损的那一招只在最后一次出手**。
+
+    规则：只有分支为 `thinking_truncated`、且已经是最后一次重试时才关。
+
+    - `thinking_truncated`（输出预算被思考吃光）：同样的输入 + 同样的预算 ⇒ 不关就
+      必然再次烧穿，最后一次机会赌不起，关思考是唯一出路。
+    - `thinking_only`（思考正常收尾、只是没写正文）：**不关**。注入恢复提示通常就够，
+      关思考只会白损复杂任务的推理质量，没有收益。
+    - `max_retries == 1` 时 `attempt >= max_retries` 在第 1 次即成立 ⇒ **直接关**。
+      这是有意为之：只有一次机会时「先无损后有损」排不出来，与其让有损招永远上不了场
+      （L0 变死代码），不如把唯一机会用在最可能成功的那招上。
+    """
+    if branch != BRANCH_THINKING_TRUNCATED:
+        return False
+    return attempt >= max(1, int(max_retries))
+
+
+def _mark_quick_mode_message(message: AIMessage, attempt: int) -> dict[str, Any] | None:
+    """给「关思考兜底产出」的正文打结构化标记，供前端/下游识别这是快速模式产物。
+
+    ⚠️ 只在消息带 id 时打标：langchain 的 add_messages reducer **按 id 覆盖**，
+    而 `model_copy` 出来的消息若 id 为空会被当成**新消息**追加 → 正文重复出现。
+    拿不到 id 就放弃打标（可见性由 quick_mode_notice 的完成事件兜底，不受影响）。
+    """
+    if not getattr(message, "id", None):
+        logger.warning("[Guard] 关思考产出消息无 id，跳过结构化标记（避免正文重复落库）")
+        return None
+    kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+    kwargs["terminal_response_quick_mode"] = True
+    kwargs["terminal_response_quick_mode_attempt"] = attempt
+    return {"messages": [message.model_copy(update={"additional_kwargs": kwargs})]}
 
 # ─── 恢复提示（按分支定制，均以 <system_reminder> 包裹）───
 
@@ -264,6 +324,45 @@ def fallback_notice(branch: str, retries: int) -> tuple[str, str]:
     else:
         hint = "建议重发一次；若反复出现，请把会话 ID 反馈给模型服务维护方。"
     return reason, hint
+
+
+#: 信号表里区分「关思考兜底成功」与「空响应降级失败」的字段。
+#: 两者共用 `_FALLBACK_SIGNALS` 同一张表 + pop 语义（读取方是唯一消费者）。
+_SIGNAL_QUICK_MODE = "quick_mode"
+
+
+def _record_quick_mode_signal(key: str, attempt: int) -> None:
+    """登记「本轮正文是关思考兜底产出的」信号。
+
+    与 `_record_fallback_signal` 的分工（消费方行为相反，别混）：
+      - 那个用于**失败**收尾（正文为空、落降级文案）⇒ 消费方要**拦截** M3 完成门；
+      - 本函数用于**成功**收尾（关思考后拿到了正文）⇒ 消费方**不得拦截**完成门
+        （明明有产出），只需向用户说明这条回复的性质。
+    """
+    with _fallback_lock:
+        _FALLBACK_SIGNALS[key] = {
+            _SIGNAL_QUICK_MODE: True,
+            "attempt": int(attempt),
+        }
+        _FALLBACK_SIGNALS.move_to_end(key)
+        while len(_FALLBACK_SIGNALS) > _FALLBACK_SIGNAL_WINDOW:
+            _FALLBACK_SIGNALS.popitem(last=False)
+
+
+def quick_mode_notice(attempt: int) -> tuple[str, str]:
+    """返回 ``(reason, hint)``：告知用户本条回复是「关闭深度思考」换来的。
+
+    为什么必须提示而不是静默返回：关思考的产出与正常回复**外观完全一样**，
+    用户分辨不出，会把它当完整答案使用。空白气泡是**显性失败**（用户立刻知道出事了，
+    会重发、会拆任务），静默降级是**隐性失败** —— 一旦碰上真正依赖长推理链的任务，
+    用户拿到看似合理实则浅的答案且不会怀疑。**明着失败安全，静默降级危险。**
+    """
+    return (
+        "模型本轮的思考过程超出了单次输出上限被截断，系统已自动改用「快速模式」"
+        "（关闭深度思考）重新生成。下方内容即为快速模式的产出，结论可用，"
+        "但深度分析可能不如常规模式完整。",
+        "若需要更完整的推理，建议把任务拆小后重发。",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -464,8 +563,13 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
         self._lock = threading.Lock()
         # thread_id -> 已用重试次数
         self._retry_counts: OrderedDict[str, int] = OrderedDict()
-        # thread_id -> 待注入的恢复提示（下一轮 wrap_model_call 消费后即清）
-        self._pending_prompts: OrderedDict[str, str] = OrderedDict()
+        # thread_id -> 待注入的恢复重试（下一轮 wrap_model_call 消费后即清）
+        self._pending_prompts: OrderedDict[str, _PendingRecovery] = OrderedDict()
+        # thread_id -> 本轮模型调用被关思考的「重试序号」（_augment_request 记、_apply 取）。
+        # 存在的原因：after_model 只看得到「模型返回了什么」，看不到「这是第几次重试、
+        # 有没有关思考」——正文非空时无从判断该不该打「快速模式」标记。故由
+        # wrap_model_call 在注入时留下凭据，after_model 消费后立即清除。
+        self._quick_mode_pending: OrderedDict[str, int] = OrderedDict()
         # 统计（便于生产日志确认是否真的在生效）
         self._stats: dict[str, int] = {}
 
@@ -491,6 +595,7 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
             while len(self._retry_counts) > _BUDGET_WINDOW:
                 old_key, _ = self._retry_counts.popitem(last=False)
                 self._pending_prompts.pop(old_key, None)
+                self._quick_mode_pending.pop(old_key, None)
 
     def _count(self, key: str) -> int:
         with self._lock:
@@ -500,17 +605,35 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
         with self._lock:
             self._retry_counts.pop(key, None)
             self._pending_prompts.pop(key, None)
+            self._quick_mode_pending.pop(key, None)
 
-    def _queue_prompt(self, key: str, prompt: str) -> None:
+    def _queue_prompt(self, key: str, pending: _PendingRecovery) -> None:
         with self._lock:
-            self._pending_prompts[key] = prompt
+            self._pending_prompts[key] = pending
             self._pending_prompts.move_to_end(key)
             while len(self._pending_prompts) > _BUDGET_WINDOW:
                 self._pending_prompts.popitem(last=False)
 
-    def _drain_prompt(self, key: str) -> str | None:
+    def _drain_prompt(self, key: str) -> _PendingRecovery | None:
         with self._lock:
             return self._pending_prompts.pop(key, None)
+
+    def _mark_quick_mode(self, key: str, attempt: int) -> None:
+        """记下「本轮模型调用被关了思考」（由 _augment_request 在注入时调用）。"""
+        with self._lock:
+            self._quick_mode_pending[key] = int(attempt)
+            self._quick_mode_pending.move_to_end(key)
+            while len(self._quick_mode_pending) > _BUDGET_WINDOW:
+                self._quick_mode_pending.popitem(last=False)
+
+    def _take_quick_mode(self, key: str) -> int | None:
+        """取走并清除「本轮关过思考」的凭据（由 _apply 在正文非空时调用）。
+
+        取走即清、不区分结果：即使本轮仍没产出正文（还要继续重试），凭据也不该留到
+        下一次 —— 下一次的 _augment_request 会重新决定并按需写入。
+        """
+        with self._lock:
+            return self._quick_mode_pending.pop(key, None)
 
     def _note(self, branch: str) -> None:
         with self._lock:
@@ -533,7 +656,21 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
 
         branch = classify_empty_response(last)
         if branch == BRANCH_OK:
-            return None
+            # 正文非空 ⇒ 若上一轮模型调用是「关思考兜底」，本条就是快速模式产物：
+            # 登记信号（让 API 层告知用户）+ 给消息打结构化标记（供前端识别）。
+            # 这是方案 A 第②条的落点 —— 关思考的产出必须留痕，否则用户会把
+            # 「快速模式的结果」当成完整答案使用（比空白气泡更危险的隐性失败）。
+            key_ok = self._key(runtime)
+            quick_attempt = self._take_quick_mode(key_ok)
+            if quick_attempt is None:
+                return None
+            _record_quick_mode_signal(key_ok, quick_attempt)
+            logger.warning(
+                "[Guard] 关思考兜底成功产出正文（第 %d 次重试，快速模式）"
+                "→ 登记提示信号: thread=%s",
+                quick_attempt, key_ok,
+            )
+            return _mark_quick_mode_message(last, quick_attempt)
 
         # 分流：模型侧预算耗尽的分支与「有没有工具结果」无关，必须兜底；
         # 其余形态保持 deer-flow 语义，只兜「本轮已有工具结果」的终点场景。
@@ -551,15 +688,25 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
 
         if used < self.max_retries:
             self._bump(key)
-            self._queue_prompt(key, _recovery_prompt_for(branch, has_tool_result))
+            attempt = used + 1
+            disable_thinking = _should_disable_thinking(branch, attempt, self.max_retries)
+            self._queue_prompt(
+                key,
+                _PendingRecovery(
+                    prompt=_recovery_prompt_for(branch, has_tool_result),
+                    disable_thinking=disable_thinking,
+                    attempt=attempt,
+                ),
+            )
             # 删掉空消息，避免它留在 checkpoint 历史里污染后续上下文；
             # 注意：RemoveMessage 是写 state 的操作，这是期望行为（用户不该看到空白气泡）。
             message_updates = [RemoveMessage(id=last.id)] if getattr(last, "id", None) else []
             logger.warning(
                 "[Guard] 检出空响应（终点守卫第 %d/%d 次）→ 删除并重试: "
-                "branch=%s finish_reason=%r reasoning_len=%d thread=%s",
-                used + 1, self.max_retries, branch,
+                "branch=%s finish_reason=%r reasoning_len=%d thread=%s 恢复方式=%s",
+                attempt, self.max_retries, branch,
                 _finish_reason(last), len(_reasoning_text(last)), key,
+                "关闭思考（有损兜底）" if disable_thinking else "注入恢复提示（无损）",
             )
             return {"messages": message_updates, "jump_to": "model"}
 
@@ -644,28 +791,55 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
         return await handler(self._augment_request(request))
 
     def _augment_request(self, request: ModelRequest) -> ModelRequest:
-        """把排队的恢复提示追加到出站消息末尾。
+        """把排队的恢复重试追加到出站请求（提示注入 + 按需关思考）。
 
         用 `request.override(...)` 而非写 state：实测该注入只对本轮模型调用可见、
         **不写回 state**，因此不会进 checkpoint、不会被 _persist_session 落库污染历史
         （.workbuddy/spikes/inject_state_spike.py 对照实测）。
+        `model_settings` 的覆盖同理只作用于本轮（factory 每轮重新 bind）。
 
         用 HumanMessage 而不是 SystemMessage：规避 vLLM
         「System message must be at the beginning」400（chat.py:1264-1267 有记录）。
         附 hide_from_ui 标记，便于日志/调试分辨系统注入消息（当前持久化路径
         不读该标记，但因为不进 state 所以无泄漏风险）。
+
+        两种恢复动作（见 `_should_disable_thinking`）：
+          - 无损：只注入提示，模型仍在思考模式 —— 靠 `request.override(messages=...)`；
+          - 有损：额外关思考 —— 靠 `request.override(model_settings=...)` 带 `extra_body`
+            （唯一可用通道，验证见 `tests/spikes/extra_body_channel_probe.py`）。
         """
         runtime = getattr(request, "runtime", None)
         if runtime is None:
             return request
         key = self._key(runtime)
-        prompt = self._drain_prompt(key)
-        if not prompt:
+        pending = self._drain_prompt(key)
+        if pending is None:
             return request
         reminder = HumanMessage(
-            content=prompt,
+            content=pending.prompt,
             name="terminal_response_recovery",
             additional_kwargs={"hide_from_ui": True},
         )
+        overrides: dict[str, Any] = {"messages": [*request.messages, reminder]}
+        if pending.disable_thinking:
+            # 「关思考」的唯一可用通道（本仓 model.py 里 extra_body / chat_template_kwargs
+            # 均 grep 零命中）：model_settings → langchain factory `model.bind(**model_settings)`
+            # （.venv/.../langchain/agents/factory.py:1404，**全量 bind、无白名单过滤**）
+            # → langchain-openai 合进 payload（base.py `payload = {**self._default_params, **kwargs}`）
+            # → OpenAI SDK 识别 `extra_body` 并展平进请求体顶层。
+            # 该链路已用本地 mock server 捕获真实请求体验证（4/4 PASS）：
+            # tests/spikes/extra_body_channel_probe.py。
+            overrides["model_settings"] = {
+                **request.model_settings,
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            }
+            # 留凭据：after_model 只看得到「模型返回了什么」，看不到「这一次关没关思考」，
+            # 正文非空时无从判断该不该打「快速模式」标记。
+            self._mark_quick_mode(key, pending.attempt)
+            logger.warning(
+                "[Guard] 第 %d 次重试：关闭思考模式兜底（enable_thinking=false，"
+                "产出将标注为快速模式）: thread=%s",
+                pending.attempt, key,
+            )
         logger.info("[Guard] 注入恢复提示（用户不可见）: thread=%s", key)
-        return request.override(messages=[*request.messages, reminder])
+        return request.override(**overrides)
