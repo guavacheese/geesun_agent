@@ -64,6 +64,21 @@ deer-flow 源码注释明确写了这个陷阱：
 （生产会话 de18ad37 实锤）。故本中间件落降级文案时登记 `_FALLBACK_SIGNALS`，
 API 层 `pop_fallback_signal(thread_id)` 命中即**让完成门闭嘴**，
 改发 `fallback_notice()` 的诚实文案。
+
+**介入门槛与工具结果解耦（2026-09-17 新增，修正 deer-flow 的继承缺口）**
+原样照搬 deer-flow 的 `if not _tool_result_in_current_turn(messages): return None`
+会漏掉最该救的一类（生产会话 e9c77ce9 第二轮实锤）：
+    同一天同一会话的两轮，**同样的 thinking_truncated**，只因「本轮有没有工具结果」
+    一个走了守卫（删空消息 + 注入恢复提示 → **6 秒产出正文**），另一个被直接放过
+    （空消息落库 → 用户看到空白气泡、界面"突然停止"，因为降级信号也没登记）。
+第二轮的形态是**纯对话追问**（用户："描述的不准确，应该是 8 个纯蓝色实心小点组成的
+矩形框"），压根没有工具调用——但思考照样在 325s 里烧光 65536 输出额度。
+⇒ 「输出预算被思考吃光」与工具状态**正交**，工具结果不该当门槛。
+现改由 `_should_guard()` 分流：模型侧分支（thinking_truncated / thinking_only）
+无条件介入，其余分支保持 deer-flow 语义。
+（deer-flow 之所以踩不到：它接 DeepSeek，reasoning 通常不占 output 配额；
+ 且它有测试 test_empty_response_without_tool_result_is_not_retried **锁死了**
+ 这个行为——我们的场景是它的设计盲区，不是移植偏差。）
 """
 
 from __future__ import annotations
@@ -127,6 +142,21 @@ _RECOVERY_PROMPT_THINKING_TRUNCATED = (
     "（provider 已返回 finish_reason=length 截断信号）。\n"
     "工具结果已在对话中给出。请**直接输出面向用户的最终结论**，不要重复展开推导过程，"
     "也不要再次调用工具，除非确实缺少必要信息。\n"
+    "</system_reminder>"
+)
+
+#: 无工具结果版本（2026-09-17 新增，会话 e9c77ce9 第二轮回归位）。
+#: 上一版只有 post-tool 文案，其中「工具结果已在对话中给出」在本轮压根没调过工具时
+#: 是**事实错误**，会把模型带偏；且此时模型往往还没拿到完成任务所需的信息，
+#: 一刀切「不要再次调用工具」会堵死它唯一的出路。故单独成文：
+#:   - 强调**思考保持简短**（根因就是思考膨胀，这是唯一能改变行为的约束）
+#:   - 保留最多一次工具调用的出口
+_RECOVERY_PROMPT_THINKING_TRUNCATED_NO_TOOL = (
+    "<system_reminder>\n"
+    "你上一轮的思考过程过长，占满了本次调用的全部输出额度，导致最终回复为空"
+    "（provider 已返回 finish_reason=length 截断信号）。\n"
+    "请**直接输出面向用户的最终结论**，思考过程务必保持简短。"
+    "若结论依赖尚未获取的信息，最多再调用一次工具；否则请基于已有信息作答。\n"
     "</system_reminder>"
 )
 
@@ -343,6 +373,36 @@ def _tool_result_in_current_turn(messages: list[Any]) -> bool:
     )
 
 
+#: 「模型侧预算耗尽」分支：根因在模型自身（输出额度被思考吃光），与本轮有没有
+#: 调过工具**完全无关**，因此不能拿 `_tool_result_in_current_turn` 当门槛。
+#:
+#: 依据（生产会话 GY24428:e9c77ce9 第二轮，2026-09-17 08:18→08:23 实测）：
+#:   用户追问「描述的不准确，应该是 8 个纯蓝色实心小点组成的矩形框」——本轮**没有**
+#:   任何工具调用，模型在 325s 里把 65536 输出预算全烧在思考里（reasoning 93634 字符），
+#:   content 为空、finish_reason='length'。旧逻辑因「本轮无工具结果」直接放过 →
+#:   空 AIMessage 原样落库 → 用户只看到空白气泡；且降级信号未登记，
+#:   chat.py 的 pop_fallback_signal 取不到 → 连状态条文案都没有，表现为"突然停止"。
+#:   对照同会话第一轮：同样的 thinking_truncated，但本轮有工具结果 → 走守卫
+#:   （删空消息 + 注入恢复提示）→ **6 秒就产出了正文**。可见这道门槛挡掉的
+#:   恰恰是最该救的那一类。
+_MODEL_SIDE_BRANCHES = frozenset({BRANCH_THINKING_TRUNCATED, BRANCH_THINKING_ONLY})
+
+
+def _should_guard(branch: str, has_tool_result: bool) -> bool:
+    """守卫是否介入该分支。
+
+    - **模型侧预算耗尽**（thinking_truncated / thinking_only）→ 无条件介入。
+      这两个分支的判据本身已足够特异（content 空 + reasoning 非空 + 有/无
+      length 截断信号），且与工具状态正交，不需要再用工具结果做过滤。
+    - **其余分支**（含 fully_empty）→ 保持 deer-flow 语义，只兜「本轮已有工具结果」
+      的终点场景；无工具结果时交给 M3 完成门与模型自身处理，避免把「压根没开始 /
+      无真实用户消息的内部调用」也纳进来。
+    """
+    if branch in _MODEL_SIDE_BRANCHES:
+        return True
+    return has_tool_result
+
+
 def classify_empty_response(message: AIMessage) -> str:
     """四分支判定（本中间件相对两个参考仓的核心增量）。
 
@@ -363,9 +423,18 @@ def classify_empty_response(message: AIMessage) -> str:
     return BRANCH_FULLY_EMPTY
 
 
-def _recovery_prompt_for(branch: str) -> str:
+def _recovery_prompt_for(branch: str, has_tool_result: bool = True) -> str:
+    """按分支（+ 本轮有无工具结果）挑恢复提示。
+
+    has_tool_result 默认 True 保持旧调用点兼容；thinking_truncated 的两个版本
+    差异见 _RECOVERY_PROMPT_THINKING_TRUNCATED_NO_TOOL 的说明。
+    """
     if branch == BRANCH_THINKING_TRUNCATED:
-        return _RECOVERY_PROMPT_THINKING_TRUNCATED
+        return (
+            _RECOVERY_PROMPT_THINKING_TRUNCATED
+            if has_tool_result
+            else _RECOVERY_PROMPT_THINKING_TRUNCATED_NO_TOOL
+        )
     if branch == BRANCH_THINKING_ONLY:
         return _RECOVERY_PROMPT_THINKING_ONLY
     return _RECOVERY_PROMPT_FULLY_EMPTY
@@ -378,6 +447,9 @@ def _recovery_prompt_for(branch: str) -> str:
 
 class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
     """空响应终点守卫：重试 max_retries 次，仍空则落盘可读降级文案。
+
+    介入门槛（`_should_guard`）：模型侧分支（thinking_truncated / thinking_only）
+    无条件介入；其余分支只兜「本轮已有工具结果」的终点场景。
 
     处置流程（单次 run 内，预算由 settings.terminal_response_max_retries 控制，默认 1）：
         预算未用尽 → 删掉空 AIMessage（RemoveMessage）+ jump_to="model"
@@ -463,8 +535,10 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
         if branch == BRANCH_OK:
             return None
 
-        # 只兜「本轮已有工具结果」的终点场景；其它形态交给 M3 完成门与模型自身处理
-        if not _tool_result_in_current_turn(messages):
+        # 分流：模型侧预算耗尽的分支与「有没有工具结果」无关，必须兜底；
+        # 其余形态保持 deer-flow 语义，只兜「本轮已有工具结果」的终点场景。
+        has_tool_result = _tool_result_in_current_turn(messages)
+        if not _should_guard(branch, has_tool_result):
             logger.info(
                 "[Guard] 空响应但本轮无工具结果，跳过终点守卫: branch=%s thread=%s",
                 branch, self._key(runtime),
@@ -477,7 +551,7 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
 
         if used < self.max_retries:
             self._bump(key)
-            self._queue_prompt(key, _recovery_prompt_for(branch))
+            self._queue_prompt(key, _recovery_prompt_for(branch, has_tool_result))
             # 删掉空消息，避免它留在 checkpoint 历史里污染后续上下文；
             # 注意：RemoveMessage 是写 state 的操作，这是期望行为（用户不该看到空白气泡）。
             message_updates = [RemoveMessage(id=last.id)] if getattr(last, "id", None) else []

@@ -12,7 +12,8 @@
      空响应 → 删消息 + jump_to=model → 模型重跑 → 恢复成功
      （同场校验：注入的恢复提示不进入 state，即不污染历史）
   C) 端到端：两次都空 → 落盘降级文案
-  D) 无工具结果时不介入（对齐 deer-flow 的 _tool_result_in_current_turn）
+  D) 介入门槛与工具结果解耦：模型侧分支（thinking_truncated / thinking_only）
+     无工具结果也介入；fully_empty 无工具结果仍不介入；恢复提示分场景文案
   E) hook_config 生效（jump_to 不是静默失效）+ 图上存在 after_model → model 条件边
   F) 降级信号登记表 + 诚实文案（A 方案：让 API 层跳过 M3 的"漏了下载步骤"误归因）
 """
@@ -310,20 +311,68 @@ def scenario_c() -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# D) 无工具结果时不介入
+# D) 介入门槛：模型侧分支与工具结果解耦
 # ─────────────────────────────────────────────────────────────
 def scenario_d() -> None:
-    print("\n=== D) 本轮无工具结果 → 不介入（交给 M3 完成门）===")
-    model = ScriptedModel(replies=[empty_ai("e1", "length")])
+    """2026-09-17 改写。原断言「本轮无工具结果 → 不介入（交给 M3）」**正是漏洞本身**：
+    生产会话 e9c77ce9 第二轮就是这个形态（纯对话追问、本轮零工具调用），
+    空消息被放过原样落库 → 用户看到空白气泡 + 界面"突然停止" + 连状态条都没有。
+
+    新语义：模型侧分支（thinking_truncated / thinking_only）与工具状态正交 → 必须介入；
+    其余分支（含 fully_empty）保持 deer-flow 语义，无工具结果时不介入。
+    """
+    print("\n=== D) 介入门槛与工具结果解耦（e9c77ce9 第二轮回归位）===")
+
+    # D1 无工具结果 + thinking_truncated → 介入并重试成功
+    model = ScriptedModel(replies=[
+        empty_ai("e1", "length"),
+        AIMessage(content="图中确有 8 个纯蓝色小点组成矩形框。", id="ok1"),
+    ])
     mw = TerminalResponseMiddleware()
     agent = create_agent(model=model, tools=[ping], middleware=[mw])
+    result = agent.invoke(
+        {"messages": [HumanMessage(content="描述的不准确，应该是8个纯蓝色实心小点组成的矩形框", id="h1")]}
+    )
+    ids = [getattr(m, "id", None) for m in result["messages"]]
+    check("D1 模型被调用 2 次（空响应触发了重试）", model.cursor, 2)
+    check_true("D1 空消息已删除（未落库成空白气泡）", "e1" not in ids)
+    check_true("D1 恢复后的正文进了 state", "ok1" in ids)
+    check("D1 命中 thinking_truncated 分支", mw.stats(), {BRANCH_THINKING_TRUNCATED: 1})
 
-    result = agent.invoke({"messages": [HumanMessage(content="你好", id="h1")]})
-    msgs = result["messages"]
+    # D2 无工具结果 + thinking_only(stop) → 同样介入
+    model2 = ScriptedModel(replies=[
+        empty_ai("e2", "stop"),
+        AIMessage(content="直接给结论。", id="ok2"),
+    ])
+    mw2 = TerminalResponseMiddleware()
+    agent2 = create_agent(model=model2, tools=[ping], middleware=[mw2])
+    result2 = agent2.invoke({"messages": [HumanMessage(content="你好", id="h1")]})
+    check("D2 模型被调用 2 次（thinking_only 也介入）", model2.cursor, 2)
+    check_true("D2 空消息已删除", "e2" not in [getattr(m, "id", None) for m in result2["messages"]])
 
-    check("模型只被调用 1 次（未触发重试）", model.cursor, 1)
-    check_true("空消息仍在（本中间件未介入）", "e1" in [getattr(m, "id", None) for m in msgs])
-    check("统计为空（未命中任何分支）", mw.stats(), {})
+    # D3 无工具结果 + fully_empty → 仍不介入（保持 deer-flow 语义，防误伤内部调用）
+    blank = AIMessage(
+        content="", additional_kwargs={},
+        response_metadata={"finish_reason": "stop"}, id="e3",
+    )
+    model3 = ScriptedModel(replies=[blank])
+    mw3 = TerminalResponseMiddleware()
+    agent3 = create_agent(model=model3, tools=[ping], middleware=[mw3])
+    result3 = agent3.invoke({"messages": [HumanMessage(content="你好", id="h1")]})
+    check("D3 fully_empty 无工具结果 → 仍只调用 1 次", model3.cursor, 1)
+    check_true("D3 消息未被删（未介入）",
+               "e3" in [getattr(m, "id", None) for m in result3["messages"]])
+    check("D3 统计为空（未命中任何分支）", mw3.stats(), {})
+
+    # D4 恢复提示分场景：无工具结果版不得出现「工具结果已在对话中给出」这个错误前提
+    from src.core.terminal_response import _recovery_prompt_for
+
+    p_tool = _recovery_prompt_for(BRANCH_THINKING_TRUNCATED, True)
+    p_notool = _recovery_prompt_for(BRANCH_THINKING_TRUNCATED, False)
+    check_true("D4 有工具结果版含『工具结果已在对话中给出』", "工具结果已在对话中给出" in p_tool)
+    check_true("D4 无工具结果版不含该错误前提", "工具结果已在对话中给出" not in p_notool)
+    check_true("D4 无工具结果版强调思考简短", "思考过程务必保持简短" in p_notool)
+    check_true("D4 无工具结果版保留一次工具出口", "最多再调用一次工具" in p_notool)
 
 
 # ─────────────────────────────────────────────────────────────
