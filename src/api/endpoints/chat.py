@@ -447,6 +447,63 @@ class ChatRequest(BaseModel):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 观测：让 LangGraph chain span 回到"真根"（2026-09-29 重做版）
+# ═══════════════════════════════════════════════════════════════════════════════
+# 背景：`_OpenInferenceOnlySpanProcessor`（src/core/tracing.py:71）按属性
+# `openinference.span.kind` 丢弃 HTTP/ASGI span —— 这是**设计意图**（POST
+# /api/v1/chat 这类基础设施 span 不该进 LLM trace）。但它只"丢父节点"、不"缝合树"：
+# LangGraph 等业务 span 的 parent_span_id 仍指向那个被丢弃的 FastAPI server span
+# ⇒ 到达后端的 span 里**没有任何根**。而两个后端在 trace 层都依赖根：
+#
+#   · Langfuse：trace 级 `name`/`input`/`output` 的回退源**只有「根观测」**
+#     （未显式给 `langfuse.trace.*` 时取根 span 的 name / observation input），
+#     无根 ⇒ 三列恒空。实测 138 条 trace 中 input/output 各仅 10 条有值，
+#     且恰好是唯一那条有根的老 trace。
+#   · Phoenix：`traces` 表根本没有 name/input 列，GraphQL `Trace.rootSpan` 在无根
+#     trace 上实测返回 null ⇒ 树形/详情页退化。
+#
+# 退化时间线（trace 数据 × git 双向对齐，详见 .workbuddy/memory/2026-09-29.md）：
+#   · 09-04 16:24 起，`5b476e3`（新增 FastAPIInstrumentor）第一次构建成镜像上线
+#     ⇒ HTTP server span 成了 LLM trace 的根，name 退化成 "POST /api/v1/chat"、
+#     input/output 变空；
+#   · 09-11 起，`f3fd075`（引入本过滤器，它当时确实占了观测后端 98%）把 HTTP span
+#     丢掉 ⇒ 根彻底消失，三列全空（现状）。
+#   9.2/9.3 的"正常"是巧合而非设计：那时链路里压根没有 HTTP span，`LangGraph`
+#   天然就是根，三列取的是它自己的值。
+#
+# 修复姿势：**不新建 span、不写任何 name/input/output**，只在 event_stream 期间把
+# 当前 OTel Context 换成一个空 Context —— `get_current_span()` 随即是 INVALID_SPAN，
+# 于是 LangChain 插桩创建的 `LangGraph` span 的 parent=None，天然成为真根；它自带
+# `openinference.span.kind=CHAIN`，能过本过滤器；它的 name/input/output 正是
+# 9.2/9.3 基线里 Langfuse 三列的取值来源 ⇒ 三列是**回退**出来的、与基线逐字一致。
+#
+# 为什么不沿用上一版的 `start_as_current_span(..., context=Context())`（已废弃）：
+# 那样等于**另造一个根覆盖掉本来正确的回退源**，实测 name 退化成 "agent-run"、
+# input 退化成纯文本；而且要自己复刻 LangChain 的消息序列化格式（messages_to_dict
+# 那种 `{"type": "human", "data": {...}}`），框架一升级就失真。
+#
+# 为什么用 attach/detach 而非 `with use_span(...)`：event_stream 是 async generator，
+# 作用域要跨 yield 边界；attach 拿 token、try/finally 显式 detach 语义最直白，也不会
+# 把 Context 泄漏到 StreamingResponse 之后的调用栈。
+#
+# 实证依据（spike 均已跑通，可复现）：
+#   .workbuddy/spikes/lf_root_cut.py       —— use_span(Context()) / attach(Context())
+#                                             两种姿势均能切断与 HTTP span 的父子关系
+#   .workbuddy/spikes/lf_async_ctx2.py     —— 跨 async generator + 客户端断连场景下
+#                                             attach/detach 配对正确，子 span 落到新根下
+#   .workbuddy/spikes/lf_baseline_902b.py  —— 9.2/9.3 基线：根观测 = LangGraph、
+#                                             parent=null，三列取的就是它的值
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from opentelemetry import context as _otel_context_api
+    from opentelemetry.context import Context as _OtelContext
+except ImportError:  # pragma: no cover — 观测依赖缺失时整体降级为"不干预"
+    _otel_context_api = None  # type: ignore[assignment]
+    _OtelContext = None  # type: ignore[assignment]
+
+
 router = APIRouter()
 
 
@@ -1811,7 +1868,7 @@ async def chat(
         yield "data: [DONE]\n\n"
 
     async def event_stream():
-        """外层包装：登记在跑轮次，供删除端点 409 拒绝并发删除（2026-09-14）。
+        """外层包装：登记在跑轮次 + 把 LangGraph span 顶成真根。
 
         acquire/release 与 beat 都在这一层，_event_stream_inner 函数体一行不动：
         - release 放在 finally：正常结束、异常、以及客户端断连（内层 :1557 的
@@ -1820,13 +1877,33 @@ async def chat(
         - beat 挂在每个 chunk 上：token/工具事件密集时刷新活跃时间；空转期间由
           内层的心跳哨兵（::interval 秒一个 chunk）继续刷新。陈旧判定（
           turn_registry.STALE_MS）兜底进程被杀等 release 未执行的路径。
+        - 空 Context（2026-09-29 重做，原理见 _otel_context_api 上方注释块）：
+          只切断 OTel span 继承，**不新建 span、不写任何 name/input/output** ——
+          LangChain 插桩建的 `LangGraph` span 因此 parent=None 成为真根，Langfuse
+          trace 级三列自然回退到它自己的值（与 9.2/9.3 基线逐字一致），Phoenix 的
+          rootSpan 也一起回来。全程 best-effort：观测依赖缺失、attach/detach 失败
+          都只记 debug 日志，绝不影响 SSE 下发。
         """
         turn_registry.acquire(thread_id)
+        _ctx_token = None
+        if _otel_context_api is not None and _OtelContext is not None:
+            try:
+                # 空 Context ⇒ get_current_span() 是 INVALID_SPAN，父子链路在此断开
+                _ctx_token = _otel_context_api.attach(_OtelContext())
+            except Exception:
+                logger.debug("[TRACING] 切断 OTel 父 span 失败（已忽略）", exc_info=True)
         try:
             async for _chunk in _event_stream_inner():
                 turn_registry.beat(thread_id)
                 yield _chunk
         finally:
+            # detach 是非阻塞的纯 contextvar 复位，放 release 之前，
+            # 保证"在跑轮次"台账的释放不被任何观测侧动作拖住。
+            if _ctx_token is not None:
+                try:
+                    _otel_context_api.detach(_ctx_token)
+                except Exception:
+                    logger.debug("[TRACING] 恢复 OTel Context 失败（已忽略）", exc_info=True)
             turn_registry.release(thread_id)
 
     return StreamingResponse(
