@@ -8,7 +8,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from src.api.deps import get_current_user
-from src.core.config import settings
+from src.infra.reports import find_session_file, session_file_roots
 
 logger = logging.getLogger(__name__)
 
@@ -38,33 +38,14 @@ def _validate_path(path: str) -> bool:
 
 
 def _search_file(user_id: str, session_id: str, filename: str) -> str | None:
-    """在可能的目录中查找真实文件路径，返回绝对路径或 None。"""
-    search_dirs = [
-        ("reports", settings.report_root),
-        ("uploads", settings.upload_root),
-    ]
-    # 回退：如果 report_root 是 /data/myapp/ 但文件实际在
-    # agent_workspace/data/reports/ 下，追加该路径
-    try:
-        wsl_report_root = os.path.join(settings.agent_workspace, "data", "reports")
-        wsl_upload_root = os.path.join(settings.agent_workspace, "data", "uploads")
-        if os.path.normpath(wsl_report_root) != os.path.normpath(settings.report_root):
-            search_dirs.append(("reports", wsl_report_root))
-        if os.path.normpath(wsl_upload_root) != os.path.normpath(settings.upload_root):
-            search_dirs.append(("uploads", wsl_upload_root))
-    except Exception:
-        pass
+    """在可能的目录中查找真实文件路径，返回绝对路径或 None。
 
-    for dir_name, root_dir in search_dirs:
-        candidate = os.path.normpath(os.path.join(root_dir, user_id, session_id, filename))
-        # 确保候选路径仍在允许的根目录下
-        allowed_root = os.path.normpath(os.path.join(root_dir, user_id, session_id))
-        if not candidate.startswith(allowed_root):
-            logger.warning("路径穿越拦截: candidate=%s, allowed=%s", candidate, allowed_root)
-            continue
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+    目录清单与存在性判定统一在 `src.infra.reports.find_session_file` / `session_file_roots`
+    （2026-09-29 抽出）：sessions.py 的"老数据补全"需要同款判定（只补磁盘真实存在的
+    文件，否则模型正文里的幻觉路径会变成 HEAD 404 的红框卡片），两处各写一份必然走偏。
+    本函数保留原签名，行为不变（根目录清单 = reports / uploads / workspace 兜底）。
+    """
+    return find_session_file(user_id, session_id, filename, roots=session_file_roots())
 
 
 @router.head("/files/{user_id}/{session_id}/{filename:path}")

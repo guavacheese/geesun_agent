@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -11,7 +12,7 @@ from src.core import turn_registry
 from src.core.config import settings
 from src.infra import trash
 from src.infra.database import message_key_to_index
-from src.infra.reports import snapshot_report_files
+from src.infra.reports import find_session_file, session_file_roots, snapshot_report_files
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,67 @@ _FILE_TYPE_BY_EXT = {
 def _infer_file_type(file_name: str) -> str:
     ext = file_name.split(".")[-1].lower() if "." in file_name else ""
     return _FILE_TYPE_BY_EXT.get(ext, "other")
+
+
+# 从 AI 正文里扫交付物路径。注意：反引号`排除——markdown 格式 `path` 的反引号不应被吞入路径
+_CONTENT_FILE_PATH_RE = re.compile(r"(/uploads/|/reports/)[^\s)\]\"',`]+")
+
+
+def _scan_content_files(
+    content: str, user_id: str, session_id: str, roots: list[str] | None = None
+) -> list[dict]:
+    """从 AI 正文里扫出可交付文件（老数据补全用；纯函数，便于 spike 直接断言）。
+
+    ⚠️ 2026-09-29 C① 反幻觉：**只保留磁盘上真实存在的路径**。
+    原实现无条件按正文里出现的路径补卡片，于是模型幻觉（正文声称"已保存到
+    /reports/.../x.pptx"、文件其实从未落盘）在这里被"实体化"成 file_size=0 的卡片
+    → 前端 HEAD 404 → 红框"文件不可用"，与同屏的"本轮未产出交付物"横幅自相矛盾
+    （GY35377/60c64c4f 实测：整轮零文件产出，界面却给了张下载卡）。
+
+    判定用与下载端点同源的 `find_session_file` —— 它找不到 ⟺ 下载必然 404，
+    所以"补出来的卡片一定能下载"是守恒的；顺带取真实大小（原先恒为 0）。
+    """
+    report_prefix = f"/reports/{user_id}/{session_id}/"
+    upload_prefix = f"/uploads/{user_id}/{session_id}/"
+    files: list[dict] = []
+    seen: set[str] = set()
+    for m in _CONTENT_FILE_PATH_RE.finditer(content or ""):
+        path = m.group(0)
+        if path.startswith(report_prefix):
+            rel = path[len(report_prefix):]
+        elif path.startswith(upload_prefix):
+            rel = path[len(upload_prefix):]
+        else:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        filename = path.split("/")[-1]
+        if not filename:
+            # 目录路径（AI 只写了 /reports/{uid}/{sid}/ 没写文件名，如 fe27a95a 会话
+            # 最后一条 AI 的表格目录引用）不产生交付物，补全会产出
+            # {file_name:"", file_path:".../"} 脏条目，前端 deriveGeneratedFiles
+            # 清洗后为空 → 吞掉真实文件卡（2026-08-24 实测 md/html 报告卡不显示）。
+            continue
+        disk = find_session_file(user_id, session_id, rel, roots=roots)
+        if disk is None:
+            logger.debug(
+                "老数据补全跳过（磁盘无此文件，疑似正文幻觉路径）: "
+                "user=%s, session=%s, path=%s",
+                user_id, session_id, path,
+            )
+            continue
+        try:
+            size = os.path.getsize(disk)
+        except OSError:
+            size = 0
+        files.append({
+            "file_name": filename,
+            "file_path": path,
+            "file_size": size,
+            "file_type": _infer_file_type(filename),
+        })
+    return files
 
 
 # ─── 会话 CRUD ───
@@ -559,8 +621,12 @@ async def get_session_messages(
     兼容老数据：AI 消息没有 generated_files 时，扫描 content 自动
     补 /uploads/.../file.ext 或 /reports/.../file.ext 路径的文件信息，
     保证历史消息刷新后仍能看到文件卡片。
+
+    ⚠️ 补全**只认磁盘上真实存在的文件**（2026-09-29 C① 反幻觉）：正文里出现过
+    但并未落盘的路径（模型幻觉，如"已保存到 /reports/.../x.pptx"）不再被补成
+    卡片 —— 那种卡片 HEAD 必然 404，只会得到红框"文件不可用"。判定与下载端点
+    同源（`find_session_file`），故"补出来的卡片一定能下载"是守恒的。
     """
-    import re
     user_id = current_user["user_id"]
     msg_prefix = _ns_text(_messages_namespace(user_id, session_id))
 
@@ -578,36 +644,15 @@ async def get_session_messages(
         logger.error("获取会话消息失败: session_id=%s, error=%s", session_id, e, exc_info=True)
         messages = []
 
-    # 兼容老数据：AI 消息没有 generated_files 时从 content 补
-    # 注意：反引号`排除——markdown 格式 `path` 的反引号不应被吞入路径
-    file_path_re = re.compile(r"(/uploads/|/reports/)[^\s)\]\"',`]+")
+    # 兼容老数据：AI 消息没有 generated_files 时从 content 补（判定见 _scan_content_files：
+    # 只补磁盘上真实存在的文件，模型正文里的幻觉路径不再被"实体化"成 HEAD 404 的卡片）
+    # 候选根目录只解析一次：下面按消息逐条做存在性校验，属热路径
+    _session_roots = session_file_roots()
     for msg in messages:
         if msg.get("role") == "ai" and not msg.get("generated_files"):
-            content = msg.get("content", "")
-            files = []
-            seen = set()
-            for m in file_path_re.finditer(content):
-                path = m.group(0)
-                if not path.startswith(f"/uploads/{user_id}/{session_id}/") and \
-                   not path.startswith(f"/reports/{user_id}/{session_id}/"):
-                    continue
-                if path in seen:
-                    continue
-                seen.add(path)
-                filename = path.split("/")[-1]
-                if not filename:
-                    # 目录路径（AI 只写了 /reports/{uid}/{sid}/ 没写文件名，如
-                    # fe27a95a 会话最后一条 AI 的表格目录引用）不产生交付物，
-                    # 补全会产出 {file_name:"", file_path:".../"} 脏条目，前端
-                    # deriveGeneratedFiles 清洗后为空 → 吞掉真实文件卡
-                    # （2026-08-24 实测 md/html 报告卡不显示）。跳过。
-                    continue
-                files.append({
-                    "file_name": filename,
-                    "file_path": path,
-                    "file_size": 0,
-                    "file_type": _infer_file_type(filename),
-                })
+            files = _scan_content_files(
+                msg.get("content", ""), user_id, session_id, roots=_session_roots
+            )
             if files:
                 msg["generated_files"] = files
 

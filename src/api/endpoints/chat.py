@@ -237,6 +237,13 @@ def _infer_file_type(file_name: str) -> str:
     return _FILE_TYPE_BY_EXT.get(ext, "other")
 
 
+# 从工具结果文本里抠 /reports/ 路径（write_file 之外的工具：execute / download_from_sandbox
+# 的 JSON 或 shell 回显）。字符类比 \S+ 保守：到引号/空白/逗号/花括号/方括号为止，
+# 否则会把 JSON 尾巴（`","size":15758`）或 shell 报错的 `':` 一起吞进路径 → 前端 404。
+# 中文不在 \w 里，故用显式字符类而非 \w。
+_REPORTS_PATH_RE = re.compile(r'/reports/[^"\s,}\]]+')
+
+
 def _sanitize_generated_path(file_path: str) -> str:
     """清洗工具返回的文件路径（对称前端 deriveGeneratedFiles 清洗，2026-08-24 根治脏路径）。
 
@@ -247,10 +254,17 @@ def _sanitize_generated_path(file_path: str) -> str:
     前端 deriveGeneratedFiles 只过滤 `file_path.endsWith("/")`，漏掉尾随引号，
     故在后端 emit 前统一清洗（去首尾引号/空白）。清洗后再走磁盘查找/去重/emit，
     `diff.json'` 自动归正为 `diff.json`（磁盘存在 → 正常预览下载，且与真实条目去重）。
+
+    2026-09-29 扩展（B① 前置条件）：追加剥离 `:` `;` `,` `` ` `` —— shell 报错回显里的
+    路径常被"引号 + 冒号"包住，形如
+        cp: cannot create regular file '/reports/u/s/x.pptx': No such file or directory
+    而提取路径的正则 `[^"\\s,}\\]]+` 不把 `'` 当分隔符，会把尾部的 `':` 一起吞进路径
+    （实测得到 `/reports/u/s/x.pptx':`）。不清掉这一步，后面的沙箱候选路径（
+    /home/user/x.pptx）永远对不上 → B① 的"从沙箱拉回"必然失败。
     """
     if not file_path:
         return file_path
-    return file_path.strip().strip("'\" \t")
+    return file_path.strip().strip("'\"` \t:,;")
 
 
 async def _pull_report_from_sandbox(
@@ -339,6 +353,160 @@ async def _pull_report_from_sandbox(
         "[FILE_GEN] 沙箱产物已拉回宿主: %s (%d bytes)", disk_path, len(content)
     )
     return len(content)
+
+
+# ─── 沙箱交付物兜底回收（2026-09-29 方案 B②）───
+# 触发场景：模型用 execute 在沙箱内生成交付物（python-pptx / pandas.to_excel 等），
+# 却从未调用 download_from_sandbox 拉回宿主 → 宿主报告目录零产出，沙箱 5min TTL
+# 回收后文件永失（GY35377/60c64c4f 项目团队任命书.pptx 实测）。
+#   B① 按"工具结果里出现的路径"救（要求模型说得出路径）；
+#   B② 按"沙箱文件系统差集"救（模型连路径都没说出来也能救）——本节即 B②。
+#
+# 只回收"像交付物"的扩展名：脚本/日志/缓存/依赖不该变成用户面前的报告卡片
+# （模型常写 generate_ppt.py / output.log，那不是交付物）。
+_SALVAGE_EXTS = (
+    "md", "txt", "pdf", "docx", "doc", "xlsx", "xls", "csv", "pptx", "ppt",
+    "html", "htm", "json", "xml", "yaml", "yml", "png", "jpg", "jpeg", "svg", "zip",
+)
+# 沙箱内产物高发目录：execute 的 CWD 默认 /home/user；脚本常写 /tmp；
+# 模型被误导后还会自己 mkdir -p /reports/...（**沙箱内的同名目录**，不是宿主卷）
+_SALVAGE_DIRS = ("/home/user", "/tmp", "/reports")
+# 单轮兜底最多回收几个：避免一次性把沙箱垃圾全搬进来刷屏
+_SALVAGE_MAX_FILES = 5
+# B①：是否也解析"失败的工具结果"里的交付物路径。
+# 报错文本里的 /reports/... 也可能指向真实产物（cp 因目标目录不存在而失败，源文件仍在），
+# 跳过解析等于连"试着拉回"的机会都没有。安全性由 emit 护栏承担：
+# **报错来源的路径只有真正拉回成功（file_size > 0）才允许 emit**（见下方 B① 护栏）。
+_PARSE_ERROR_TOOL_RESULTS = True
+
+
+def _sandbox_artifact_listing(sandbox) -> dict[str, int]:
+    """列沙箱候选目录下的交付物候选 {绝对路径: 字节数}（**同步阻塞**，调用方须 to_thread）。
+
+    `sandbox.execute` 内部走 e2b `commands.run`（同步网络调用），在事件循环里直调
+    会占住整个 worker（同 `_pull_report_from_sandbox` docstring 的教训）。
+
+    为什么要大小：前后快照做差集时，"覆盖写同名文件"（同路径、内容变了）也必须算
+    本轮新产物；只比路径会漏。
+    为什么不用时间戳：沙箱 MicroVM 与 agent 容器的时钟可能漂移，`-newermt` 会漏或
+    多算；差集在本机算，无时钟依赖。
+    枚举失败（沙箱回收/命令错误）返回 {} —— 调用方据此放弃兜底，不抛异常。
+    注意这里是**fail-closed**：拿不到可信清单就不搬文件，宁可不救也不能把无关文件
+    塞进用户报告目录（部分结果比空结果更危险）。
+    """
+    if sandbox is None:
+        return {}
+    name_clause = " -o ".join("-name '*.%s'" % e for e in _SALVAGE_EXTS)
+    # ⚠️ 必须先过滤掉**不存在的**候选目录再交给 find（2026-09-29 真沙箱实测）：
+    # 新沙箱里 `/reports` 不存在（它要模型自己 mkdir 才有），而 GNU find 遇到不存在的
+    # 起始路径会以 **exit 1** 结束 → 整条命令被判失败 → 本函数返回 {} → 兜底**永久静默
+    # 失效**（每个还没在沙箱内建过 /reports 的会话都中招，恰好是绝大多数）。
+    # 实测对照：`find /home/user /tmp /reports ...` exit=1 输出空；
+    #           `find /home/user /tmp ...`（仅存在目录）exit=0 且正确列出产物。
+    # 目录全都不存在时 `if` 不执行、整体退出码为 0 → 返回 {}（无候选），语义正确。
+    dirs_clause = " ".join(_SALVAGE_DIRS)
+    cmd = (
+        "D=''; for d in %s; do [ -d \"$d\" ] && D=\"$D $d\"; done; "
+        "if [ -n \"$D\" ]; then find $D -maxdepth 4 -type f \\( %s \\) "
+        "-not -path '*/__pycache__/*' -not -path '*/site-packages/*' "
+        "-not -path '*/node_modules/*' -not -path '*/.cache/*' -not -path '*/.git/*' "
+        "-printf '%%p\\t%%s\\n' 2>/dev/null; fi"
+        % (dirs_clause, name_clause)
+    )
+    try:
+        resp = sandbox.execute(cmd, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[FILE_GEN] 沙箱产物枚举异常: %s", e)
+        return {}
+    if getattr(resp, "exit_code", 0) != 0:
+        logger.warning(
+            "[FILE_GEN] 沙箱产物枚举 exit=%s: %s",
+            getattr(resp, "exit_code", None),
+            str(getattr(resp, "output", ""))[:200],
+        )
+        return {}
+    listed: dict[str, int] = {}
+    for line in (getattr(resp, "output", "") or "").splitlines():
+        path, sep, size = line.rpartition("\t")
+        if not sep or not path.startswith("/"):
+            continue
+        try:
+            listed[path] = int(size)
+        except ValueError:
+            continue
+    return listed
+
+
+async def _salvage_sandbox_artifacts(
+    sandbox, user_id: str, session_id: str, before: dict[str, int] | None
+) -> list[dict]:
+    """收尾兜底：把沙箱里**本轮新增/改写**的交付物拉回宿主持久卷。
+
+    仅在「交付型任务 + 宿主报告目录本轮零新文件 + B① 也没救回」时调用一次
+    （调用点有 `_salvage_done` 单次门）。返回已落盘条目（字段与 file_generated
+    事件同构），无物可回收返回 []。
+
+    `before` 为 None 表示**基线不可用**（开轮枚举失败）→ 直接放弃兜底：没有基线就
+    分不清"本轮新产物"和"上一轮遗留"，硬拉会把旧文件算到本轮头上。
+    注意 `{}` 与 None 语义不同：`{}` 是"沙箱当时确实没有候选文件"，可以正常兜底。
+
+    与 `_pull_report_from_sandbox` 的分工：那个是"知道确切文件名，逐条试候选路径"；
+    本函数是"不知道文件名，枚举沙箱前后差集"。两者都不抛异常——收尾兜底不能反过来
+    把当轮搞挂；沙箱已回收时返回 []，退化为修复前行为，不会更差。
+    """
+    if sandbox is None or before is None:
+        return []
+    try:
+        after = await asyncio.to_thread(_sandbox_artifact_listing, sandbox)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[FILE_GEN] 收尾兜底枚举失败: %s", e)
+        return []
+    new_paths = [p for p, size in after.items() if before.get(p) != size]
+    if not new_paths:
+        logger.info("[FILE_GEN] 收尾兜底：沙箱内无本轮新增交付物")
+        return []
+    # 大文件优先：正式交付物（报告/表格）通常远比零散小文件更可能是用户要的东西
+    new_paths.sort(key=lambda p: (-after[p], p))
+    root = os.path.normpath(os.path.join(settings.report_root, user_id, session_id))
+    salvaged: list[dict] = []
+    for src in new_paths[:_SALVAGE_MAX_FILES]:
+        try:
+            responses = await asyncio.to_thread(sandbox.download_files, [src])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[FILE_GEN] 收尾兜底拉回异常: src=%s err=%s", src, e)
+            continue
+        content = None
+        for resp in responses or []:
+            c = getattr(resp, "content", None)
+            if c:
+                content = c
+                break
+        if not content:
+            continue
+        base_name = src.rsplit("/", 1)[-1]
+        # 路径穿越防御（与 _pull_report_from_sandbox 同款）：落盘限制在 report_root/uid/sid 内
+        disk_path = os.path.normpath(os.path.join(root, base_name))
+        if disk_path != root and not disk_path.startswith(root + os.sep):
+            logger.warning("[FILE_GEN] 收尾兜底路径越界拦截: %s", disk_path)
+            continue
+        try:
+            os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+            with open(disk_path, "wb") as f:
+                f.write(content)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[FILE_GEN] 收尾兜底写盘失败: %s err=%s", disk_path, e)
+            continue
+        salvaged.append({
+            "file_name": base_name,
+            "file_path": "/reports/%s/%s/%s" % (user_id, session_id, base_name),
+            "file_size": len(content),
+            "file_type": _infer_file_type(base_name),
+        })
+        logger.warning(
+            "[FILE_GEN] 收尾兜底：沙箱产物已拉回宿主 %s ← %s (%d bytes)",
+            disk_path, src, len(content),
+        )
+    return salvaged
 
 
 def _merge_disk_diff_into_generated(
@@ -587,6 +755,28 @@ async def chat(
         f"【当前会话路径】\n"
         f"输入文件：/uploads/{user_id}/{session_id}/\n"
         f"报告输出：/reports/{user_id}/{session_id}/\n"
+        # ─── 交付物写入通道（2026-09-29 方案 A）───
+        # 背景：GY35377/60c64c4f 实测——模型用 execute 在沙箱内生成 pptx，再在**沙箱内**
+        # `mkdir -p /reports/... && cp ...`（exit 0）就宣称"已保存、可直接下载"，实际宿主
+        # 报告目录一个文件都没有，用户点下载必然 404。
+        # 根因是**同一段路径字符串在两套后端下含义不同**：write_file 走 FilesystemBackend
+        # 直写宿主报告卷；execute 走 sandbox 默认后端（agent.py:690 注释"execution is not
+        # path-routable"），而沙箱**未挂载任何宿主目录**（sandbox.create_sandbox 无 mount）。
+        # 明说通道边界，从源头掐掉这类幻觉（不替代 B 的兜底，二者互补）。
+        f"⚠️ 交付物写入通道（务必遵守，弄错用户会拿到不存在的文件）：\n"
+        f"  · 写报告/文档/表格等交付物 → **只能用 write_file/write 工具**写 "
+        f"/reports/{user_id}/{session_id}/...；该虚拟路径直通宿主报告目录，写完即可下载。\n"
+        f"  · **禁止用 execute/shell 往 /reports/... 或 /uploads/... 写文件**：这两个目录是"
+        f"虚拟路径，沙箱里**没有挂载**它们（execute 走沙箱文件系统，不参与路径路由）。"
+        f"shell 里的 mkdir/cp 到 /reports/... 只落在沙箱内部，宿主报告目录不会有任何文件，"
+        f"而且沙箱空闲约 5 分钟即被回收，文件随即消失。\n"
+        f"  · 若确实要用 shell 生成文件（如 python-pptx / pandas.to_excel）：产物先落在沙箱"
+        f"（如 /home/user/xxx.pptx），**必须再用 download_from_sandbox 拉回** "
+        f"/reports/{user_id}/{session_id}/ —— 这是 shell 产物唯一的交付通道。\n"
+        f"  · 同理，沙箱里也看不到 /uploads/... 的用户文件：读它们用 read_file/ls，"
+        f"或先 upload_to_sandbox 把文件送进沙箱再处理。\n"
+        f"  · **未真正看到 download_from_sandbox 或 write_file 的成功回执前，"
+        f"禁止声称文件\"已保存/已生成/可直接下载\"**；不确定就如实说明缺少哪一步。\n"
     )
 
     # M1：环境快照注入（系统自动探测，模型不应自行重装/探测环境）
@@ -1067,6 +1257,23 @@ async def chat(
         # M3 任务类型感知（方案 A）：仅"要求文件交付物"的任务启用零产出拦截，
         # 内容型任务（散文/问答）交付物即回复本身，零产出直接放行。
         _is_deliverable = _is_deliverable_task(body.message)
+        # ─── B② 收尾兜底基线：沙箱侧交付物快照（2026-09-29）───
+        # 只在"交付型任务"取（内容型任务永不需要兜底，省掉一次沙箱往返）。
+        # 失败置 None = 基线不可用 → 禁止兜底：没有基线就分不清"本轮新产物"与
+        # "上一轮遗留"，硬拉会把旧文件算到本轮头上，制造假卡片（比不救更糟）。
+        _before_sandbox_files: dict[str, int] | None = None
+        _salvage_done = False
+        if _is_deliverable and sandbox is not None:
+            try:
+                _before_sandbox_files = await asyncio.to_thread(
+                    _sandbox_artifact_listing, sandbox
+                )
+                logger.debug(
+                    "[FILE_GEN] 沙箱产物基线: %d 个候选文件", len(_before_sandbox_files)
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[FILE_GEN] 沙箱产物基线枚举失败（放弃收尾兜底）: %s", e)
+                _before_sandbox_files = None
         # graph_input 是 chat() 外层变量；event_stream 内若要重新赋值（完成门自动
         # 继续轮注入 SystemMessage），必须用独立局部变量 _graph_input，否则
         # Python 会把 graph_input 判定为 event_stream 局部变量，首轮读取即
@@ -1446,7 +1653,15 @@ async def chat(
                                 # ─── 检测工具返回的文件信息，提取生成/下载的文件 ───
                                 # 不限定工具名，任何返回 /reports/ 路径的工具都能触发
                                 file_path_virtual = None
-                                if not is_error:
+                                # B①（2026-09-29）：原实现 `if not is_error` 一刀切跳过——
+                                # 报错结果里的 /reports/... 同样可能指向**真实产物**
+                                # （GY35377/60c64c4f 实测：`cp /home/user/x.pptx
+                                #  /reports/.../x.pptx` 因沙箱内没有该目录而 exit 1，
+                                #  源文件 x.pptx 好端端在 /home/user/ 下）。跳过 = 连
+                                # "试着从沙箱拉回"的机会都没有。故放开解析，安全性由
+                                # 下方 emit 护栏承担：**报错来源的路径只有拉回成功
+                                # （file_size > 0）才允许 emit**，绝不凭一行报错文本发卡片。
+                                if not is_error or _PARSE_ERROR_TOOL_RESULTS:
                                     # 1. 结构化解析：MCP 工具（如 download_from_sandbox）返回
                                     #    list[{'type','text'}] 或 dict，text 里是 JSON 字符串；
                                     #    直接用 json.loads 取路径字段，避免正则贪婪匹配吃进 JSON 尾巴
@@ -1484,9 +1699,7 @@ async def chat(
                                                 file_path_virtual = m.group(1)
                                         else:
                                             # [^"\s,}\]]+ 匹配到中文等非分隔符字符为止（\w 不含中文）
-                                            m = re.search(
-                                                r'/reports/[^"\s,}\]]+', content_str
-                                            )
+                                            m = _REPORTS_PATH_RE.search(content_str)
                                             if m:
                                                 file_path_virtual = m.group(0).rstrip(
                                                     '"'
@@ -1495,7 +1708,7 @@ async def chat(
                                 # 规范化文件路径：如果 write_file 返回的路径是 WSL/宿主机完整路径
                                 # （如 /mnt/d/.../data/reports/.../file），从中提取 /reports/... 部分
                                 if file_path_virtual and not file_path_virtual.startswith("/reports/"):
-                                    reports_m = re.search(r'/reports/[^"\s,}\]]+', file_path_virtual)
+                                    reports_m = _REPORTS_PATH_RE.search(file_path_virtual)
                                     if reports_m:
                                         file_path_virtual = reports_m.group(0)
                                         logger.debug(
@@ -1567,7 +1780,11 @@ async def chat(
                                         except Exception:
                                             pass
                                     # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
-                                    if file_size == 0:
+                                    # B① 收窄：报错结果**不采信**"返回值里的 size"——那是
+                                    # 工具/模型自称的数字，不是宿主磁盘事实；采信它等于绕过
+                                    # 下面的 emit 护栏，凭空放行一张幽灵卡片。报错来源只认
+                                    # "拉回成功"这一条事实来源（见 _pull_report_from_sandbox）。
+                                    if file_size == 0 and not is_error:
                                         size_m = re.search(
                                             r'"size"\s*:\s*(\d+)', content_str
                                         )
@@ -1583,6 +1800,21 @@ async def chat(
                                     if is_report_path and not filename:
                                         logger.warning(
                                             "[FILE_GEN] 忽略目录路径 file_generated: path=%s (无文件名)",
+                                            file_path_virtual,
+                                        )
+                                        continue
+
+                                    # ─── B① 安全护栏（2026-09-29）───
+                                    # 来自**报错结果**的路径，只有真正拉回成功（file_size>0，
+                                    # 即 _pull_report_from_sandbox 已把它落到宿主卷）才允许
+                                    # emit。否则一行 `No such file or directory` 里的路径就会
+                                    # 变成一张 HEAD 404 的红框卡片 —— 比不显示更糟：它让用户
+                                    # 以为文件存在过。护栏放在这里（而非解析处），一次覆盖
+                                    # /reports/ 与 /skills/ 两条分支。
+                                    if is_error and file_size == 0:
+                                        logger.info(
+                                            "[FILE_GEN] 报错结果中的路径未拉回成功，跳过 emit"
+                                            "（防幽灵卡片）: path=%s",
                                             file_path_virtual,
                                         )
                                         continue
@@ -1679,6 +1911,35 @@ async def chat(
                     yield _ev
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
                 _new_files = _after_files - _before_files
+
+                # ─── B② 收尾兜底：交付型任务 + 宿主零产出 → 扫沙箱把漏掉的产物拉回 ───
+                # 位置放在 M3 完成门**之前**：兜底救回来的产物应当让本轮正常放行，而不是
+                # 先弹"未产出交付物"再补救（那是自相矛盾的 UX，正是本次要修的病）。
+                # 单次门 _salvage_done：完成门重试轮不重复扫（差集已取过，重扫只是多花
+                # 一次沙箱往返且无新信息）。
+                if (
+                    not _new_files
+                    and not _generated_files
+                    and _is_deliverable
+                    and not _salvage_done
+                    and _before_sandbox_files is not None
+                ):
+                    _salvage_done = True
+                    _salvaged = await _salvage_sandbox_artifacts(
+                        sandbox, user_id, session_id, _before_sandbox_files
+                    )
+                    for _sf in _salvaged:
+                        if _sf["file_path"] in _emitted_files:
+                            continue
+                        _emitted_files.add(_sf["file_path"])
+                        _files_in_window += 1  # 新交付物计数（非空转信号，与 B① 一致）
+                        _generated_files.append(_sf)
+                        yield f"data: {json.dumps({'type': 'file_generated', **_sf}, ensure_ascii=False)}\n\n"
+                    if _salvaged:
+                        _after_files = snapshot_report_files(
+                            settings.report_root, user_id, session_id
+                        )
+                        _new_files = _after_files - _before_files
                 # ─── 空响应降级优先于 M3 零产出拦截（2026-09-16）───
                 # 模型层一个字都没产出时，「/reports 为空」只是它的**后果**，
                 # 不能按"漏了 download_from_sandbox / write_file"归因（de18ad37 实锤）。
@@ -1788,11 +2049,25 @@ async def chat(
                         "[M3] 完成门拦截（本轮零产出）: user=%s, session=%s, generated=%d, new_files=%d, retries=%d",
                         user_id, session_id, len(_generated_files), len(_new_files), _completion_retries,
                     )
+                    # C② 反幻觉（2026-09-29）：模型常在**未做任何验证**的情况下于正文声称
+                    # "已保存/可直接下载"（GY35377/60c64c4f 实测：连续四轮零工具调用纯复述，
+                    # 同屏还挂着"本轮未产出交付物"横幅，界面自相矛盾）。
+                    # 零产出是磁盘事实，故这里**明确否定**该类表述——与本门"只描述事实、
+                    # 不做无据推测"的原则不冲突：否定句同样是事实断言（文件确实不存在），
+                    # 不是对"模型漏了哪一步"的猜测。
+                    # 措辞随核查范围变化：B② 沙箱兜底跑过才有资格说"沙箱也没有"。
+                    _verified_scope = (
+                        "宿主报告目录与沙箱均已核查，均无本轮新交付物"
+                        if _salvage_done
+                        else "宿主报告目录无本轮新交付物"
+                    )
                     yield f"data: {json.dumps({
                         'type': 'completion_blocked',
                         'code': 'no_artifact_in_reports',
                         'title': '本轮未产出交付物',
-                        'reason': '本轮任务未产出任何交付物（/reports 为空）',
+                        'reason': f'本轮任务未产出任何交付物（{_verified_scope}）；'
+                                  '若上文中出现“已保存/已生成/可直接下载”一类说法，该说法不成立，'
+                                  '请勿据此操作（文件不存在）',
                         # 措辞只描述事实 + 条件式建议：本门只看得到磁盘差集，看不到
                         # 模型是否漏了哪一步，原文"请检查是否遗漏 ..."是无据推测
                         #（2026-09-16 会话 de18ad37 因"输出"×"表格"顺带词误命中而错报）。
