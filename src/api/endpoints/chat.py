@@ -253,6 +253,74 @@ def _sanitize_generated_path(file_path: str) -> str:
     return file_path.strip().strip("'\" \t")
 
 
+def _pull_report_from_sandbox(
+    sandbox, file_path_virtual: str, user_id: str, session_id: str, filename: str
+) -> int:
+    """沙箱产物拉回宿主持久卷（2026-09-29 方案A：file_generated 兜底持久化）。
+
+    背景（GY35377/60c64c4f 项目团队任命书.pptx 实测）：模型在沙箱内 execute
+    生成的产物（python-pptx 等）落在**沙箱文件系统**，未走 download_from_sandbox
+    拉回宿主；沙箱 5min 空闲 TTL 被 lifecycle-manager 回收后文件随之消失，
+    但 file_generated 事件已按模型声称的 /reports/ 路径推送 → 前端 HEAD 404
+    → 红框"文件不可用"。write_file 写 /reports/ 走 FilesystemBackend 直写
+    持久卷本无此问题，漏网的只是"沙箱内 execute 产物"。
+
+    策略：emit 前发现磁盘缺失（file_size==0）时，按候选路径从沙箱读回字节
+    并落盘到 settings.report_root/{user}/{session}/——生成瞬间即持久化，
+    之后沙箱回收无所谓，也不再依赖模型自觉调 download_from_sandbox。
+
+    候选沙箱路径（按命中率排序）：
+      1. 模型声称的虚拟路径本身（沙箱内 mkdir -p /reports/... 后写同一绝对路径）
+      2. /home/user 下的相对写法（execute CWD 多为 /home/user）
+      3. /home/user/{basename}、/tmp/{basename}（脚本就近输出）
+
+    返回落盘后的文件大小；任何失败返回 0（不阻断 SSE 流，退化为现状 404，
+    不会比修复前更差）。沙箱已回收时 download_files 全 file_not_found → 0。
+    """
+    if sandbox is None or not filename:
+        return 0
+    base_name = filename.rsplit("/", 1)[-1]
+    candidates = [
+        file_path_virtual,
+        f"/home/user/reports/{user_id}/{session_id}/{filename}",
+        f"/home/user/{base_name}",
+        f"/tmp/{base_name}",
+    ]
+    try:
+        responses = sandbox.download_files(candidates)
+    except Exception as e:  # noqa: BLE001 — 沙箱断连/回收等，降级不阻断
+        logger.warning("[FILE_GEN] 沙箱拉回异常: path=%s err=%s", file_path_virtual, e)
+        return 0
+    content = None
+    for resp in responses or []:
+        c = getattr(resp, "content", None)
+        if c:
+            content = c
+            break
+    if not content:
+        logger.warning(
+            "[FILE_GEN] 沙箱内未找到产物（可能沙箱已回收）: tried=%s", candidates
+        )
+        return 0
+    # 路径穿越防御（与 files.py 同款）：落盘必须限制在 report_root/uid/sid 内
+    root = os.path.normpath(os.path.join(settings.report_root, user_id, session_id))
+    disk_path = os.path.normpath(os.path.join(root, filename))
+    if disk_path != root and not disk_path.startswith(root + os.sep):
+        logger.warning("[FILE_GEN] 拉回路径越界拦截: %s", disk_path)
+        return 0
+    try:
+        os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+        with open(disk_path, "wb") as f:
+            f.write(content)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[FILE_GEN] 拉回写盘失败: %s err=%s", disk_path, e)
+        return 0
+    logger.info(
+        "[FILE_GEN] 沙箱产物已拉回宿主: %s (%d bytes)", disk_path, len(content)
+    )
+    return len(content)
+
+
 def _merge_disk_diff_into_generated(
     generated_files: list,
     disk_files: frozenset[str],
@@ -1399,6 +1467,15 @@ async def chat(
                                                     break
                                             except Exception:
                                                 pass
+                                        # 方案A（2026-09-29）：磁盘缺失 → 从沙箱拉回
+                                        # 持久化后再 emit（沙箱 execute 产物 TTL 回收即
+                                        # 丢失，GY35377/60c64c4f pptx 404 实测根因）。
+                                        # 此时沙箱刚执行完工具必然存活，拉回成功率最高。
+                                        if file_size == 0 and filename:
+                                            file_size = _pull_report_from_sandbox(
+                                                sandbox, file_path_virtual,
+                                                user_id, session_id, filename,
+                                            )
                                     else:  # /skills/__agent__/
                                         filename = file_path_virtual[
                                             len("/skills/__agent__/") :
