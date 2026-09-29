@@ -14,7 +14,7 @@ from src.infra.database import message_key
 from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
-from src.core import turn_registry
+from src.core import execution_guard, turn_registry
 from src.core.mcp import get_mcp_tools
 from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
 from src.api.deps import get_store, get_checkpointer, get_current_user
@@ -235,6 +235,57 @@ _FILE_TYPE_BY_EXT = {
 def _infer_file_type(file_name: str) -> str:
     ext = file_name.split(".")[-1].lower() if "." in file_name else ""
     return _FILE_TYPE_BY_EXT.get(ext, "other")
+
+
+def _tool_result_is_error(
+    tool_name: str, content_str: str, status: str | None = None
+) -> bool:
+    """判定一条工具结果是否失败（决定 SSE 的 success 字段与文件解析准入）。
+
+    优先级：**框架的 `ToolMessage.status` > 内容启发式**。
+
+    为什么必须让 status 优先（2026-09-29 根因修复）：
+    execute 通道护栏（`agent.py` 的 `ValidatedCompositeBackend.execute`）拒绝越界命令时
+    抛 `ValueError` → deepagents 工具层回
+    `ToolMessage(status="error", content="Error: Invalid parameter. {拒绝文案}")`。
+    这段内容**既不含** "command failed with exit code"、**也不以** "Execution error:"
+    开头 → 旧的 execute 关键词分支判 `is_error=False` → 拒绝结果被当**成功**结果送进
+    文件解析 → 护栏文案里的 `/reports/<uid>/<sid>/<文件名>` 被当路径提取 → 产出一张
+    `file_size=0` 的幽灵卡片（2026-09-29 活体 e2e 实测，正是本次要消灭的那类病）。
+    status 是框架权威字段，有它就不该再猜。
+
+    关键词兜底仍保留（status 缺失/老版本 SDK 时用），并保持原语义：
+    - 结构化 JSON：只看 `success` 字段，命中即返回，**不落关键词**（历史上
+      `"error": null` 撞上宽泛关键词把成功标成失败）；
+    - `read_file` 是内容型工具，成功返回的正文里可能含 "No such file"（如 SKILL.md 里
+      的示例文本）→ 只认 deepagents 失败时必带的 "Error: " 前缀。
+    """
+    if status == "error":
+        return True
+    if not content_str:
+        return False
+    try:
+        parsed = json.loads(content_str)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    else:
+        # 解析成 JSON 了：只认 success 字段（非 dict / 无该字段 → 视为无失败信号）
+        return isinstance(parsed, dict) and "success" in parsed and not parsed["success"]
+    lower = content_str.lower()
+    if tool_name == "execute":
+        return (
+            "command failed with exit code" in lower
+            or content_str.startswith("Execution error:")
+        )
+    if tool_name == "read_file":
+        return content_str.startswith(("Error: ", "error: "))
+    return any(
+        marker in lower
+        for marker in (
+            "exception", "traceback", "failed", "failure",
+            "timeout", "permission denied", "no such file",
+        )
+    )
 
 
 # 从工具结果文本里抠 /reports/ 路径（write_file 之外的工具：execute / download_from_sandbox
@@ -1258,12 +1309,18 @@ async def chat(
         # 内容型任务（散文/问答）交付物即回复本身，零产出直接放行。
         _is_deliverable = _is_deliverable_task(body.message)
         # ─── B② 收尾兜底基线：沙箱侧交付物快照（2026-09-29）───
-        # 只在"交付型任务"取（内容型任务永不需要兜底，省掉一次沙箱往返）。
         # 失败置 None = 基线不可用 → 禁止兜底：没有基线就分不清"本轮新产物"与
         # "上一轮遗留"，硬拉会把旧文件算到本轮头上，制造假卡片（比不救更糟）。
+        #
+        # 取值条件**不限于** _is_deliverable 轮次（2026-09-29 A+B 改为"有沙箱就取"）：
+        # B 的触发源是**轮中**才出现的 execute 越界写拒绝，而基线必须在轮首取——
+        # 词表漏判时（60c64c4f 那轮英文 "appointment PPT" 未命中 pptx 强信号，
+        # _is_deliverable=False）事后无法回头补基线，B 会全程失效。
+        # 代价是每个带沙箱的轮次多一次 find（亚秒级），换来"任意轮次都能救回沙箱产物"，
+        # 也让 B② 兜底不再受关键词词表漏判影响。
         _before_sandbox_files: dict[str, int] | None = None
         _salvage_done = False
-        if _is_deliverable and sandbox is not None:
+        if sandbox is not None:
             try:
                 _before_sandbox_files = await asyncio.to_thread(
                     _sandbox_artifact_listing, sandbox
@@ -1499,46 +1556,16 @@ async def chat(
                                 elif isinstance(raw, str):
                                     candidate = raw
                                 content_str = str(candidate) if candidate else ""
-                                is_error = False
-                                if content_str:
-                                    # 优先尝试 JSON 解析：MCP 工具返回结构化 JSON 带 success 字段
-                                    try:
-                                        parsed = json.loads(content_str)
-                                        if isinstance(parsed, dict) and "success" in parsed:
-                                            is_error = not parsed["success"]
-                                        # 结构化 JSON 不走关键词匹配
-                                    except (json.JSONDecodeError, TypeError):
-                                        # 非 JSON 内容，退回到精确关键词匹配（去掉了宽泛的 "error"）
-                                        lower = content_str.lower()
-                                        if tool_name == "execute":
-                                            is_error = (
-                                                "command failed with exit code" in lower
-                                                or content_str.startswith("Execution error:")
-                                            )
-                                        else:
-                                            if tool_name == "read_file":
-                                                # read_file 是内容型工具：成功返回全文（带行号），
-                                                # 内容里可能含 failed/no such file 等正常文本（2026-08-19
-                                                # 实测：tech-spec-pdf-diff/SKILL.md 第 25 行
-                                                # "No such file or directory" 命中旧关键词 → 成功误判 FAIL）。
-                                                # deepagents 失败必以 "Error: " 前缀开头
-                                                # （middleware/filesystem.py:1094 content=f"Error: {error}"）。
-                                                is_error = content_str.startswith(
-                                                    ("Error: ", "error: ")
-                                                )
-                                            else:
-                                                is_error = any(
-                                                    marker in lower
-                                                    for marker in [
-                                                        "exception",
-                                                        "traceback",
-                                                        "failed",
-                                                        "failure",
-                                                        "timeout",
-                                                        "permission denied",
-                                                        "no such file",
-                                                    ]
-                                                )
+                                # ─── 失败判定（2026-09-29 抽为纯函数便于单测）───
+                                # 注意 status 优先：护栏拒绝的 ToolMessage(status="error")
+                                # 文案不含 exit code/Execution error，旧关键词分支会把它
+                                # 误判为成功 → 拒绝文案里的路径被当交付物解析。详见
+                                # _tool_result_is_error docstring。
+                                is_error = _tool_result_is_error(
+                                    tool_name,
+                                    content_str,
+                                    getattr(last_msg, "status", None),
+                                )
 
                                 # ─── tool 节点可观测性日志：工具名 + 成功/失败 + 结果截断 ───
                                 # 屏蔽 langgraph print 后工具调用过程不再出现在日志，
@@ -1912,19 +1939,51 @@ async def chat(
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
                 _new_files = _after_files - _before_files
 
-                # ─── B② 收尾兜底：交付型任务 + 宿主零产出 → 扫沙箱把漏掉的产物拉回 ───
+                # ─── B② 收尾兜底：把沙箱里漏掉的产物拉回宿主 ───
                 # 位置放在 M3 完成门**之前**：兜底救回来的产物应当让本轮正常放行，而不是
                 # 先弹"未产出交付物"再补救（那是自相矛盾的 UX，正是本次要修的病）。
                 # 单次门 _salvage_done：完成门重试轮不重复扫（差集已取过，重扫只是多花
                 # 一次沙箱往返且无新信息）。
+                #
+                # 触发条件两个来源（2026-09-29 A+B 扩展）：
+                #   ① 原条件（词表判交付 + 宿主零产出）；② 本轮 execute 命中虚拟路径护栏。
+                # ②为什么必要：`_is_deliverable` 是**关键词启发式**，会漏判（实测
+                # 60c64c4f：英文 "appointment PPT" 未命中强信号 "pptx" → 判 False →
+                # 基线没取、兜底全程没生效）。而"模型试图往 /reports 写"这件事本身就是
+                # **交付意图的强信号**，比词表可靠；此刻沙箱里极可能已经躺着它写出来的
+                # 产物（先写 /home/user 再 cp /reports 的典型形态）。
+                # A 是高频拦截层、不是完备保证（变量拼接/base64/通配符可绕），
+                # B 不依赖命令解析、只比沙箱前后差集 ⇒ A 被绕过也不丢产物。
+                # 🔭 治本方案 C（把宿主报告卷 bind-mount 进沙箱，通道不对称彻底消失）
+                # 本次未做，理由与触发条件见 src/core/execution_guard.py 模块头「后续演进」。
+                _exec_violation = execution_guard.peek_execute_path_violation(
+                    user_id, session_id
+                )
                 if (
-                    not _new_files
-                    and not _generated_files
-                    and _is_deliverable
-                    and not _salvage_done
+                    not _salvage_done
                     and _before_sandbox_files is not None
+                    and (
+                        (
+                            not _new_files
+                            and not _generated_files
+                            and _is_deliverable
+                        )
+                        or _exec_violation is not None
+                    )
                 ):
                     _salvage_done = True
+                    # 条件成立才 consume：条件不满足（如基线不可用）时把信号留给本轮
+                    # 后续循环/下一轮，避免"吃掉信号却什么都没做"。
+                    _exec_violation = execution_guard.consume_execute_path_violation(
+                        user_id, session_id
+                    )
+                    if _exec_violation is not None:
+                        logger.warning(
+                            "[FILE_GEN] 命中 execute 越界写信号 → 强制收尾兜底: "
+                            "user=%s, session=%s, cmd=%s",
+                            user_id, session_id,
+                            str(_exec_violation.get("command_head", ""))[:160],
+                        )
                     _salvaged = await _salvage_sandbox_artifacts(
                         sandbox, user_id, session_id, _before_sandbox_files
                     )

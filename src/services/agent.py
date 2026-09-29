@@ -15,6 +15,7 @@ from deepagents.backends import (
     StoreBackend,
 )
 from deepagents.backends.protocol import (
+    ExecuteResponse,
     FileDownloadResponse,
     GlobResult,
     GrepResult,
@@ -29,6 +30,7 @@ from deepagents.middleware.skills import (
     _alist_skills_with_errors,
     _list_skills_with_errors,
 )
+from src.core import execution_guard
 from src.core.loop_detection import LoopDetectionMiddleware
 from src.core.terminal_response import TerminalResponseMiddleware
 
@@ -351,9 +353,31 @@ class ValidatedCompositeBackend(CompositeBackend):
     # 防止任何意外长扫描（含未拦截的宽泛模式）阻塞 asyncio 事件循环
     GLOB_TIMEOUT_SEC = 10
 
+    # ─── A｜execute 通道护栏（2026-09-29）───
+    # `/reports`、`/uploads` 是**虚拟文件系统路径**：write_file 命中路由直写宿主卷，
+    # 而 execute（shell）不参与路径路由、落到沙箱，且 create_sandbox **未挂载任何
+    # 宿主目录** ⇒ 命令里出现这两个路径一律是"通道用错"，不是"目录没建好"。
+    # 完整事故链与设计取舍见 src/core/execution_guard.py 模块头。
+    #
+    # 只匹配**路径字面量**（后跟 `/`、空白、引号、命令分隔符或行尾），
+    # 不误伤 `/reportsX` 这类同前缀目录名。
+    # ⚠️ 滑网面（诚实记录，别当完备保证）：变量拼接、base64 解码后执行、通配符
+    #    `/re*ts`、`cd / && cd reports`、进程内 open() 写别的路径 —— A 只覆盖
+    #    "字面量出现"这一高频形态；**不丢产物由 B（收尾差集回收）保证**。
+    # 🔭 治本方案 C（未做，理由与触发条件见 execution_guard.py 模块头）：
+    #    把宿主 report_root/{uid}/{sid}（可写）+ upload_root/{uid}/{sid}（只读）
+    #    bind-mount 进沙箱 ⇒ 通道不对称消失，A/B 退化为冗余保险。
+    EXECUTE_VIRTUAL_PATH_RE = re.compile(
+        r"/(?:reports|uploads)(?=[/\s'\"`;|&)]|$)", re.MULTILINE
+    )
+
     def __init__(self, default, routes, *, user_id: str = "", session_id: str = ""):
         super().__init__(default=default, routes=routes)
         self._report_prefix = f"/reports/{user_id}/{session_id}/" if user_id and session_id else "/reports/<user_id>/<session_id>/"
+        # A/B 共用的会话身份：A 的举报（execution_guard.note_*）与日志都需要它。
+        # 注意不能从 default backend 反推——本地兜底路径下 default 是 LocalShellBackend。
+        self._user_id = user_id
+        self._session_id = session_id
 
     def _reject_glob_scan(self, pattern: str, path: str | None) -> str | None:
         """B1: 拦截 '**' 全盘扫描（2026-08-18 根因修复）。
@@ -683,6 +707,63 @@ class ValidatedCompositeBackend(CompositeBackend):
             logger.warning("[VALIDATED_CB] 拒绝读取二进制: path=%s", file_path)
             return ReadResult(error=f"拒绝读取: {hint}", file_data=None)
         return await super().aread(file_path, offset=offset, limit=limit)
+
+    # ─── A｜execute / aexecute 通道护栏（2026-09-29）───
+    # 拦截点为什么唯一且必经：deepagents 的 execute 工具只调
+    # `resolved_backend.execute/aexecute`，而 `resolved_backend` 就是本类
+    # （CompositeBackend.execute 原文："execution is not path-routable — it always
+    # delegates to the default backend"）。详见 src/core/execution_guard.py。
+    def _reject_execute_virtual_path(self, command: str) -> str | None:
+        """命中"命令引用虚拟路径"→ 返回拒绝提示（含正确通道），否则 None。"""
+        if not command or not self.EXECUTE_VIRTUAL_PATH_RE.search(command):
+            return None
+        return execution_guard.virtual_path_write_hint(command, self._report_prefix)
+
+    def _note_execute_violation(self, command: str, *, via_async: bool) -> None:
+        """B｜登记"本轮发生过越界写尝试"，供 API 层收尾时触发沙箱产物回收。
+
+        只举报、不做任何沙箱 I/O：这里是工具调用热路径，同步版本做网络往返会占住
+        事件循环（见 execution_guard.note_execute_path_violation docstring）。
+        best-effort：举报失败绝不影响"拒绝"本身——拒绝是安全动作，举报只是救济线索。
+        """
+        try:
+            execution_guard.note_execute_path_violation(
+                self._user_id, self._session_id, command
+            )
+            logger.warning(
+                "[VALIDATED_CB] 拒绝 execute 引用虚拟路径(%s): cmd=%s",
+                "async" if via_async else "sync",
+                command[:200],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[VALIDATED_CB] 登记 execute 越界信号失败: %s", e)
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        """A：拒绝引用 /reports、/uploads 的命令（虚拟路径在沙箱内不存在）。
+
+        拒绝姿势选 `ValueError` 而非 `ExecuteResponse(exit_code=1)`：
+        `ExecuteResponse` 无 error 字段，且工具层**恒定**回 `status="success"`
+        （只把 exit_code 拼进正文），会被当作成功。`ValueError` 是工具层显式
+        捕获并转 `ToolMessage(status="error")` 的预留通道。
+
+        ⚠️ 签名必须原样保留关键字 `timeout`：工具层用
+        `execute_accepts_timeout(type(executable))` 判定，而 `executable` 就是本类
+        （`middleware/filesystem.py` sync/async 两处）。签名丢了 timeout，模型带
+        timeout 的调用会被工具层直接拒掉，护栏立刻变成功能回归。
+        """
+        hint = self._reject_execute_virtual_path(command)
+        if hint is not None:
+            self._note_execute_violation(command, via_async=False)
+            raise ValueError(hint)
+        return super().execute(command, timeout=timeout)
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        """A 的异步版（模型实际走这条：工具层优先用 coroutine 分支）。"""
+        hint = self._reject_execute_virtual_path(command)
+        if hint is not None:
+            self._note_execute_violation(command, via_async=True)
+            raise ValueError(hint)
+        return await super().aexecute(command, timeout=timeout)
 
 
 def build_backend(user_id: str, session_id: str, store, sandbox):
