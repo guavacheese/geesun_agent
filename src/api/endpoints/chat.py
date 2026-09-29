@@ -253,7 +253,7 @@ def _sanitize_generated_path(file_path: str) -> str:
     return file_path.strip().strip("'\" \t")
 
 
-def _pull_report_from_sandbox(
+async def _pull_report_from_sandbox(
     sandbox, file_path_virtual: str, user_id: str, session_id: str, filename: str
 ) -> int:
     """沙箱产物拉回宿主持久卷（2026-09-29 方案A：file_generated 兜底持久化）。
@@ -276,30 +276,50 @@ def _pull_report_from_sandbox(
 
     返回落盘后的文件大小；任何失败返回 0（不阻断 SSE 流，退化为现状 404，
     不会比修复前更差）。沙箱已回收时 download_files 全 file_not_found → 0。
+
+    ⚠️ 必须 await + to_thread（2026-09-29 加固，随 1.0.20 发布）：
+    `sandbox.download_files` 是**同步阻塞**方法（内部走网络读沙箱文件），直接调在
+    async 生成器里会占住事件循环——沙箱已回收时（每条候选都要等到超时才返回）
+    整个 worker 会僵住，**其他用户正在跑的 SSE 流一起卡**，不只影响当前会话。
+    本仓既有约定见 `src/infra/trash.py:96`：「同步阻塞函数，调用方须用
+    asyncio.to_thread 包住」。
+    同时改为**逐条候选 + 命中即短路**：库内 `download_files` 会遍历传入的全部路径，
+    原来一次传 4 条 = 无条件读 4 次；现在首条命中即停，省往返也缩短最坏路径。
     """
     if sandbox is None or not filename:
         return 0
     base_name = filename.rsplit("/", 1)[-1]
-    candidates = [
-        file_path_virtual,
-        f"/home/user/reports/{user_id}/{session_id}/{filename}",
-        f"/home/user/{base_name}",
-        f"/tmp/{base_name}",
-    ]
-    try:
-        responses = sandbox.download_files(candidates)
-    except Exception as e:  # noqa: BLE001 — 沙箱断连/回收等，降级不阻断
-        logger.warning("[FILE_GEN] 沙箱拉回异常: path=%s err=%s", file_path_virtual, e)
-        return 0
+    # dict.fromkeys 去重且保序：候选 1 与候选 2 常常是同一条路径（模型照抄虚拟路径）
+    candidates = list(
+        dict.fromkeys(
+            [
+                file_path_virtual,
+                f"/home/user/reports/{user_id}/{session_id}/{filename}",
+                f"/home/user/{base_name}",
+                f"/tmp/{base_name}",
+            ]
+        )
+    )
     content = None
-    for resp in responses or []:
-        c = getattr(resp, "content", None)
-        if c:
-            content = c
+    tried: list[str] = []
+    for cand in candidates:
+        tried.append(cand)
+        try:
+            # to_thread：同步阻塞方法，绝不能在事件循环里直调（见 docstring）
+            responses = await asyncio.to_thread(sandbox.download_files, [cand])
+        except Exception as e:  # noqa: BLE001 — 断连/回收：换下一条候选，不重试同一路径
+            logger.warning("[FILE_GEN] 沙箱拉回异常: path=%s err=%s", cand, e)
+            continue
+        for resp in responses or []:
+            c = getattr(resp, "content", None)
+            if c:
+                content = c
+                break
+        if content:
             break
     if not content:
         logger.warning(
-            "[FILE_GEN] 沙箱内未找到产物（可能沙箱已回收）: tried=%s", candidates
+            "[FILE_GEN] 沙箱内未找到产物（可能沙箱已回收）: tried=%s", tried
         )
         return 0
     # 路径穿越防御（与 files.py 同款）：落盘必须限制在 report_root/uid/sid 内
@@ -1472,7 +1492,7 @@ async def chat(
                                         # 丢失，GY35377/60c64c4f pptx 404 实测根因）。
                                         # 此时沙箱刚执行完工具必然存活，拉回成功率最高。
                                         if file_size == 0 and filename:
-                                            file_size = _pull_report_from_sandbox(
+                                            file_size = await _pull_report_from_sandbox(
                                                 sandbox, file_path_virtual,
                                                 user_id, session_id, filename,
                                             )
