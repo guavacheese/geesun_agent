@@ -1304,6 +1304,15 @@ async def chat(
         # 立刻断连、没走到消费点，它不会自己消失——留着会被**下一轮**当成自己的信号，
         # 把一轮正常的回复误报成"模型未产出"）。断连兜底路径同样要取走，见下方 finally。
         pop_fallback_signal(thread_id)
+        # execute 通道护栏信号（2026-09-29 A+B）：与上面降级信号**同因同位置**，故并排。
+        # 为什么必须在这里清：该信号的消费点只在收尾兜底分支内，且它一旦存在就会让
+        # `_before_sandbox_files is not None and (... or _exec_violation is not None)`
+        # 无条件成立（见下方 B② 触发条件）。上一轮若在 backend 登记信号之后立刻断连
+        # （GeneratorExit 直接跳出 while 循环），永远走不到消费点，信号不会自己消失
+        # ——残留到下一轮会：① 让一轮毫无越界行为的回复白跑一次沙箱兜底并打出误导性
+        # WARNING；② 把 `_salvage_done` 提前置 True，使该轮**真正**的越界信号因
+        # `not _salvage_done` 不成立而拿不到救济（B 在该轮失效）。故开轮先清。
+        execution_guard.clear_execute_path_violation(user_id, session_id)
         _terminal_fallback: dict | None = None
         # M3 任务类型感知（方案 A）：仅"要求文件交付物"的任务启用零产出拦截，
         # 内容型任务（散文/问答）交付物即回复本身，零产出直接放行。

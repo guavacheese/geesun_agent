@@ -15,8 +15,12 @@
     A  拒绝姿势契约：ValueError（而非 ExecuteResponse(exit_code=1)，后者会被工具层
        当成功）
     A  拒绝文案契约：必须给出正确通道（write_file / download_from_sandbox）
-    B  轮次信号生命周期：note/peek/consume/clear + 窗口上限 + 跨会话隔离
-    B  A→B 串联：backend 命中即登记信号；信号驱动收尾救济把沙箱产物拉回宿主
+  B  轮次信号生命周期：note/peek/consume/clear + 窗口上限 + 跨会话隔离
+  B  A→B 串联：backend 命中即登记信号；信号驱动收尾救济把沙箱产物拉回宿主
+  B  调用点接入契约（AST 静态断言）：chat.py 开轮 clear / 收尾 peek+consume 真实存在，
+     顺序为 clear < peek < consume；note_* 只由 backend 调用
+     （补测动机：1.0.22 首轮构建抓到 clear_* 全文零调用点而模块行为测试全绿
+      —— 模块级正确 ≠ 被正确接入，见该节注释）
 
 运行环境：**生产同款镜像**（chat.py 依赖 fastapi 等；deepagents 需与生产同版本）：
   docker run --rm --entrypoint /bin/sh 172.16.220.74:8333/geesun_ai/geesun-agent:1.0.21 \
@@ -503,6 +507,120 @@ def test_a_tool_result_error_judgement() -> None:
     )
 
 
+# ─────────── B：调用点接入契约（AST 静态断言，2026-09-29 补）───────────
+#
+# 为什么必须单独测"调用点"：本套件原先只测 execution_guard 的**模块行为**
+# （clear/peek/consume 各自调了都对），但没有任何一条断言它们**被 chat.py 调用**。
+# 结果 1.0.22 首轮构建就抓到这个缺口：clear_execute_path_violation 只有定义、
+# 全文零调用点 —— 开轮清残留这一环完全没落地，而模块行为测试全绿。
+# 教训与 2026-09-17 那次同源：**模块级正确 ≠ 被正确接入**。
+# 这类缺口用一个 AST 断言就能永久挡住，成本极低，故固化在此。
+
+
+def _chat_source_path() -> str:
+    """取 chat.py 的真实源码路径（不依赖 cwd，镜像内/本机都能定位）。"""
+    import src.api.endpoints.chat as _chat  # noqa: PLC0415
+    return inspect.getsourcefile(_chat) or ""
+
+
+def _guard_call_sites(path: str) -> dict[str, list[int]]:
+    """AST 解析 chat.py，返回 {execution_guard 方法名: [行号...]}。
+
+    只认**真实调用节点**（ast.Call），注释与字符串天然不会被匹配到 ——
+    这正是"反向标记命中 ≠ 有旧代码（可能是注释）"那个坑的正解。
+    """
+    import ast  # noqa: PLC0415
+
+    with open(path, "r", encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    found: dict[str, list[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # 形如 execution_guard.<name>(...)
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "execution_guard"
+        ):
+            found.setdefault(func.attr, []).append(node.lineno)
+    return found
+
+
+def test_b_call_site_wiring() -> None:
+    print("\n── B：调用点接入契约（chat.py AST 静态断言）──")
+
+    path = _chat_source_path()
+    check_true("B·能定位 chat.py 源码路径", bool(path) and os.path.exists(path), path)
+    sites = _guard_call_sites(path)
+
+    # 先自证解析到的是真的 chat.py（而不是空文件/桩文件）
+    import ast  # noqa: PLC0415
+
+    with open(path, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    check_true(
+        "B·AST 解析到真实 chat.py（含 _tool_result_is_error 定义）",
+        any(
+            isinstance(n, ast.FunctionDef) and n.name == "_tool_result_is_error"
+            for n in ast.walk(ast.parse(src, filename=path))
+        ),
+    )
+
+    # ① 开轮清残留必须被调用（本次缺口本体）
+    check_true(
+        "B·chat.py 开轮调用 clear_execute_path_violation（防跨轮串味）",
+        len(sites.get("clear_execute_path_violation", [])) >= 1,
+        "命中行=%s" % sites.get("clear_execute_path_violation", []),
+    )
+    # ② 收尾消费点必须在
+    peek_lines = sites.get("peek_execute_path_violation", [])
+    consume_lines = sites.get("consume_execute_path_violation", [])
+    check_true("B·chat.py 收尾 peek 存在", len(peek_lines) >= 1, "命中行=%s" % peek_lines)
+    check_true(
+        "B·chat.py 收尾 consume 存在（唯一消费者）", len(consume_lines) >= 1,
+        "命中行=%s" % consume_lines,
+    )
+    # ③ 顺序契约：开轮清必须**早于**收尾 peek/consume
+    #    否则"清除"发生在信号已被消费之后，等于没清。
+    clear_lines = sites.get("clear_execute_path_violation", [])
+    if clear_lines and peek_lines and consume_lines:
+        check_true(
+            "B·顺序契约：clear(开轮) < peek(收尾) < consume(收尾)",
+            min(clear_lines) < min(peek_lines) <= max(consume_lines),
+            "clear=%d peek=%d consume=%d" % (min(clear_lines), min(peek_lines), min(consume_lines)),
+        )
+    else:
+        check_true("B·顺序契约：clear < peek < consume", False, "前置调用点缺失，无法判序")
+
+    # ④ 反向：agent.py 的 backend 覆写必须是**同步+异步成对**（漏一个等于半开护栏）
+    src_agent = "/app/src/services/agent.py"
+    if not os.path.exists(src_agent):
+        # 本机跑（非镜像）时按仓库相对路径兜底
+        src_agent = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "src", "services", "agent.py")
+    if os.path.exists(src_agent):
+        with open(src_agent, "r", encoding="utf-8") as fh:
+            agent_tree = ast.parse(fh.read(), filename=src_agent)
+        methods = {
+            n.name
+            for n in ast.walk(agent_tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        check_true("B·agent.py 覆写 execute（同步）", "execute" in methods)
+        check_true("B·agent.py 覆写 aexecute（异步）", "aexecute" in methods)
+    else:
+        check_true("B·能定位 agent.py 以核对 backend 覆写", False, src_agent)
+
+    # ⑤ 合同：note_* 只由 backend 调用（不在 API 层登记，避免职责漂移）
+    check_true(
+        "B·note_execute_path_violation 不在 chat.py 出现（登记职责属 backend）",
+        "note_execute_path_violation" not in sites,
+        "chat.py 命中=%s" % sites.get("note_execute_path_violation", []),
+    )
+
+
 # ─────────────────────────── main ───────────────────────────
 
 
@@ -519,6 +637,7 @@ def main() -> int:
     test_b_window_cap()
     test_b_backend_note_on_reject()
     test_b_salvage_driven_by_signal()
+    test_b_call_site_wiring()
     for _d in _SHELL_TMPDIRS:
         shutil.rmtree(_d, ignore_errors=True)
     print()
