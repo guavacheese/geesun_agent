@@ -25,13 +25,19 @@ APP_GID=1001
 
 echo "==> 数据目录: $DATA_ROOT"
 mkdir -p "$DATA_ROOT"/agent "$DATA_ROOT"/uploads "$DATA_ROOT"/reports
+# skills 三层目录：__system__ 预装 / __agent__ agent 自创 / __user_*__ 用户上传（上传 API
+# 按需 makedirs，无需预建）。compose 把 $DATA_ROOT/skills 挂为容器 /data/agent/skills，是
+# backend 路由 root_dir，缺失即 path_not_found；必须在此预建并随下方 chown -R 归 1001。
+# 2026-10-08 实测：root 手工补建的 skills/（root:root 755）致容器 appuser 写入全部
+# EACCES——agent 自创 skill 与新用户 skill 上传同时失效（session a4cc5127 事故）。
+mkdir -p "$DATA_ROOT"/skills/__system__ "$DATA_ROOT"/skills/__agent__
 echo "==> 备份目录: $BACKUP_ROOT"
 mkdir -p "$BACKUP_ROOT"
 
 echo "==> 设置属主为容器 UID/GID $APP_UID:$APP_GID"
 chown -R "$APP_UID:$APP_GID" "$DATA_ROOT" "$BACKUP_ROOT"
 chmod 0755 "$DATA_ROOT" "$BACKUP_ROOT"
-chmod 0755 "$DATA_ROOT"/agent "$DATA_ROOT"/uploads "$DATA_ROOT"/reports
+chmod 0755 "$DATA_ROOT"/agent "$DATA_ROOT"/uploads "$DATA_ROOT"/reports "$DATA_ROOT"/skills
 
 # CubeSandbox CA 检查（agent/mcp 容器挂载源，相对 deploy/ 上级 certs/ 目录）
 CA_FILE="$SCRIPT_DIR/../certs/cube-root-ca.crt"
