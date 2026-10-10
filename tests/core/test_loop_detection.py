@@ -18,6 +18,9 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from src.core.loop_detection import (
+    LOOP_FORCED_STOP_KEY,
+    STOP_REASON_REPEAT_CALLS,
+    STOP_REASON_TOOL_FREQUENCY,
     _hash_tool_calls,
     _stable_tool_key,
     LoopDetectionMiddleware,
@@ -109,3 +112,68 @@ def test_non_tool_message_no_trigger():
     state = _state_with([AIMessage(content="just text")])
     result = mw._apply(state, _RUNTIME)
     assert result is None
+
+
+# ─── ②A（2026-10-10）：硬停必须写 state 标记，否则 API 层无从止损 ───────────
+
+
+def test_hard_stop_writes_loop_forced_stop_marker():
+    """Layer 1 硬停 → state update 里带 loop_forced_stop（原因/次数/工具）。"""
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=3)
+    call = _call("read_file", {"path": "/reports/u/s/a.txt"})
+
+    result = None
+    for _ in range(3):
+        result = mw._apply(_state_with([_ai(call)]), _RUNTIME)
+
+    assert result is not None
+    marker = result[LOOP_FORCED_STOP_KEY]
+    assert marker["reason"] == STOP_REASON_REPEAT_CALLS
+    assert marker["count"] >= 3
+    assert marker["tool_names"] == ["read_file"]
+    assert isinstance(marker["at"], float)  # 时间戳供跨轮复盘
+    # 原有语义不变：tool_calls 被剥空、附加强制停止文案
+    assert result["messages"][0].tool_calls == []
+
+
+def test_tool_frequency_hard_stop_reason_distinguished():
+    """Layer 2 硬停 → 原因码与 Layer 1 可区分（复盘时能分辨"同参重复"与"换参高频"）。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=2, tool_freq_hard_limit=3,
+    )
+    calls = [_call("read_file", {"path": f"/reports/u/s/ch{i}.txt"}) for i in range(3)]
+
+    result = None
+    for c in calls:
+        result = mw._apply(_state_with([_ai(c)]), _RUNTIME)
+
+    assert result is not None
+    marker = result[LOOP_FORCED_STOP_KEY]
+    assert marker["reason"] == STOP_REASON_TOOL_FREQUENCY
+    assert marker["tool_name"] == "read_file"
+
+
+def test_soft_warning_does_not_write_marker():
+    """软提醒（warn 段）不得写标记 —— 它只是注入提示，不该终止本轮。"""
+    mw = LoopDetectionMiddleware(warn_threshold=2, hard_limit=5)
+    call = _call("read_file", {"path": "/reports/u/s/a.txt"})
+    mw._apply(_state_with([_ai(call)]), _RUNTIME)
+    result = mw._apply(_state_with([_ai(call)]), _RUNTIME)
+    assert result is None
+
+
+def test_before_agent_clears_stale_marker():
+    """开轮清零：上一 run 的硬停标记必须被清掉（否则误杀下一轮正常回复）。"""
+    mw = LoopDetectionMiddleware()
+    stale = _state_with([])
+    stale[LOOP_FORCED_STOP_KEY] = {"reason": STOP_REASON_REPEAT_CALLS, "count": 5}
+    assert mw.before_agent(stale, _RUNTIME) == {LOOP_FORCED_STOP_KEY: None}
+
+    # 干净 state（无标记）→ 不做无谓的 state 写入
+    assert mw.before_agent(_state_with([]), _RUNTIME) is None
+
+
+def test_state_schema_exposes_marker_key():
+    """middleware 必须把自定义 state 键交给 langchain 合并（接线契约）。"""
+    assert LOOP_FORCED_STOP_KEY in LoopDetectionMiddleware.state_schema.__annotations__

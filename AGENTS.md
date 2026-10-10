@@ -627,3 +627,54 @@ geesun_agent_web/app/chat/page.tsx 的 handleDelete 原本是 `catch { /* ignore
   每 interval 秒 yield `: ping`），照常刷新 beat。
 - 也顺带核实：**当前没有 human-in-the-loop 暂停语义**（agent.py:918
   `interrupt_on` 三项全是 False）→ 不做"待交互"琥珀态，不是漏掉。
+
+## 2026-10-10 追加：async 端点里裸调同步阻塞函数 = 冻死整个 worker
+
+### 事故（会话 GY24428:a2719d7b）
+用户 08:39 上传 268MB PDF（DLP 加密）→ 08:40 模型还能 `ls` 出来 → 08:41-09:23
+agent 服务被 swarm **连续杀死 ≥7 次**（exit 137 / healthcheck unhealthy），
+用户侧表现"传了文件就再也没反应"。
+
+### 三段证据链（缺一段就会误判，这次第一步就踩了）
+1. **容器日志不可信**：agent 期间重启 7 次，`docker logs` 只剩当前实例 →
+   "没看到请求"≠"请求没来"。必须走 Loki（留存 720h，含已销毁容器）。
+2. **内存曲线排除 OOM**：同期 agent 峰值仅 350MiB/2GiB，不是资源问题
+   （对照：MCP 侧 512MiB 限额被 256MiB 文件双次全量读撑爆才是 OOM，见 MCP 1.0.3）。
+3. **死亡指纹指向事件循环**：每次崩溃前约 **3 分 19 秒完全静默**——连
+   `/healthz` 都不响应。healthcheck 是 30s 间隔 / 5s 超时 / 5 次重试，
+   恰好对应"事件循环被占住、连协程都调度不上"。
+
+### 根因
+`chat.py` 在 async 端点里**裸调两个同步阻塞函数**（旧 752/757 行）：
+`create_sandbox`（`CubeSandbox.get_or_create` 网络建沙箱 + `sandbox.execute`
+跑 pip config/CA 注入）与 `get_env_snapshot`（`probe_sandbox_env` 的
+`execute(timeout=30)`）。沙箱冷启/网络慢时几十秒占死事件循环，**同进程所有会话
+的 SSE 一起卡**，不只当前会话。本仓早有约定（`src/infra/trash.py:96`、
+`chat.py` 内 `download_files` 加固注释），这两处是漏网。
+
+### 教训（写给未来的自己）
+- **async 端点里出现同步 SDK 调用，一律视为 P0**。判断法：函数体里有没有
+  `requests`/`httpx.Client`/`sandbox.execute`/`time.sleep`，有就 `await
+  asyncio.to_thread(...)`。别指望"它平时很快"——只在冷启/超时才咬人。
+- **`to_thread` 化会改变并发形态**：改前同步调用把事件循环占死，反而不并发；
+  改后同 thread 的请求真的并行跑进来，原本"只是浪费一次创建"的竞态升级成
+  **自己杀掉自己的沙箱**（两路各建一个实例 → 后写覆盖 `_sandbox_cache` →
+  先建实例失去强引用被 GC → `__del__` 销毁沙箱，2026-08-14 实测形态）。
+  故 `create_sandbox` 配了 per-thread 创建锁（sandbox.py）。**改并发模型必须
+  同时审计该函数的所有共享状态**。
+- **"守卫触发"不等于"真的止损"——必须让调用方感知**。LoopDetectionMiddleware
+  的硬停只是把 `tool_calls` 剥空让**图**这一轮结束，API 层完全不知情：
+  M3 完成门随后按"`/reports` 零产出"注入自动继续轮，把刚掐断的循环重新推起来
+  → 硬停→继续→再硬停无限打转。修法是硬停时写 state 标记
+  （`loop_forced_stop`，middleware `state_schema` 扩展），chat.py 从 updates
+  事件读到即 break，不再走自动继续轮。**任何"内部熔断"都要问一句：谁需要知道它
+  发生过？**
+- **验证要用生产实际跑的那条装配路径**。②A 的机制在 langchain 原生
+  `create_agent` 上先验通了，但生产走 `create_deep_agent`（它会追加一串
+  自己的 middleware + 处理 private state）—— 完全可能把自定义 state 键吃掉。
+  故补 `tests/spikes/deep_agent_loop_marker.py` 在真实装配路径上再验一遍
+  （channels 含键 / updates 可见 / 开轮清零）。**"机制在 A 上成立"不等于
+  "在生产 B 上成立"**。
+- **测试要有负向对照**，否则并发/时序类断言可能是"窗口太小碰巧过"：
+  并发创建测试附带"摘掉锁必然重复创建"的对照；AST 接线断言附带"摘掉 break
+  检测器必须报 False"的对照。

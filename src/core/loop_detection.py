@@ -49,10 +49,11 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, NotRequired, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -173,8 +174,39 @@ _TOOL_FREQ_HARD_STOP_MSG = (
     "[FORCED STOP] 工具 {tool_name} 已调用 {count} 次，超过单个工具安全上限。请用已收集的结果产出最终答案。"
 )
 
+# ─── 硬停标记：中间件 → API 层的唯一通道（2026-10-10，②A）──────────────
+# 为什么需要它：硬停（剥空 tool_calls）只让**图**这一轮结束，API 层完全不知道
+# 发生过什么 —— chat.py 的 M3 完成门随后照常按「/reports 有无新产物」判定，
+# 零产出就注入自动继续轮，等于把刚掐断的循环**重新推起来**：硬停→继续→再硬停
+# 无限打转（会话 GY24428:a2719d7b 的"硬停未能真正止损"）。
+# 约定：常量集中在此，调用方不得硬编码字符串。
+LOOP_FORCED_STOP_KEY = "loop_forced_stop"
+STOP_REASON_REPEAT_CALLS = "repeat_calls"  # Layer 1：同一工具调用组重复
+STOP_REASON_TOOL_FREQUENCY = "tool_frequency"  # Layer 2：同工具名高频
 
-class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
+
+class LoopDetectionState(AgentState):
+    """扩展 agent state：承载「本轮已被强制收敛」的标记。
+
+    为什么落 state 而不是模块级信号表（terminal_response 的 _FALLBACK_SIGNALS 那种）：
+      本标记的语义是 **run 级**的 —— 必须在每个 run 开始时清零，否则上一轮的硬停
+      会被下一轮当成自己的信号。state 天然带这个生命周期：``before_agent`` 在
+      langgraph 里每个 run 开头执行一次，正好用来清零；同时它随 checkpoint 走，
+      观测/复盘时也能从 state 里看出"这一轮是被强停的"。
+      而 langchain 的 middleware 扩展 state 走 ``state_schema`` 类属性
+      （langchain factory.py:1154 `state_schemas = [*(m.state_schema for m in middleware), ...]`
+       + `_resolve_schemas` 合并），无需改 agent.py 的装配代码。
+
+    读取方：``src/api/endpoints/chat.py`` 从 ``stream_mode="updates"`` 事件里取
+    ``LoopDetectionMiddleware.after_model`` 节点输出的本键，命中即**真正终止本轮**
+    （不再走 M3 完成门的自动继续轮），并发一条 ``completion_blocked``
+    （code=loop_forced_stop）告知用户。
+    """
+
+    loop_forced_stop: NotRequired[dict[str, Any] | None]
+
+
+class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
     """检测并打断重复工具调用循环（两段式：软提醒 + 硬剥 tool_calls）。
 
     关键设计（对齐 deer-flow）：
@@ -185,7 +217,12 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
     - thread_id 走 runtime.execution_info.thread_id（非 runtime.context）
     - 简化：不用 run_id 分 scope（无子代理 executor）
     - 频次检测带"零新交付物豁免"（防长任务误报）
+    - 硬停同时写 ``loop_forced_stop`` state 标记（2026-10-10，②A）：只剥 tool_calls
+      而不告知 API 层，会被 M3 完成门的自动继续轮重新推起来，等于没止损
     """
+
+    #: 扩展 state（承载硬停标记）；langchain 会把它合并进 graph state schema
+    state_schema = LoopDetectionState
 
     def __init__(
         self,
@@ -235,22 +272,24 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
     # ─── 检测核心 ─────────────────────────────
 
     def _track_and_check(
-        self, state: AgentState, runtime: Runtime
-    ) -> tuple[str | None, bool]:
+        self, state: LoopDetectionState, runtime: Runtime
+    ) -> tuple[str | None, dict[str, Any] | None]:
         """两层检测：
         1. hash 级：同一工具调用组重复（名+参数）
         2. 频次级：同工具名高频（捕获换参但同工具型空转）
-        返回 (warning_message_or_None, should_hard_stop)。
+        返回 (warning_message_or_None, stop_info_or_None)。
+        stop_info 非 None 即"应硬停"，其内容会被写进 ``loop_forced_stop`` state 供
+        API 层消费（键见 LOOP_FORCED_STOP_KEY）。
         """
         messages = state.get("messages", [])
         if not messages:
-            return None, False
+            return None, None
         last_msg = messages[-1]
         if getattr(last_msg, "type", None) != "ai":
-            return None, False
+            return None, None
         tool_calls = getattr(last_msg, "tool_calls", None)
         if not tool_calls:
-            return None, False
+            return None, None
 
         thread_id = self._get_thread_id(runtime)
         call_hash = _hash_tool_calls(tool_calls)
@@ -276,7 +315,12 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                     "Loop hard limit reached — forcing stop (thread=%s, call_hash=%s, count=%d, tools=%s)",
                     thread_id, call_hash, count, tool_names,
                 )
-                return _HARD_STOP_MSG, True
+                return _HARD_STOP_MSG, {
+                    "reason": STOP_REASON_REPEAT_CALLS,
+                    "call_hash": call_hash,
+                    "count": count,
+                    "tool_names": tool_names,
+                }
 
             if count >= self.warn_threshold:
                 warned = self._warned[thread_id]
@@ -316,7 +360,11 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                         "Tool frequency hard limit — forcing stop (thread=%s, tool=%s, count=%d)",
                         thread_id, name, freq_count,
                     )
-                    return _TOOL_FREQ_HARD_STOP_MSG.format(tool_name=name, count=freq_count), True
+                    return _TOOL_FREQ_HARD_STOP_MSG.format(tool_name=name, count=freq_count), {
+                        "reason": STOP_REASON_TOOL_FREQUENCY,
+                        "tool_name": name,
+                        "count": freq_count,
+                    }
 
                 if freq_count >= eff_warn:
                     freq_warned = self._tool_freq_warned[thread_id]
@@ -330,7 +378,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                 else:
                     self._tool_freq_warned[thread_id].discard(name)
 
-        return None, False
+        return None, None
 
     # ─── 硬剥 tool_calls 的 update 构造 ─────────────
 
@@ -359,7 +407,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         update["response_metadata"] = response_metadata
         return update
 
-    def _apply(self, state: AgentState, runtime: Runtime) -> dict | None:
+    def _apply(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
         warning, hard_stop = self._track_and_check(state, runtime)
 
         if hard_stop:
@@ -370,7 +418,18 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             stripped_msg = last_msg.model_copy(
                 update=self._build_hard_stop_update(last_msg, content)
             )
-            return {"messages": [stripped_msg]}
+            # ★ ②A（2026-10-10）：把「硬停发生过 + 原因」写进 state。API 层
+            # （chat.py）从 updates 事件读到本键后会**真正终止本轮**——只剥
+            # tool_calls 而不告知 API 层 = 硬停形同虚设：M3 完成门看不到这个信号，
+            # 照样按"零产出"注入自动继续轮，把刚掐断的循环重新推起来
+            # （会话 GY24428:a2719d7b 的"硬停未能止损"）。
+            return {
+                "messages": [stripped_msg],
+                LOOP_FORCED_STOP_KEY: {
+                    **hard_stop,
+                    "at": time.time(),
+                },
+            }
 
         if warning:
             # 软提醒：延迟到 wrap_model_call 注入（不能 after_model，防破坏 tool_calls↔ToolMessage 配对）
@@ -420,29 +479,40 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
     # ─── hook 实现（适配点 1：两参签名）────────────
 
     @override
-    def before_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+    def before_agent(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
+        # ─── 开轮清零硬停标记（②A 生命周期铁律）───
+        # 标记的语义是「**本轮**被强停」。langgraph 每个 run 开头都会跑一次
+        # before_agent，正是清零时机：若让上一 run 的标记残留，chat.py 会把一轮
+        # 完全正常的回复也判成硬停轮而提前终止（隐性错误比漏判更难查）。
+        # 读取方是 chat.py，每轮必须独立判定，故此清零点与写入点必须成对存在。
+        if state.get(LOOP_FORCED_STOP_KEY):
+            logger.info(
+                "[LOOP] 开轮清零上一轮硬停标记 (thread=%s, prev=%s)",
+                self._get_thread_id(runtime), state.get(LOOP_FORCED_STOP_KEY),
+            )
+            return {LOOP_FORCED_STOP_KEY: None}
         # 清理上一 run 残留的 pending warning（简化：不按 run_id 分，整 pending 清）
         return None
 
     @override
-    async def abefore_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+    async def abefore_agent(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
         return self.before_agent(state, runtime)
 
     @override
-    def after_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+    def after_model(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
         return self._apply(state, runtime)
 
     @override
-    async def aafter_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+    async def aafter_model(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
         return self._apply(state, runtime)
 
     @override
-    def after_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+    def after_agent(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
         self._pending_warnings.pop(self._get_thread_id(runtime), None)
         return None
 
     @override
-    async def aafter_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+    async def aafter_agent(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
         return self.after_agent(state, runtime)
 
     @override

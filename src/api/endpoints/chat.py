@@ -15,6 +15,7 @@ from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
 from src.core import execution_guard, turn_registry
+from src.core.loop_detection import LOOP_FORCED_STOP_KEY
 from src.core.mcp import get_mcp_tools
 from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
 from src.api.deps import get_store, get_checkpointer, get_current_user
@@ -1305,6 +1306,15 @@ async def chat(
         # 故在循环前初始化，避免 GeneratorExit 早抛时 NameError（2026-08-21）
         _new_files: frozenset[str] = frozenset()
         _completion_blocked = False
+        # ─── 循环硬停信号（②A，2026-10-10）───
+        # LoopDetectionMiddleware 的硬停（剥空 tool_calls）只让**图**这一轮收尾，
+        # 本层原本完全不知情：M3 完成门随后按「/reports 有无新产物」判定，零产出就
+        # 注入自动继续轮 —— 等于把刚掐断的循环重新推起来（a2719d7b 的"硬停未止损"）。
+        # 现在中间件把硬停写进 state（loop_forced_stop），本层从 updates 事件捕获后
+        # **直接终止本轮**、不再走自动继续轮，并发一条提示告知用户。
+        # 生命周期 = 一轮 SSE（局部变量），且中间件 before_agent 每个 run 开头会清零
+        # state 侧标记，双保险防止跨轮误判。
+        _loop_forced_stop: dict | None = None
         # TerminalResponseMiddleware 降级信号（2026-09-16）：本轮以「空响应降级」收尾时
         # 由中间件登记、这里取走。命中即说明**模型层没有产出**（而非下游漏了文件步骤），
         # 故跳过 M3 完成门的零产出拦截，改发 fallback_notice() 的诚实文案，避免归因错位。
@@ -1371,6 +1381,7 @@ async def chat(
             """
             nonlocal _last_debug_step, thinking_emitted, generating_emitted, _generated_files, _consecutive_tool_failures, _reasoning_started_at_ms, _reasoning_ended_at_ms
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
+            nonlocal _loop_forced_stop
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # ─── 清洗：messages 里不应有 SystemMessage ───
             # 主 system 由 deepagents 的 system_message 字段承载（factory 最内层
@@ -1498,6 +1509,43 @@ async def chat(
                     elif mode == "updates":
                         # 根据 node 名称和输出内容解析 Agent 行为
                         for node_name, node_output in data.items():
+                            # ─── 循环硬停信号捕获（②A，2026-10-10）───
+                            # 必须放在「跳过 middleware 节点」名单之前：这个信号正是
+                            # 由中间件节点（LoopDetectionMiddleware.after_model）产出的，
+                            # 放在后面会被名单逻辑挡掉（本中间件目前不在名单里，但不能
+                            # 依赖这个巧合）。中间件 before_agent 的清零会写
+                            # loop_forced_stop=None，falsy ⇒ 天然不会被当成硬停。
+                            if isinstance(node_output, dict):
+                                _lfs = node_output.get(LOOP_FORCED_STOP_KEY)
+                                if _lfs and _loop_forced_stop is None:
+                                    _loop_forced_stop = _lfs
+                                    logger.error(
+                                        "[LOOP] 硬停生效，本轮将被强制终止（不再自动继续）: "
+                                        "user=%s, session=%s, reason=%s, tool=%s, count=%s",
+                                        user_id, session_id, _lfs.get("reason"),
+                                        _lfs.get("tool_name")
+                                        or ",".join(_lfs.get("tool_names") or []),
+                                        _lfs.get("count"),
+                                    )
+                                    # 告知用户真实原因（此前只表现为"莫名其妙停了"）。
+                                    # 用 completion_blocked 事件承载：前端已按
+                                    # title/reason/hint 通用渲染，无需改前端；code 独立
+                                    # 以便与"零产出/产物缺失/空响应降级"三类在复盘时区分。
+                                    yield f"data: {json.dumps({
+                                        'type': 'completion_blocked',
+                                        'code': LOOP_FORCED_STOP_KEY,
+                                        'title': '检测到工具调用循环，已强制收敛',
+                                        'reason': (
+                                            '本轮反复出现相同/高频的工具调用且迟迟不收敛，'
+                                            '系统已强制停止工具调用并要求模型用已有结果作答。'
+                                        ),
+                                        'hint': (
+                                            '若任务较复杂，建议拆成小步骤重发；'
+                                            '若反复出现，请把会话 ID 反馈给模型服务维护方。'
+                                        ),
+                                        'terminated': True,
+                                    }, ensure_ascii=False)}\n\n"
+
                             # 跳过 middleware 节点（非 agent 关键节点）
                             if node_name in (
                                 "SkillsMiddleware.before_agent",
@@ -2074,6 +2122,24 @@ async def chat(
                     _no_progress_triggered = False
                     _before_files = _after_files  # 重新基线
                     continue
+                if _loop_forced_stop is not None:
+                    # ─── 硬停：本轮到此为止，绝不自动继续（②A，2026-10-10）───
+                    # 这是整个 ② 的落点：中间件已把 tool_calls 剥空逼模型出纯文本，
+                    # 若此处再让 M3 完成门按"零产出"注入自动继续轮，模型会被重新推回
+                    # 循环 —— 硬停 → 完成门继续 → 再硬停，无限打转，正是 a2719d7b
+                    # 「hard stop 未能真正止损」的最后一环。
+                    # 注意：**不设** _completion_blocked —— 该标记会把最后一条 AI
+                    # 消息写成 completion="blocked_no_output"（"零交付物"），而硬停轮
+                    # 完全可能有产物（文件已 emit + 已入 _generated_files），标注会误导
+                    # 复盘。硬停事实已由上面的 SSE 事件（code=loop_forced_stop）与
+                    # ERROR 日志承载，二者在复盘时比这个标记更精确。
+                    logger.error(
+                        "[LOOP] 硬停轮终止（跳过 M3 完成门自动继续）: user=%s, session=%s, "
+                        "reason=%s, generated=%d, new_files=%d",
+                        user_id, session_id, _loop_forced_stop.get("reason"),
+                        len(_generated_files), len(_new_files),
+                    )
+                    break
                 if _generated_files or _new_files:
                     # 有本轮产出 → 再校验 skill 工作流关键产物（跑过 stage1/stage3 时）。
                     # 缺失即"流程没走完"（如 stage1 产物没拉回 reports），不放行，
