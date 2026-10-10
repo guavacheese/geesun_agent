@@ -294,6 +294,7 @@ from langchain.messages import trim_messages, SystemMessage, HumanMessage
 from src.core.config import settings
 from src.core.model import create_model, switch_model, file_to_image, model_call_guard, get_engine_prompt_tokens
 from src.core.prompts.plc_auditor import PLC_AUDITOR_SYSTEM_PROMPT
+from src.core.tool_output_budget import ToolOutputBudgetMiddleware
 
 # ─── Monkey-patch: 给 StoreBackend 补上 adownload_files ─────────────────
 # deepagents StoreBackend 缺少异步下载文件的实现，默认降级为 asyncio.to_thread
@@ -338,10 +339,17 @@ class ValidatedCompositeBackend(CompositeBackend):
     # /skills/__agent__/：agent 自创 skill 层（三层设计：__system__ 预装 / __agent__ 自创 / __user_{id}__ 用户上传）
     # /home/、/tmp/：沙箱内路径——write_file 走 sandbox backend 的 e2b 上传通道直写沙箱（仅 UTF-8 文本），
     #   让 AI 直接 write_file 写脚本/中间文件，不必绕 execute heredoc（也更安全，无 shell 注入面）
+    # /large_tool_results/（2026-10-10 补）：大工具结果转存的**唯一落点**。它此前
+    #   不在白名单，而 routes 表里配了 StateBackend() —— 白名单与路由表脱节，导致
+    #   deepagents 自带的 offload 在 4863afff 现场被本类拒写（14:32:03 日志
+    #   `[VALIDATED_CB] 拒绝写入: path=/large_tool_results/chatcmpl-tool-...`），
+    #   45.8MB 原文原地留在 state。补上后：ToolOutputBudgetMiddleware 的转存、
+    #   以及库自带 offload（若触发）都写这里；路由指向真实磁盘（见 routes 表）。
     ALLOWED_WRITE_PREFIXES = {
         "/reports/", "/workspace/memories/", "/conversation_history/",
         "/skills/__agent__/",
         "/home/", "/tmp/",
+        "/large_tool_results/",
     }
 
     # 沙箱内仍禁写的路径（/home/ /tmp/ 已放行直写沙箱；这些是系统级/挂载路径，AI 不应碰）
@@ -908,8 +916,24 @@ def build_backend(user_id: str, session_id: str, store, sandbox):
         # ),
         # offload → LangGraph state，不写磁盘，不经过沙箱;offload 归档：SummarizationMiddleware 写 /conversation_history/xxx.md
         "/conversation_history/": StateBackend(),
-        # 大工具结果驱逐 → LangGraph state
-        "/large_tool_results/": StateBackend(),
+        # 大工具结果转存 → **真实磁盘**（2026-10-10 改：原为 StateBackend()）
+        #
+        # 为什么必须落盘而不是留在 state：
+        #   原路由 StateBackend() 只是把内容从 messages channel 挪到 state 的 files
+        #   channel —— 不再进模型上下文（prompt 只拼 messages），但**内容仍在 state 里**，
+        #   每次 checkpoint 都要全量序列化落 Postgres。4863afff 那条 45.8MB 的
+        #   checkpoint_writes 就是这么来的。
+        # 为什么落在 agent_workspace 下（而非新增独立根目录）：
+        #   ① 该目录在生产 compose 里已挂载（`${AGENT_DATA_ROOT}/agent:/data/agent`），
+        #      落盘即持久化，**不必新增 .env 键 / 改 compose**（少一处双源审计面）；
+        #   ② 它**不在** `_build_inventory_provider` 的扫描范围（只扫 upload_root /
+        #      report_root）⇒ 转存文件不会污染"当前会话真实资源清单"。
+        # 虚拟路径仍是 /large_tool_results/<name>：该前缀已写进 deepagents 的系统提示词
+        # （middleware/filesystem.py:548），模型据此用 read_file / grep 取回。
+        "/large_tool_results/": FilesystemBackend(
+            root_dir=f"{settings.agent_workspace}/tool_results/{user_id}/{session_id}/",
+            virtual_mode=True,
+        ),
     }
     if sandbox:
         # sandbox 作为 default backend —— execute 走这里！
@@ -1048,6 +1072,28 @@ async def create_agent(
             _FreshSkillsMiddleware(backend=backend, sources=skills),
             switch_model,
             file_to_image,
+            # ★ 工具结果体积闸门（2026-10-10 新增）。位置是**论证过的**，不是随手插的：
+            #   ① 必须在 summarization_mw / model_call_guard **之前**（wrap_* 链
+            #      "first = outermost"，见 langchain factory.py:629 与 AgentMiddleware
+            #      文档 "first in list as outermost layer"）：两者都按
+            #      `request.messages` 的体量算数（Summarization 按 token 触发、
+            #      model_call_guard 按总字符估 prompt_tokens 并动态收紧 max_tokens），
+            #      本中间件先瘦身，它们才算得准；
+            #   ② 必须在 file_to_image **之后**：后者把图片 file block 转 image_url
+            #      （Qwen 视觉），先转再瘦身，避免把待转的 base64 文本当超限结果处置；
+            #   ③ 必须在 LoopDetection / TerminalResponse **之前**：TerminalResponse 的
+            #      正确性前提是"注册在末尾"（见其下方长注释），插在后面会破坏它。
+            #   为什么 wrap_tool_call 侧位置无所谓：本项目没有其它 user middleware
+            #   实现 wrap_tool_call（实测 grep 为空），而相对 deepagents 的
+            #   FilesystemMiddleware 我们必然在内层（用户中间件被插在 base stack 之后，
+            #   graph.py:367）—— 内层正是需要的：只有在那里改写 result，改写才能随返回
+            #   上行并写进 state。详见 src/core/tool_output_budget.py 模块头。
+            ToolOutputBudgetMiddleware(
+                backend=backend,
+                enabled=settings.tool_output_budget_enabled,
+                externalize_min_chars=settings.tool_output_externalize_min_chars,
+                fallback_max_chars=settings.tool_output_fallback_max_chars,
+            ),
             summarization_mw,
             model_call_guard,
             # ★ 链尾最后一道守卫：防"工具全成功但整体不收敛"烧满 recursion_limit。

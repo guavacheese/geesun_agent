@@ -139,6 +139,23 @@ class Settings(BaseSettings):
     #   pydantic-settings 大小写不敏感（实测 2.14.0，case_sensitive 默认 False），
     #   但两种大小写**同时存在时 UPPERCASE 优先**，故勿在同一 .env 里混写同一键。
     terminal_response_max_retries: int = 2
+    # ─── ToolOutputBudgetMiddleware（2026-10-10 新增，治"单条工具结果撑爆上下文"）───
+    # 事故：会话 4863afff 单次 execute 返回 45,777,272 字符（45.8MB）→ 进 messages →
+    # deepagents 自带 offload 因白名单拒绝写入而失效（原文保留）→ 撑爆上下文，
+    # 同时 28MB span 撞 OTLP 4MB 上限。见 src/core/tool_output_budget.py 模块头。
+    # 总开关（回滚用）：False = 完全绕过本中间件（行为回到 2026-10-10 之前）。
+    tool_output_budget_enabled: bool = True
+    # 转存阈值（字符）：超过即把完整内容写入虚拟文件系统 /large_tool_results/，
+    # messages 里只留"路径 + 头尾预览"。取值 40000 —— **刻意小于** deepagents 自带的
+    # offload 阈值 80000（NUM_CHARS_PER_TOKEN×tool_token_limit=4×20000），
+    # 保证我们永远先于库动作、结果不会再落进 StateBackend（那里内容仍在 state 里，
+    # 每次 checkpoint 都要全量序列化）。<= 0 表示不转存。
+    tool_output_externalize_min_chars: int = 40_000
+    # 内联硬上界（字符）：转存失败时的 fail-closed 兜底 —— 宁可截断，绝不放行原文。
+    # 它同时就是"任何单条工具结果的内联天花板"这一不变量的载体。
+    # 60000 < 80000（库的 offload 阈值），故两层不会对同一条结果各处置一次。
+    # <= 0 表示不限制（仅排障用，会削弱上述不变量）。
+    tool_output_fallback_max_chars: int = 60_000
     # ─── model 调用灾难性总时长超时（兜底中的兜底，2026-08-28 由 600 上调至 1800）───
     # openai SDK 的 timeout 是"字节间隔超时"（httpx read timeout），vLLM 慢速流式时
     # 永不触发（2026-08-19 实测 16.8 万 token prefill 挂 20 分钟无超时）；
