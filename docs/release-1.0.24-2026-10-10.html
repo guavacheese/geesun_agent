@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>geesun_agent 1.0.24 发布与验证报告 — 2026-10-10</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2328; --ink2:#4a5260; --ink3:#7b8494;
+    --line:#e3e6ec; --line2:#eef0f4;
+    --red:#c0392b; --green:#1a7f4b; --amber:#b7791f; --blue:#1f5fa8; --purple:#6b4bb5;
+    --redbg:#fdf0ee; --greenbg:#eef8f2; --amberbg:#fdf6e8; --bluebg:#eef4fc;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:32px 20px 64px; background:var(--bg); color:var(--ink);
+    font:15px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.2px}
+  h2{font-size:19px;margin:38px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 8px;color:var(--ink2)}
+  .sub{color:var(--ink3);font-size:13.5px;margin-bottom:24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:14px 0}
+  .verdict{border-left:4px solid var(--green);background:var(--greenbg)}
+  .verdict b{color:var(--green)}
+  .warn{border-left:4px solid var(--amber);background:var(--amberbg)}
+  .bad{border-left:4px solid var(--red);background:var(--redbg)}
+  .info{border-left:4px solid var(--blue);background:var(--bluebg)}
+  code{background:#eef1f5;padding:1.5px 5px;border-radius:4px;font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:13px}
+  pre{background:#1f2328;color:#e6edf3;padding:14px 16px;border-radius:8px;overflow-x:auto;font-size:12.5px;line-height:1.62}
+  pre .ok{color:#7ee2a8}.pre .bad{color:#ff8b7b}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:#f1f3f7;font-weight:600;font-size:13px;color:var(--ink2)}
+  tr:nth-child(even) td{background:#fafbfc}
+  .pass{color:var(--green);font-weight:600;white-space:nowrap}
+  .fail{color:var(--red);font-weight:600;white-space:nowrap}
+  .pid{color:var(--blue);font-weight:600;white-space:nowrap}
+  ul{margin:8px 0 8px 4px;padding-left:22px}
+  li{margin:5px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  .kv{font-size:13.5px;color:var(--ink2)}
+  .kv b{color:var(--ink)}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 7px;border-radius:99px;border:1px solid var(--line);background:#fff;color:var(--ink3);margin-right:6px}
+  svg{max-width:100%;height:auto;display:block;margin:6px auto}
+  .cap{text-align:center;color:var(--ink3);font-size:12.5px;margin:2px 0 16px}
+  hr{border:0;border-top:1px solid var(--line);margin:32px 0}
+  .num{color:var(--ink3);font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>geesun_agent 1.0.24 发布与验证报告</h1>
+  <div class="sub">
+    生产节点 <code>10.10.10.67</code>（Docker Swarm · stack <code>geesun</code>）&nbsp;|&nbsp;
+    2026-10-10 11:44–11:53&nbsp;|&nbsp;
+    agent <code>1.0.23 → 1.0.24</code>&nbsp;|&nbsp;
+    digest <code>c37d84fe</code>
+  </div>
+
+  <div class="card verdict">
+    <b>结论：发布成功，两个 P0 均已修复并在生产活体上验证通过。</b>
+    1.0.24 已上线运行（<code>healthy</code>、<code>FailingStreak=0</code>、部署后无失败 task）。
+    原先每 ~5 分钟一轮的重启循环根因已消除；<span class="kv">在沙箱内真跑 25 秒长命令期间，
+    <code>/healthz</code> 探活 159/159 全成功、最大延迟 0.002s</span>。
+    另有 <b>1 项新发现的 P1</b>（首轮预热 ~2.9s 全局停顿，一次性、非每轮）与
+    <b>1 项工具缺陷</b>（发布验证脚本的 grep 断言曾整体静默失效）需要你决策，详见文末。
+  </div>
+
+  <h2>一、修了什么：两个 P0</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <span class="tag">P0-1</span><b>沙箱 async 接口是「假异步」，一条长命令冻死整个服务</b>
+      <p class="kv"><b>位置</b> <code>langchain_cubesandbox/sandbox.py</code> 的
+      <code>aexecute</code> / <code>aupload_files</code> / <code>adownload_files</code></p>
+      <p class="kv"><b>根因</b> <code>async def</code> 函数体里<b>同步直调</b>阻塞的 e2b SDK
+      （<code>return self.execute(...)</code>）。agent 是<b>单个 uvicorn worker（单事件循环）</b>，
+      于是 <code>execute</code> 的 <code>timeout</code> 上限 600s 内的任何长命令都会占死事件循环 ——
+      全部会话卡住、连 <code>/healthz</code> 都不应答 ⇒ swarm healthcheck 判
+      <code>unhealthy</code> 后 SIGKILL（<code>task: non-zero exit (137)</code>）⇒ 重启后又冻。</p>
+      <p class="kv"><b>关键证据</b> 上游 deepagents <code>BackendProtocol.aexecute</code>
+      默认实现本就是 <code>await asyncio.to_thread(self.execute, ...)</code>；本类覆写默认实现时
+      <b>丢掉了 <code>to_thread</code></b>。且 <code>git log -L</code> 显示三个方法自初始 commit
+      <code>8518ff3</code> 起从未改过 —— <b>非本次引入</b>。</p>
+      <p class="kv"><b>现场吻合</b> 11:06:54 模型决定调 <code>execute</code> 跑 150 页 OCR
+      （日志「execute工具超时限制是600秒」）→ 之后无日志 → 11:10 healthcheck 累计 5 次失败 → SIGKILL。
+      容器内裸 TCP 连 <code>127.0.0.1:8009</code> 仅 <b>3ms 成功</b>，而同进程
+      <code>GET /healthz</code> 连续 3 次 <b>8.008s 超时</b> —— 端口在听，但请求进不了事件循环。</p>
+      <p class="kv"><b>修法</b> 三个方法改 <code>await asyncio.to_thread(...)</code>，与上游对齐。
+      commit <code>b9e60ea</code>。</p>
+    </div>
+
+    <div class="card">
+      <span class="tag">P0-2</span><b>冷启动 4.5 分钟 &gt; healthcheck 容忍 180s</b>
+      <p class="kv"><b>位置</b> <code>deploy/docker-compose.yml</code> 的 healthcheck</p>
+      <p class="kv"><b>根因</b> 实测冷启动要 <b>4.5 分钟</b>
+      （11:00:48 容器启动 → 11:05:18 才打出 tracing 初始化日志），而旧配置容忍窗口只有
+      <code>start_period 30s + retries 5 × interval 30s = 180s</code> ⇒ 首次部署<b>必然</b>在就绪前
+      把失败计数攒满，容器一就绪就被 swarm SIGKILL。</p>
+      <p class="kv"><b>判据差异（易混淆）</b>
+      启动慢 → health 日志为 <code>URLError: Connection refused</code>（还没监听）；
+      跑起来后冻住 → 请求 timeout（端口在听但不应答）。<b>两种死法，判据不同。</b></p>
+      <p class="kv"><b>修法</b> <code>start_period 30s→300s</code>、<code>retries 5→10</code>
+      （总容忍 10 分钟）。commit <code>45e550b</code>。</p>
+      <p class="kv"><b>对照</b> 紧接着重启的第二个容器因页缓存已热，<b>10 秒即 healthy</b> ——
+      印证差异来自冷/热页缓存，而非代码。</p>
+    </div>
+  </div>
+
+  <h3>冻结点示意</h3>
+  <svg viewBox="0 0 680 250" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,sans-serif">
+    <defs>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+        <path d="M0,0 L7,3.2 L0,6.4 z" fill="#7b8494"/>
+      </marker>
+      <marker id="arR" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+        <path d="M0,0 L7,3.2 L0,6.4 z" fill="#c0392b"/>
+      </marker>
+    </defs>
+
+    <text x="10" y="18" font-size="12.5" font-weight="700" fill="#c0392b">修复前</text>
+    <rect x="10" y="28" width="300" height="182" rx="8" fill="#fdf0ee" stroke="#e8c4bd"/>
+    <rect x="26" y="42" width="120" height="34" rx="6" fill="#fff" stroke="#d9b3ab"/>
+    <text x="86" y="63" font-size="11.5" text-anchor="middle" fill="#1f2328">uvicorn（1 worker）</text>
+    <rect x="26" y="86" width="120" height="46" rx="6" fill="#fff" stroke="#d9b3ab"/>
+    <text x="86" y="103" font-size="10.5" text-anchor="middle" fill="#1f2328">事件循环</text>
+    <text x="86" y="120" font-size="10.5" text-anchor="middle" fill="#c0392b">被占死</text>
+    <rect x="168" y="86" width="126" height="46" rx="6" fill="#fff" stroke="#d9b3ab"/>
+    <text x="231" y="102" font-size="10.5" text-anchor="middle" fill="#1f2328">同步 e2b</text>
+    <text x="231" y="118" font-size="10.5" text-anchor="middle" fill="#7b8494">(sleep 600s 上限)</text>
+    <path d="M146,108 L164,108" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arR)"/>
+    <text x="26" y="156" font-size="10.5" fill="#4a5260">· 其他会话全部卡住</text>
+    <text x="26" y="173" font-size="10.5" fill="#4a5260">· /healthz 不应答（8s 超时）</text>
+    <text x="26" y="190" font-size="10.5" fill="#c0392b">· healthcheck unhealthy → SIGKILL(137)</text>
+
+    <text x="360" y="18" font-size="12.5" font-weight="700" fill="#1a7f4b">修复后</text>
+    <rect x="360" y="28" width="310" height="182" rx="8" fill="#eef8f2" stroke="#bfe3cd"/>
+    <rect x="376" y="42" width="120" height="34" rx="6" fill="#fff" stroke="#a9d8bd"/>
+    <text x="436" y="63" font-size="11.5" text-anchor="middle" fill="#1f2328">uvicorn（1 worker）</text>
+    <rect x="376" y="86" width="120" height="46" rx="6" fill="#fff" stroke="#a9d8bd"/>
+    <text x="436" y="103" font-size="10.5" text-anchor="middle" fill="#1f2328">事件循环</text>
+    <text x="436" y="120" font-size="10.5" text-anchor="middle" fill="#1a7f4b">持续可用</text>
+    <rect x="518" y="86" width="136" height="46" rx="6" fill="#fff" stroke="#a9d8bd"/>
+    <text x="586" y="102" font-size="10.5" text-anchor="middle" fill="#1f2328">线程池</text>
+    <text x="586" y="118" font-size="10.5" text-anchor="middle" fill="#7b8494">asyncio.to_thread</text>
+    <path d="M496,108 L514,108" stroke="#1a7f4b" stroke-width="1.6" marker-end="url(#ar)"/>
+    <text x="376" y="156" font-size="10.5" fill="#4a5260">· 其他会话不受影响</text>
+    <text x="376" y="173" font-size="10.5" fill="#4a5260">· /healthz 全程应答（实测 2ms）</text>
+    <text x="376" y="190" font-size="10.5" fill="#1a7f4b">· healthcheck 稳定通过</text>
+
+    <text x="10" y="234" font-size="11" fill="#7b8494">与上游 deepagents <tspan font-weight="700">BackendProtocol.aexecute</tspan> 的默认实现（<tspan font-family="monospace">backends/protocol.py:860</tspan>）对齐 —— 属语义偏差，而非取舍。</text>
+  </svg>
+  <div class="cap">图 1 · P0-1 的冻结机制与修复方式</div>
+
+  <h2>二、验收矩阵（全部在生产实机上执行）</h2>
+
+  <table>
+    <thead>
+      <tr><th style="width:15%">层次</th><th style="width:30%">判据</th><th style="width:32%">实测结果</th><th style="width:23%">结论</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><b>① 代码级</b><br><span class="num">镜像内 AST</span></td>
+        <td>六层闸门，含第 [6] 层 <b>进函数体</b>查三个 async 方法是否含 <code>to_thread</code>、有无同步直调残留</td>
+        <td><code>aexecute</code> L588 / <code>aupload_files</code> L623 / <code>adownload_files</code> L630，
+            三者 <code>to_thread:true, bare_sync:false</code></td>
+        <td class="pass">ALL PASS<br><span class="kv num">FAIL=0</span></td>
+      </tr>
+      <tr>
+        <td><b>② 行为级</b><br><span class="num">一次性容器</span></td>
+        <td>在 <code>aexecute("sleep 6")</code> 期间另开协程按 0.1s 心跳计数；
+            两路并发耗时 ≈ 单次</td>
+        <td><b>1.0.24</b>：<code>ticks=61</code>（期望≈60），并发 <b>6.04s ≈ 单次 6.11s</b><br>
+            <b>1.0.23 对照</b>：<code>ticks=1</code>，并发 <b>12.06s（= 6.06×2，串行）</b></td>
+        <td class="pass">5 PASS / 0 FAIL<br><span class="kv">判据非恒真</span></td>
+      </tr>
+      <tr>
+        <td><b>③ 部署级</b></td>
+        <td>19 服务收敛至 1/1、agent 镜像 tag &amp; digest 一致、容器健康</td>
+        <td>收敛 <b>12.5s</b>；<code>1.0.24@sha256:c37d84fe…</code>；
+            <code>running health=healthy restart=0</code></td>
+        <td class="pass">通过</td>
+      </tr>
+      <tr>
+        <td><b>④ 回归守卫</b></td>
+        <td>1.0.23 的循环硬停修复是否被重建弄丢</td>
+        <td>符号 <code>LOOP_FORCED_STOP_KEY</code> / <code>loop_forced_stop</code>
+            仍命中 <code>chat.py</code>+<code>loop_detection.py</code>；
+            功能探针在 1.0.24 上仍 <b>17 PASS / 0 FAIL</b></td>
+        <td class="pass">无倒退</td>
+      </tr>
+      <tr>
+        <td><b>⑤ 活体级</b><br><span class="num">真发 chat</span></td>
+        <td>全新会话（沙箱必冷启）+ 明确要求模型<b>真在沙箱里执行</b>
+            <code>sleep 25 &amp;&amp; echo LONG_DONE_1024</code>，期间持续探 <code>/healthz</code></td>
+        <td><code>tool_call</code>/<code>tool_result</code> 事件齐全，回答原样带回
+            <code>LONG_DONE_1024</code> 与 exit code 0；
+            healthz <b>159/159 成功、最大延迟 0.002s</b></td>
+        <td class="pass">ALL PASS</td>
+      </tr>
+      <tr>
+        <td><b>⑥ 链路</b></td>
+        <td>Caddy + 关键 API + <code>/healthz</code></td>
+        <td><code>/ 307</code>、<code>/docs 200</code>、<code>/api/v1/models 200</code>、
+            <code>/api/v1/sessions 401</code>、<code>/healthz {"status":"ok"}</code></td>
+        <td class="pass">通过</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="card info">
+    <b>为什么必须有 ② 和 ⑤ 两层？</b>
+    静态断言（AST 里有 <code>to_thread</code>）只能证明「写法对了」，证明不了
+    「事件循环真的没被占」。所以 ② 直接问事件循环自己（数心跳），
+    ⑤ 则在生产上真跑一条长命令 —— 并且 [E] 判据检查「长命令<b>真的被执行了</b>」，
+    若模型没调工具则判 <code>INCONCLUSIVE</code> 而非 PASS，避免「测了个寂寞还宣称通过」。
+  </div>
+
+  <h2>三、部署时间线</h2>
+  <table>
+    <thead><tr><th style="width:16%">时刻</th><th>动作</th><th style="width:30%">结果</th></tr></thead>
+    <tbody>
+      <tr><td class="num">11:41</td><td>构建 <code>geesun-agent:1.0.24</code> 并推送 Harbor</td><td>21m23s，digest <code>c37d84fe</code></td></tr>
+      <tr><td class="num">11:43</td><td>行为级判据在 1.0.24 上复测</td><td class="pass">5 PASS / 0 FAIL</td></tr>
+      <tr><td class="num">11:44:11</td><td>生产 <code>.env</code> TAG <code>1.0.23→1.0.24</code></td><td>11793→11793 等长，<code>.bak-20261010114411</code></td></tr>
+      <tr><td class="num">11:44:51</td><td>同步 <code>docker-compose.yml</code> + <code>.env.example</code></td><td>md5 一致、CRLF=0，<code>.bak-20261010114451</code></td></tr>
+      <tr><td class="num">11:45:11</td><td><code>docker stack deploy</code>（无需重建）</td><td>19 服务更新</td></tr>
+      <tr><td class="num">11:45:24</td><td>收敛检查</td><td class="pass">12.5s 全 1/1</td></tr>
+      <tr><td class="num">11:47–11:52</td><td>发布后验证 + 回归守卫 + 活体探针</td><td class="pass">全部通过</td></tr>
+      <tr><td class="num">11:52:59</td><td>部署后快照</td><td><code>healthy</code>、<code>FailingStreak=0</code></td></tr>
+      <tr><td class="num">—</td><td>探针提交 <code>be63a7d</code> 推送</td><td><code>1716e02..be63a7d</code></td></tr>
+    </tbody>
+  </table>
+
+  <p class="kv"><b>同步 deploy 文件时做的事前 diff</b>（不盲目覆盖生产）：生产 compose 自上次同步后已落后，
+  差异经全量 diff 确认<b>恰为</b> healthcheck 注释块 + <code>retries/start_period</code> 两行实值
+  （1100B 差额 = 新增中文注释，UTF-8 三字节/字）；<code>.env.example</code> 差异恰为 1 行；
+  <code>build-push.sh</code> 已一致、不动。</p>
+
+  <hr>
+
+  <h2>四、本轮新发现（需要你决策）</h2>
+
+  <div class="card warn">
+    <span class="tag">P1 · 未修</span><b>首个 chat 轮存在 ~2.9s 的事件循环全局停顿</b>
+    <p class="kv">活体探针首跑出现最大延迟 <b>2.743s</b>。不能用调阈值的方式变绿 ——
+    请服务端 access log 当独立证人后确认：服务端<b>真有 2.943s 空档</b>
+    （<code>11:49:33.837 → 11:49:36.780</code>），事件循环线程上最后一条日志是
+    <b>skills 加载</b>，之后静默到 <code>model_call_guard</code>。
+    且同一轮里 <code>[FRESH_SKILLS]</code> 告警<b>出现了两遍</b>（疑似加载两次）。</p>
+    <p class="kv"><b>但它只发生在容器启动后的第一个 chat 轮</b>：热进程重跑 → 最大延迟
+    <b>0.002s</b>、&gt;2s 样本 0 个；3 轮简单对话最大空档仅 0.202–0.209s（探针 0.2s 轮询抖动）。
+    ⇒ 属<b>一次性首轮预热</b>（agent 图构建 + skills 加载 + 首次 tokenizer），
+    距 healthcheck <code>timeout=5s</code> 尚有余量。</p>
+    <p class="kv"><b>可选下一步</b>：① 查 skills 为何一轮加载两次（去重）；
+    ② 排查每轮 <code>create_agent</code> 是否可缓存复用；
+    ③ 或先记录不处理（当前不影响可用性）。<b>等你定，我不擅自动手。</b></p>
+  </div>
+
+  <div class="card bad">
+    <span class="tag">工具缺陷 · 已修</span><b>发布验证脚本的 grep 断言曾整体静默失效</b>
+    <p class="kv"><b>现象</b>：三个符号断言全返 <code>0</code>，<b>同时</b>反向断言也显示
+    「（无命中 ✓）」—— 两个相反方向都"看起来正常"，末尾还打印
+    「###DONE### 未发现硬失败」。</p>
+    <p class="kv"><b>根因 1（我的调用）</b>：Git Bash 的 <b>MSYS 路径转换</b>把
+    <code>--grep-file /langchain-cubesandbox/…</code> 改写成
+    <code>C:/Users/…/PortableGit/langchain-cubesandbox/…</code>，容器里没这路径。
+    <b>规避：一律加 <code>MSYS_NO_PATHCONV=1</code>。</b></p>
+    <p class="kv"><b>根因 2（脚本自身，更严重）</b>：<code>grep … 2>/dev/null | wc -l</code>
+    把「文件不存在」的报错吞掉，<code>wc</code> 恒为 0 ⇒ 判据<b>既恒假又能假通过</b>；
+    且符号 0 命中<b>从未记入 fails</b>。历史几次发布的符号断言可能一直在空跑。</p>
+    <p class="kv"><b>已修</b>：① grep 范围先独立断言存在；② 路径形如 <code>C:/…</code>
+    （MSYS 痕迹）直接硬失败并提示；③ 不再吞 stderr，用 <code>###GREP_EXIT=</code> 区分
+    无匹配(1)/出错(≥2)，出错即硬失败；④ 符号未命中记入 <code>fails</code>。</p>
+    <p class="kv"><b>自证</b>：正确调用 → <code>ALL PASS</code> / exit 0；
+    错误调用 → <code>MISSING</code> + 两条硬失败 / <b>exit 1</b>。</p>
+    <p class="kv"><b>建议</b>：把这条 lessons-learned 写进 <code>AGENTS.md</code>（需你点头，未擅自改）。</p>
+  </div>
+
+  <h2>五、沉淀的判别法</h2>
+  <div class="card info">
+    <b>客户端计时 ≠ 服务端停顿。</b>
+    探针是容器内另一个进程，容器 <code>cpus=2.0</code>；langgraph / 模型阶段把 2 核占满会让
+    <b>探针自己</b>被 CPU 饿着 —— 客户端看到的「高延迟」混入了这个污染。
+    判「事件循环真停摆」还是「探针被饿着」，必须请<b>服务端 access log 当独立证人</b>：
+    按秒统计 <code>/healthz</code> 行数，找 &gt;1s 的相邻空档。
+  </div>
+  <div class="card info">
+    <b>别把 healthcheck 的轮询间隔误读成停摆。</b>
+    <code>docker logs</code> 里 30s 间隔的空档，在没有探针运行时属<b>正常</b>
+    （swarm healthcheck 自己每 30s 打一次）。本轮初看有 16 处 &gt;0.75s 空档，
+    逐条归因后真正的异常只有 1 处。
+  </div>
+
+  <h2>六、当前生产状态</h2>
+  <table>
+    <thead><tr><th>服务</th><th>副本</th><th>镜像</th><th>容器</th></tr></thead>
+    <tbody>
+      <tr><td><code>geesun_geesun-agent</code></td><td>1/1</td><td><code>geesun-agent:1.0.24</code></td><td class="pass">Up 7 min (healthy)</td></tr>
+      <tr><td><code>geesun_geesun-agent-web</code></td><td>1/1</td><td><code>geesun-agent-web:1.0.10</code></td><td class="pass">Up 11 days (healthy)</td></tr>
+      <tr><td><code>geesun_geesun-mcp</code></td><td>1/1</td><td><code>geesun-mcp-server:1.0.3</code></td><td class="pass">1/1</td></tr>
+      <tr><td colspan="4" class="kv">stack 共 <b>19</b> 个服务全部 1/1；agent healthcheck <b>FailingStreak=0</b>，
+        最近 5 次探测全部 <code>ExitCode=0</code></td></tr>
+    </tbody>
+  </table>
+
+  <p class="kv" style="margin-top:26px;color:#7b8494;font-size:12.5px">
+    本轮改动：<code>langchain-cubesandbox</code> <code>b9e60ea</code>（sandbox.py 三方法 to_thread 化）&nbsp;·&nbsp;
+    <code>geesun_agent</code> <code>45e550b</code>（healthcheck 容忍窗口）&nbsp;·&nbsp;
+    <code>1716e02</code> / <code>be63a7d</code>（六个探针 + 两个活体探针）&nbsp;·&nbsp;
+    生产 <code>.env</code> TAG + <code>docker-compose.yml</code> + <code>.env.example</code>
+  </p>
+
+</div>
+</body>
+</html>
