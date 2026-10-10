@@ -353,6 +353,37 @@ class ValidatedCompositeBackend(CompositeBackend):
     # 防止任何意外长扫描（含未拦截的宽泛模式）阻塞 asyncio 事件循环
     GLOB_TIMEOUT_SEC = 10
 
+    # ─── C｜execute 输出体积闸门（2026-10-10）───
+    # 事故：会话 4863afff 里模型跑的 OCR 脚本把结果（含 base64 图片）整坨 print 到
+    # stdout，单次 execute 返回 45,777,272 字符（45.8MB）。deepagents 的 offload
+    # 安全网（/large_tool_results/，阈值 NUM_CHARS_PER_TOKEN×20000 = 80000 字符）
+    # 本该把它搬出 messages，却被本类 ALLOWED_WRITE_PREFIXES 拒绝写入 →
+    # 45.8MB 原地留在 LangGraph state → 下一轮模型调用必然撑爆窗口
+    # （同时 28MB span 撞 OTLP/alloy 4MB 上限）。闸门设在**源头**：任何单次
+    # execute 的结果都不许无界增长。
+    #
+    # ⚠ 为什么闸门必须放在本类，而不是 langchain-cubesandbox 的 `execute()`：
+    # deepagents 的 read/ls/grep/glob/write/edit **全部复用** `self.execute()`
+    # （backends/sandbox.py:629/668/698/813/857/956/987），并按结构化格式解析其
+    # 输出（_parse_read_output / _parse_ls_output / _parse_grep_output /
+    # _parse_glob_output / _check_preflight_result）。在底层 execute 上截断会把
+    # 提示文本追加进 JSON 尾部 → 解析失败 → read_file / grep / ls / write 全线
+    # 报错。而本类是**唯一**的工具层执行入口（见下方 A 段注释：CompositeBackend
+    # .execute 原文 "execution is not path-routable — it always delegates to the
+    # default backend"），内部文件系统管道不经此处 ⇒ 截断只作用于"模型自己发的
+    # shell 命令"。
+    #
+    # 取值依据：deepagents 自身 read() 的上限是 MAX_OUTPUT_BYTES = 500KiB
+    # （backends/sandbox.py:108），其 offload 阈值为 80000 字符；参考 deer-flow
+    # fail-closed 兜底思路取 200000 字符，**不采用**其沙箱侧 10MiB——中文 token
+    # 更贵、我们的上下文预算更小。<= 0 表示不限制（仅排障用）。
+    MAX_EXECUTE_OUTPUT_CHARS = 200_000
+    # 截断保留比例：尾部 50%。尾部不能少——脚本的最终结论与 traceback 都在尾部
+    # （本例 45.8MB 的 tail 恰是 `Result type: <class 'list'>`），且 stderr 被拼在
+    # output 末尾（langchain-cubesandbox/langchain_cubesandbox/sandbox.py:471），
+    # 天然落在尾部保留区。
+    EXECUTE_OUTPUT_TAIL_RATIO = 0.5
+
     # ─── A｜execute 通道护栏（2026-09-29）───
     # `/reports`、`/uploads` 是**虚拟文件系统路径**：write_file 命中路由直写宿主卷，
     # 而 execute（shell）不参与路径路由、落到沙箱，且 create_sandbox **未挂载任何
@@ -755,7 +786,7 @@ class ValidatedCompositeBackend(CompositeBackend):
         if hint is not None:
             self._note_execute_violation(command, via_async=False)
             raise ValueError(hint)
-        return super().execute(command, timeout=timeout)
+        return self._clamp_execute_output(super().execute(command, timeout=timeout))
 
     async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """A 的异步版（模型实际走这条：工具层优先用 coroutine 分支）。"""
@@ -763,7 +794,62 @@ class ValidatedCompositeBackend(CompositeBackend):
         if hint is not None:
             self._note_execute_violation(command, via_async=True)
             raise ValueError(hint)
-        return await super().aexecute(command, timeout=timeout)
+        return self._clamp_execute_output(
+            await super().aexecute(command, timeout=timeout)
+        )
+
+    @staticmethod
+    def _clamp_execute_output(
+        resp: ExecuteResponse,
+        *,
+        limit: int | None = None,
+    ) -> ExecuteResponse:
+        """C：单次 execute 输出超限则头尾保留 + 明确通知，并置 `truncated=True`。
+
+        设计取舍（三条，都是刻意的）：
+        1. **不改 exit_code**：命令成功/失败的事实与输出体积无关，动它会让模型
+           误判（以为命令本身失败了）。
+        2. **不抛异常**：这是兜底闸门，自身出错时宁可放行原文（上游还有
+           middleware 兜底），绝不能把一次成功的命令变成 error。
+        3. **截断必须自报**：通知写在正文里，模型一定能看到自己被截断了；
+           本例的事故正是"没人告诉任何一方输出有多离谱"。
+
+        诚实说明：e2b 的 `CommandResult` **无 truncated 字段**
+        （`e2b/sandbox/commands/command_handle.py:37` 只有 stderr/stdout/exit_code/
+        error），所以 langchain-cubesandbox 里的
+        `getattr(result, "truncated", False)` 恒为 False —— 这个标志此前从未真正
+        生效过，由本闸门首次赋予真实语义（工具层会据此追加
+        "[Output was truncated due to size limits]"）。
+        """
+        limit = (
+            ValidatedCompositeBackend.MAX_EXECUTE_OUTPUT_CHARS
+            if limit is None
+            else limit
+        )
+        output = resp.output or ""
+        if limit <= 0 or len(output) <= limit:
+            return resp
+        total = len(output)
+        notice = (
+            f"\n\n[输出超限已截断：原始输出 {total} 字符，超过单次上限 {limit} 字符。"
+            f"已保留开头与结尾，中间部分被丢弃。"
+            f"需要完整内容时，请把命令输出重定向到文件后分段读取，例如："
+            f"`<你的命令> > /tmp/out.txt 2>&1`，再用 "
+            f"read_file(file_path='/tmp/out.txt', offset=0, limit=200) 逐段取回。]\n"
+        )
+        if len(notice) >= limit:
+            # 上限比通知还小（极端配置）：牺牲正文，优先保住
+            # "模型一定知道自己看到的不完整"这条不变量。
+            notice = f"\n\n[输出超限已截断：原始输出 {total} 字符，超过上限 {limit} 字符。]"
+        budget = max(limit - len(notice), 0)
+        tail_keep = int(budget * ValidatedCompositeBackend.EXECUTE_OUTPUT_TAIL_RATIO)
+        head_keep = budget - tail_keep
+        clamped = output[:head_keep] + notice + (output[total - tail_keep:] if tail_keep else "")
+        return ExecuteResponse(
+            output=clamped,
+            exit_code=resp.exit_code,
+            truncated=True,
+        )
 
 
 def build_backend(user_id: str, session_id: str, store, sandbox):
