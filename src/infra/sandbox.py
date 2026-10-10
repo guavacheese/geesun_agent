@@ -186,6 +186,28 @@ def get_env_snapshot(
     return snapshot
 
 
+# ─── 每 thread 一把「创建锁」（2026-10-10）────────────────────────────
+# 背景：chat.py 的 create_sandbox 调用改为 `await asyncio.to_thread(...)`（修事件循环
+# 阻塞，见 chat.py:752 注释）之后，**同一 thread 的并发请求会真的并行跑进来** ——
+# 改前同步调用把事件循环占死，反而不并发。此时若两路同时走到 get_or_create：
+#   · 两路各建一个沙箱实例（双倍资源 + 双倍耗时）
+#   · 后写覆盖 _sandbox_cache[thread_id] ⇒ 先建的那个失去强引用被 GC
+#   ⇒ langchain-cubesandbox 的 `__del__` 语义会**销毁对应沙箱**（2026-08-14 实测：
+#     活跃沙箱被 DELETE、后续 execute 全 504）。
+# 故这把锁不是"省一次创建"，是**防止自己杀掉自己的沙箱**。
+_per_thread_create_locks: dict[str, threading.Lock] = {}
+
+
+def _get_create_lock(thread_id: str) -> threading.Lock:
+    """取（或惰性建）该 thread 的创建锁；dict 本身由 _sandbox_cache_lock 保护。"""
+    with _sandbox_cache_lock:
+        lock = _per_thread_create_locks.get(thread_id)
+        if lock is None:
+            lock = threading.Lock()
+            _per_thread_create_locks[thread_id] = lock
+        return lock
+
+
 def create_sandbox(thread_id: str):
     key = settings.cube_api_key
     if not key or not key.startswith("e2b_"):
@@ -197,59 +219,68 @@ def create_sandbox(thread_id: str):
         if cached is not None:
             return cached
 
-    try:
-        from langchain_cubesandbox import CubeSandbox
+    # 创建路径串行化（见 _per_thread_create_locks 注释）：慢路径（网络建沙箱 +
+    # pip config + CA 注入）全程持锁，并发请求在此等待而不是重复创建。
+    with _get_create_lock(thread_id):
+        # double-check：等锁期间可能已被前一路建好
+        with _sandbox_cache_lock:
+            cached = _sandbox_cache.get(thread_id)
+            if cached is not None:
+                return cached
 
-        sandbox = CubeSandbox.get_or_create(
-            template=settings.cube_template_id,
-            thread_id=thread_id,
-            api_url=settings.cube_api_url,
-            api_key=key,
-            ssl_cert=str(ca_path),
-            timeout=settings.sandbox_idle_timeout_sec,
-        )
+        try:
+            from langchain_cubesandbox import CubeSandbox
 
-        # 沙箱内配置 pip 指向内网 devpi 源（136 出口干净，绕开 AC 认证网关/egress MITM）
-        # 按需安装：AI 需要时才 pip install，沙箱创建时不预装
-        if hasattr(sandbox, "_sandbox") and sandbox._sandbox is not None:
-            try:
-                _r = sandbox.execute(
-                    "pip config set global.index-url http://192.168.10.136:3141/root/pypi/+simple/ "
-                    "&& pip config set global.trusted-host 192.168.10.136"
-                )
-                # 记录执行结果（不静默吞）：排查 pip config 是否真正生效
-                logger.warning("[DIAG] 沙箱 pip config 结果: %s", str(_r)[:200])
-            except Exception as e:
-                logger.warning("[DIAG] 沙箱 pip config 失败: %s", e)
-
-            # 注入 cube-egress MITM 根 CA（治本：沙箱信任后 https 出站全通，pip/curl 不再报
-            # CERTIFICATE_VERIFY_FAILED）。CA 由部署时从 CubeSandbox 控制面同步到 certs/。
-            # 背景：沙箱 https 出站被 cube-egress 透明代理用 cube-root-ca.crt 签发证书，
-            # 沙箱不信任该 CA → SSL 验证失败（2026-08-13 实测 pip install 全挂）。
-            _ca_file = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "..", "certs", "cube-root-ca.crt",
+            sandbox = CubeSandbox.get_or_create(
+                template=settings.cube_template_id,
+                thread_id=thread_id,
+                api_url=settings.cube_api_url,
+                api_key=key,
+                ssl_cert=str(ca_path),
+                timeout=settings.sandbox_idle_timeout_sec,
             )
-            if os.path.isfile(_ca_file):
+
+            # 沙箱内配置 pip 指向内网 devpi 源（136 出口干净，绕开 AC 认证网关/egress MITM）
+            # 按需安装：AI 需要时才 pip install，沙箱创建时不预装
+            if hasattr(sandbox, "_sandbox") and sandbox._sandbox is not None:
                 try:
-                    with open(_ca_file, "rb") as _f:
-                        _ca_b64 = base64.b64encode(_f.read()).decode()
                     _r = sandbox.execute(
-                        f"echo {_ca_b64} | base64 -d > /tmp/cube-root-ca.crt "
-                        "&& mkdir -p /usr/local/share/ca-certificates "
-                        "&& cp /tmp/cube-root-ca.crt /usr/local/share/ca-certificates/cube-root-ca.crt "
-                        "&& update-ca-certificates 2>&1 | tail -2"
+                        "pip config set global.index-url http://192.168.10.136:3141/root/pypi/+simple/ "
+                        "&& pip config set global.trusted-host 192.168.10.136"
                     )
-                    logger.warning("[DIAG] 沙箱注入 cube-egress CA 结果: %s", str(_r)[:200])
+                    # 记录执行结果（不静默吞）：排查 pip config 是否真正生效
+                    logger.warning("[DIAG] 沙箱 pip config 结果: %s", str(_r)[:200])
                 except Exception as e:
-                    logger.warning("[DIAG] 沙箱注入 cube-egress CA 失败: %s", e)
-            else:
-                logger.warning("[DIAG] certs/cube-root-ca.crt 不存在，跳过 CA 注入")
-            # 首次创建完成后缓存实例，同 thread_id 后续请求复用
-            with _sandbox_cache_lock:
-                _sandbox_cache[thread_id] = sandbox
-            return sandbox
-        return None
-    except Exception as e:
-        logger.warning("sandbox unavailable: %s", e)
-        return None
+                    logger.warning("[DIAG] 沙箱 pip config 失败: %s", e)
+
+                # 注入 cube-egress MITM 根 CA（治本：沙箱信任后 https 出站全通，pip/curl 不再报
+                # CERTIFICATE_VERIFY_FAILED）。CA 由部署时从 CubeSandbox 控制面同步到 certs/。
+                # 背景：沙箱 https 出站被 cube-egress 透明代理用 cube-root-ca.crt 签发证书，
+                # 沙箱不信任该 CA → SSL 验证失败（2026-08-13 实测 pip install 全挂）。
+                _ca_file = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "certs", "cube-root-ca.crt",
+                )
+                if os.path.isfile(_ca_file):
+                    try:
+                        with open(_ca_file, "rb") as _f:
+                            _ca_b64 = base64.b64encode(_f.read()).decode()
+                        _r = sandbox.execute(
+                            f"echo {_ca_b64} | base64 -d > /tmp/cube-root-ca.crt "
+                            "&& mkdir -p /usr/local/share/ca-certificates "
+                            "&& cp /tmp/cube-root-ca.crt /usr/local/share/ca-certificates/cube-root-ca.crt "
+                            "&& update-ca-certificates 2>&1 | tail -2"
+                        )
+                        logger.warning("[DIAG] 沙箱注入 cube-egress CA 结果: %s", str(_r)[:200])
+                    except Exception as e:
+                        logger.warning("[DIAG] 沙箱注入 cube-egress CA 失败: %s", e)
+                else:
+                    logger.warning("[DIAG] certs/cube-root-ca.crt 不存在，跳过 CA 注入")
+                # 首次创建完成后缓存实例，同 thread_id 后续请求复用
+                with _sandbox_cache_lock:
+                    _sandbox_cache[thread_id] = sandbox
+                return sandbox
+            return None
+        except Exception as e:
+            logger.warning("sandbox unavailable: %s", e)
+            return None

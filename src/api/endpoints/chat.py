@@ -749,12 +749,22 @@ async def chat(
 
     # 按本轮透传的 mcp_servers 过滤 MCP 工具（缺省 = 全部 enabled）
     tools = await get_mcp_tools(body.mcp_servers)
-    sandbox = create_sandbox(thread_id)
+
+    # ⚠️ 必须 await + to_thread（2026-10-10 加固）：create_sandbox / get_env_snapshot
+    # 内部是**同步阻塞**调用（CubeSandbox.get_or_create 走网络建沙箱、sandbox.execute
+    # 跑环境探测，单次最长 30s 超时），裸调在 async 入口里会占住事件循环 —— 沙箱冷启
+    # 或网络慢时整个 worker 僵住，**同进程所有会话的 SSE 流一起卡**，连 /healthz 都
+    # 不响应，swarm healthcheck 判 unhealthy 后 SIGKILL。
+    # 实证（会话 GY24428:a2719d7b）：08:41-09:23 agent 连续被杀 ≥7 次，每次死亡前
+    # 约 3 分 19 秒完全静默（连 healthz 都不打）；同期 agent 内存峰值仅 350MiB/2GiB，
+    # 非 OOM —— 是事件循环被冻住，不是资源不足。
+    # 本仓既有约定见 src/infra/trash.py:96 与 _ensure_file_on_disk（本文件 :345）。
+    sandbox = await asyncio.to_thread(create_sandbox, thread_id)
     logger.info("[DIAG] create_sandbox(thread_id=%s) → sandbox=%s", thread_id, type(sandbox).__name__ if sandbox else "None")
 
     # ─── M1 环境预检：快照注入 + 磁盘硬阈值拒绝（设计文档 M1）───
     # 快照缓存按 thread_id 60s 复用；无沙箱（本地模式）时 env_snapshot 为 None，跳过
-    env_snapshot = get_env_snapshot(sandbox, thread_id)
+    env_snapshot = await asyncio.to_thread(get_env_snapshot, sandbox, thread_id)
     if env_snapshot is not None and env_snapshot.ok:
         disk = env_snapshot.disk_avail_mb
         if disk is not None and disk < settings.sandbox_disk_hard_mb:
