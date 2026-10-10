@@ -8,7 +8,7 @@ from src.core.logging import *  # noqa: F401,F403 — 日志最早就绪
 # setup_tracing() 必须在 from .api.router import api_router 之前执行，
 # 因为 router → endpoints → services/agent 会触发 deepagents + langchain 的导入。
 # OpenInference 的 auto_instrument 需要在模块加载时 patch 进去。
-from src.core.tracing import setup_tracing
+from src.core.tracing import setup_tracing, shutdown_tracing
 
 setup_tracing()
 # ──────────────────────────────────────────────
@@ -153,8 +153,16 @@ async def lifespan(app: FastAPI):
 
     # 服务退出时手动关闭连接池
     _trash_sweeper.cancel()
-    await store.aclose()
-    await checkpointer.aclose()
+    try:
+        await store.aclose()
+        await checkpointer.aclose()
+    finally:
+        # 关停追踪：flush BatchSpanProcessor 里未导出的 span。
+        # 放在 finally 里 —— 连接池关闭抛异常也不能把 flush 跳过，否则尾部 trace
+        # 会随进程一起消失（SimpleSpanProcessor 时代逐条即时导出，没这个问题；
+        # 2026-10-10 换 Batch 后这一条是必须的配套）。
+        # 用 to_thread 包住：force_flush 最多阻塞 timeout，不能占着事件循环。
+        await asyncio.to_thread(shutdown_tracing)
     logging.warning("Store + Checkpointer 连接池已关闭，服务退出完成")
 
 

@@ -36,10 +36,17 @@ ea303fe（2026-09-09）因观察到"有非 LLM 数据在灌观测后端"而把�
 
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _initialized = False
+
+#: setup_tracing() 建好的 TracerProvider —— 供 shutdown_tracing() 关停前 flush。
+#: 为什么需要留引用：BatchSpanProcessor 把未导出的 span 放在自己的队列里，
+#: 进程退出时若不 flush 就整段消失（Simple 时代逐条即时导出，没这个问题）。
+_tracer_provider: Any = None
+_shutdown_done = False
 
 # ── span 过滤判据 ──
 # OpenInference 埋点（LangChain/LangGraph/deepagents）**一定**设置该属性：
@@ -66,6 +73,11 @@ try:
     from opentelemetry.sdk.trace import SpanProcessor as _SpanProcessorBase
 except ImportError:  # pragma: no cover — opentelemetry-sdk 是硬依赖，此处仅形式防御
     _SpanProcessorBase = object  # type: ignore[assignment,misc]
+
+try:
+    from opentelemetry.sdk.trace.export import SpanExporter as _SpanExporterBase
+except ImportError:  # pragma: no cover — 同上
+    _SpanExporterBase = object  # type: ignore[assignment,misc]
 
 
 class _OpenInferenceOnlySpanProcessor(_SpanProcessorBase):  # type: ignore[misc]
@@ -121,6 +133,262 @@ class _OpenInferenceOnlySpanProcessor(_SpanProcessorBase):  # type: ignore[misc]
         return self._downstream.force_flush(timeout_millis)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# span 体积防护（2026-10-10 事故后新增）
+# ═══════════════════════════════════════════════════════════════════════════════
+# 事故现场（会话 4863afff，14:31:55）：
+#   RESOURCE_EXHAUSTED: grpc: received message larger than max (28027858 vs 4194304)
+# 三条实测事实决定了这里为什么需要**多层**，而不是"换成 Batch"一行了事：
+#
+#   ① 4 MiB 是 alloy（grpc-go **服务端**）的 MaxRecvMsgSize，不是应用侧可调参数；
+#      超限的请求被整体拒绝 → 该次导出携带的 span **全部**丢失。
+#   ② Phoenix 当时用 SimpleSpanProcessor（同步导出）→ 失败的导出重试把承载请求的
+#      worker 按住约 8 秒（14:31:55→14:32:03），正压在工具结果后处理那一刻。
+#   ③ OTel SDK 的 SpanLimits **默认不限制属性值长度**
+#      （max_span_attribute_length / max_attribute_length 缺省 None，见
+#      opentelemetry/sdk/trace/__init__.py:642-645），所以 28 MiB 的 input.value
+#      能一路走到 exporter。
+#
+# 层与层的分工（缺任何一层都有明确的失效路径）：
+#   L1 SpanLimits（SDK 标准，零自定义代码）—— 在 set_attribute 源头截断单个属性值。
+#      收益：绝大多数 span 根本长不到危险体量。局限：它只约束「单值长度 × 属性数 ×
+#      事件数」的乘积上界 —— 128 属性 × 32768 字符 × 3 字节/中文 ≈ 12 MiB，仍然远超
+#      4 MiB。**乘积上界不等于硬保证**，所以还需要 L2。
+#   L2 _SpanPayloadGuardProcessor —— 量**真实**估算体积，超限整条丢弃并打 error。
+#      这是"硬保证"的落点：与 execute 输出闸门同一条结论 —— 只守上界不算守，
+#      必须量真东西；只做一层防御必然炸。
+#   L3 _ChunkedSpanExporter —— 约束**一次网络请求**的体积。换 BatchSpanProcessor
+#      会引入一个 Simple 时代不存在的新风险：默认 max_export_batch_size=512，
+#      而 `BatchProcessor._export` 对导出失败**不重试**（span 已从队列弹出，见
+#      opentelemetry/sdk/_shared_internal/__init__.py:167）→ 一次超限 = 512 条一起消失。
+#      分片把单次损失上限压到一片。
+#   L4 shutdown_tracing —— 关停前 flush。Simple 逐条即时导出不留尾巴，换 Batch 后
+#      最后一段留在内存里，进程退出即丢（此前全仓无人调用 flush，Langfuse 那路
+#      本来就是 Batch，一直在丢尾部）。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: 估算系数：protobuf 的 tag/长度前缀 + gRPC 帧开销。刻意取偏大值 ——
+#: 估算偏大只会多丢一条边缘 span，估算偏小则会让整批被服务端拒绝。
+_ENCODING_OVERHEAD_FACTOR = 2.0
+#: span 名称 + 元数据的固定开销（估算用，不求精确）
+_SPAN_META_OVERHEAD_BYTES = 64
+#: 单个 event 的固定开销（时间戳、名称等）
+_EVENT_META_OVERHEAD_BYTES = 64
+
+
+def _value_bytes(value: Any) -> int:
+    """属性值编码后的近似字节数（**按 UTF-8 计**，中文 1 字符按 3 字节）。"""
+    if isinstance(value, str):
+        return len(value.encode("utf-8", "ignore"))
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    if isinstance(value, bool):
+        return 1
+    if isinstance(value, (int, float)):
+        return 8
+    if isinstance(value, (list, tuple)):
+        return sum(_value_bytes(item) for item in value)
+    return 0
+
+
+def _attributes_bytes(attributes: Any) -> int:
+    """一组属性的近似字节数（键 + 值）。容器异常时抛出，由调用方按 fail-closed 处理。"""
+    if not attributes:
+        return 0
+    total = 0
+    for key, value in attributes.items():
+        total += len(str(key).encode("utf-8", "ignore")) + _value_bytes(value)
+    return total
+
+
+def _estimate_span_bytes(span: Any) -> int:
+    """估算一条 span 编码为 OTLP protobuf 后的字节数。
+
+    只统计**主导项**：名称、属性、事件、状态描述。resource 属性不计 —— 它按
+    Resource 全局共享、不随 span 增长（口径说明，便于日后核对）。
+
+    刻意不追求精确：闸门只做量级判定。中文按 UTF-8 3 字节计这一点很关键 ——
+    SDK 的 SpanLimits 用的是**字符数**，若这里也按字符估，会低估到 1/3。
+    """
+    name = getattr(span, "name", "") or ""
+    total = len(str(name).encode("utf-8", "ignore")) + _SPAN_META_OVERHEAD_BYTES
+    total += _attributes_bytes(getattr(span, "attributes", None))
+    for event in getattr(span, "events", None) or ():
+        total += _EVENT_META_OVERHEAD_BYTES + _attributes_bytes(
+            getattr(event, "attributes", None)
+        )
+    status = getattr(span, "status", None)
+    description = getattr(status, "description", None)
+    if description:
+        total += len(str(description).encode("utf-8", "ignore"))
+    return int(total * _ENCODING_OVERHEAD_FACTOR)
+
+
+class _SpanPayloadGuardProcessor(_SpanProcessorBase):  # type: ignore[misc]
+    """单条 span 体积闸门：超限即丢弃，绝不放过（fail-closed）。
+
+    挂在 `_OpenInferenceOnlySpanProcessor` **内层** —— 先按 span kind 过滤掉 98% 的
+    HTTP/ASGI span（历史实测 Phoenix spans 表 106,368/108,209 是 HTTP 形态），
+    只对本就要上报的 span 做测量，不做无用功。
+
+    为什么是"丢弃"而不是"就地截断"：on_end 拿到的 ReadableSpan 已结束，官方文档
+    明确 *"Users should NOT be creating these objects directly"*
+    （opentelemetry/sdk/trace/__init__.py:410），改写属性不是受支持的用法；
+    而源头截断已由 L1 SpanLimits 负责。本层只回答一个问题：
+    **"这条 span 会不会把整批拖下水？会 → 现在就丢掉它，并留下证据。"**
+
+    估算本身失败时同样丢弃（fail-closed）：估不出体积 = 未知体量，
+    放行它等于把 4 MiB 上限交给运气。
+    """
+
+    _dropped = 0
+    _passed = 0
+
+    def __init__(self, downstream: Any, *, limit_bytes: int) -> None:
+        self._downstream = downstream
+        self._limit_bytes = limit_bytes
+
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        try:
+            self._downstream.on_start(span, parent_context)
+        except Exception:  # 观测链路异常不得影响业务
+            logger.debug("[TRACING] on_start 转发下游异常", exc_info=True)
+
+    def on_end(self, span: Any) -> None:
+        try:
+            size = _estimate_span_bytes(span)
+        except Exception:
+            _SpanPayloadGuardProcessor._dropped += 1
+            logger.error(
+                "[TRACING] span 体积估算失败，已丢弃（fail-closed）：name=%r —— "
+                "估不出体积就不能放行，否则等于把 4 MiB 上限交给运气",
+                getattr(span, "name", "?"),
+                exc_info=True,
+            )
+            return
+
+        if self._limit_bytes > 0 and size > self._limit_bytes:
+            _SpanPayloadGuardProcessor._dropped += 1
+            logger.error(
+                "[TRACING] 丢弃超限 span：name=%r 估算=%d 字节 > 上限=%d 字节。"
+                "该 span 若导出会撞 alloy 4 MiB 接收上限（RESOURCE_EXHAUSTED），"
+                "且 BatchSpanProcessor 失败**不重试**（span 已出队）→ 会让同批其余 span "
+                "一起丢失。请检查该 span 的属性来源（多为工具结果/对话内容被整段"
+                "记进 input.value / output.value）。",
+                getattr(span, "name", "?"),
+                size,
+                self._limit_bytes,
+            )
+            return
+
+        _SpanPayloadGuardProcessor._passed += 1
+        try:
+            self._downstream.on_end(span)
+        except Exception:
+            logger.debug("[TRACING] on_end 转发下游异常", exc_info=True)
+
+    def shutdown(self) -> None:
+        logger.info(
+            "[TRACING] span 体积闸门统计 — 放行=%d 丢弃=%d（单条上限 %d 字节）",
+            _SpanPayloadGuardProcessor._passed,
+            _SpanPayloadGuardProcessor._dropped,
+            self._limit_bytes,
+        )
+        try:
+            self._downstream.shutdown()
+        except Exception:
+            logger.debug("[TRACING] 下游 shutdown 异常", exc_info=True)
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._downstream.force_flush(timeout_millis)
+
+
+def _pack_span_chunks(spans: Any, limit_bytes: int) -> list[list[Any]]:
+    """按估算体积把 span 序列贪心装箱，保证每片 ≤ ``limit_bytes``。
+
+    单条自身就超限的 span 会独占一片 —— 本函数**不再兜第二层**：那种 span 已由
+    `_SpanPayloadGuardProcessor` 在上游丢弃，两层做同一件事只会互相掩盖问题。
+    """
+    chunks: list[list[Any]] = []
+    current: list[Any] = []
+    current_bytes = 0
+    for span in spans:
+        try:
+            size = _estimate_span_bytes(span)
+        except Exception:
+            logger.error(
+                "[TRACING] 分片时体积估算失败，该 span 独占一片", exc_info=True
+            )
+            size = limit_bytes if limit_bytes > 0 else 0
+        if current and limit_bytes > 0 and current_bytes + size > limit_bytes:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(span)
+        current_bytes += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+class _ChunkedSpanExporter(_SpanExporterBase):  # type: ignore[misc]
+    """把一次导出拆成多次请求，避免"整批一起超限 → 整批一起消失"。
+
+    这是**换 BatchSpanProcessor 引入的新风险**的对应措施，不是锦上添花：
+    SimpleSpanProcessor 每次只导出 1 条 span，永远撞不到"批量体积"问题；Batch 默认
+    ``max_export_batch_size=512``，若每条约 100 KiB，单次请求可达 50 MiB。而
+    ``BatchProcessor._export`` 对失败**不重试**（只记日志，span 已从队列弹出），
+    因此一次超限就是 512 条静默消失。
+
+    返回值语义：全成功 → SUCCESS；任一片失败 → FAILURE。
+    当前 SDK 不重试，故不会重复上报；即便上游将来加重试也安全 ——
+    Phoenix / Langfuse 均按 span_id 落库，重复上报幂等。
+    """
+
+    def __init__(self, downstream: Any, *, limit_bytes: int) -> None:
+        self._downstream = downstream
+        self._limit_bytes = limit_bytes
+        self._split_count = 0
+
+    @property
+    def split_count(self) -> int:
+        """因超限而被拆分的次数（便于测试与排障）。"""
+        return self._split_count
+
+    def export(self, spans: Any) -> Any:
+        from opentelemetry.sdk.trace.export import SpanExportResult
+
+        if self._limit_bytes <= 0:
+            return self._downstream.export(spans)
+
+        spans = tuple(spans)
+        chunks = _pack_span_chunks(spans, self._limit_bytes)
+        if len(chunks) > 1:
+            self._split_count += 1
+            logger.info(
+                "[TRACING] 导出批次 %d 条估算超上限，已拆为 %d 次请求（上限 %d 字节/次）",
+                len(spans),
+                len(chunks),
+                self._limit_bytes,
+            )
+
+        result = SpanExportResult.SUCCESS
+        for chunk in chunks:
+            try:
+                if self._downstream.export(chunk) is not SpanExportResult.SUCCESS:
+                    result = SpanExportResult.FAILURE
+            except Exception:
+                logger.exception("[TRACING] 分片导出异常（该片丢失，其余照常）")
+                result = SpanExportResult.FAILURE
+        return result
+
+    def shutdown(self) -> None:
+        self._downstream.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._downstream.force_flush(timeout_millis)
+
+
 def setup_tracing() -> bool:
     """初始化 OpenInference 追踪，向 Phoenix + Langfuse 上报 trace，并注册 metrics。
 
@@ -148,7 +416,6 @@ def setup_tracing() -> bool:
         from opentelemetry.sdk import trace as trace_sdk
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace.export import (
-            SimpleSpanProcessor,
             BatchSpanProcessor,
         )
         # ── Metrics SDK（2026-09-03 补链路：此前只注册 trace → gen_ai_*/http_server_* 全 0）──
@@ -184,20 +451,59 @@ def setup_tracing() -> bool:
             "project.name": settings.otel_project_name,
             "openinference.project.name": settings.otel_project_name,
         })
-        tracer_provider = trace_sdk.TracerProvider(resource=resource)
 
-        # ── 1. Phoenix gRPC exporter（包 OpenInference span 过滤）──
+        # ── L1：span 属性值长度上限（SDK 标准 SpanLimits，零自定义代码）──
+        # 为什么必须显式设：SDK 的 max_span_attribute_length / max_attribute_length
+        # **默认 None = 不截断**（opentelemetry/sdk/trace/__init__.py:642-645），
+        # 这正是 28 MiB 的 input.value 能一路走到 alloy 的原因。
+        # 语义：SDK 按**字符**截断（BoundedAttributes._clean_attribute 做 value[:max_len]），
+        # 中文 1 字符 ≈ 3 字节，故注释与配置项都按字符表述。
+        # 计数类上限（属性数/事件数）保持 SDK 默认 128 —— 276 线业务 span 远未触顶，
+        # 收紧它们只会丢合法信息，真正的硬保证交给 L2 量体积。
+        span_limits = None
+        if settings.otel_span_limits_enabled:
+            span_limits = trace_sdk.SpanLimits(
+                max_span_attribute_length=settings.otel_span_attribute_value_limit,
+                max_attribute_length=settings.otel_event_attribute_value_limit,
+            )
+        else:
+            logger.warning(
+                "[TRACING] otel_span_limits_enabled=False — 属性值长度不设上限，"
+                "已退回 2026-10-10 之前的行为（大 span 仍可能撞 alloy 4 MiB 上限）"
+            )
+
+        tracer_provider = trace_sdk.TracerProvider(
+            resource=resource, span_limits=span_limits
+        )
+
+        def _build_processor(exporter: Any) -> Any:
+            """统一装配链条：过滤(最外) → 体积闸门 → Batch → 分片 → exporter(最内)。
+
+            顺序不是随意排的：
+            · 过滤放最外 —— 先丢掉 98% 的 HTTP/ASGI span，后面的测量与分片不做无用功；
+            · 闸门在 Batch 之外 —— 被丢弃的 span 根本不进队列，不占队列也不参与分片；
+            · 分片紧贴 exporter —— 它约束的是**一次网络请求**的体积，必须最靠内，
+              才能看到 Batch 真正要发出去的那一批。
+            """
+            chunked = _ChunkedSpanExporter(
+                exporter, limit_bytes=settings.otel_export_request_bytes_limit
+            )
+            guarded = _SpanPayloadGuardProcessor(
+                BatchSpanProcessor(chunked),
+                limit_bytes=settings.otel_span_payload_limit_bytes,
+            )
+            return _OpenInferenceOnlySpanProcessor(guarded)
+
+        # ── 1. Phoenix gRPC exporter ──
         phoenix_endpoint = settings.phoenix_collector_endpoint
         if phoenix_endpoint:
             os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = phoenix_endpoint
             tracer_provider.add_span_processor(
-                _OpenInferenceOnlySpanProcessor(
-                    SimpleSpanProcessor(GrpcExporter(endpoint=phoenix_endpoint))
-                )
+                _build_processor(GrpcExporter(endpoint=phoenix_endpoint))
             )
             logger.info(
                 "[TRACING] Phoenix gRPC exporter 已添加 — endpoint=%s"
-                "（已挂 OpenInference span 过滤）",
+                "（OpenInference 过滤 + 体积闸门 + 分片；Batch 导出）",
                 phoenix_endpoint,
             )
         else:
@@ -205,7 +511,7 @@ def setup_tracing() -> bool:
                 "[TRACING] phoenix_collector_endpoint 为空 — Phoenix exporter 跳过"
             )
 
-        # ── 2. Langfuse HTTP exporter（包 OpenInference span 过滤）──
+        # ── 2. Langfuse HTTP exporter ──
         if settings.langfuse_secret_key and settings.langfuse_base_url:
             import base64
 
@@ -221,15 +527,11 @@ def setup_tracing() -> bool:
                 "/api/public/otel/v1/traces"
             )
             tracer_provider.add_span_processor(
-                _OpenInferenceOnlySpanProcessor(
-                    BatchSpanProcessor(
-                        HttpExporter(endpoint=langfuse_endpoint, headers=headers)
-                    )
-                )
+                _build_processor(HttpExporter(endpoint=langfuse_endpoint, headers=headers))
             )
             logger.info(
                 "[TRACING] Langfuse HTTP exporter 已添加 — endpoint=%s"
-                "（已挂 OpenInference span 过滤）",
+                "（OpenInference 过滤 + 体积闸门 + 分片；Batch 导出）",
                 langfuse_endpoint,
             )
         else:
@@ -274,6 +576,9 @@ def setup_tracing() -> bool:
 
         # ── 4. 激活 ──
         trace_api.set_tracer_provider(tracer_provider)
+        # 留引用供 shutdown_tracing() 关停前 flush（Batch 的尾巴在这里面）
+        global _tracer_provider
+        _tracer_provider = tracer_provider
         LangChainInstrumentor().instrument()
 
         # HTTP server instrument（http_server_* metrics + HTTP server span）。
@@ -310,10 +615,17 @@ def setup_tracing() -> bool:
         logger.info(
             "[TRACING] OpenInference 初始化完成 — "
             "auto_instrument=langchain, "
-            "Phoenix=%s, Langfuse=%s, Metrics=%s, span_filter=OpenInferenceOnly",
+            "Phoenix=%s, Langfuse=%s, Metrics=%s, span_filter=OpenInferenceOnly, "
+            "span_limits=%s（属性值上限 %d 字符 / 事件 %d 字符）, "
+            "单条 span 上限 %d 字节, 单次导出上限 %d 字节",
             bool(phoenix_endpoint),
             bool(settings.langfuse_secret_key and settings.langfuse_base_url),
             metrics_registered,
+            "on" if span_limits is not None else "off",
+            settings.otel_span_attribute_value_limit,
+            settings.otel_event_attribute_value_limit,
+            settings.otel_span_payload_limit_bytes,
+            settings.otel_export_request_bytes_limit,
         )
         return was_setup
 
@@ -328,3 +640,60 @@ def setup_tracing() -> bool:
     except Exception as e:
         logger.warning("[TRACING] 初始化异常: %s", e)
         return False
+
+
+def shutdown_tracing(timeout_millis: int = 3000) -> bool:
+    """关停追踪：flush 掉 Batch 里还没导出的 span，然后逐层 shutdown。
+
+    ★ 为什么必须有（换 BatchSpanProcessor 引入的**新**风险）：
+      SimpleSpanProcessor 是逐条即时导出，进程退出不留尾巴；换成 Batch 后，最后
+      一段时间内的 span 留在内存队列里（默认 schedule_delay 5s + 未满批的部分），
+      进程退出即消失。此前**全仓没有任何地方**调用 force_flush/shutdown
+      （grep 实测），也就是说 Langfuse 那一路（本来就是 Batch）一直在丢尾部 trace，
+      只是没人统计过丢了多少。
+
+    ★ 为什么默认超时是 3s 而不是 SDK 惯用的 30s：
+      `deploy/docker-compose.yml` **没有**设置 `stop_grace_period`，即 `docker stop`
+      走默认 10s 宽限期，超时直接 SIGKILL。若这里给 10s（甚至 30s），flush 会与
+      SIGKILL 抢时间，而且会把宽限期吃光、让其余关停工作（连接池 aclose）没时间做。
+      本地 alloy 在同一个 compose 网络里，正常 flush 是毫秒级，3s 是充裕的上限。
+      若确实需要更长，请同时给 app 服务加 `stop_grace_period`。
+
+    调用点：src/server.py 的 lifespan（yield 之后，放在 finally 里）。用 to_thread
+    包住，因为 force_flush 会阻塞最多 ``timeout_millis``。
+
+    :return: 是否 flush 成功（未初始化时返回 True —— 没启用不算失败）
+    """
+    global _shutdown_done
+    if _shutdown_done:
+        return True
+    if _tracer_provider is None:
+        logger.debug("[TRACING] 未初始化，shutdown_tracing 跳过")
+        return True
+
+    ok = True
+    try:
+        flushed = _tracer_provider.force_flush(timeout_millis)
+        if flushed:
+            logger.info(
+                "[TRACING] 关停前 flush 完成（超时上限 %d ms）", timeout_millis
+            )
+        else:
+            ok = False
+            logger.warning(
+                "[TRACING] 关停前 flush 超时（%d ms）— 队列里剩余的 span 会丢失",
+                timeout_millis,
+            )
+    except Exception:
+        ok = False
+        logger.error("[TRACING] 关停前 flush 异常", exc_info=True)
+
+    try:
+        # 逐层转发：过滤 → 闸门 → Batch → 分片 → exporter，
+        # 顺带打出「过滤统计」「体积闸门统计」两条 info，便于确认防护是否生效。
+        _tracer_provider.shutdown()
+    except Exception:
+        logger.error("[TRACING] provider.shutdown 异常", exc_info=True)
+
+    _shutdown_done = True
+    return ok

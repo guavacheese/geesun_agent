@@ -44,6 +44,24 @@ class Settings(BaseSettings):
     # 无法按服务筛选/告警。设此字段让 job=geesun-agent（trace 侧 service 名同步正确）。
     otel_service_name: str = "geesun-agent"
 
+    # ─── OTel span 体积上限（2026-10-10 事故后新增）───
+    # 事故：会话 4863afff 产生 28,027,858 字节的 span，撞 alloy 的 gRPC 接收上限
+    # (4 MiB)，而 Phoenix 当时走 SimpleSpanProcessor（同步导出）→ 导出重试把承载
+    # 请求的 worker 按住约 8 秒（14:31:55→14:32:03）。
+    # 四层防护的开关与阈值；**默认值即生产值**，刻意不新增 .env 键（避免双源漂移）。
+    # otel_span_limits_enabled=False 可整体退回 2026-10-10 之前的行为。
+    otel_span_limits_enabled: bool = True
+    # 单属性值长度上限（**字符数**，SDK SpanLimits.max_span_attribute_length 语义）。
+    # ⚠ SDK 按字符截断，中文 1 字符 ≈ 3 字节 → 32768 字符最坏约 96 KiB。
+    otel_span_attribute_value_limit: int = 32768
+    # 事件属性值长度上限（字符数）：event 多为日志/异常行，用不上大额度
+    otel_event_attribute_value_limit: int = 4096
+    # 单条 span 编码后的估算上限（字节）：超限即整条丢弃（fail-closed）
+    otel_span_payload_limit_bytes: int = 1048576
+    # 单次 OTLP 导出请求的估算上限（字节）：批次按此分片
+    # （alloy 侧 4 MiB 是硬上限，取 3 MiB 留余量）
+    otel_export_request_bytes_limit: int = 3145728
+
     # 允许的前端跨域源（逗号分隔）；生产部署填 Web 实际域名 / IP
     cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
