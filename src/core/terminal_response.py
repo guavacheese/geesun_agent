@@ -49,7 +49,8 @@
      只对本轮模型调用可见、**不写回 agent state**，因此不会进 checkpoint、
      不会被 chat.py:443-528 的 `_persist_session` 落库污染历史。
      （对照：after_model 返回 `{"messages": [...]}` 会进 state 并落库。）
-     这也是 loop_detection.py:410-412 已用的成熟模式。
+     这也是 loop_detection.py 的 `LoopDetectionMiddleware._apply`
+     （after_model 返回 `{"messages": [...]}`）已用的成熟模式。
 
 **重试预算语义**：沿用 deer-flow 的「**每次 run 只给 1 次**」而非「每条空消息 1 次」——
 deer-flow 源码注释明确写了这个陷阱：
@@ -427,7 +428,7 @@ def _finish_reason(message: AIMessage) -> str:
     所以**聚合后的 AIMessage 上读 `response_metadata["finish_reason"]` 是可用的**
     （生产实证：Langfuse GENERATION output 里
      `"response_metadata": {"finish_reason": "tool_calls", ...}`；
-     本项目 loop_detection.py:357 也已在用同一路径）。
+     本项目 loop_detection.py 的 `_build_hard_stop_update` 也已在用同一路径）。
     """
     meta = getattr(message, "response_metadata", None) or {}
     value = meta.get("finish_reason")
@@ -582,7 +583,7 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
         用 runtime.execution_info.thread_id（langgraph/runtime.py:39）——
         Runtime 不含 config（runtime.py:131 明示），所以不能用
         runtime.context["thread_id"]（deer-flow 的做法，对我们不适用）。
-        与 loop_detection.py:224-233 保持一致。
+        与 loop_detection.py 的 `_get_thread_id` 保持一致。
         """
         info = getattr(runtime, "execution_info", None)
         thread_id = getattr(info, "thread_id", None) if info is not None else None

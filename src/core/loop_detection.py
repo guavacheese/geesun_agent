@@ -17,7 +17,17 @@
     底层实测都是 langchain AgentMiddleware（deepagents graph.py:865 内部就是
     create_agent，langchain-1.3.13 middleware/types.py 含全部 hook）。
 
-适配（4 点，均源码实锤）：
+适配（5 点，均源码实锤）：
+  0. ★ 工具层契约（2026-10-10 补，会话 GY24428:aaf95335 实证）：
+     deer-flow 的中间件天然假设的是**它自己的自研工具集** —— 它的 read_file 签名是
+     `read_file(path, start_line, end_line)`（deer-flow sandbox/tools.py:2148），
+     与我们用的 deepagents 内置工具（`file_path` / `offset` / `limit`）不是同一套契约。
+     移植时必须逐字段核对工具名与参数名，**不能只适配框架层**：当时把下面 1-4 点
+     当作"全部适配"，漏了这一层，`read_file` 的稳定 key 恒为 ":0-0" —— 读哪个文件、
+     读哪一段都不影响，窗口内攒够 hard_limit 次必然硬停（"读文件→改脚本→跑"是调试类
+     任务的肌肉记忆动作，不是概率问题而是必中）。
+     现改为从模型侧工具 args_schema 反查字段名（见 §工具参数契约），
+     并在 args 出现 schema 外槽位字段时告警（把静默降级变成可观测）。
   1. hook 签名用两参 `(state, runtime)` —— 与 langchain 内建
      SummarizationMiddleware.after_model（summarization.py:371）一致。
      （_FreshSkillsMiddleware 写三参 (state, runtime, config) 能跑是意外：
@@ -53,11 +63,15 @@ import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, NotRequired, override
+from typing import Any, NotRequired, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import (
+    ModelCallResult,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
@@ -108,49 +122,214 @@ def _bucket_line(line: int, size: int) -> int:
     return (max(line, 1) - 1) // size
 
 
-def _stable_tool_key(name: str, args: dict, fallback_key: str | None) -> str:
-    """从关键参数派生稳定 key（不过拟合噪声）。
+def _as_int(value: object, default: int = 1) -> int:
+    """尽力把工具参数转成 int（模型可能传 "100" 这种字符串），失败取 default。"""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
-    - read_file：path + 行号桶 → 同文件不同行段视为同一意图（防逐行换段刷屏）
-    - write_file / str_replace：内容敏感，用全参数 hash（防止把"不同 payload 更新同文件"误判）
-    - 其他：只用 path/url/query/command/pattern/glob/cmd 等显著字段
+
+# ─── 工具参数契约：从真实参数 schema 反查，不硬编码字段名 ──────────────
+#
+# 背景（2026-10-10 生产实锤，会话 GY24428:aaf95335）：
+#   本文件曾照抄 deer-flow 的 _stable_tool_key，把 read_file 的路径/行段字段硬编码为
+#   `path` / `start_line` / `end_line`。这段代码在 deer-flow **完全正确** —— 因为
+#   deer-flow 的 read_file 是它自研的沙箱工具（sandbox/tools.py:2148，签名就是
+#   read_file(path, start_line, end_line)）。而本项目的 read_file 来自 deepagents
+#   filesystem middleware，真实契约是 `file_path` / `offset` / `limit`。
+#   移植时只适配了框架层（hook 签名、runtime 取数、阈值——见 §适配 4 点），
+#   工具层契约默认"上游怎么写就怎么用"，于是三个字段一个都取不到：
+#       path=""、start=end=1 → key 恒为 ":0-0"
+#   → 窗口内攒够 hard_limit 次 read_file **必然**硬停。而"读文件 → 改脚本 → 跑"
+#   正是调试类任务的肌肉记忆动作：不是概率问题，是必中。aaf95335 会话里模型已经
+#   自己诊断出 PaddleOCR 调用错误、正在修，第 5 次 read_file 被掐断，离成功一步之遥。
+#
+#   失败之所以静默：`args.get("x") or ""` 取不到字段时不报错、不告警，直接降级成
+#   常量 —— 既不崩溃，单测也全绿（原单测照 deer-flow 契约构造 args，属自证式），
+#   只在生产以"误判"形式现身，而误判与代码缺陷之间隔着一整条推理链。
+#
+# 治本：字段名不再由本文件断言，而是**从 agent 实际持有的工具 args_schema 反查**。
+#   下面这些常量只是"反查时按什么顺序试"的查询条件，不是契约；
+#   契约冲突时以 schema 为准，且会告警（见 _detect_contract_drift）。
+#
+#: 路径/目标标识类字段候选（按优先级试）
+_PATH_FIELD_CANDIDATES: tuple[str, ...] = (
+    "file_path", "path", "filepath", "file", "filename", "dir", "directory",
+)
+#: 起始位置候选（绝对行号；0-indexed 如 deepagents offset 与 1-indexed 如 deer-flow
+#: start_line 在"分桶"这一粗粒度用途下等价，无需区分）
+_START_FIELD_CANDIDATES: tuple[str, ...] = (
+    "offset", "start_line", "start", "from_line", "line",
+)
+#: 结束位置候选：值为**绝对结束行号**（如 deer-flow 的 end_line）
+_END_FIELD_CANDIDATES: tuple[str, ...] = ("end_line", "end", "to_line")
+#: 跨度候选：值为**行数**（如 deepagents 的 limit=100），
+#: 必须换算成绝对结束行 start+span —— 若误当绝对行号，"从第 200 行起读 100 行"
+#: 会与"从头读 100 行"落进同一分桶而互相掩盖。
+_SPAN_FIELD_CANDIDATES: tuple[str, ...] = ("limit", "count", "lines")
+#: 内容类字段：命中即视为"内容敏感工具"（同一文件写不同内容不是重复调用）
+_PAYLOAD_FIELD_CANDIDATES: tuple[str, ...] = (
+    "content", "old_string", "new_string", "text", "body", "data", "code", "contents",
+)
+#: 无 schema 信息（契约未知）时的显著字段兜底，保住既有行为
+_SALIENT_FIELDS_FALLBACK: tuple[str, ...] = (
+    "path", "url", "query", "command", "pattern", "glob", "cmd",
+)
+#: 契约漂移探测面：args 里出现这些字段却不在工具 schema 中 → 明确的错位信号
+_CONTRACT_PROBE_FIELDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        _PATH_FIELD_CANDIDATES
+        + _START_FIELD_CANDIDATES
+        + _END_FIELD_CANDIDATES
+        + _SPAN_FIELD_CANDIDATES
+        + _PAYLOAD_FIELD_CANDIDATES
+    )
+)
+
+
+def _schema_field_names(schema: object) -> frozenset[str] | None:
+    """把各种 schema 表示归一化为字段名集合（取不到返回 None）。"""
+    if schema is None:
+        return None
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        return frozenset(str(k) for k in props) if isinstance(props, dict) and props else None
+    fields = getattr(schema, "model_fields", None)  # pydantic v2（BaseTool.args_schema 常态）
+    if isinstance(fields, dict) and fields:
+        return frozenset(str(k) for k in fields)
+    fields = getattr(schema, "__fields__", None)  # pydantic v1 兜底
+    if isinstance(fields, dict) and fields:
+        return frozenset(str(k) for k in fields)
+    return None
+
+
+def _extract_schema_fields(tool: object) -> frozenset[str] | None:
+    """从工具对象提取其参数名集合（契约反查的唯一入口）。
+
+    支持三种形态：langchain BaseTool（.args_schema）、OpenAI function 格式 dict、
+    裸 parameters dict。**取不到一律返回 None** —— 调用方必须把 None 当作
+    "契约未知"走 args 探测兜底，不得当作"字段不存在"（否则又是静默误判）。
     """
-    if name == "read_file" and fallback_key is None:
-        path = args.get("path") or ""
-        start_line = args.get("start_line")
-        end_line = args.get("end_line")
-        try:
-            start_line = int(start_line) if start_line is not None else 1
-        except (TypeError, ValueError):
-            start_line = 1
-        try:
-            end_line = int(end_line) if end_line is not None else start_line
-        except (TypeError, ValueError):
-            end_line = start_line
-        start_line, end_line = sorted((start_line, end_line))
-        return f"{path}:{_bucket_line(start_line, 200)}-{_bucket_line(end_line, 200)}"
+    for attr in ("args_schema", "tool_call_schema"):
+        names = _schema_field_names(getattr(tool, attr, None))
+        if names:
+            return names
+    if isinstance(tool, dict):
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if isinstance(fn, dict):
+            return _schema_field_names(fn.get("parameters"))
+    return None
 
-    if name in {"write_file", "str_replace"}:
-        if fallback_key is not None:
-            return fallback_key
+
+def _resolve_field(
+    args: dict, schema_fields: frozenset[str] | None, candidates: tuple[str, ...]
+) -> str | None:
+    """按候选优先级解析出该工具**真实使用**的字段名（双源：schema 权威 + args 探测）。
+
+    - schema 已知：只认 schema 里有的名字（本次 args 没传也算命中 —— 用默认值也算
+      一次"读整个文件/从头读"的调用，这正是期望语义）
+    - schema 未知（工具尚未学习到）：退化为在 args 里探测，保住无 schema 环境的既有行为
+    """
+    for cand in candidates:
+        if schema_fields is None:
+            if cand in args:
+                return cand
+        elif cand in schema_fields:
+            return cand
+    return None
+
+
+def _detect_contract_drift(
+    args: dict, schema_fields: frozenset[str] | None
+) -> str | None:
+    """schema 已知时，args 里出现"疑似槽位字段但不在 schema 中"→ 返回该字段名。
+
+    这正是 aaf95335 的形态：args 带 path/start_line/end_line，而 read_file 的 schema
+    只有 file_path/offset/limit。旧实现静默取空值 → key 恒定 → 必然误判；现在把
+    "静默降级"改成"显式告警"（调用方按 (tool, field) 限流只报一次），
+    使同类契约漂移在**首次发生**时就可见，而不是等它以任务失败的形式浮出水面。
+    """
+    if schema_fields is None:
+        return None
+    for field in _CONTRACT_PROBE_FIELDS:
+        if field in args and field not in schema_fields:
+            return field
+    return None
+
+
+def _stable_tool_key(
+    args: dict,
+    fallback_key: str | None,
+    schema_fields: frozenset[str] | None = None,
+) -> str:
+    """从关键参数派生稳定 key（不过拟合噪声，也不被字段名漂移带偏）。
+
+    ``schema_fields`` 语义见 _resolve_field（None = 契约未知，走 args 探测兜底）。
+
+    三类工具 —— **按 schema 特征判定，不再按工具名硬编码**：
+    - 分页读取型（有路径字段 + 行段字段，如 read_file{file_path,offset,limit}）：
+      按"文件 + 行段桶"聚合，同文件同行段重复读才算循环，读新行段不算。
+    - 内容敏感型（有 content/old_string/new_string 等 payload 字段，如 write_file /
+      edit_file）：用全参 hash，同一文件写不同内容不是重复调用。
+    - 其余（ls/glob/grep/execute…）：只用标识类显著字段，忽略 timeout 等噪声参数。
+    """
+    if fallback_key is not None:
+        # 非 dict 载荷（provider 把 args 序列化成非 JSON 对象）→ 原样用，最深兜底
+        return fallback_key
+
+    path_field = _resolve_field(args, schema_fields, _PATH_FIELD_CANDIDATES)
+    start_field = _resolve_field(args, schema_fields, _START_FIELD_CANDIDATES)
+    end_field = _resolve_field(args, schema_fields, _END_FIELD_CANDIDATES)
+    span_field = _resolve_field(args, schema_fields, _SPAN_FIELD_CANDIDATES)
+
+    # ① 分页读取型：路径 + 任一"行段"字段
+    #    守卫：路径必须**真实取到值**才走分桶。否则（例如 args 用了 schema 之外的旧
+    #    字段名，schema 反查出的 file_path 在本次 args 里并不存在）取到的会是空串，
+    #    分桶又会退化成常量 key —— 那正是 aaf95335 的形态。宁可落到下面的全参 hash
+    #    （永不塌成常量，最坏漏报而非误杀），也不让"契约错位"再次变成"必然硬停"。
+    if path_field and (start_field or end_field or span_field):
+        path = args.get(path_field)
+        if path:
+            start = _as_int(args.get(start_field)) if start_field else 1
+            if end_field:  # 值为绝对结束行号
+                end = _as_int(args.get(end_field), start)
+            elif span_field:  # 值为行数 → 换算成绝对结束行
+                end = start + max(_as_int(args.get(span_field), 1), 0)
+            else:
+                end = start
+            lo, hi = sorted((start, end))
+            return f"{path}:{_bucket_line(lo, 200)}-{_bucket_line(hi, 200)}"
+
+    # ② 内容敏感型：存在 payload 类字段
+    if _resolve_field(args, schema_fields, _PAYLOAD_FIELD_CANDIDATES):
         return json.dumps(args, sort_keys=True, default=str)
 
-    salient_fields = ("path", "url", "query", "command", "pattern", "glob", "cmd")
+    # ③ 其余：标识类显著字段（schema 反查到的路径字段也并入，覆盖 file_path 这类命名）
+    salient_fields = set(_SALIENT_FIELDS_FALLBACK)
+    if path_field:
+        salient_fields.add(path_field)
     stable_args = {f: args[f] for f in salient_fields if args.get(f) is not None}
     if stable_args:
         return json.dumps(stable_args, sort_keys=True, default=str)
-    if fallback_key is not None:
-        return fallback_key
     return json.dumps(args, sort_keys=True, default=str)
 
 
-def _hash_tool_calls(tool_calls: list[dict]) -> str:
-    """对一组工具调用（名+稳定 key）做确定性 hash，顺序无关。"""
+def _hash_tool_calls(
+    tool_calls: list[dict],
+    schema_lookup: Callable[[str], frozenset[str] | None] | None = None,
+) -> str:
+    """对一组工具调用（名+稳定 key）做确定性 hash，顺序无关。
+
+    ``schema_lookup`` 把工具名映射到其真实参数名集合（见 _extract_schema_fields）。
+    传 None 或查不到时该工具走 args 探测兜底 —— 两个来源都不会退化成常量 key。
+    """
     normalized: list[str] = []
     for tc in tool_calls:
         name = tc.get("name", "")
         args, fallback_key = _normalize_tool_call_args(tc.get("args", {}))
-        key = _stable_tool_key(name, args, fallback_key)
+        schema_fields = schema_lookup(name) if schema_lookup is not None else None
+        key = _stable_tool_key(args, fallback_key, schema_fields)
         normalized.append(f"{name}:{key}")
     normalized.sort()
     blob = json.dumps(normalized, sort_keys=True, default=str)
@@ -254,6 +433,10 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self._tool_name_counter: dict[str, Counter[str]] = defaultdict(Counter)
         self._tool_freq_warned: dict[str, set[str]] = defaultdict(set)
         self._pending_warnings: dict[str, list[str]] = defaultdict(list)
+        # 工具名 → 真实参数名集合（契约反查结果；None = 契约未知，见 _extract_schema_fields）
+        self._tool_fields: dict[str, frozenset[str] | None] = {}
+        # 契约漂移告警限流：(工具名, 越界字段名) 只报一次
+        self._drift_warned: set[tuple[str, str]] = set()
 
     # ─── thread/run 定位（适配点 2/3）───────────────
 
@@ -268,6 +451,100 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         info = getattr(runtime, "execution_info", None)
         thread_id = getattr(info, "thread_id", None) if info is not None else None
         return str(thread_id) if thread_id else "default"
+
+    # ─── 工具契约学习（E：字段名从 args_schema 反查，替代硬编码）─────────
+
+    @staticmethod
+    def _tool_name_of(tool: object) -> str | None:
+        """从 BaseTool / OpenAI function dict 里取工具名。"""
+        name = getattr(tool, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        if isinstance(tool, dict):
+            inner = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            candidate = inner.get("name") if isinstance(inner, dict) else None
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
+
+    def _describe_contracts(self, names: list[str]) -> str:
+        """把反查结果渲染成一行排障摘要（首次学习时打 INFO）。"""
+        parts: list[str] = []
+        for name in names:
+            fields = self._tool_fields.get(name)
+            if fields is None:
+                parts.append(f"{name}=契约未知")
+                continue
+            path_field = _resolve_field({}, fields, _PATH_FIELD_CANDIDATES)
+            start_field = _resolve_field({}, fields, _START_FIELD_CANDIDATES)
+            end_field = _resolve_field({}, fields, _END_FIELD_CANDIDATES)
+            span_field = _resolve_field({}, fields, _SPAN_FIELD_CANDIDATES)
+            payload = _resolve_field({}, fields, _PAYLOAD_FIELD_CANDIDATES)
+            if path_field and (start_field or end_field or span_field):
+                parts.append(
+                    f"{name}=分页读取({path_field},{start_field or end_field or span_field})"
+                )
+            elif payload:
+                parts.append(f"{name}=内容敏感({payload})")
+            else:
+                parts.append(f"{name}=显著字段")
+        return "; ".join(parts)
+
+    def _learn_tool_schemas(self, tools: object) -> None:
+        """从 agent 真实持有的工具集学习参数契约（首次见到即缓存，之后零成本）。
+
+        这是「字段名不再硬编码」的落点：契约来自工具自身的 args_schema，而不是本文件
+        的断言。时机选在 wrap_model_call —— 它在 after_model（检测发生处）**之前**
+        必然执行一次，所以检测时契约已就绪；即便某工具没学到，_stable_tool_key 也会
+        退化为 args 探测，不会重演"静默取空值"。
+        """
+        if not tools:
+            return
+        learned: list[str] = []
+        with self._lock:
+            for tool in tools:
+                name = self._tool_name_of(tool)
+                if not name or name in self._tool_fields:
+                    continue
+                self._tool_fields[name] = _extract_schema_fields(tool)
+                learned.append(name)
+        if learned:
+            logger.info(
+                "[LOOP] 工具参数契约已反查 %d 个（字段名以 schema 为准）：%s",
+                len(learned), self._describe_contracts(learned),
+            )
+
+    def _schema_fields_for(self, tool_name: str) -> frozenset[str] | None:
+        """查表：工具名 → 参数名集合（未学到返回 None，交由 _stable_tool_key 探测兜底）。"""
+        return self._tool_fields.get(tool_name)
+
+    def _check_contract_drift(self, tool_call: dict) -> None:
+        """工具调用的 args 是否在用 schema 之外的槽位字段？（契约漂移信号）
+
+        限流到同一 (工具, 字段) 只报一次：漂移是代码级问题而非逐次事件，但**绝不能
+        因为怕刷屏而不报** —— aaf95335 的根因恰恰是完全不报，把契约错位伪装成
+        "检测逻辑正常工作"。
+        """
+        name = tool_call.get("name", "")
+        if not name or name not in self._tool_fields:
+            return
+        args, _ = _normalize_tool_call_args(tool_call.get("args", {}))
+        if not args:
+            return
+        drift = _detect_contract_drift(args, self._tool_fields.get(name))
+        if drift is None:
+            return
+        key = (name, drift)
+        with self._lock:
+            if key in self._drift_warned:
+                return
+            self._drift_warned.add(key)
+        logger.error(
+            "[LOOP] 工具参数契约漂移：%s 的 schema 中不存在字段 %r —— "
+            "循环检测已按 schema 反查取键（不再静默取空值），但该字段来自旧契约，"
+            "请核对工具签名与 loop_detection 的候选槽位表。args键=%s",
+            name, drift, sorted(args)[:12],
+        )
 
     # ─── 检测核心 ─────────────────────────────
 
@@ -292,7 +569,10 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
             return None, None
 
         thread_id = self._get_thread_id(runtime)
-        call_hash = _hash_tool_calls(tool_calls)
+        # 先做契约漂移体检（不改变判定结果，只让错位可见），再用真实契约算指纹
+        for tc in tool_calls:
+            self._check_contract_drift(tc)
+        call_hash = _hash_tool_calls(tool_calls, self._schema_fields_for)
 
         with self._lock:
             # Layer 1：hash 级
@@ -521,6 +801,9 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelCallResult:
+        # 契约学习点：ModelRequest.tools（langchain types.py:99）是 agent 实际持有的
+        # 工具全集 —— 反查它们的 args_schema 才拿到真契约，而非本文件的硬编码断言。
+        self._learn_tool_schemas(request.tools)
         return handler(self._augment_request(request))
 
     @override
@@ -529,4 +812,5 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelCallResult:
+        self._learn_tool_schemas(request.tools)
         return await handler(self._augment_request(request))

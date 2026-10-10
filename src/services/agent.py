@@ -1117,7 +1117,7 @@ async def create_agent(
             # langchain 1.3.13 factory.py:1738 `add_edge("model", w_after_model[-1].name)`
             # + `range(len-1, 0, -1)` → **after_model 逆序执行，最后注册的最先看到模型输出**。
             # 若注册在 LoopDetection 之前，LoopDetection 会先给消息追加软提醒/硬停文案
-            # （loop_detection.py:410-412 同款注入），使其 content 非空，
+            # （loop_detection.py 的 `_apply` 同款注入），使其 content 非空，
             # 本中间件的判空即被绕过 → **反而漏掉真正的空响应**。
             #
             # 代价（已实测确认可接受）：`jump_to="model"` 会短路 after_model 静态链，
