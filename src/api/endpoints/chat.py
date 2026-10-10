@@ -24,6 +24,63 @@ from src.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+# ─── 后台保存任务：脱离 SSE 取消作用域（2026-10-10）───────────────────────────
+# 事故：会话 4863afff 断连后 store 里 **0 行**，服务端既无"保存完成"也无"保存失败"
+#   （14:32:05.602977 打出 `[DIAG] SSE 流中断` 后一条日志都没有）。
+# 根因：Starlette 的 StreamingResponse 在客户端断连时取消请求 task，断连 finally 里的
+#   `await _persist_session(...)` 在**第一个 await** 就抛 CancelledError；而
+#   `except Exception` 抓不到它（Py3.8+ CancelledError 继承 BaseException）→ 两条
+#   日志全被跳过 → 静默 0 落库。这个 bug 2026-08-11、2026-09-30 各抓到过一次。
+# 实测证据（tests/spikes/sse_disconnect_repro.py：真 uvicorn + 真 TCP RST 断开）：
+#   direct  ：finally ENTER → enter → CancelledError → **无 WROTE**（复现事故）
+#   detached：spawned → 156ms 后 **WROTE 42 msgs**（修复有效）
+#   shield  ：外层 await 仍抛 CancelledError，内层虽跑完但**结果无法回传** → 不采用
+# 结论：用 create_task 把保存协程交给事件循环独立承载 —— 新 task 不在任何取消
+#   作用域内，原 task 被取消不会传染它。
+_DETACHED_SAVES: set[asyncio.Task] = set()
+
+
+def _on_detached_save_done(task: asyncio.Task) -> None:
+    """后台保存的结果侧日志：成功打写入条数，失败打完整堆栈。
+
+    存在的意义就是"不许静默"：原先失败与取消都不见天日，用户只看到历史凭空消失。
+    """
+    try:
+        if task.cancelled():
+            logger.error(
+                "[PERSIST] 后台保存任务被取消（不应发生，本轮消息可能丢失）: %s",
+                task.get_name(),
+            )
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "[PERSIST] 后台保存失败（关键错误，本轮消息可能丢失）: %s",
+                exc, exc_info=exc,
+            )
+            return
+        logger.warning(
+            "[PERSIST] 后台保存完成（断连兜底）: %s → 写入 %s 条",
+            task.get_name(), task.result(),
+        )
+    except BaseException:
+        # 回调自身异常绝不能向上冒（会打进 asyncio 的 unhandled 日志里，噪音且难查）
+        logger.exception("[PERSIST] 后台保存结果回调自身异常")
+
+
+def _spawn_detached_save(coro, *, label: str) -> asyncio.Task:
+    """把保存协程剥离出当前取消作用域执行。
+
+    ⚠ 调用方**不要** await 返回的 task —— await 会把它重新拉回取消作用域，
+    等同没剥离。结果与失败一律由 `_on_detached_save_done` 回报。
+    """
+    task = asyncio.get_running_loop().create_task(coro, name=label)
+    _DETACHED_SAVES.add(task)
+    task.add_done_callback(_DETACHED_SAVES.discard)
+    task.add_done_callback(_on_detached_save_done)
+    return task
+
+
 def _clip(text: str, limit: int) -> str:
     """按配置上限裁剪文本；limit <= 0 表示不限制（2026-09-12 新增）。
 
@@ -1227,11 +1284,33 @@ async def chat(
                     stored_message_count,
                 )
                 return stored_message_count or 0
+        except asyncio.CancelledError:
+            # 2026-10-10：CancelledError 继承 BaseException，原来的 `except Exception`
+            # 抓不到它，保存被取消时**完全静默**（事故现场两条日志都没有）。显式记录后
+            # 必须重抛 —— 不能吞掉取消语义。
+            logger.error(
+                "保存会话消息被取消（关键错误，本轮消息可能丢失）: user=%s, session=%s",
+                user_id, session_id, exc_info=True,
+            )
+            raise
         except Exception as e:
             logger.error(
                 "保存会话消息失败（关键错误，本轮消息可能丢失）: %s", e, exc_info=True
             )
         return 0
+
+    async def _persist_session_and_release(*args, **kwargs) -> int:
+        """断连兜底专用包装：保存写完之后才 release（2026-10-10）。
+
+        保存被 detach 出取消作用域后，外层 event_stream 的 finally 会先于保存完成
+        执行。若 release 仍在那边做，"在跑轮次"台账会提前释放 → 用户此刻提交删除
+        请求可能趁持久化过程中插进来。这里把 release 与保存绑在同一个后台任务里，
+        维持原有顺序不变量。
+        """
+        try:
+            return await _persist_session(*args, **kwargs)
+        finally:
+            turn_registry.release(thread_id)
 
     async def _astream_with_heartbeat(stream, interval: float = 15.0):
         """把 agent.astream 包成带静默保活心跳的异步生成器。
@@ -1270,6 +1349,11 @@ async def chat(
         finally:
             _anext.cancel()
 
+    # 断连兜底保存的归属标记（2026-10-10）：内层把保存任务 detach 出去后登记于此，
+    # 外层 event_stream 的 finally 据此把 turn_registry.release 移交给它 ——
+    # 维持"release 一定发生在写台账之后"的既有不变量（否则删除请求可能趁持久化
+    # 过程中插进来，把刚写的会话又删掉/或留下孤儿）。正常路径始终为 None。
+    _detached_cleanup: dict[str, asyncio.Task | None] = {"task": None}
 
     async def _event_stream_inner():
         invoke_kwargs = {}
@@ -2234,32 +2318,42 @@ async def chat(
         finally:
             # 断连/取消/异常路径：流被中断，正常保存逻辑未执行，强制保存 checkpoint 状态
             if not _saved:
+                logger.warning(
+                    "[DIAG] SSE 流中断（断连/取消），强制保存当前会话: user=%s, session=%s",
+                    user_id, session_id,
+                )
                 try:
-                    logger.warning(
-                        "[DIAG] SSE 流中断（断连/取消），强制保存当前会话: user=%s, session=%s",
-                        user_id, session_id,
-                    )
                     # 断连路径也要取走降级信号（若守卫已登记但本轮没走到消费点）：
                     # 否则它会以 thread_id 为键留在登记表里被下一轮消费，造成误报。
                     if _terminal_fallback is None:
                         _terminal_fallback = pop_fallback_signal(thread_id)
                     # 断连路径：turn_ended 兜底取 now（持久化时刻作为 turn 终点）
                     interrupted_turn_end = _turn_ended_at_ms if _turn_ended_at_ms is not None else int(time.time() * 1000)
-                    await _persist_session(
-                        agent, thread_id, user_id, session_id, store, body,
-                        generated_files=_generated_files,
-                        disk_files=_new_files,
-                        completion_blocked=_completion_blocked,
-                        terminal_fallback=_terminal_fallback,
-                        reasoning_started_at_ms=_reasoning_started_at_ms,
-                        reasoning_ended_at_ms=_reasoning_ended_at_ms,
-                        turn_started_at_ms=_turn_started_at_ms,
-                        turn_ended_at_ms=interrupted_turn_end,
-                        reason="interrupted",
+                    # ⚠ 2026-10-10：此处**绝不能 await**。断连时本 task 已处于取消中，
+                    #   await 会在第一个 await 点抛 CancelledError，保存整段蒸发
+                    #   （实测复现见 tests/spikes/sse_disconnect_repro.py 的 direct 场景，
+                    #    与 4863afff 事故现场逐字吻合：打了"SSE 流中断"后一条日志都没有）。
+                    #   改由事件循环独立承载，并把 release 一并移交（保持"先写台账后 release"）。
+                    _detached_cleanup["task"] = _spawn_detached_save(
+                        _persist_session_and_release(
+                            agent, thread_id, user_id, session_id, store, body,
+                            generated_files=_generated_files,
+                            disk_files=_new_files,
+                            completion_blocked=_completion_blocked,
+                            terminal_fallback=_terminal_fallback,
+                            reasoning_started_at_ms=_reasoning_started_at_ms,
+                            reasoning_ended_at_ms=_reasoning_ended_at_ms,
+                            turn_started_at_ms=_turn_started_at_ms,
+                            turn_ended_at_ms=interrupted_turn_end,
+                            reason="interrupted",
+                        ),
+                        label=f"persist-interrupted:{session_id}",
                     )
-                except Exception as e:
+                except BaseException as e:
+                    # 保底：连 create_task 都失败（事件循环将关闭等）也必须可见，
+                    # 绝不静默 —— 走到这里意味着本轮消息真的会丢。
                     logger.error(
-                        "断连强制保存失败（关键错误，本轮消息可能丢失）: %s",
+                        "断连强制保存**无法启动**（关键错误，本轮消息可能丢失）: %s",
                         e, exc_info=True,
                     )
 
@@ -2290,9 +2384,11 @@ async def chat(
         """外层包装：登记在跑轮次 + 把 LangGraph span 顶成真根。
 
         acquire/release 与 beat 都在这一层，_event_stream_inner 函数体一行不动：
-        - release 放在 finally：正常结束、异常、以及客户端断连（内层 :1557 的
-          强制持久化 finally 先执行完）都会走到——**release 一定发生在"写台账"
-          之后**，否则删除请求可能趁持久化过程中插进来。
+        - release 放在 finally：正常结束、异常、以及客户端断连都会走到——**release
+          一定发生在"写台账"之后**，否则删除请求可能趁持久化过程中插进来。
+          ⚠ 2026-10-10 修复后：断连路径的保存已被 detach 出取消作用域（见内层
+          finally 注释），此时本层不再 release，而是把 release 交给承载体保存的
+          后台任务（内层 `_persist_session_and_release`），顺序不变量保持不变。
         - beat 挂在每个 chunk 上：token/工具事件密集时刷新活跃时间；空转期间由
           内层的心跳哨兵（::interval 秒一个 chunk）继续刷新。陈旧判定（
           turn_registry.STALE_MS）兜底进程被杀等 release 未执行的路径。
@@ -2323,7 +2419,11 @@ async def chat(
                     _otel_context_api.detach(_ctx_token)
                 except Exception:
                     logger.debug("[TRACING] 恢复 OTel Context 失败（已忽略）", exc_info=True)
-            turn_registry.release(thread_id)
+            if _detached_cleanup["task"] is None:
+                turn_registry.release(thread_id)
+            # else：断连兜底保存已被 detach 到独立任务，release 移交给它在**写完
+            #       台账之后**执行（2026-10-10）—— 维持"release 一定发生在写台账
+            #       之后"的不变量，否则删除请求可能趁持久化过程中插进来。
 
     return StreamingResponse(
         event_stream(),

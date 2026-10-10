@@ -14,6 +14,12 @@
        M3 完成门随后又注入自动继续轮，循环被重新推起来。
        注：本文件只断言**接线**；标记能不能真的从 updates 流出来，由
        tests/core/test_loop_detection_integration.py 用真实图验证。
+    ③ 2026-10-10：断连兜底保存必须**脱离 SSE 取消作用域**（_spawn_detached_save），
+       且失败/取消必须可见。会话 4863afff 事故：客户端断连后 store 里 0 行，服务端
+       打完 `[DIAG] SSE 流中断` 后一条日志都没有 —— 因为 finally 里的
+       `await _persist_session(...)` 在第一个 await 点抛 CancelledError，
+       而 `except Exception` 抓不到 BaseException 子类，静默跳过。
+       机制实测见 tests/spikes/sse_disconnect_repro.py（真 uvicorn + 真 RST 断开）。
 
 运行：
     docker run --rm -v D:/workspace/geesun_agent:/mnt -w /mnt \
@@ -185,4 +191,192 @@ def test_break_detector_is_sensitive():
     ast.fix_missing_locations(stripped)
     assert _has_forced_stop_break(stripped) is False, (
         "摘掉 break 后检测器仍然报 True —— 该断言无法捕获「硬停不成终止」的回归"
+    )
+
+
+# ─── ③ 断连兜底保存必须脱离取消作用域 ───────────────────────────────────────
+
+def _disconnect_branch(tree: ast.Module) -> ast.If | None:
+    """定位断连兜底保存分支：``if not _saved:``。"""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Name)
+            and test.operand.id == "_saved"
+        ):
+            return node
+    return None
+
+
+def _awaits_in(node: ast.AST) -> list[int]:
+    """收集子树里所有 await 的行号。"""
+    return [n.lineno for n in ast.walk(node) if isinstance(n, ast.Await)]
+
+
+def _calls_named(node: ast.AST, name: str) -> list[int]:
+    """收集子树里所有以 <name>(...) 形式调用的行号。"""
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
+    ]
+
+
+def _func_def(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    return None
+
+
+def _handlers_catching(tree: ast.Module, func_name: str, exc_attr: str) -> bool:
+    """函数体内是否存在 ``except asyncio.<exc_attr>`` 分支。"""
+    func = _func_def(tree, func_name)
+    if func is None:
+        return False
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Try):
+            continue
+        for handler in node.handlers:
+            t = handler.type
+            if (
+                isinstance(t, ast.Attribute)
+                and t.attr == exc_attr
+                and isinstance(t.value, ast.Name)
+                and t.value.id == "asyncio"
+            ):
+                return True
+    return False
+
+
+def test_disconnect_persist_has_no_await():
+    """断连兜底分支内**不得有任何 await**。
+
+    断连时本 task 已处于取消中，第一个 await 即抛 CancelledError —— 保存整段蒸发
+    （4863afff 事故：store 0 行 + 两条日志都没有）。
+    """
+    branch = _disconnect_branch(_tree())
+    assert branch is not None, (
+        "找不到断连兜底保存分支（`if not _saved:`）—— 结构已变，本组断言失效，请同步更新"
+    )
+    awaited = _awaits_in(branch)
+    assert not awaited, (
+        f"断连兜底保存分支内仍有 await（行 {awaited}）。断连时 task 已在取消中，"
+        "await 会在第一个 await 点抛 CancelledError 导致保存静默丢失；"
+        "必须改走 _spawn_detached_save 脱离取消作用域。"
+    )
+
+
+def test_disconnect_persist_is_detached():
+    """断连兜底保存必须经 ``_spawn_detached_save`` 承载。"""
+    branch = _disconnect_branch(_tree())
+    assert branch is not None
+    spawns = _calls_named(branch, "_spawn_detached_save")
+    assert spawns, (
+        "断连兜底保存没有走 _spawn_detached_save —— 保存协程仍在取消作用域内"
+    )
+
+
+def test_detached_save_registers_result_callback():
+    """``_spawn_detached_save`` 必须注册结果回调，否则失败又变静默。"""
+    func = _func_def(_tree(), "_spawn_detached_save")
+    assert func is not None, "缺少 _spawn_detached_save 定义"
+    assert _func_def(_tree(), "_on_detached_save_done") is not None, (
+        "缺少 _on_detached_save_done（结果侧日志的唯一出口）"
+    )
+    registered = any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "add_done_callback"
+        and any(
+            isinstance(a, ast.Name) and a.id == "_on_detached_save_done"
+            for a in n.args
+        )
+        for n in ast.walk(func)
+    )
+    assert registered, (
+        "_spawn_detached_save 未把 _on_detached_save_done 注册为 done_callback —— "
+        "后台保存失败将再次静默（正是本次事故的形态）"
+    )
+
+
+def test_persist_session_logs_cancellation():
+    """``_persist_session`` 必须显式捕获 CancelledError。
+
+    CancelledError 继承 BaseException，只有 ``except Exception`` 时抓不到它 ——
+    这就是"保存被取消完全静默"的直接原因。
+    """
+    assert _handlers_catching(_tree(), "_persist_session", "CancelledError"), (
+        "_persist_session 没有 `except asyncio.CancelledError` 分支：保存被取消时"
+        "不会留下任何日志（4863afff 现场既无「保存完成」也无「保存失败」）。"
+    )
+
+
+def test_release_waits_for_detached_save():
+    """``turn_registry.release`` 必须让位于 detach 出来的保存任务。
+
+    既有不变量是「release 一定发生在写台账之后」，否则删除请求可能趁持久化过程中
+    插进来。保存被 detach 后若仍在外层 finally 无条件 release，这个不变量就破了。
+    """
+    tree = _tree()
+    src = CHAT_PY.read_text(encoding="utf-8")
+    guarded = any(
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Subscript)
+        and any(isinstance(op, ast.Is) for op in node.test.ops)
+        and any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "release"
+            for n in ast.walk(node)
+        )
+        for node in ast.walk(tree)
+    )
+    assert guarded, (
+        "外层 event_stream 的 finally 里缺少 `if _detached_cleanup['task'] is None: "
+        "turn_registry.release(...)` —— 断连路径下 release 会先于写台账执行"
+    )
+    assert "_persist_session_and_release" in src, (
+        "缺少 _persist_session_and_release：release 没有与保存绑在同一个后台任务里"
+    )
+
+
+class _ReAwaitInjector(ast.NodeTransformer):
+    """负向对照用：把 detach 换回裸 await（模拟被重构改回去）。"""
+
+    def visit_If(self, node: ast.If):
+        test = node.test
+        if (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Name)
+            and test.operand.id == "_saved"
+        ):
+            await_expr = ast.Expr(
+                value=ast.Await(
+                    value=ast.Call(
+                        func=ast.Name(id="_persist_session", ctx=ast.Load()),
+                        args=[],
+                        keywords=[],
+                    )
+                )
+            )
+            node.body = [await_expr, *node.body]
+        return self.generic_visit(node)
+
+
+def test_disconnect_detached_detector_is_sensitive():
+    """负向对照：塞回裸 await 后检测器必须报出来（否则本组断言等于空测）。"""
+    branch = _disconnect_branch(_tree())
+    assert branch is not None and not _awaits_in(branch)  # 当前实现：无 await
+
+    polluted = _ReAwaitInjector().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
+    ast.fix_missing_locations(polluted)
+    assert _awaits_in(_disconnect_branch(polluted)), (
+        "注入 await 后检测器仍然报「无 await」—— 该断言无法捕获「保存改回裸 await」的回归"
     )
