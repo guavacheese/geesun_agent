@@ -62,7 +62,7 @@
   | alloy | 0.5 | 512m | docker-compose.yml |
   | prometheus | 0.5 | 512m | docker-compose.yml |
   | grafana | 0.5 | 512m | docker-compose.yml |
-  | geesun-mcp | 1.0 | 512m | docker-compose.mcp.yml |
+  | geesun-mcp | 2.0 | **4g** | docker-compose.mcp.yml |
   | geesun-agent-web | 1.0 | 512m | docker-compose.web.yml |
   | phoenix | 1.0 | 1g | docker-compose.phoenix.yml |
   | phoenix-db | 1.0 | 1g | docker-compose.phoenix.yml |
@@ -72,6 +72,8 @@
   | minio | 0.5 | 512m | docker-compose.langfuse.yml |
   | redis | 0.5 | 512m | docker-compose.langfuse.yml |
   | postgres（langfuse） | 1.0 | 1g | docker-compose.langfuse.yml |
+
+- **geesun-mcp 于 2026-10-10 由 `1.0 / 512m` 提升为 `2.0 / 4g`**：原 512m 上限会被 256MiB 级大文件上传撑爆（16:9 场景为 2026-10-09 session `cecfdd84` 上传 256.4MiB PDF 全部失败）。放大路径为 `geesun_mcp_server/main.py` 的 `upload_to_sandbox` → `decrypt_and_upload_to_sandbox` **双次全量 `f.read()`**（2×256.4MiB ≈ 512.8MiB 驻留）+ multipart 编码缓冲 + 解密响应体，峰值约 1.1GB。证据链：内核 memcg OOM 10-08/10-09 各 6 次、swarm task 连续 `exit 137`、cAdvisor 曲线顶在 506–512MiB 后断掉。**该服务单副本共享，OOM 重启会打断所有用户的 in-flight 工具调用**，故限额不可再按"轻量网关"看待。结构性修复（消双读 / getsize 预检 / 流式上传）属后续项，本表仅记录止血值。
 
 ### 1.4 端口发布模式（swarm `mode: ingress` vs `mode: host`）
 

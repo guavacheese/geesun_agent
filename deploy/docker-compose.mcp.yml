@@ -54,8 +54,19 @@ services:
         condition: any
       resources:
         limits:
-          cpus: "1.0"
-          memory: 512m
+          # 2026-10-10 限额提升 512m→4g / 1.0→2.0（原值会被 256MiB 级大文件上传撑爆）。
+          # 内存放大路径（geesun_mcp_server/main.py）：
+          #   upload_to_sandbox L169 `content = f.read()` 先把 256.4MiB 全量读进内存并常驻
+          #   → L184 检出 DLP 加密 → L190 转 decrypt_and_upload_to_sandbox，内部 L247/L290
+          #   再 read 一遍，此时调用方的 content 引用尚未释放 → 2×256.4MiB ≈ 512.8MiB 已越限
+          #   → 再加 httpx multipart 编码缓冲 + 256.4MiB 解密响应体，实测峰值约 1.1GB。
+          # 证据：内核 memcg OOM 记录 10-08 6 次 / 10-09 6 次（anon-rss 每次都顶在 512–520MB），
+          #       swarm task 连续 exit 137，cAdvisor 曲线在 506–512MiB 顶点处断掉后回落。
+          # 影响面：MCP 是全体用户共享的单副本，OOM-kill 会同时打断所有 in-flight 工具调用
+          #         （agent 侧表现为 "was cancelled - another message came in" 与工具永不返回）。
+          # 结构修复（消双读 / getsize 预检 / 流式上传）见后续 P1，本项为立即止血。
+          cpus: "2.0"
+          memory: 4g
     logging:
       driver: json-file
       options:
