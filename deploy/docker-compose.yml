@@ -83,11 +83,24 @@ services:
       # /healthz 同时列在 src/core/tracing.py 的 _HTTP_EXCLUDED_URLS，双重不产生 trace。
       # 间隔 15s→30s、retries 10→5：探活只需发现"进程死了"，30s×5=150s 的判死窗口
       # 与原来 15s×10 完全等价，但无效请求再减半。
+      #
+      # ⚠️ 2026-10-10 再次修正（生产 P0，实测依据）：
+      #   start_period 30s→300s、retries 5→10 —— 即"启动期不计失败 300s +
+      #   运行期判死窗口 300s"，总容忍 10 分钟。
+      #   原因：agent 容器**冷启动实测要 4.5 分钟**（新镜像首次运行、页缓存冷时
+      #   import 重依赖：11:00:48 容器启动 → 11:05:18 才打出 tracing 初始化日志），
+      #   而旧配置的容忍窗口只有 30s + 5×30s = 180s ⇒ 首次部署**必然**在就绪前
+      #   把失败计数攒满，容器一就绪就被 swarm SIGKILL（task 报
+      #   `non-zero exit (137): dockerexec: unhealthy container`）。
+      #   对比实测：紧接着重启的第二个容器因页缓存已热，10 秒即 healthy。
+      #   注意这与"运行中事件循环被冻住"是**两种不同的死法**，判据也不同：
+      #     · 启动慢 → health 日志为 `URLError: Connection refused`（没在监听）
+      #     · 跑起来后冻住 → health 日志为请求 timeout（端口在听但不应答）
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8009/healthz').status==200 else 1)"]
       interval: 30s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      start_period: 300s
     deploy:
       restart_policy:
         condition: any
