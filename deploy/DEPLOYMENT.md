@@ -134,18 +134,29 @@
 
 **改了哪个仓 → 只递增哪个变量**（`build-push.sh` 与 compose 都从 `deploy/.env` 取值）：
 
-| 改了哪个仓源码 | 递增的变量 | 默认值（`.env.example`） | compose 引用 |
+| 改了哪个仓源码 | 递增的变量 | 当前值（`.env.example`） | compose 引用 |
 | --- | --- | --- | --- |
-| `geesun_agent` | `GEESUN_AGENT_TAG` | `1.0.0`（L136） | `docker-compose.yml:27` |
-| `geesun_mcp_server` | `MCP_TAG` | `1.0.0`（L27） | `docker-compose.mcp.yml:22` |
-| `geesun_agent_web` | `WEB_TAG` | `1.0.0`（L142） | `docker-compose.web.yml:15` |
+| `geesun_agent` | `GEESUN_AGENT_TAG` | `1.0.22`（L213） | `docker-compose.yml:27` |
+| `geesun_mcp_server` | `MCP_TAG` | `1.0.3`（L27） | `docker-compose.mcp.yml:22` |
+| `geesun_agent_web` | `WEB_TAG` | `1.0.10`（L229） | `docker-compose.web.yml:15` |
 
 **五步流程**（以改 mcp 源码为例；agent/mcp/web 同理换变量名）：
 
-1. **构建机**编辑 `deploy/.env`（⚠️ 不是 `.env.example` 模板）：`MCP_TAG=1.0.0` → `MCP_TAG=1.0.1`。tag 只求唯一，patch 位 +1 即可，不必语义化版本。
-2. **构建机** `cd deploy && HARBOR_USER=xxx HARBOR_PASSWORD=yyy bash build-push.sh`——脚本自动 source `deploy/.env`（build-push.sh:29-33），把 `geesun_ai/geesun-mcp-server:1.0.1` 推到 Harbor。geesun-agent 另支持位置参数 `bash build-push.sh 1.0.1`（优先级高于 `.env`，见 build-push.sh:47）。
-3. **把同一个新值同步到目标机 `deploy/.env`**（SFTP 或 vi）。⚠️ 两机不一致 = 构建推了 1.0.1、目标机 spec 仍指向 1.0.0 → 拉到旧镜像。这是"递增没生效"最常见的翻车点。
-4. **目标机** `./start_stack.sh --no-build --with=<与上次完全一致>`——stack deploy 幂等 diff，只有 image 从 1.0.0 → 1.0.1 的那一个服务滚动重启，其余服务零操作。
+1. **构建机**编辑 `deploy/.env`（⚠️ 不是 `.env.example` 模板）：`MCP_TAG=1.0.2` → `MCP_TAG=1.0.3`。tag 只求唯一，patch 位 +1 即可，不必语义化版本。
+2. **构建机** `cd deploy && HARBOR_USER=xxx HARBOR_PASSWORD=yyy bash build-push.sh`——脚本自动 source `deploy/.env`（build-push.sh:29-33），把 `geesun_ai/geesun-mcp-server:1.0.3` 推到 Harbor。geesun-agent 另支持位置参数 `bash build-push.sh 1.0.1`（优先级高于 `.env`，见 build-push.sh:47）。
+   > 只改了 mcp 一个仓时，可只执行 `build_push_mcp()` 内那三条等价命令（`docker login` → `docker build -f geesun_mcp_server/Dockerfile -t $REGISTRY_GEESUN/geesun-mcp-server:$MCP_TAG geesun_mcp_server` → `docker push`），避免 `build-push.sh` 连带重建 agent/web 镜像。本机 `geesun_agent` 工作区若有未提交改动，**更要**走这条窄路径。
+
+   > ⚠️ **本机构建机 `docker login` 可能失败**：`Error saving credentials: rename C:\...\.docker\config.json… Access is denied`（config.json 被占用）。可用目标机代替构建机——目标机 `/root/.docker/config.json` 已有 Harbor 登录态，且构建容器能直连 PyPI：把 `git archive HEAD` 导出的 tar 传上去解包 → `docker build` → `docker push`，全程无需在命令里出现凭据。
+
+   > ⚠️ **`requirements.txt` 只 pin 8 个直接依赖，传递依赖每次重建都会现解最新版**（`e2b` / `pydantic` / `mcp` / `starlette` / `uvicorn` / `numpy` …；头部注释声称"与 uv.lock 严格对齐、可复现"与实际不符，Dockerfile 根本不读 `uv.lock`）。2026-10-10 实测：同样源码，1.0.1 镜像内 `e2b==2.46.0`、当天重建即为 `e2b==2.55.1`；而 `uv.lock`（2026-06-26 后未更新）写的是 `2.29.5` —— 三套互不一致。**后果**：任何一次重建都会把 SDK 升级夹带进发布，出问题无法区分是「自己的改动」还是「依赖升级」。**止血/热修场景**建议用基座镜像法，让发布变量唯一：
+   > ```dockerfile
+   > # Dockerfile.hotfix —— 依赖集与线上逐字节一致，只换被修的源码文件
+   > FROM 172.16.220.74:8333/geesun_ai/geesun-mcp-server:<线上在跑的 tag>
+   > COPY --chown=1001:1001 main.py /app/main.py
+   > ```
+   > 然后用 `diff <(在新镜像里 pip freeze) <(在线上镜像里 pip freeze)` 断言**依赖 diff 为空**再发布。彻底修法（待办）：把线上 `pip freeze` 全量锁进 `requirements.txt`，或让 Dockerfile 改走 `uv sync --frozen` 并刷新 `uv.lock`。
+3. **把同一个新值同步到目标机 `deploy/.env`**（SFTP 或 vi）。⚠️ 两机不一致 = 构建推了新 tag、目标机 spec 仍指向旧 tag → 拉到旧镜像。这是"递增没生效"最常见的翻车点。
+4. **目标机** `./start_stack.sh --no-build --with=<与上次完全一致>`——stack deploy 幂等 diff，只有 image 从 1.0.2 → 1.0.3 的那一个服务滚动重启，其余服务零操作。
 5. **验证**：`./service_stack.sh`；或 `docker service inspect geesun_geesun-mcp --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'` 确认 digest 已变化；`docker service logs -f geesun_geesun-mcp` 看新进程日志。
 
 > 若只想热更单服务、不想重跑 start_stack.sh 或动目标机 `.env`，见 §1.6.4。
@@ -164,8 +175,9 @@
 
 ```sh
 docker service update --image <registry>/<镜像名>:<新tag> geesun_<compose服务名>
-# 例：把 mcp 热更到 1.0.1
-docker service update --image 172.16.220.74:8333/geesun_ai/geesun-mcp-server:1.0.1 geesun_geesun-mcp
+# 例：把 mcp 热更到 1.0.3（带上 --with-registry-auth，让节点用 67 上的 Harbor 登录态拉取）
+docker service update --with-registry-auth \
+  --image 172.16.220.74:8333/geesun_ai/geesun-mcp-server:1.0.3 geesun_geesun-mcp
 ```
 
 **两条铁律**（2026-09-01 双斜杠 404 / 09-03 langfuse-worker 热更实测沉淀）：
@@ -292,7 +304,9 @@ Grafana：`http://10.10.10.67:3100`（admin + `.env` 的 `GRAFANA_PASSWORD`）�
 | 变量 | 默认 / 示例 | 消费方 | 说明 |
 | --- | --- | --- | --- |
 | `mcp_server_url` | `http://geesun-mcp:8000/mcp` | config.py（MCP client） | 覆盖默认 localhost，走 appnet2 服务名 |
-| `MCP_TAG` | `1.0.0` | docker-compose.mcp.yml | MCP 镜像 tag |
+| `MCP_TAG` | `1.0.3` | docker-compose.mcp.yml | MCP 镜像 tag |
+| `MCP_MAX_UPLOAD_MB` | `2048`（可不设，走代码默认） | geesun-mcp 运行时（main.py） | 单文件上传上限（MiB）。超限返回 `error_code=file_too_large` 的结构化中文错误，不再把共享容器内存撑爆。**仅对 Stage 1 起生效**（MCP ≥ 1.0.3） |
+| `DECRYPT_TIMEOUT_S` | `600`（可不设，走代码默认） | geesun-mcp 运行时（main.py） | 调用 DLP 解密网关的超时秒数；2026-10-10 前硬编码 30s，256MiB 级文件必被误伤 |
 | `DECRYPT_API_URL` | `http://REPLACE_ME_DECRYPT_HOST:PORT/decrypt` | geesun-mcp 运行时 | DLP 解密网关（compose 外，待替换） |
 | `E2B_API_URL` | `http://172.16.66.13:6000` | config.py / sandbox | CubeSandbox E2B 控制面（**6000 不是 8003**） |
 | `E2B_API_KEY` | `REPLACE_ME` | config.py / sandbox | E2B key |
