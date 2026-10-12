@@ -150,6 +150,65 @@ def _mark_turn_last_ai(history: list[dict], fields: dict) -> int | None:
     return idx
 
 
+def _iso_from_ms(ms: int) -> str:
+    """毫秒时间戳 → 带时区的 ISO 字符串（与 entry 其余时间字段同一格式）。"""
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def _interrupted_turn_fields(
+    turn_started_at_ms: int | None,
+    turn_ended_at_ms: int | None,
+) -> dict:
+    """P0′（2026-10-12）：断连/取消路径写进**本轮**最后一条 AI 的"本轮事实"。
+
+    为什么不能复用正常路径的 `turn_duration_ms`：断连时刻不是任务终点。
+    `turn_ended_at_ms` 在断连路径上取的是"持久化时刻"（`chat.py` 内层 finally），
+    于是 `duration = 断连时刻 − 流建立时刻` 实际度量的是 **"用户刷新得有多快"** ——
+    会话 `GY24428:5f65f8df` 落下的 `turn_duration_ms=664703`（11m 4.7s）就是这么来的：
+    前端据此渲染"已完成 · 11m 5s"，而那一轮**一个交付物都没有**。数据层没有"中断"
+    这个状态可落，就只能落成"完成"。
+
+    故中断路径改为：
+      · `turn_status="interrupted"` —— 数据层第一次能表达"这轮没跑完"；
+      · `turn_started_at` —— 保留起点，前端可显示"已进行 X 分钟"（而非"耗时 X"）；
+      · `turn_ended_at` —— 连接断开时刻，语义是"观察窗结束"，不是任务结束。
+
+    纯函数，便于 spike 用 ast 提取后直接断言（与 `_mark_turn_last_ai` 同族）。
+    """
+    fields: dict = {"turn_status": "interrupted"}
+    if turn_started_at_ms is not None:
+        fields["turn_started_at"] = _iso_from_ms(turn_started_at_ms)
+    if turn_ended_at_ms is not None:
+        fields["turn_ended_at"] = _iso_from_ms(turn_ended_at_ms)
+    return fields
+
+
+def _reasoning_duration_fields(
+    *,
+    interrupted: bool,
+    reasoning_started_at_ms: int | None,
+    reasoning_ended_at_ms: int | None,
+) -> dict:
+    """本条 AI 消息的推理时长/起点字段（纯函数，便于 spike 直接断言）。
+
+    正常路径：两个时间戳都有值才写 `reasoning_duration_ms` + `reasoning_started_at`。
+    中断路径（P0′）：`reasoning_ended_at_ms` 未必是"推理真的结束"，也可能是断连兜底
+    时刻 —— 拿它算时长会把"用户刷新得多快"当成"推理秒数"（与 `turn_duration_ms`
+    同源缺陷）。故中断时**只写起点、不写时长**：宁可这一段没有确数，也不给错数。
+    前端 ReasoningBlock 拿 `reasoning_started_at` 仍能稳定锚定与自行计时。
+    """
+    if reasoning_started_at_ms is None:
+        return {}
+    if interrupted:
+        return {"reasoning_started_at": _iso_from_ms(reasoning_started_at_ms)}
+    if reasoning_ended_at_ms is None:
+        return {}
+    return {
+        "reasoning_duration_ms": max(0, reasoning_ended_at_ms - reasoning_started_at_ms),
+        "reasoning_started_at": _iso_from_ms(reasoning_started_at_ms),
+    }
+
+
 def _attach_generated_files(
     history: list[dict], generated_files: list[dict]
 ) -> list[dict]:
@@ -1110,8 +1169,15 @@ async def chat(
         事件 → 推理结束；while 循环 break → turn 结束。持久化到 AI 消息 entry 的
         reasoning_duration_ms / turn_duration_ms / reasoning_started_at 三个字段，
         让前端 ReasoningBlock 跨刷新稳定显示秒数（对齐 deer-flow 风格）。
+
+        P0′（2026-10-12）中断记账：`reason="interrupted"` 时**不写任何时长字段**
+        （reasoning_duration_ms / turn_duration_ms），改写 `turn_status="interrupted"`
+        + `turn_started_at` + `turn_ended_at`。理由见下方两处 `interrupted` 分支。
         """
         generated_files = generated_files or []
+        # P0′（2026-10-12）：断连/取消路径。此时 `turn_ended_at_ms` 只是"连接断开时刻"，
+        # 不是本轮任务的终点 —— 见下方两处 `interrupted` 分支的说明。
+        interrupted = reason == "interrupted"
         if disk_files:
             # 磁盘差集补全：工具解析的 generated_files 可能脏（模型把 file_path 传成
             # 目录），用 report_root 磁盘真实文件名补缺（2026-08-21 根治）
@@ -1240,18 +1306,15 @@ async def chat(
                     #   首个 token 事件）。仅当 reasoning 存在 + 两个时间戳都有值时写入。
                     # reasoning_started_at：推理起始的 ISO 时间戳，供前端 ReasoningBlock
                     #   锚定（防组件挂载漂移），与 reasoning_duration_ms 配合使用。
-                    if (
-                        role == "ai"
-                        and reasoning
-                        and reasoning_started_at_ms is not None
-                        and reasoning_ended_at_ms is not None
-                    ):
-                        entry["reasoning_duration_ms"] = max(
-                            0, reasoning_ended_at_ms - reasoning_started_at_ms
-                        )
-                        entry["reasoning_started_at"] = datetime.fromtimestamp(
-                            reasoning_started_at_ms / 1000, tz=timezone.utc
-                        ).isoformat()
+                    # ⚠ P0′（2026-10-12）：中断路径的取舍（只写起点、不写时长）收敛到
+                    #   纯函数 _reasoning_duration_fields，见其文档；改前这段是三条件
+                    #   内联 if，无法被 spike 直接断言。
+                    if role == "ai" and reasoning:
+                        entry.update(_reasoning_duration_fields(
+                            interrupted=interrupted,
+                            reasoning_started_at_ms=reasoning_started_at_ms,
+                            reasoning_ended_at_ms=reasoning_ended_at_ms,
+                        ))
                     history.append(entry)
 
                 # 持久化 turn_duration_ms（整轮耗时）：写到**本轮**最后一条 AI 消息上。
@@ -1263,7 +1326,22 @@ async def chat(
                 # 现在统一走 _mark_turn_last_ai（按「最后一条 user 之后」划定本轮区间），
                 # 区间内没有 AI 就不写：宁可这一轮没有耗时值（前端走内存计时兜底 / 不显示），
                 # 也不给错的归属。
-                if turn_started_at_ms is not None and turn_ended_at_ms is not None:
+                if interrupted:
+                    # ─── P0′（2026-10-12）：断连 ≠ 本轮完成 ───
+                    # payload 由纯函数 _interrupted_turn_fields 构造（见其文档：
+                    # 为什么不能写 turn_duration_ms、为什么保留起点）。
+                    # 归属仍走 _mark_turn_last_ai：本轮无 AI 产出则不写（宁可无标记，
+                    # 也不把"中断"打到上一轮的 AI 上）。
+                    if _mark_turn_last_ai(
+                        history,
+                        _interrupted_turn_fields(turn_started_at_ms, turn_ended_at_ms),
+                    ) is None:
+                        logger.warning(
+                            "[DIAG] 本轮无 AI 产出，跳过 turn_status=interrupted 打点"
+                            "（避免写到上一轮的 AI 上）: session=%s, history=%d 条",
+                            session_id, len(history),
+                        )
+                elif turn_started_at_ms is not None and turn_ended_at_ms is not None:
                     turn_duration_ms = max(0, turn_ended_at_ms - turn_started_at_ms)
                     if _mark_turn_last_ai(
                         history, {"turn_duration_ms": turn_duration_ms}

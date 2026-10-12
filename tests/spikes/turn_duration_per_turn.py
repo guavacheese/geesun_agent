@@ -116,12 +116,19 @@ _chat = extract(
         "_last_ai_index_for_turn",
         "_mark_turn_last_ai",
         "_attach_generated_files",
+        "_iso_from_ms",
+        "_interrupted_turn_fields",
+        "_reasoning_duration_fields",
     },
+    extra_globals={"datetime": __import__("datetime").datetime,
+                   "timezone": __import__("datetime").timezone},
 )
 plan_append = _chat["_plan_message_append"]
 last_ai_index_for_turn = _chat["_last_ai_index_for_turn"]
 mark_turn_last_ai = _chat["_mark_turn_last_ai"]
 attach_generated_files = _chat["_attach_generated_files"]
+interrupted_turn_fields = _chat["_interrupted_turn_fields"]
+reasoning_duration_fields = _chat["_reasoning_duration_fields"]
 
 _db = extract(
     ROOT / "src" / "infra" / "database.py",
@@ -507,6 +514,106 @@ print("=" * 78)
 s6()
 
 
+def s7() -> None:
+    """P0′（2026-10-12）：中断路径的记账 —— 断连不得被写成"完成"。
+
+    事故现场（会话 GY24428:5f65f8df）：用户刷新页面 → SSE 断连 → 持久化路径传
+    `reason="interrupted"`，但 `reason` 只进日志文案、不进数据，而 `turn_duration_ms`
+    照写 ⇒ `duration = 断连时刻 − 流建立时刻 = 664703ms`。前端据此渲染
+    "已完成 · 11m 5s"，**而那一轮没有任何交付物**。
+
+    两个字段的取舍都由**真实函数**给出（非复刻）：
+      · `_interrupted_turn_fields` —— 改中断路径的 payload；
+      · `_reasoning_duration_fields` —— 推理时长同理（断连时刻不是推理终点）。
+    """
+    # ① payload 本体：有状态、有起止、**没有耗时**
+    fields = interrupted_turn_fields(1_000_000, 1_664_703)
+    check("中断 payload 带 turn_status=interrupted",
+          fields.get("turn_status") == "interrupted", repr(fields))
+    check("★ 中断 payload **不含** turn_duration_ms（不再把断连时刻当终点）",
+          "turn_duration_ms" not in fields, repr(fields))
+    check("中断 payload 保留 turn_started_at（前端可显示「已进行 X 分钟」）",
+          str(fields.get("turn_started_at", "")).startswith("1970-01-01T00:16:4"),
+          repr(fields.get("turn_started_at")))
+    check("中断 payload 记 turn_ended_at（连接断开时刻 = 观察窗结束）",
+          "turn_ended_at" in fields, repr(fields))
+    # ISO 字符串可被前端 new Date() 直接消费
+    import datetime as _dt
+    _dt.datetime.fromisoformat(str(fields["turn_started_at"]).replace("Z", "+00:00"))
+    check("turn_started_at 是合法 ISO（前端 new Date() 可解析）", True)
+
+    # ② 退化：起止缺失时不崩、仍给状态（宁可字段少，也不要错值）
+    check("起止都为 None → 只给 turn_status（不写空时刻）",
+          interrupted_turn_fields(None, None) == {"turn_status": "interrupted"},
+          repr(interrupted_turn_fields(None, None)))
+    check("只缺起点 → 只给 status + ended",
+          set(interrupted_turn_fields(None, 5000)) == {"turn_status", "turn_ended_at"},
+          repr(interrupted_turn_fields(None, 5000)))
+
+    # ③ 推理时长：中断时只写起点，不写时长
+    rf_int = reasoning_duration_fields(
+        interrupted=True, reasoning_started_at_ms=10_000, reasoning_ended_at_ms=200_000
+    )
+    check("★ 中断时 reasoning_duration_ms **不写**（断连时刻不是推理终点）",
+          "reasoning_duration_ms" not in rf_int, repr(rf_int))
+    check("中断时仍写 reasoning_started_at（ReasoningBlock 可锚定）",
+          "reasoning_started_at" in rf_int, repr(rf_int))
+    rf_ok = reasoning_duration_fields(
+        interrupted=False, reasoning_started_at_ms=10_000, reasoning_ended_at_ms=200_000
+    )
+    check("正常路径 reasoning_duration_ms 行为不变（190000ms）",
+          rf_ok.get("reasoning_duration_ms") == 190_000, repr(rf_ok))
+    check("正常路径两个字段同时写",
+          set(rf_ok) == {"reasoning_duration_ms", "reasoning_started_at"}, repr(rf_ok))
+    check("正常路径缺终点 → 什么都不写（改前口径不变）",
+          reasoning_duration_fields(
+              interrupted=False, reasoning_started_at_ms=10_000, reasoning_ended_at_ms=None
+          ) == {}, "应返回 {}")
+    check("无起点 → 什么都不写",
+          reasoning_duration_fields(
+              interrupted=True, reasoning_started_at_ms=None, reasoning_ended_at_ms=200_000
+          ) == {}, "应返回 {}")
+
+    # ④ 端到端（真实落盘链）：中断的一轮写进 store 后长什么样
+    store = FakeStore()
+    h1 = [msg("u1", "user", "问1"), msg("a1", "ai", "答1")]
+    save_turn(store, h1, 0, 4_500)  # 轮1 正常
+
+    # 轮2：跑了 11 分钟被刷新掐断，checkpoint 里有 AI 产出（部分正文）
+    h2 = h1 + [msg("u2", "user", "问2"), msg("a2", "ai", "刚开了个头…")]
+    idx = mark_turn_last_ai(h2, interrupted_turn_fields(1_000_000, 1_664_703))
+    check("中断标记落在**本轮**最后一条 AI（下标 3）", idx == 3, repr(idx))
+    prev_count, last_id = store.watermark()
+    next_seq, new_items, _mode = plan_append(h2, prev_count, last_id)
+    store.write(next_seq, new_items)
+    show("store 实际内容（轮2 为中断轮）：", store)
+
+    a2 = store.rows["00000004"]
+    check("★ store 里的 a2 带 turn_status=interrupted",
+          a2.get("turn_status") == "interrupted", repr(a2.get("turn_status")))
+    check("★ store 里的 a2 **没有** turn_duration_ms（前端无从渲染「已完成 11m 5s」）",
+          a2.get("turn_duration_ms") is None, repr(a2.get("turn_duration_ms")))
+    check("轮1 的 a1 不受中断轮影响（仍是自己的 4500ms）",
+          store.rows["00000002"].get("turn_duration_ms") == 4_500,
+          repr(store.rows["00000002"].get("turn_duration_ms")))
+
+    # ⑤ 反证：旧行为（照写 turn_duration_ms）在**同一条 history** 上会产出 664703
+    h_old = copy.deepcopy(h2[:-1] + [msg("a2", "ai", "刚开了个头…")])
+    mark_turn_last_ai(h_old, {"turn_duration_ms": max(0, 1_664_703 - 1_000_000)})
+    check("反证：旧写法在同一条 history 上落下 664703ms（= 11m 4.7s，正是事故现场那个数）",
+          h_old[3].get("turn_duration_ms") == 664_703,
+          repr(h_old[3].get("turn_duration_ms")))
+    check("反证：新写法同一位置没有该字段 —— 两个判据可区分",
+          "turn_duration_ms" not in h2[3], repr(h2[3].get("turn_duration_ms")))
+
+
+print()
+print("=" * 78)
+print("S7 P0′ 中断记账：断连不得被写成「完成」（2026-10-12）")
+print("=" * 78)
+s7()
+
+
 def source_sync() -> None:
     """chat.py 改了打点判据/落盘逻辑，本脚本必须同步改——否则直接 FAIL。"""
     print()
@@ -540,6 +647,30 @@ def source_sync() -> None:
           '"tool_call_id": tool_call_id,' in src)
     check("chat.py 本轮无 AI 时跳过 generated_files 关联并留 WARNING",
           "跳过 generated_files 关联" in src)
+
+    # ─── P0′（2026-10-12）：中断记账必须真的接线 ───
+    # 纯函数测过不等于接上了（典型缺口：判据在、调用点没换）。
+    # 这里断言 wiring，S7 断言行为，两者互补。
+    check("chat.py 中断分支真的调用 _interrupted_turn_fields（非复刻内联）", (
+        "_interrupted_turn_fields(turn_started_at_ms, turn_ended_at_ms)" in src
+    ))
+    check("chat.py 中断分支与正常分支互斥（elif，不是两个独立 if）",
+          "if interrupted:" in src
+          and "elif turn_started_at_ms is not None and turn_ended_at_ms is not None:" in src)
+    check("chat.py 推理时长改走 _reasoning_duration_fields（不再三条件内联 if）", (
+        "_reasoning_duration_fields(" in src
+        and 'entry["reasoning_duration_ms"] = max(' not in src
+    ))
+    check("chat.py 中断路径不再写 turn_duration_ms（只由 elif 分支写）", (
+        src.count('{"turn_duration_ms": turn_duration_ms}') == 1
+        and "if interrupted:" in src
+    ))
+    check("chat.py 中断打点同样复用了「本轮无 AI 产出」WARNING 口径",
+          "跳过 turn_status=interrupted 打点" in src)
+    check("chat.py 显式定义 interrupted = reason == \"interrupted\" 单一来源",
+          'interrupted = reason == "interrupted"' in src)
+    check("turn_status 的赋值点唯一（只在 _interrupted_turn_fields 里，避免多处漂移）",
+          src.count('"turn_status"') == 1, str(src.count('"turn_status"')))
 
 
 source_sync()
