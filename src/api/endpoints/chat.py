@@ -238,6 +238,12 @@ def _sse_response(
             "Connection": "keep-alive",
             # 禁用 nginx/openresty 缓冲，保证 SSE 实时逐字节下发（配合心跳保活）
             "X-Accel-Buffering": "no",
+            # 本次 run 的 id（P1-c）。前端的「停止查看 / 终止任务 / 继续查看」都需要它，
+            # 而 `GET /active-run` 读的是 store 行 —— `run_registry.persist` 刻意吞掉
+            # 写失败（见其 docstring），那种情况下 active-run 返回 null，前端就再也
+            # 定位不到这个 run。响应头是"我刚起的这一轮"的直接来源，不受写库影响。
+            # ⚠ 跨源（开发态前端直连 :8009）需要 server.py 的 CORS expose_headers。
+            "X-Run-Id": run_id,
         },
     )
 

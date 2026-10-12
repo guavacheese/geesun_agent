@@ -188,6 +188,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # 自定义响应头必须显式 expose，否则跨源请求下浏览器不会把它交给 JS。
+    # 目前只有一个：SSE 通道的 X-Run-Id（P1-c）——开发态前端直连 :8009 属跨源，
+    # 不 expose 的话前端拿不到 run id，「停止查看 / 终止任务」会失效。
+    expose_headers=["X-Run-Id"],
 )
 
 app.include_router(api_router)
