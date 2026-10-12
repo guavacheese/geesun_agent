@@ -674,3 +674,121 @@ def test_message_id_detector_is_sensitive():
     stripped = _IdKwargDropper().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
     ast.fix_missing_locations(stripped)
     assert not _has_id_kwarg(stripped), "摘掉 id= 后检测器仍然报有 —— 本组断言等于空测"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 收尾标志必须无条件置位（★ 1.0.27 线上事故的回归锁，2026-10-12）
+#
+# 事故经过：`_worker_finalize_started["started"] = True` 原本写在
+# `if not _finalized:` **内部**。而正常完成路径会设 `_finalized = True`
+# （紧跟 `await _finish_run(run_id, STATUS_COMPLETED)`），于是整块被跳过、
+# 标志永远是 False ⇒ `_on_worker_done` 一路走到兜底，兜底的 status 判据是
+# `INTERRUPTED if task.cancelled() else FAILED`，正常完成的轮次落进 else 分支，
+# 用 `_finish_run(FAILED)` 把刚落好的 COMPLETED 覆盖成 failed（`_finish_run`
+# 刻意不幂等 —— 它无条件 `run_registry.mark`）。
+#
+# 线上证据（1.0.27 生产日志）：**正常读完 [DONE] 的一轮**（不断连、正文产出正常）
+#   [RUN] 本轮已启动（脱离连接）: run=999437635bf54eb0 …
+#   [RUN] worker 未进收尾机制，执行兜底收尾（本轮尚无产出需落库）: status=failed
+# 且该 run 无「worker 异常退出」也无「worker 被取消」两条日志中的任何一条 ⇒
+# worker 是正常返回的。断连场景（cf0cc926…）同样复现。
+#
+# 为什么必须用 AST 而不是行为测试：`_run_worker` / `_on_worker_done` 都是 `chat()`
+# 端点内的闭包，要行为级复现就得把整个端点连同 store / bridge / checkpointer 一起
+# 拉起来。而本缺陷是纯粹的**结构**问题（置位在不在 if 里），AST 断言恰好精确且廉价。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _is_finalize_flag_assign(stmt: ast.stmt) -> bool:
+    """``_worker_finalize_started["started"] = True`` 这一条赋值语句。"""
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return False
+    t = stmt.targets[0]
+    return (
+        isinstance(t, ast.Subscript)
+        and isinstance(t.value, ast.Name)
+        and t.value.id == "_worker_finalize_started"
+        and isinstance(t.slice, ast.Constant)
+        and t.slice.value == "started"
+    )
+
+
+def _is_not_finalized_test(test: ast.expr) -> bool:
+    """``not _finalized``（``if not _finalized:`` 的判据）。"""
+    return (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Name)
+        and test.operand.id == "_finalized"
+    )
+
+
+def _finalize_flag_layout(tree: ast.Module):
+    """在 ``_run_worker`` 的 finally 里定位两个语句的下标。
+
+    返回 ``(idx_flag, idx_if)``：
+      · ``idx_flag`` —— 置位语句在 ``finalbody`` 中的下标；``None`` 表示它
+        **不是** finally 的直接子节点（即被包在某个 if 里，或压根没有）。
+      · ``idx_if`` —— ``if not _finalized:`` 在 ``finalbody`` 中的下标。
+    找不到 ``_run_worker`` 或无 finally 时返回 ``None``。
+    """
+    fn = _func_def(tree, "_run_worker")
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Try) and node.finalbody):
+            continue
+        idx_flag = idx_if = None
+        for i, stmt in enumerate(node.finalbody):
+            if _is_finalize_flag_assign(stmt):
+                idx_flag = i
+            if isinstance(stmt, ast.If) and _is_not_finalized_test(stmt.test):
+                idx_if = i
+        if idx_flag is not None or idx_if is not None:
+            return (idx_flag, idx_if)
+    return None
+
+
+def test_worker_finalize_flag_is_set_unconditionally():
+    """★ 正常完成路径也必须置位收尾标志（否则 done-callback 覆盖终态）。"""
+    layout = _finalize_flag_layout(_tree())
+    assert layout is not None, "未在 `_run_worker` 的 finally 里找到收尾标志 / `if not _finalized:`"
+    idx_flag, idx_if = layout
+    assert idx_flag is not None, (
+        "finally 里没有 `_worker_finalize_started['started'] = True` 的**无条件**赋值 —— "
+        "它被放进了 `if not _finalized:` 内部，正常完成路径不会置位，"
+        "done-callback 会用 `_finish_run(FAILED)` 覆盖 COMPLETED（1.0.27 线上事故原形）"
+    )
+    assert idx_if is None or idx_flag < idx_if, (
+        "置位必须**先于** `if not _finalized:` 出现在 finally 体内（且在其外）"
+    )
+
+
+class _FinalizeFlagNester(ast.NodeTransformer):
+    """负向对照：把置位语句包进 ``if True:`` —— 复现 1.0.27 的缺陷形态。"""
+
+    def visit_Try(self, node: ast.Try):
+        self.generic_visit(node)
+        if not node.finalbody:
+            return node
+        new_body, nested = [], False
+        for stmt in node.finalbody:
+            if not nested and _is_finalize_flag_assign(stmt):
+                new_body.append(ast.If(test=ast.Constant(value=True), body=[stmt], orelse=[]))
+                nested = True
+            else:
+                new_body.append(stmt)
+        node.finalbody = new_body
+        return node
+
+
+def test_finalize_flag_detector_is_sensitive():
+    """负向对照：把置位包进 if 后检测器必须报「不是无条件」—— 否则本组断言等于空测。"""
+    assert _finalize_flag_layout(_tree())[0] is not None  # 当前实现必须通过
+
+    stripped = _FinalizeFlagNester().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
+    ast.fix_missing_locations(stripped)
+    layout = _finalize_flag_layout(stripped)
+    assert layout is None or layout[0] is None, (
+        "把置位包进 if 之后，检测器仍报「无条件置位」—— 该断言无法捕获本次回归"
+    )

@@ -3099,6 +3099,19 @@ async def chat(
                 except Exception:
                     logger.debug("[TRACING] 恢复 OTel Context 失败（已忽略）", exc_info=True)
 
+            # ★ 置位必须**无条件**、且先于任何 create_task（1.0.28 修复，2026-10-12）。
+            #   `_worker_finalize_started` 的语义是「收尾责任已由 worker 的 finally
+            #   接手」；done-callback 的兜底**只该**覆盖「连 finally 都跑不到」的那个
+            #   窗口（开轮 prologue 的 await 被取消/抛异常，见 _on_worker_done）。
+            #   原实现把它放在 `if not _finalized:` **内部**，于是正常完成路径
+            #   （_finalized=True）从不置位 ⇒ done-callback 一路走到兜底，用
+            #   `_finish_run(FAILED)` 把刚落好的 COMPLETED 覆盖成 failed
+            #   （_finish_run 刻意不幂等：它无条件 run_registry.mark）。
+            #   1.0.27 线上实证：每轮正常对话都留下一条
+            #     「[RUN] worker 未进收尾机制，执行兜底收尾 … status=failed」；
+            #   run 行终态恒为 failed（正常完成 / 主动断连两种场景均复现）。
+            _worker_finalize_started["started"] = True
+
             if not _finalized:
                 # 中断 / 异常 / 收尾中途被打断：把剩余收尾交给**脱离取消作用域**的后台任务。
                 #
@@ -3106,9 +3119,6 @@ async def chat(
                 #   CancelledError，收尾整段蒸发（4863afff 事故现场：打了「SSE 流中断」
                 #   之后一条日志都没有；实证见 tests/spikes/sse_disconnect_repro.py 的
                 #   direct 场景）。
-                # ⚠ 置位必须先于 create_task：worker task 的 done-callback 也会读它来决定
-                #   要不要兜底收尾，置位后由这里统一负责，避免两条路径重复收尾。
-                _worker_finalize_started["started"] = True
                 try:
                     # 中断路径也要取走降级信号（若守卫已登记但本轮没走到消费点）：
                     # 否则它会以 thread_id 为键留在登记表里被下一轮消费，造成误报。
