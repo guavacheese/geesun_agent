@@ -22,8 +22,13 @@ deer-flow 桥里的事件是**粗粒度**的（`updates` / `events`，一个 ste
 
 | 类别 | 事件 | 存放 | 重连时如何补齐 |
 |---|---|---|---|
-| 结构性 | `ai_message_start` / `tool_call` / `tool_result` / `file_generated` / `error` / `agent_status` | **有界日志**（默认 512 条）+ 序号游标 | 按 `Last-Event-ID` 重放；越界则给 `StreamGap` |
+| 结构性 | `ai_message_start` / `tool_call` / `tool_result` / `file_generated` / `error` / `agent_status` / `completion_blocked` / `quick_mode_notice` | **有界日志**（默认 512 条）+ 序号游标 | 按 `Last-Event-ID` 重放；越界则给 `StreamGap` |
 | 逐 token | `token` / `reasoning` | **累积器**（只留尾部 N 字符） | 首帧 `StreamSnapshot` 给权威正文 |
+
+⚠ 上表的结构性事件列的是**已知调用方**，不是穷尽枚举：判据是"它是带完整 JSON 载荷的
+离散事实、且重连必须能补发"，就归结构性、走 `publish`。P1-b 实测补进来两个既有的
+事件类型（`completion_blocked` 四种 code + `quick_mode_notice`），它们承载终态/降级
+提示，若不进有界日志，重连后前端会看不到"本轮为什么被拦"。
 
 ## 帧语义（线上协议由 P1-b 负责落地为 SSE）
 

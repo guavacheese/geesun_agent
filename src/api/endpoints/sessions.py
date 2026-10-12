@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from src.api.deps import get_store, get_current_user
-from src.core import turn_registry
+from src.core import run_registry, turn_registry
 from src.core.config import settings
 from src.infra import trash
 from src.infra.database import message_key_to_index
@@ -594,6 +594,51 @@ async def delete_session(
             logger.info("已清理会话文件: user=%s, session=%s, dir=%s", user_id, session_id, orig)
 
     return {"deleted": True, "session_id": session_id, "counts": counts}
+
+
+# ─── 刷新后问「这个会话还有在跑的 run 吗」（P1-b 新增）───
+
+
+@router.get("/sessions/{session_id}/active-run")
+async def get_active_run(
+    session_id: str,
+    store=Depends(get_store),
+    current_user: dict = Depends(get_current_user),
+):
+    """返回该会话当前**活跃**的 run；没有则 `run_id: null`。
+
+    这是前端刷新后的第一站（P1-c）。浏览器刷新会销毁整个 JS 上下文 —— abort 回调、
+    onError、本地状态一行都不会执行，所以「服务端还在跑」和「我把它刷掉了」这个区分
+    **只能在服务端判**。判据就是 worker 每轮落下的 run 行（`("runs", user_id)` 命名
+    空间，行 key = session_id，见 run_registry）。
+
+    两点与直觉不同、但都是刻意的：
+      · 孤儿行（属于**上一个进程**的活跃行）会在这里被校正并写回 failed(orphaned)：
+        进程被杀会留下 status=running 的僵尸行，不校正前端就会永远等一个不存在
+        的 run。写回同样必须，否则每次刷新都要重走一遍发现流程（每次都打 WARNING）。
+      · 终态行**不返回、也不清掉**：它承载「上一轮结局」（如「已中断」），
+        GET /sessions/{sid}/messages 里的 turn_status 依赖同一份事实。
+
+    会话不存在时同样返回 `run_id: null`（不报 404）：本端点回答的是「有没有在跑的
+    run」，不是「会话在不在」；顺带少一次 store 读，且不构成探测面 —— 两种情形下
+    调用方看到的东西完全一样。
+    """
+    user_id = current_user["user_id"]
+    row = await run_registry.select_active_run(
+        store, user_id=user_id, session_id=session_id
+    )
+    if row is None:
+        return {"run_id": None}
+    logger.info(
+        "会话有活跃 run: user=%s, session=%s, run=%s, status=%s",
+        user_id, session_id, row.get("run_id"), row.get("status"),
+    )
+    return {
+        "run_id": row.get("run_id"),
+        "status": row.get("status"),
+        "started_at": row.get("started_at"),
+        "created_at": row.get("created_at"),
+    }
 
 
 # ─── 获取消息 ───

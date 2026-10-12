@@ -21,6 +21,14 @@
        而 `except Exception` 抓不到 BaseException 子类，静默跳过。
        机制实测见 tests/spikes/sse_disconnect_repro.py（真 uvicorn + 真 RST 断开）。
 
+    ④ 2026-10-12（P1-b）：run 从 SSE 生成器里解耦出来之后，收尾动作整体搬进
+       `_finish_run`，兜底分支的判据由 `_saved` 变为 `_finalized`（拆成
+       `_persisted` / `_finalized` 两位，见 `_disconnect_branch` 的说明）。
+       ③ 的两条断言（无 await / 必须走 detach）在迁移后**原样保留** —— 它们守的是
+       同一个事故形态，与收尾被搬去哪一层无关。新增的两条守的是 P1-b 才有的顺序
+       不变量：release 让位于持久化、落终态早于 `[DONE]`。
+       SSE 帧格式与三个新端点的契约断言在 tests/api/test_run_endpoints.py。
+
 运行：
     docker run --rm -v D:/workspace/geesun_agent:/mnt -w /mnt \
       -e PYTHONPATH=/mnt/.testdeps --entrypoint /app/.venv/bin/python \
@@ -197,7 +205,14 @@ def test_break_detector_is_sensitive():
 # ─── ③ 断连兜底保存必须脱离取消作用域 ───────────────────────────────────────
 
 def _disconnect_branch(tree: ast.Module) -> ast.If | None:
-    """定位断连兜底保存分支：``if not _saved:``。"""
+    """定位断连兜底保存分支：``if not _finalized:``。
+
+    P1-b 前这里是 ``if not _saved:``。改名不是修辞：``_saved`` 只有一个语义
+    （"存过没有"），而迁移后收尾被拆成两段 ——  ``_persisted``（已落库）与
+    ``_finalized``（终态 + publish_end 都已落地）。兜底分支要判的是后者：
+    取消可能正好落在"已落库但还没落终态"之间，那种情况**不该**重复写库，
+    但**必须**补完终态与 [DONE]，否则 run 行永远停在活跃态。
+    """
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
@@ -206,7 +221,7 @@ def _disconnect_branch(tree: ast.Module) -> ast.If | None:
             isinstance(test, ast.UnaryOp)
             and isinstance(test.op, ast.Not)
             and isinstance(test.operand, ast.Name)
-            and test.operand.id == "_saved"
+            and test.operand.id == "_finalized"
         ):
             return node
     return None
@@ -261,7 +276,8 @@ def test_disconnect_persist_has_no_await():
     """
     branch = _disconnect_branch(_tree())
     assert branch is not None, (
-        "找不到断连兜底保存分支（`if not _saved:`）—— 结构已变，本组断言失效，请同步更新"
+        "找不到断连兜底保存分支（`if not _finalized:`）—— 结构已变，本组断言失效，"
+        "请同步更新"
     )
     awaited = _awaits_in(branch)
     assert not awaited, (
@@ -316,33 +332,115 @@ def test_persist_session_logs_cancellation():
     )
 
 
-def test_release_waits_for_detached_save():
-    """``turn_registry.release`` 必须让位于 detach 出来的保存任务。
+def _call_lines(node: ast.AST | None, attr: str) -> list[int]:
+    """收集子树里所有 ``<anything>.<attr>(...)`` 调用的行号。"""
+    if node is None:
+        return []
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == attr
+    ]
 
-    既有不变量是「release 一定发生在写台账之后」，否则删除请求可能趁持久化过程中
-    插进来。保存被 detach 后若仍在外层 finally 无条件 release，这个不变量就破了。
+
+def _finish_run_releases(tree: ast.Module) -> list[int]:
+    """``_finish_run`` 体内对 ``turn_registry.release`` 的调用行号。"""
+    return _call_lines(_func_def(tree, "_finish_run"), "release")
+
+
+def _finally_calls(tree: ast.Module, func_name: str, callee: str) -> bool:
+    """``<func_name>`` 的某个 try 的 **finally** 体里是否调用了 ``callee(...)``。"""
+    func = _func_def(tree, func_name)
+    if func is None:
+        return False
+    return any(
+        isinstance(n, ast.Try)
+        and any(
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == callee
+            for stmt in n.finalbody
+            for sub in ast.walk(stmt)
+        )
+        for n in ast.walk(func)
+    )
+
+
+def test_release_follows_persist_in_finish_run():
+    """``turn_registry.release`` 必须让位于持久化（P1-b 后由 ``_finish_run`` 承载）。
+
+    不变量（2026-10-10）：release 一定发生在写台账**之后** —— 否则用户此刻提交删除
+    请求，可能趁持久化过程中插进来，把刚写的台账又删掉、留下孤儿行。
+
+    P1-b 前它由「外层 event_stream 的 finally 里 ``if _detached_cleanup['task'] is
+    None: release(...)`` 守卫」表达；P1-b 把收尾整体搬进 ``_finish_run`` 之后，改由
+    **结构**表达：
+
+      ① release 是 ``_finish_run`` 体内的调用；
+      ② ``_finish_run`` 只被 ``_persist_session_and_release`` 的 **finally** 调用。
+
+    ②的"晚于"是 Python 语言保证（finally 必在 try 体之后执行），所以两条同时成立
+    即「release 晚于持久化」在**所有**路径（正常收尾 / 中断后的 detach 收尾）上都
+    成立 —— 不依赖某一个调用点写得对。
     """
     tree = _tree()
-    src = CHAT_PY.read_text(encoding="utf-8")
-    guarded = any(
-        isinstance(node, ast.If)
-        and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Subscript)
-        and any(isinstance(op, ast.Is) for op in node.test.ops)
-        and any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "release"
-            for n in ast.walk(node)
-        )
-        for node in ast.walk(tree)
+
+    assert _finish_run_releases(tree), (
+        "`_finish_run` 里没有 turn_registry.release(...) —— 删除护栏会提前放行"
     )
-    assert guarded, (
-        "外层 event_stream 的 finally 里缺少 `if _detached_cleanup['task'] is None: "
-        "turn_registry.release(...)` —— 断连路径下 release 会先于写台账执行"
+    assert _finally_calls(tree, "_persist_session_and_release", "_finish_run"), (
+        "`_persist_session_and_release` 没有在 finally 里调 `_finish_run` —— "
+        "收尾可能早于持久化执行（中断路径下甚至压根不执行）"
     )
-    assert "_persist_session_and_release" in src, (
-        "缺少 _persist_session_and_release：release 没有与保存绑在同一个后台任务里"
+
+
+def test_finish_run_orders_terminal_state_before_done():
+    """落终态必须早于 ``publish_end``（= 前端看到的 ``data: [DONE]``）。
+
+    顺序有语义：进程若在两者之间死掉，store 里会留下一条**活跃**的行；同一次 boot
+    内 boot_id 相同，惰性孤儿校正兜不住它 —— 前端就会永远显示「任务进行中」。
+    反过来（先 [DONE] 后落态）则会让前端在"已结束"之后仍查得到一个活跃 run。
+    """
+    finish = _func_def(_tree(), "_finish_run")
+    assert finish is not None, "找不到 `_finish_run`"
+    marks = _call_lines(finish, "mark")
+    ends = _call_lines(finish, "publish_end")
+    assert marks and ends, (
+        f"`_finish_run` 缺少 mark / publish_end 调用（mark={marks}, publish_end={ends}）"
+    )
+    assert min(marks) < min(ends), (
+        f"publish_end 排在落终态之前（mark={marks}, publish_end={ends}）—— "
+        "进程若在两者之间死掉，会留下永远显示「进行中」的僵尸 run"
+    )
+
+
+class _ReleaseDropper(ast.NodeTransformer):
+    """负向对照用：把 ``_finish_run`` 里的 release 摘掉（模拟"收尾忘了放行删除护栏"）。"""
+
+    def visit_AsyncFunctionDef(self, node):
+        if node.name == "_finish_run":
+            node.body = [
+                n for n in node.body
+                if not (
+                    isinstance(n, ast.Expr)
+                    and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Attribute)
+                    and n.value.func.attr == "release"
+                )
+            ]
+        return self.generic_visit(node)
+
+
+def test_release_detector_is_sensitive():
+    """负向对照：摘掉 release 后检测器必须报空 —— 否则本组断言等于空测。"""
+    assert _finish_run_releases(_tree())  # 当前实现必须通过
+
+    stripped = _ReleaseDropper().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
+    ast.fix_missing_locations(stripped)
+    assert not _finish_run_releases(stripped), (
+        "摘掉 release 后检测器仍然报有 —— 该断言无法捕获「收尾忘了放行删除护栏」的回归"
     )
 
 
@@ -355,7 +453,7 @@ class _ReAwaitInjector(ast.NodeTransformer):
             isinstance(test, ast.UnaryOp)
             and isinstance(test.op, ast.Not)
             and isinstance(test.operand, ast.Name)
-            and test.operand.id == "_saved"
+            and test.operand.id == "_finalized"
         ):
             await_expr = ast.Expr(
                 value=ast.Await(

@@ -5,20 +5,36 @@ import re
 import time
 import logging
 import psycopg
+from contextlib import aclosing
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi import APIRouter, Depends, Header, Query, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from src.infra.database import message_key
 from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
-from src.core import execution_guard, turn_registry
+from src.core import execution_guard, run_registry, turn_registry
 from src.core.loop_detection import LOOP_FORCED_STOP_KEY
 from src.core.mcp import get_mcp_tools
 from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
-from src.api.deps import get_store, get_checkpointer, get_current_user
+from src.core.stream_bridge import (
+    DELTA_REASONING,
+    DELTA_TOKEN,
+    END_SENTINEL,
+    HEARTBEAT_SENTINEL,
+    StreamDelta,
+    StreamEvent,
+    StreamGap,
+    StreamSnapshot,
+)
+from src.api.deps import (
+    get_store,
+    get_checkpointer,
+    get_current_user,
+    get_stream_bridge,
+)
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -38,6 +54,18 @@ logger = logging.getLogger(__name__)
 # 结论：用 create_task 把保存协程交给事件循环独立承载 —— 新 task 不在任何取消
 #   作用域内，原 task 被取消不会传染它。
 _DETACHED_SAVES: set[asyncio.Task] = set()
+
+#: worker 侧周期 beat 间隔（秒）。取 30 是为了远小于 turn_registry.STALE_MS（300s）——
+#: 即使某一轮 beat 因为事件循环被同步 IO 短暂占住而迟到，也不会越过陈旧阈值。
+#: ⚠ 为什么需要它：beat 原先挂在**每个 SSE chunk** 上，P1-b 之后 run 不再随连接存活，
+#: 没有订阅者时那条驱动源就消失了（订阅侧的心跳跑在消费者里，无订阅者时不动）。
+BEAT_INTERVAL_SECONDS = 30.0
+
+#: run 终态后回收进程内态的宽限期（秒）。取值只需覆盖"前端重连的重试节奏"
+#: （秒级~十秒级，含用户切走再切回前台的间隔）；留 90s 是为了不去猜前端的具体实现。
+#: 更晚到来的订阅请求本就该走 GET /sessions/{sid}/active-run → 拿 null →
+#: 回权威存储重取（P1-c），而不是指望进程内窗口还在。
+RUN_REAP_DELAY_SECONDS = 90.0
 
 
 def _on_detached_save_done(task: asyncio.Task) -> None:
@@ -79,6 +107,185 @@ def _spawn_detached_save(coro, *, label: str) -> asyncio.Task:
     task.add_done_callback(_DETACHED_SAVES.discard)
     task.add_done_callback(_on_detached_save_done)
     return task
+
+
+# ─── P1-b：run 与连接解耦后的线上协议 ─────────────────────────────────────────
+# 桥（src/core/stream_bridge.py）只负责"把事件分发给订阅者"，**线上帧格式**由这里定。
+#
+# 硬约束：P1-b 上线时前端（geesun_agent_web）还没改（P1-c 才改），所以帧格式必须与
+# 改造前**逐字兼容**：
+#   · 结构性事件仍是 `data: {"type": ..., ...}`；正文/推理仍是
+#     `data: {"type": "token"|"reasoning", "content": ...}`；
+#   · 保活仍是 `": ping\n\n"`（SSE 注释行）；结束仍是 `data: [DONE]` ——
+#     前端拿它当"正常结束"的**唯一**判据（lib/sse-client.ts 的
+#     STREAM_TRUNCATED_MESSAGE：EOF 而无哨兵即判定传输被切断）。
+# 新增两类帧（`snapshot` / `resync`）对现有前端安全：它的解析器只处理 `data: ` 开头的
+# 行（其余一律 skip），且 reducer 的 `default:` 分支直接 `return slice`。
+
+
+def _sse_frame(payload: dict, *, event_id: str | None = None) -> str:
+    """编码一个 SSE 帧。`event_id` 写进 `id:` 行，客户端续订时作为 Last-Event-ID 回传。"""
+    head = f"id: {event_id}\n" if event_id else ""
+    return f"{head}data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _bridge_item_to_frame(item, *, append_text_snapshot: bool = False) -> str | None:
+    """桥的一帧 → SSE 帧。返回 None 表示"这一帧不必下发"。
+
+    `append_text_snapshot`：**新订阅者**（本地没有任何正文）专用，见下。
+    """
+    if isinstance(item, StreamEvent):
+        if item is HEARTBEAT_SENTINEL:
+            # SSE 注释行：字节照传（保持 TCP 不被 proxy_read_timeout 掐断），前端忽略
+            return ": ping\n\n"
+        if item is END_SENTINEL:
+            return "data: [DONE]\n\n"
+        body = item.data if isinstance(item.data, dict) else {"data": item.data}
+        return _sse_frame({"type": item.event, **body}, event_id=item.id)
+    if isinstance(item, StreamDelta):
+        return _sse_frame({"type": item.kind, "content": item.text})
+    if isinstance(item, StreamSnapshot):
+        if append_text_snapshot:
+            # ─── 新订阅者：把"替换型"快照降级成两帧"追加型"文本 ───────────────
+            # 桥的首帧恒为快照（替换语义）。对**续订者**替换是对的：它本地已有半截
+            # 正文，需要被权威全文覆盖。但对**新订阅者**，P1-b 上线时的前端还不认识
+            # `snapshot` 这个 type（P1-c 才加），会**静默忽略整帧** ⇒ 首订时已经生成
+            # 的那段前缀正文永远看不到，用户看到的是"回答从中间开始"。
+            #
+            # 所以新订阅者改发老的追加型帧：字节形状与改造前逐字一致，任何版本的
+            # 前端都能渲染；语义上也等价 —— 本地为空，"追加全文"就等于"全文"。
+            #
+            # 触发窗口为什么真实存在：worker 由 create_task 启动后，`bridge.subscribe`
+            # 挂队列本身要 await condition 才生效 —— 这段时间里 worker 完全可能先
+            # publish 出正文。靠时序碰巧不丢，不是保证。
+            parts: list[str] = []
+            # 顺序与实时流一致：先推理、后正文
+            if item.reasoning:
+                parts.append(
+                    _sse_frame({"type": DELTA_REASONING, "content": item.reasoning})
+                )
+            if item.content:
+                parts.append(_sse_frame({"type": DELTA_TOKEN, "content": item.content}))
+            return "".join(parts) or None
+        if not item.content and not item.reasoning:
+            # 空快照没有信息量。首订时几乎恒为空（worker 刚起、还没有 token），此时
+            # 下发只会给现有前端塞一个它不认识的 type；只有真带内容（= 订晚了 /
+            # 断线重连）才下发。
+            return None
+        return _sse_frame({
+            "type": "snapshot",
+            "content": item.content,
+            "reasoning": item.reasoning,
+            "content_dropped_chars": item.content_dropped_chars,
+            "reasoning_dropped_chars": item.reasoning_dropped_chars,
+        })
+    if isinstance(item, StreamGap):
+        # 游标已被裁剪：正文由紧随其后的快照补齐，但结构性历史缺了一段。前端应据此
+        # 回权威存储重取（P1-c），否则会把缺头的事件序列当成完整状态。
+        return _sse_frame({
+            "type": "resync",
+            "requested_event_id": item.requested_event_id,
+            "earliest_available_event_id": item.earliest_available_event_id,
+            "latest_available_event_id": item.latest_available_event_id,
+        })
+    return None
+
+
+def _sse_response(
+    run_id: str,
+    bridge,
+    *,
+    last_event_id: str | None = None,
+    heartbeat_interval: float = 15.0,
+) -> StreamingResponse:
+    """把桥的订阅流包成 SSE 响应（P1-b 之后**唯一**的下发通道）。
+
+    ⚠ `aclosing` 不能省：`async for` 里 break/return **不会**关闭异步生成器（CPython
+    只在 aclose 或 GC 时跑 finally）。不关就留下"幽灵订阅者"——桥会一直往它的队列
+    投递，白占内存。这是桥模块 docstring 明写的调用契约。
+    """
+    # 新订阅者（没带游标）本地一条正文都没有 ⇒ 首帧快照降级成老前端认得的追加型帧
+    # （见 _bridge_item_to_frame 的 append_text_snapshot）。
+    # 只对**首帧**生效：此后若再出现快照，那是订阅者队列溢出后的重同步（RESYNC →
+    # _catch_up）—— 此时本地已由实时增量累积了正文，必须用替换语义，追加会让正文重复。
+    _append_first_snapshot = last_event_id is None
+
+    async def _gen():
+        _first = True
+        async with aclosing(
+            bridge.subscribe(
+                run_id,
+                last_event_id=last_event_id,
+                heartbeat_interval=heartbeat_interval,
+            )
+        ) as stream:
+            async for item in stream:
+                frame = _bridge_item_to_frame(
+                    item, append_text_snapshot=_first and _append_first_snapshot
+                )
+                _first = False
+                if frame is not None:
+                    yield frame
+                if item is END_SENTINEL:
+                    return
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # 禁用 nginx/openresty 缓冲，保证 SSE 实时逐字节下发（配合心跳保活）
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _log_worker_done(task: asyncio.Task) -> None:
+    """worker 的结果侧日志：不许静默（否则"这一轮为什么没结果"完全不可见）。"""
+    try:
+        if task.cancelled():
+            logger.warning("[RUN] worker 被取消: %s", task.get_name())
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "[RUN] worker 异常退出（本轮可能没有结果）: %s", exc, exc_info=exc
+            )
+    except BaseException:
+        logger.exception("[RUN] worker 结果回调自身异常")
+
+
+async def _reap_run_later(run_id: str, bridge, delay: float) -> None:
+    """宽限期后回收该 run 的**进程内**态：桥的窗口 + run 登记表记录。
+
+    为什么必须回收：桥的正文累积器上限是 200k 字符 × 2 类（token / reasoning），
+    即单个 run 最多常驻约 400KB，且**每轮一份**。不回收就是随轮数线性增长的内存
+    泄漏（run 记录本身很小，但同理没有任何理由让它常驻）。
+    为什么必须**延迟**：前端断线重连是秒级节奏，"刚结束就重连"属正常路径（用户切
+    走又切回前台）。就地回收会让这次重连拿到 404 / 空流，而它本来能靠桥的重放
+    窗口拿到完整尾部 + `[DONE]`。
+    两步之间没有 await 让出点 ⇒ 外部只会观察到"两条都在"或"两条都不在"，不会撞见
+    "记录没了但桥窗口还在"的半回收态。
+    """
+    await asyncio.sleep(delay)
+    run_registry.drop(run_id)
+    await bridge.cleanup(run_id)
+
+
+def _log_reap_done(task: asyncio.Task) -> None:
+    """回收任务的结果侧日志：失败必须可见（静默 = 垃圾没扫掉却无人知晓，即泄漏）。"""
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "[RUN] 终态回收失败（进程内态未释放，构成内存泄漏）: %s",
+                exc, exc_info=exc,
+            )
+    except BaseException:
+        logger.exception("[RUN] 回收结果回调自身异常")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -974,10 +1181,64 @@ async def chat(
     store=Depends(get_store),
     checkpointer=Depends(get_checkpointer),
     current_user: dict = Depends(get_current_user),  # 从 JWT 取当前用户
+    bridge=Depends(get_stream_bridge),
 ):
     user_id = current_user["user_id"]
     session_id = body.session_id
     thread_id = f"{user_id}:{session_id}"
+
+    # ─── D2 护栏：同一会话已有活跃 run → 409，不并存 ─────────────────────────
+    # 为什么必须拒绝而不是顶掉旧 run（interrupt）：刷新后前端可能重发一次，而旧 run
+    # 仍在后台跑。"顶掉"会丢掉用户已经等待的那一轮进度；"并存"会让两条流往同一个
+    # thread 的 checkpoint 里交替写，历史必然错乱。对齐 deer-flow 的
+    # `multitask_strategy` 默认值 reject。
+    # 与 turn_registry（删除会话护栏）的分工：那条管"会话能不能删"，这条管
+    # "这一轮能不能起"。两者都要，不能互相替代。
+    _active_run = run_registry.active_for_thread(thread_id)
+    if _active_run is not None:
+        logger.warning(
+            "[RUN] 拒绝重复提交（该会话已有在跑的 run）: user=%s session=%s run=%s",
+            user_id, session_id, _active_run.run_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "run_already_active",
+                "message": "该会话已有任务在运行，请等待它结束或先终止它",
+                "run_id": _active_run.run_id,
+            },
+        )
+
+    # worker 是否已把收尾交给后台任务（见 _run_worker 的 finally 与 _on_worker_done）。
+    # 用可变容器而不是 bool 变量：闭包里的赋值不会让外层读到新绑定，容器语义更直白。
+    _worker_finalize_started = {"started": False}
+
+    def _on_worker_done(task: asyncio.Task) -> None:
+        """worker 退出时的日志 + **兜底收尾**。
+
+        为什么需要兜底：收尾机制（`_run_worker` 里的 try/except/finally）生效之前还有
+        一个开轮 prologue，里面唯一的 await 是沙箱产物基线枚举。若正好在那里被取消或
+        抛异常，worker 会直接退出、连 finally 都进不去 —— run 行就留在活跃态，而它的
+        `boot_id` 与本进程相同、惰性孤儿校正**兜不住**，前端会一直显示「任务进行中」。
+
+        兜底只做**非持久化**部分（release + 落终态 + publish_end）：那个窗口里 agent
+        一行都还没跑，本轮没有任何新消息需要落库。
+        """
+        _log_worker_done(task)
+        if _worker_finalize_started["started"]:
+            return  # 收尾已由 worker 的 finally 接手，不重复做
+        status = (
+            run_registry.STATUS_INTERRUPTED
+            if task.cancelled()
+            else run_registry.STATUS_FAILED
+        )
+        logger.warning(
+            "[RUN] worker 未进收尾机制，执行兜底收尾（本轮尚无产出需落库）: run=%s status=%s",
+            run.run_id, status,
+        )
+        asyncio.create_task(
+            _finish_run(run.run_id, status), name=f"finalize-fallback:{run.run_id}"
+        )
 
     # ─── 并发护栏快照（2026-09-12）：会话在本轮开跑前是否存在？───
     # 用途见 _persist_session 开头的防复活守卫：若用户在轮次进行中删除会话，
@@ -1528,18 +1789,61 @@ async def chat(
             )
         return 0
 
-    async def _persist_session_and_release(*args, **kwargs) -> int:
-        """断连兜底专用包装：保存写完之后才 release（2026-10-10）。
+    async def _finish_run(run_id: str, status: str) -> None:
+        """收尾三元组：release → 落终态 → 通知订阅者。**三处的顺序都有语义**。
 
-        保存被 detach 出取消作用域后，外层 event_stream 的 finally 会先于保存完成
-        执行。若 release 仍在那边做，"在跑轮次"台账会提前释放 → 用户此刻提交删除
-        请求可能趁持久化过程中插进来。这里把 release 与保存绑在同一个后台任务里，
-        维持原有顺序不变量。
+        · release 在持久化**之后**（2026-10-10 不变量）：否则用户此刻提交删除请求，
+          可能趁持久化过程中插进来，把刚写的台账又删掉 / 留下孤儿行。
+        · 落终态在 publish_end **之前**：进程若在两者之间死掉，store 里会留下一条
+          "活跃"的行 —— 同一次 boot 内 boot_id 相同，惰性孤儿校正**兜不住**它，
+          前端就会一直显示「任务进行中」。
+        · publish_end（= 前端看到的 `[DONE]`）在持久化**之后**：前端收到 [DONE] 会
+          立刻允许编辑，此时消息必须已经落盘，否则编辑用的 from_index 会越界
+          （2026-08 实测；P1-b 前这条约束由 yield 顺序保证，现在由本函数保证）。
+        """
+        turn_registry.release(thread_id)
+        try:
+            await run_registry.mark(store, run_id, status)
+        except Exception:  # 落态失败不该阻断 [DONE]
+            logger.exception(
+                "[RUN] 终态落盘失败（刷新后可能一直显示「进行中」）: run=%s status=%s",
+                run_id, status,
+            )
+        await bridge.publish_end(run_id)
+
+        # ─── 终态已达成 ⇒ 进程内态可以进入回收队列 ───────────────────────────────
+        # 方案文档的清单里没有这一步，但不加它就是 P1-b 亲手引入的内存泄漏（见
+        # _reap_run_later 的算式）。挂在这里而不是 finally：只有"终态 + [DONE] 都
+        # 已落地"才算真的结束，否则回收会把还在收尾的 run 的窗口提前拔掉。
+        # 刻意 create_task 而不是 await：宽限期是 sleep，await 会把收尾任务（可能是
+        # 脱离取消作用域的后台任务）拴在这个必然要等 90s 的 sleep 上。
+        _reap = asyncio.create_task(
+            _reap_run_later(run_id, bridge, RUN_REAP_DELAY_SECONDS),
+            name=f"reap:{run_id}",
+        )
+        _reap.add_done_callback(_log_reap_done)
+
+    async def _persist_session_and_release(
+        run_id: str, *, persisted: bool, status: str, **persist_kwargs
+    ) -> int:
+        """**中断收尾**专用打包：落盘（若还没落）→ release → 终态 → publish_end。
+
+        为什么必须打包成一个后台任务：worker 被取消/断连时它的 finally **不能 await**
+        —— 本 task 已在取消中，第一个 await 点即抛 CancelledError，整段收尾蒸发
+        （4863afff 事故现场：打了「SSE 流中断」后一条日志都没有）。所以收尾动作只能
+        交给这个脱离取消作用域的任务，而它们之间的顺序有语义（见 _finish_run）。
+
+        `persisted=True` 表示正常路径已经把这一轮存过了，只是在落终态阶段被打断 ——
+        此时不重复写库。`persisted=False` 时重跑一次是安全的：_persist_session 走
+        水印式增量（aget_message_watermark → _plan_message_append 只写新增），
+        第二次跑会因为水印推进而不再追加任何消息。
         """
         try:
-            return await _persist_session(*args, **kwargs)
+            if persisted:
+                return 0
+            return await _persist_session(**persist_kwargs)
         finally:
-            turn_registry.release(thread_id)
+            await _finish_run(run_id, status)
 
     async def _astream_with_heartbeat(stream, interval: float = 15.0):
         """把 agent.astream 包成带静默保活心跳的异步生成器。
@@ -1578,13 +1882,71 @@ async def chat(
         finally:
             _anext.cancel()
 
-    # 断连兜底保存的归属标记（2026-10-10）：内层把保存任务 detach 出去后登记于此，
-    # 外层 event_stream 的 finally 据此把 turn_registry.release 移交给它 ——
-    # 维持"release 一定发生在写台账之后"的既有不变量（否则删除请求可能趁持久化
-    # 过程中插进来，把刚写的会话又删掉/或留下孤儿）。正常路径始终为 None。
-    _detached_cleanup: dict[str, asyncio.Task | None] = {"task": None}
+    async def _run_worker(run: "run_registry.RunRecord") -> None:
+        """一轮对话的**生产者**：脱离 SSE 连接独立推进（P1-b）。
 
-    async def _event_stream_inner():
+        与原 `_event_stream_inner` 的差别只有两处，其余逐行保留：
+          1. 每个事件不再 `yield` 给连接，而是 `await` 桥的 publish —— 订阅者来去
+             不再影响本函数。这是"刷新不再杀任务"的落点。
+          2. OTel 空 Context 的 attach/detach 从连接层**搬进来**：它包围的是产生
+             LLM span 的 agent 逻辑，留在端点会让 LangGraph span 重新挂到 FastAPI 的
+             HTTP server span 之下 —— 注释块（本文件 :910 起）里记录的"Langfuse 三列
+             全空 / Phoenix 无 rootSpan"会原样回归。方案文档未点名，属高危遗漏项。
+
+        收尾顺序（都不能动）：持久化 → release → 落终态 → publish_end，理由见
+        `_finish_run`。被打断时整套收尾交给脱离取消作用域的后台任务。
+
+        调用方：`chat()` 用 `asyncio.create_task` 起它（不是 await）—— 必须脱离请求
+        task 的取消作用域，否则客户端断连时 Starlette 会把本轮一起取消，就白改了。
+        """
+        run_id = run.run_id
+
+        # ─── "在跑轮次"台账：acquire 从连接层搬到这里 ───
+        # 轮次的"活着"由 worker 定义，不再由连接定义。
+        turn_registry.acquire(thread_id)
+
+        async def _beat_forever() -> None:
+            """worker 自带的周期 beat（与有没有订阅者无关）。"""
+            while True:
+                await asyncio.sleep(BEAT_INTERVAL_SECONDS)
+                turn_registry.beat(thread_id)
+
+        _beat_task = asyncio.create_task(_beat_forever(), name=f"beat:{run_id}")
+
+        # ─── OTel 空 Context：让 LangGraph span 成真根（原理见本文件 :910 注释块）───
+        _ctx_token = None
+        if _otel_context_api is not None and _OtelContext is not None:
+            try:
+                # 空 Context ⇒ get_current_span() 是 INVALID_SPAN，父子链路在此断开
+                _ctx_token = _otel_context_api.attach(_OtelContext())
+            except Exception:
+                logger.debug("[TRACING] 切断 OTel 父 span 失败（已忽略）", exc_info=True)
+
+        async def _pub(payload: dict) -> None:
+            """发一个**结构性**事件（进桥的有界日志，可被 Last-Event-ID 重放）。"""
+            etype = str(payload.get("type") or "message")
+            await bridge.publish(
+                run_id, etype, {k: v for k, v in payload.items() if k != "type"}
+            )
+
+        async def _pub_delta(kind: str, text: str) -> None:
+            """发一段**逐增量**文本（token / reasoning），走桥的尾部累积器。"""
+            await bridge.publish_delta(run_id, kind, text)
+
+        # ─── 收尾状态位：必须在**第一个 await 之前**就位 ───
+        # 理由：本函数靠 finally 兜底收尾，而它可能在任意 await 点被取消后触发。若那时
+        # 某个状态位还没绑定，收尾自己会 NameError —— 就从"丢一轮消息"升级成"收尾也
+        # 崩、run 行永远停在活跃态"。
+        # 其余收尾要用的状态见上方 `_turn_started_at_ms` 那一片原始声明：它们同样是同步
+        # 语句，且都排在本函数首个 await（下方沙箱产物基线枚举）之前，本来就满足约束。
+        # `_persisted` / `_finalized` 是 P1-b 新增的，原本的对应物（单一 `_saved`）写在
+        # try 之前、即首个 await **之后**，所以必须在这里提前 —— 不能留在原处。
+        # 两者分开而不是一个布尔：取消可能正好落在"已落库但还没落终态 / 还没
+        # publish_end"之间，那种情况不该重复写库，但**必须**补完终态与收尾。
+        _persisted = False
+        _finalized = False
+        _status_on_failure = run_registry.STATUS_INTERRUPTED
+
         invoke_kwargs = {}
         # 如果传了 model_config，通过 runtime context 传给 switch_model middleware
         if body.model_override:
@@ -1688,7 +2050,7 @@ async def chat(
         _files_in_window = 0
         _no_progress_injections = 0
         async def _drain_astream(_input):
-            """消费一轮 agent.astream，实时 yield SSE 事件；内部吞掉异常不崩流。
+            """消费一轮 agent.astream，把事件 publish 进桥；内部吞掉异常不崩本轮。
             M3-v2 继续轮传入 {'messages': [SystemMessage(...)]} 追加系统消息，
             依赖 deepagents astream 继续模式（spike 验证，未通过时自动继续保持关闭）。
             """
@@ -1729,11 +2091,15 @@ async def chat(
                     stream_mode=["messages", "updates"],
                     **invoke_kwargs,
                 )
-                # 包静默保活心跳：模型长思考不吐字节时发 SSE 注释行维持 TCP 连接，
-                # 防止代理 proxy_read_timeout（60s）掐断 → 前端思考消失/无输出。
+                # 包静默保活：模型长思考不吐字节时本该发 SSE 注释行保活 TCP，
+                # 防止代理 proxy_read_timeout（60s）掐断。
+                # ⚠ P1-b：保活帧**不再由这里产生** —— 对客户端的 `": ping"` 改由桥的
+                #   subscribe(heartbeat_interval) 在**订阅侧**发（无消费者自然不用发）。
+                #   这里保留这条哨兵的真正理由变成了**驱动 turn_registry.beat**：
+                #   台账的刷新源不能依赖 SSE chunk（没有订阅者时就没有 chunk）。
                 async for mode, data in _astream_with_heartbeat(_stream, 15.0):
                     if mode == "__heartbeat__":
-                        yield ": ping\n\n"
+                        turn_registry.beat(thread_id)
                         continue
 
                     if (
@@ -1749,7 +2115,7 @@ async def chat(
                                 # 新 step 到来前先通知前端：上一条 AI 消息结束
                                 # 这是关键：让前端能正确分割多条 AIMessage
                                 if _last_debug_step is not None:
-                                    yield f"data: {json.dumps({'type': 'ai_message_start'}, ensure_ascii=False)}\n\n"
+                                    await _pub({'type': 'ai_message_start'})
                                 _last_debug_step = step
                                 thinking_emitted = False  # 新 step → 重置 thinking 标记
                                 generating_emitted = False  # 新 step → 重置 generating 标记
@@ -1792,8 +2158,8 @@ async def chat(
                                 # 持久化埋点：首个 reasoning 事件 → 记录推理起始时刻
                                 if _reasoning_started_at_ms is None:
                                     _reasoning_started_at_ms = int(time.time() * 1000)
-                                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'thinking'}, ensure_ascii=False)}\n\n"
-                            yield f"data: {json.dumps({'type': 'reasoning', 'content': reasoning}, ensure_ascii=False)}\n\n"
+                                await _pub({'type': 'agent_status', 'status': 'thinking'})
+                            await _pub_delta(DELTA_REASONING, reasoning)
                         elif content:
                             # 2. 正常 token：这是"写答案"阶段，状态应为 generating（生成中），
                             #    而非 thinking（思考中）。之前误把首个答案 token 标成 thinking，
@@ -1816,8 +2182,8 @@ async def chat(
                                 # （覆盖路径：无 reasoning 内容直接进 token 的场景，如某些非 CoT 模型）
                                 if _reasoning_ended_at_ms is None:
                                     _reasoning_ended_at_ms = int(time.time() * 1000)
-                                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'generating'}, ensure_ascii=False)}\n\n"
-                            yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+                                await _pub({'type': 'agent_status', 'status': 'generating'})
+                            await _pub_delta(DELTA_TOKEN, content)
 
                     elif mode == "updates":
                         # 根据 node 名称和输出内容解析 Agent 行为
@@ -1844,7 +2210,7 @@ async def chat(
                                     # 用 completion_blocked 事件承载：前端已按
                                     # title/reason/hint 通用渲染，无需改前端；code 独立
                                     # 以便与"零产出/产物缺失/空响应降级"三类在复盘时区分。
-                                    yield f"data: {json.dumps({
+                                    await _pub({
                                         'type': 'completion_blocked',
                                         'code': LOOP_FORCED_STOP_KEY,
                                         'title': '检测到工具调用循环，已强制收敛',
@@ -1857,7 +2223,7 @@ async def chat(
                                             '若反复出现，请把会话 ID 反馈给模型服务维护方。'
                                         ),
                                         'terminated': True,
-                                    }, ensure_ascii=False)}\n\n"
+                                    })
 
                             # 跳过 middleware 节点（非 agent 关键节点）
                             if node_name in (
@@ -1905,18 +2271,13 @@ async def chat(
                             ):
                                 # LLM 调用了工具
                                 for tc in last_msg.tool_calls:
-                                    yield f"data: {
-                                        json.dumps(
-                                            {
+                                    await _pub({
                                                 'type': 'tool_call',
                                                 'tool': tc['name'],
                                                 'args': tc['args'],
                                                 'id': tc['id'],
-                                            },
-                                            ensure_ascii=False,
-                                        )
-                                    }\n\n"
-                                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'running_tool', 'tool': last_msg.tool_calls[0]['name']}, ensure_ascii=False)}\n\n"
+                                            })
+                                await _pub({'type': 'agent_status', 'status': 'running_tool', 'tool': last_msg.tool_calls[0]['name']})
 
                             elif node_name == "tools" and hasattr(last_msg, "name"):
                                 # 工具执行结果
@@ -1964,9 +2325,7 @@ async def chat(
                                     elif tool_name == "run_pdf_diff_stage3":
                                         _skill_state["stage3"] = True
 
-                                yield f"data: {
-                                    json.dumps(
-                                        {
+                                await _pub({
                                             'type': 'tool_result',
                                             'tool': tool_name,
                                             'id': tool_call_id,
@@ -1985,10 +2344,7 @@ async def chat(
                                             )
                                             if content_str
                                             else None,
-                                        },
-                                        ensure_ascii=False,
-                                    )
-                                }\n\n"
+                                        })
 
                                 # ─── 工具连续失败检测：超限提前终止，防止烧满 recursion_limit ───
                                 # 模型在错误循环里空转时（如反复 glob 失败/read 失败），
@@ -2236,9 +2592,7 @@ async def chat(
                                     else:
                                         _emitted_files.add(file_path_virtual)
                                         _files_in_window += 1  # P0：新交付物计数（非空转信号）
-                                        yield f"data: {
-                                                    json.dumps(
-                                                        {
+                                        await _pub({
                                                             'type': 'file_generated',
                                                             'file_name': file_path_virtual.split(
                                                                 '/'
@@ -2248,10 +2602,7 @@ async def chat(
                                                             'file_type': _infer_file_type(
                                                                 file_path_virtual.split('/')[-1]
                                                             ),
-                                                        },
-                                                        ensure_ascii=False,
-                                                    )
-                                                }\n\n"
+                                                        })
                                         # 同时记录到 _generated_files 列表，保存时按
                                         # tool_call_id 精确关联到**发起该工具调用**的那条
                                         # AI（2026-10-12：锚取自 ToolMessage.tool_call_id，
@@ -2271,7 +2622,7 @@ async def chat(
                 # ─── 工具连续失败超限：预期内主动终止，不打印堆栈（非程序 bug）───
                 # 只向前端发 error 事件（比 GraphRecursionError 快几十步）
                 logger.warning("工具连续失败超限提前终止: %s", e)
-                yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
+                await _pub({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'})
             except NoProgressAbortError as e:
                 # ─── P0 无进展循环：中断本轮，注入收敛提示让模型收敛 ───
                 # 触发后 _graph_input 被替换为收敛提示，外层 while 循环继续跑一轮；
@@ -2283,7 +2634,7 @@ async def chat(
                 # be at the beginning'；资源清单 13dab48→f093303 同款教训）。
                 _no_progress_triggered = True  # 标记：收敛轮跳过 M3 零产出拦截
                 logger.warning("[P0] 无进展循环，注入收敛提示: %s", e)
-                yield f"data: {json.dumps({'type': 'agent_status', 'status': 'no_progress', 'content': f'{str(e)[:200]}'}, ensure_ascii=False)}\n\n"
+                await _pub({'type': 'agent_status', 'status': 'no_progress', 'content': f'{str(e)[:200]}'})
                 # 收敛提示：让模型停止重复，验证已有产出并交付
                 _graph_input = {"messages": [HumanMessage(
                     f"系统检测到无进展循环：你已连续多轮重复相同操作（{str(e)[:150]}）"
@@ -2301,7 +2652,7 @@ async def chat(
             except Exception as e:
                 # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
                 logger.exception("Agent 流式处理异常: %s", e)
-                yield f"data: {json.dumps({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'}, ensure_ascii=False)}\n\n"
+                await _pub({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'})
 
 
         # ─── M3 完成门（设计文档）：系统校验本轮 /reports/ 产出，零产出不放行结束 ───
@@ -2315,13 +2666,14 @@ async def chat(
         # P0：NoProgressAbortError 触发标记——收敛轮跳过 M3 零产出拦截
         # （收敛轮刚注入提示，本轮零产出是预期的，不应被完成门拦截）
         _no_progress_triggered = False
-        # 断连强制保存：正常路径保存成功后置 True；流被 GeneratorExit/CancelledError
-        # 打断时 finally 兜底强制保存（2026-08-11 15:26 断连丢"写 skill"指令的修复）
-        _saved = False
+        # P1-b：收尾状态位 `_persisted` / `_finalized` 刻意声明在本函数**开头**（见
+        # 上面「收尾状态位」那个块），**不在这里** —— 从本行往下的第一个 await 是沙箱
+        # 产物基线枚举（`asyncio.to_thread`），取消完全可能正好落在那里；而 finally
+        # 一旦触发就要读这两个位，此刻才声明的话收尾自身会 NameError：把"丢一轮消息"
+        # 升级成"连收尾都崩、run 行永远停在活跃态"。
         try:
             while True:
-                async for _ev in _drain_astream(_graph_input):
-                    yield _ev
+                await _drain_astream(_graph_input)
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
                 _new_files = _after_files - _before_files
 
@@ -2382,7 +2734,7 @@ async def chat(
                         # 归属走 _attach_generated_files 的回退链（本轮最后一条带 tool_calls
                         # 的 AI）。这与流式一致：兜底在流尾 emit，前端也挂到当时最后一条 AI。
                         _generated_files.append(_sf)
-                        yield f"data: {json.dumps({'type': 'file_generated', **_sf}, ensure_ascii=False)}\n\n"
+                        await _pub({'type': 'file_generated', **_sf})
                     if _salvaged:
                         _after_files = snapshot_report_files(
                             settings.report_root, user_id, session_id
@@ -2409,14 +2761,14 @@ async def chat(
                         "→ 提示用户: user=%s, session=%s",
                         _qm_attempt, user_id, session_id,
                     )
-                    yield f"data: {json.dumps({
+                    await _pub({
                         'type': 'quick_mode_notice',
                         'code': 'thinking_disabled_fallback',
                         'title': '本轮为快速模式产出',
                         'reason': _qm_reason,
                         'hint': _qm_hint,
                         'terminated': False,
-                    }, ensure_ascii=False)}\n\n"
+                    })
                     _fallback = None
                 if _fallback is not None:
                     _terminal_fallback = _fallback
@@ -2430,14 +2782,14 @@ async def chat(
                         user_id, session_id, _fallback.get("branch"),
                         _fallback.get("finish_reason"), int(_fallback.get("reasoning_len", 0) or 0),
                     )
-                    yield f"data: {json.dumps({
+                    await _pub({
                         'type': 'completion_blocked',
                         'code': 'model_output_truncated',
                         'title': '模型本轮未产出内容',
                         'reason': _ft_reason,
                         'hint': _ft_hint,
                         'terminated': False,
-                    }, ensure_ascii=False)}\n\n"
+                    })
                     break
                 if _no_progress_triggered:
                     # 收敛轮：跳过零产出拦截，直接继续下一轮（_graph_input 已换成收敛提示）
@@ -2481,14 +2833,14 @@ async def chat(
                             "[M3] skill 产物缺失且重试耗尽: user=%s, session=%s, missing=%s",
                             user_id, session_id, _missing,
                         )
-                        yield f"data: {json.dumps({
+                        await _pub({
                             'type': 'completion_blocked',
                             'code': 'skill_artifact_missing',
                             'title': 'skill 工作流产物缺失',
                             'reason': f'skill 工作流产物缺失: {_missing}',
                             'hint': '请检查是否遗漏 download_from_sandbox 拉回产物',
                             'terminated': True,
-                        }, ensure_ascii=False)}\n\n"
+                        })
                         break
                     _completion_retries += 1
                     logger.warning(
@@ -2527,7 +2879,7 @@ async def chat(
                         if _salvage_done
                         else "宿主报告目录无本轮新交付物"
                     )
-                    yield f"data: {json.dumps({
+                    await _pub({
                         'type': 'completion_blocked',
                         'code': 'no_artifact_in_reports',
                         'title': '本轮未产出交付物',
@@ -2540,7 +2892,7 @@ async def chat(
                         # 模型层真没产出的情况已由 terminal_response 降级信号在更早处分流。
                         'hint': '若任务本应产出文件，请检查是否遗漏 download_from_sandbox / write_file 步骤',
                         'terminated': _completion_retries >= settings.sandbox_completion_gate_max_retries,
-                    }, ensure_ascii=False)}\n\n"
+                    })
                     break
                 _completion_retries += 1
                 logger.warning(
@@ -2552,29 +2904,85 @@ async def chat(
                     "请检查是否遗漏 download_from_sandbox / write_file 步骤，并继续完成。"
                 )]}
                 _before_files = _after_files  # 重新基线
-            _saved = True  # 循环正常结束（未被取消/打断），finally 不再兜底保存
-        finally:
-            # 断连/取消/异常路径：流被中断，正常保存逻辑未执行，强制保存 checkpoint 状态
-            if not _saved:
+            # ─── 正常收尾（顺序有语义，见 _finish_run）───────────────────────────
+            # 刻意放在 try **内**：取消可能正好落在这段里（POST /cancel 或进程关停），
+            # 此时下面的 finally 必须能看出"收尾没做完"并补一次。
+            # turn_ended 兜底：while 循环有 4 个 break 出口都没主动设 turn_ended，
+            # 这里统一设值为 now（持久化时刻），这样无论 break / 异常早退 / 被取消，
+            # 都至少能算到"持久化时刻"。偏差是 _persist_session 的执行耗时
+            #（读 checkpoint + 写 store，几十到几百毫秒，可忽略）。
+            if _turn_ended_at_ms is None:
+                _turn_ended_at_ms = int(time.time() * 1000)
+            await _persist_session(
+                agent, thread_id, user_id, session_id, store, body,
+                generated_files=_generated_files,
+                disk_files=_new_files,
+                completion_blocked=_completion_blocked,
+                terminal_fallback=_terminal_fallback,
+                reasoning_started_at_ms=_reasoning_started_at_ms,
+                reasoning_ended_at_ms=_reasoning_ended_at_ms,
+                turn_started_at_ms=_turn_started_at_ms,
+                turn_ended_at_ms=_turn_ended_at_ms,
+                reason="normal",
+            )
+            _persisted = True
+            # release → 落终态 → publish_end（= 前端看到的 `data: [DONE]`）
+            await _finish_run(run_id, run_registry.STATUS_COMPLETED)
+            _finalized = True
+        except BaseException as e:
+            # 含 CancelledError（POST /cancel 与进程关停都走这条）。这里只做**分类与
+            # 记录**，真正的收尾统一在 finally 里做 —— 收尾本身要 await，而本 task
+            # 此刻已在取消中，只能交给脱离取消作用域的后台任务。
+            if isinstance(e, asyncio.CancelledError):
                 logger.warning(
-                    "[DIAG] SSE 流中断（断连/取消），强制保存当前会话: user=%s, session=%s",
-                    user_id, session_id,
+                    "[RUN] 本轮被取消（用户终止任务 / 进程关停），收尾移交后台任务: "
+                    "run=%s user=%s session=%s",
+                    run_id, user_id, session_id,
                 )
+            else:
+                _status_on_failure = run_registry.STATUS_FAILED
+                logger.exception("[RUN] 本轮异常退出，收尾移交后台任务: run=%s", run_id)
+            raise
+        finally:
+            _beat_task.cancel()
+            # detach 是非阻塞的纯 contextvar 复位，先做：观测侧动作不能拖住后面的收尾。
+            if _ctx_token is not None:
                 try:
-                    # 断连路径也要取走降级信号（若守卫已登记但本轮没走到消费点）：
+                    _otel_context_api.detach(_ctx_token)
+                except Exception:
+                    logger.debug("[TRACING] 恢复 OTel Context 失败（已忽略）", exc_info=True)
+
+            if not _finalized:
+                # 中断 / 异常 / 收尾中途被打断：把剩余收尾交给**脱离取消作用域**的后台任务。
+                #
+                # ⚠ 这里**绝不能 await**：本 task 已在取消中，await 会在第一个 await 点抛
+                #   CancelledError，收尾整段蒸发（4863afff 事故现场：打了「SSE 流中断」
+                #   之后一条日志都没有；实证见 tests/spikes/sse_disconnect_repro.py 的
+                #   direct 场景）。
+                # ⚠ 置位必须先于 create_task：worker task 的 done-callback 也会读它来决定
+                #   要不要兜底收尾，置位后由这里统一负责，避免两条路径重复收尾。
+                _worker_finalize_started["started"] = True
+                try:
+                    # 中断路径也要取走降级信号（若守卫已登记但本轮没走到消费点）：
                     # 否则它会以 thread_id 为键留在登记表里被下一轮消费，造成误报。
                     if _terminal_fallback is None:
                         _terminal_fallback = pop_fallback_signal(thread_id)
-                    # 断连路径：turn_ended 兜底取 now（持久化时刻作为 turn 终点）
-                    interrupted_turn_end = _turn_ended_at_ms if _turn_ended_at_ms is not None else int(time.time() * 1000)
-                    # ⚠ 2026-10-10：此处**绝不能 await**。断连时本 task 已处于取消中，
-                    #   await 会在第一个 await 点抛 CancelledError，保存整段蒸发
-                    #   （实测复现见 tests/spikes/sse_disconnect_repro.py 的 direct 场景，
-                    #    与 4863afff 事故现场逐字吻合：打了"SSE 流中断"后一条日志都没有）。
-                    #   改由事件循环独立承载，并把 release 一并移交（保持"先写台账后 release"）。
-                    _detached_cleanup["task"] = _spawn_detached_save(
+                    _interrupted_end = (
+                        _turn_ended_at_ms
+                        if _turn_ended_at_ms is not None
+                        else int(time.time() * 1000)
+                    )
+                    _spawn_detached_save(
                         _persist_session_and_release(
-                            agent, thread_id, user_id, session_id, store, body,
+                            run_id,
+                            persisted=_persisted,
+                            status=_status_on_failure,
+                            agent=agent,
+                            thread_id=thread_id,
+                            user_id=user_id,
+                            session_id=session_id,
+                            store=store,
+                            body=body,
                             generated_files=_generated_files,
                             disk_files=_new_files,
                             completion_blocked=_completion_blocked,
@@ -2582,94 +2990,132 @@ async def chat(
                             reasoning_started_at_ms=_reasoning_started_at_ms,
                             reasoning_ended_at_ms=_reasoning_ended_at_ms,
                             turn_started_at_ms=_turn_started_at_ms,
-                            turn_ended_at_ms=interrupted_turn_end,
+                            turn_ended_at_ms=_interrupted_end,
                             reason="interrupted",
                         ),
-                        label=f"persist-interrupted:{session_id}",
+                        label=f"finalize-interrupted:{session_id}",
                     )
                 except BaseException as e:
                     # 保底：连 create_task 都失败（事件循环将关闭等）也必须可见，
                     # 绝不静默 —— 走到这里意味着本轮消息真的会丢。
                     logger.error(
-                        "断连强制保存**无法启动**（关键错误，本轮消息可能丢失）: %s",
+                        "[RUN] 中断收尾**无法启动**（关键错误，本轮消息可能丢失）: %s",
                         e, exc_info=True,
                     )
 
-        # ─── SSE 流结束，先保存消息到会话历史，再发 [DONE] ───
-        # 防止前端 [DONE] 后立即编辑导致竞态（消息尚未落盘 → from_index 越界）
-        # turn_ended 兜底：while 循环有 4 个 break 出口都没主动设 turn_ended，
-        # 在这里统一设值为 now（持久化时刻），这样无论 break / 异常早退
-        # / 断连走外层 finally 都至少能算到"持久化时刻"。
-        # 偏差是 _persist_session 函数执行耗时（读 checkpoint + 写 store，
-        # 几十到几百毫秒，可忽略）。
-        if _turn_ended_at_ms is None:
-            _turn_ended_at_ms = int(time.time() * 1000)
-        await _persist_session(
-            agent, thread_id, user_id, session_id, store, body,
-            generated_files=_generated_files,
-            disk_files=_new_files,
-            completion_blocked=_completion_blocked,
-            terminal_fallback=_terminal_fallback,
-            reasoning_started_at_ms=_reasoning_started_at_ms,
-            reasoning_ended_at_ms=_reasoning_ended_at_ms,
-            turn_started_at_ms=_turn_started_at_ms,
-            turn_ended_at_ms=_turn_ended_at_ms,
-            reason="normal",
-        )
-        yield "data: [DONE]\n\n"
+    # ─── 登记 run 并启动 worker（P1-b 的核心：run 不再随连接存活）───────────────
+    # 顺序上刻意放在 setup **之后**：setup 里的失败（沙箱磁盘不足 503 等）要保持 HTTP
+    # 语义 —— 那是"请求能不能开始"，必须同步告诉调用方；而 run 一旦开始，就不该再由
+    # 连接决定生死。
+    run = run_registry.create(user_id=user_id, session_id=session_id, thread_id=thread_id)
+    # 落行，供"刷新后查 active-run"使用（写失败不抛，见 run_registry.persist）
+    await run_registry.persist(store, run)
 
-    async def event_stream():
-        """外层包装：登记在跑轮次 + 把 LangGraph span 顶成真根。
+    # ⚠ 必须 create_task，**不能**在响应生成器里 await：
+    #   worker 要脱离**请求 task** 的取消作用域 —— 客户端断连时 Starlette 取消的是
+    #   请求 task，而 create_task 出来的任务不在它的 task group 里，取消不会传染。
+    #   这正是"刷新不再杀任务"的落点（同一手法的实证见本文件顶部 _spawn_detached_save
+    #   与 tests/spikes/sse_disconnect_repro.py 的 detached 场景）。
+    _worker = asyncio.create_task(_run_worker(run), name=f"run:{run.run_id}")
+    run_registry.attach_task(run.run_id, _worker)
+    _worker.add_done_callback(_on_worker_done)
 
-        acquire/release 与 beat 都在这一层，_event_stream_inner 函数体一行不动：
-        - release 放在 finally：正常结束、异常、以及客户端断连都会走到——**release
-          一定发生在"写台账"之后**，否则删除请求可能趁持久化过程中插进来。
-          ⚠ 2026-10-10 修复后：断连路径的保存已被 detach 出取消作用域（见内层
-          finally 注释），此时本层不再 release，而是把 release 交给承载体保存的
-          后台任务（内层 `_persist_session_and_release`），顺序不变量保持不变。
-        - beat 挂在每个 chunk 上：token/工具事件密集时刷新活跃时间；空转期间由
-          内层的心跳哨兵（::interval 秒一个 chunk）继续刷新。陈旧判定（
-          turn_registry.STALE_MS）兜底进程被杀等 release 未执行的路径。
-        - 空 Context（2026-09-29 重做，原理见 _otel_context_api 上方注释块）：
-          只切断 OTel span 继承，**不新建 span、不写任何 name/input/output** ——
-          LangChain 插桩建的 `LangGraph` span 因此 parent=None 成为真根，Langfuse
-          trace 级三列自然回退到它自己的值（与 9.2/9.3 基线逐字一致），Phoenix 的
-          rootSpan 也一起回来。全程 best-effort：观测依赖缺失、attach/detach 失败
-          都只记 debug 日志，绝不影响 SSE 下发。
-        """
-        turn_registry.acquire(thread_id)
-        _ctx_token = None
-        if _otel_context_api is not None and _OtelContext is not None:
-            try:
-                # 空 Context ⇒ get_current_span() 是 INVALID_SPAN，父子链路在此断开
-                _ctx_token = _otel_context_api.attach(_OtelContext())
-            except Exception:
-                logger.debug("[TRACING] 切断 OTel 父 span 失败（已忽略）", exc_info=True)
-        try:
-            async for _chunk in _event_stream_inner():
-                turn_registry.beat(thread_id)
-                yield _chunk
-        finally:
-            # detach 是非阻塞的纯 contextvar 复位，放 release 之前，
-            # 保证"在跑轮次"台账的释放不被任何观测侧动作拖住。
-            if _ctx_token is not None:
-                try:
-                    _otel_context_api.detach(_ctx_token)
-                except Exception:
-                    logger.debug("[TRACING] 恢复 OTel Context 失败（已忽略）", exc_info=True)
-            if _detached_cleanup["task"] is None:
-                turn_registry.release(thread_id)
-            # else：断连兜底保存已被 detach 到独立任务，release 移交给它在**写完
-            #       台账之后**执行（2026-10-10）—— 维持"release 一定发生在写台账
-            #       之后"的不变量，否则删除请求可能趁持久化过程中插进来。
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            # 禁用 nginx/openresty 缓冲，保证 SSE 实时逐字节下发（配合心跳保活）
-            "X-Accel-Buffering": "no",
-        },
+    logger.warning(
+        "[RUN] 本轮已启动（脱离连接）: run=%s user=%s session=%s",
+        run.run_id, user_id, session_id,
     )
+    return _sse_response(run.run_id, bridge)
+
+
+# ─── P1-b 新增端点 ①：续订（刷新 / 断线后重新挂上同一个 run）──────────────────
+
+
+@router.get("/chat/runs/{run_id}/stream")
+async def resume_run_stream(
+    run_id: str,
+    last_event_id_header: str | None = Header(default=None, alias="Last-Event-ID"),
+    last_event_id_query: str | None = Query(default=None, alias="last_event_id"),
+    bridge=Depends(get_stream_bridge),
+    current_user: dict = Depends(get_current_user),
+):
+    """订阅一个**已经存在**的 run。与 POST /chat 的唯一区别：这里不启动任何东西。
+
+    游标有两个入口，优先取标准头：浏览器原生 `EventSource` 重连时会自动带
+    `Last-Event-ID`；本仓前端走 fetch + ReadableStream，得自己填。同名 query 参数
+    是给手工重放 / 调试用的兜底（用 curl 塞头不方便）。游标缺失或格式不符**不报错**
+    —— 桥会退化成"从头重放"，代价只是多收一段；报错会让用户以为任务没了。
+
+    为什么必须先校验**归属**：桥的 `subscribe` 对未知 run_id 是**惰性建流**的
+    （见 MemoryStreamBridge._get_or_create_stream）——不校验的话，任何编造的 run_id
+    都能换到一个永远只吐心跳的连接：既是资源消耗面，也是纯粹的进程内泄漏。
+    所以顺序固定为：查登记表 → 校验归属 → 才允许订阅。
+
+    已进入终态但尚未被回收（RUN_REAP_DELAY_SECONDS 宽限期内）的 run 仍可订阅，且
+    会立刻拿到重放窗口 + `[DONE]` —— "刷新时任务刚好结束"走的正是这条路。回收之后
+    才返回 404，此时前端应改走 `GET /sessions/{sid}/active-run` 拿 null 并回权威
+    存储重取（P1-c）。
+    """
+    rec = run_registry.get(run_id)
+    # 不区分"不存在"与"不属于你"：统一 404，避免把状态码当成探测别人 run_id 的探针。
+    if rec is None or rec.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="run 不存在")
+
+    last_event_id = last_event_id_header or last_event_id_query
+
+    logger.info(
+        "[RUN] 续订: run=%s user=%s session=%s status=%s cursor=%s",
+        run_id, rec.user_id, rec.session_id, rec.status, last_event_id or "(none)",
+    )
+    return _sse_response(run_id, bridge, last_event_id=last_event_id)
+
+
+# ─── P1-b 新增端点 ②：显式终止（「终止任务」按钮的新落点）─────────────────────
+
+
+@router.post("/chat/runs/{run_id}/cancel")
+async def cancel_run(
+    run_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """显式终止一个 run：取消它的 worker task。**只取消，不在这里落状态。**
+
+    为什么不在这里 mark(interrupted) / publish_end —— 本仓既有的顺序不变量（见
+    `_finish_run`）：前端把 `data: [DONE]` 当作"本轮结束"的唯一判据，收到它就解锁
+    编辑；因此 [DONE] 必须**晚于**消息落盘，否则编辑用的 from_index 会越界
+    （2026-08 实测）。所以落库/终态/[DONE] 一律由 worker 被取消后的收尾链完成
+    （finally → 脱离取消作用域的后台任务）。这里若抢先发 [DONE]，等于亲手造出
+    "前端已解锁、消息却没落盘"的窗口 —— 正是本次改造要消灭的那类时序缺陷。
+
+    返回体里的 `status` 因此是取消**前**的活跃态：它是"已受理"的凭据而非终态。
+    终态请以 `[DONE]` 或 `GET /sessions/{sid}/active-run` 为准。
+    """
+    rec = run_registry.get(run_id)
+    if rec is None or rec.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="run 不存在")
+
+    if not rec.is_active:
+        # 幂等：已经结束了（正常完成 / 已被终止 / 失败）。不报错 —— 前端可能因网络
+        # 重试而重复提交终止，报错只会弹一个对用户毫无意义的红框。
+        logger.info(
+            "[RUN] 终止请求落在已结束的 run 上（幂等返回）: run=%s status=%s",
+            run_id, rec.status,
+        )
+        return {"run_id": run_id, "cancelled": False, "status": rec.status}
+
+    target = rec.task
+    if target is None or target.done():
+        # 窗口极小但真实存在：① run 已 create、worker task 还没 attach（persist 的
+        # await 期间）；② worker 已退出、但兜底收尾还没把状态推成终态。两种都没有可
+        # 取消的目标 —— 如实回报"没取消到"，而不是谎报成功。
+        logger.warning(
+            "[RUN] 终止请求无可取消目标（worker 未 attach 或已退出）: run=%s status=%s",
+            run_id, rec.status,
+        )
+        return {"run_id": run_id, "cancelled": False, "status": rec.status}
+
+    target.cancel()
+    logger.warning(
+        "[RUN] 已请求终止: run=%s user=%s session=%s",
+        run_id, rec.user_id, rec.session_id,
+    )
+    return {"run_id": run_id, "cancelled": True, "status": rec.status}

@@ -11,6 +11,16 @@ def get_checkpointer(request: Request):
     return request.app.state.checkpointer
 
 
+def get_stream_bridge(request: Request):
+    """进程内事件桥（P1-b）。run 往它 publish，SSE 端点从它 subscribe。
+
+    与 store/checkpointer 同样挂在 `app.state`：它是**进程级单例**，不是每请求一个
+    （桥内按 run_id 分流，见 src/core/stream_bridge.py）。单副本前提——扩副本需换
+    Redis 桥，接口不变。
+    """
+    return request.app.state.stream_bridge
+
+
 async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     """从 Authorization Header 解析 JWT，返回当前用户信息。
 

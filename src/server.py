@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .api.router import api_router
+from .core.stream_bridge import MemoryStreamBridge
 from .infra.database import _build_dsn, ReconnectingAsyncPostgresStore, ReconnectingAsyncPostgresSaver
 from .infra import trash
 
@@ -123,6 +124,13 @@ async def lifespan(app: FastAPI):
 
     app.state.store = store
 
+    # ─── 进程内事件桥（P1-b）───────────────────────────────────────────────
+    # 用途：把 run 的生产（worker）与消费（SSE 连接）解耦——浏览器刷新只断订阅，
+    # worker 照常把事件 publish 进桥。生命周期 = 进程（不是每请求），故在这里建。
+    # 单副本前提：桥是进程内的（supports_cross_process=False）；生产 stack 全部
+    # 1/1 副本，扩副本时要换 Redis 桥（接口不变，见 src/core/stream_bridge.py）。
+    app.state.stream_bridge = MemoryStreamBridge()
+
     checkpointer = ReconnectingAsyncPostgresSaver(dsn)
     await checkpointer.setup()
     app.state.checkpointer = checkpointer
@@ -154,6 +162,9 @@ async def lifespan(app: FastAPI):
     # 服务退出时手动关闭连接池
     _trash_sweeper.cancel()
     try:
+        # 先关桥：它内部只有内存态（每 run 的有界日志 + 订阅队列），close() 清掉即可，
+        # 不涉及 IO，所以放在连接池之前、不需要 try 保护。
+        await app.state.stream_bridge.close()
         await store.aclose()
         await checkpointer.aclose()
     finally:
