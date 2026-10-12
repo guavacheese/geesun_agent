@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import uuid
 import logging
 import psycopg
 from contextlib import aclosing
@@ -299,6 +300,25 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
+def _strip_injected_path_hint(content: str) -> str:
+    """去掉 user 消息里注入的 `path_hint` 前缀（回放副本专用）。
+
+    原先是内联在 `_persist_session` 的 message 循环里（`if role == "user" and
+    "\\n\\n" in content`）。P1-c 的 setup 预写（见 `_write_setup_user_message`）也要做
+    同一件事，而**两处必须逐字一致**：预写进去的条目会被流尾的水印视为"已归档"、
+    永不再被改写，任何偏差都会直接变成用户看到的正文差异。
+
+    判据是"按最后一个空行切、取后半段"（历史沿革，未改语义）：`path_hint` 与
+    `body.message` 之间正是用 `\\n\\n` 分隔的，所以切完剩下的就是用户真正输入的内容。
+    注意该判据对"用户自己在正文里打了空行"的消息同样生效（只保留最后一段）——
+    这是既有行为，本次只做提取、不改判据；要修需单独一轮并带迁移。
+    """
+    if "\n\n" not in content:
+        return content
+    parts = content.rsplit("\n\n", 1)
+    return parts[-1].strip() if len(parts) > 1 else parts[0].strip()
+
+
 def _turn_start_index(history: list[dict]) -> int:
     """本轮区间的起点下标（= 最后一条 user 消息的下标 + 1）。
 
@@ -556,6 +576,100 @@ def _warn_oversized_items(items: list[dict], *, prefix: str) -> None:
                 "prefix=%s role=%s id=%s",
                 size, limit, prefix, entry.get("role"), entry.get("id"),
             )
+
+
+async def _write_setup_user_message(
+    store,
+    *,
+    user_id: str,
+    session_id: str,
+    message_id: str,
+    content: str,
+) -> bool:
+    """setup 阶段把本轮 user 消息先写进 store，返回是否真的写入（P1-c D5）。
+
+    ## 为什么必须提前写
+
+    `_persist_session` 只在**流结束**时落盘。所以在此之前，"第 2 轮跑到一半刷新"
+    会撞上两个同源现象：
+
+    · `GET /sessions/{sid}/messages` 返回的是**上一轮**的消息 —— 用户刚问的问题凭空消失；
+    · 续订时桥给新订阅者的首帧是追加型 `token`/`reasoning` 帧，前端会把正文追加到
+      最后一条 AI 消息上，也就是**上一轮的 AI** ⇒ 正文串轮。
+
+    两者的根因都是"本轮 user 消息还不存在"。补上它，续订才有正确的落点。
+
+    ## 为什么能安全重入（不会写重复、也不会被改写）
+
+    `message_id` 是我们生成的 uuid，并作为 `HumanMessage(id=...)` 显式喂进图。
+    实测（`.workbuddy/_probe_msg_id.py`，三组对照）：
+
+    · 显式 id 会被 LangGraph **原样保留**在 checkpoint 里；
+    · dict 形式（改造前的写法）则由框架生成 uuid，控制不了；
+    · 同 id 重发在 `add_messages` 下是**替换**而非追加。
+
+    于是流尾的 `aget_message_watermark` 拿到的 `last_stored_id` 正是它，
+    `_plan_message_append` 从它**之后**开始追加 ⇒ 只补写 AI 消息；本条既不会被
+    重复写，也不会被流尾用另一份 content 改写。
+
+    ⚠ 这条 id **不是可选装饰**。预写会把水位的 `last_stored_id` 从"上一轮的 AI 消息"
+    换成"我们刚写的这一条"，所以这一条必须能被 `_plan_message_append` 在 history 里
+    认出来 —— 否则水印会**永久退化成 by_length**，等于亲手关掉了那条专门对抗
+    `SummarizationMiddleware` 压缩的 by_id 路径。压缩后 `len(history)` 小于
+    `prev_count`，by_length 判为"无新增"，本轮 AI 回答**一条都写不进去**：没有异常、
+    没有日志，只有用户刷新后看不到回答。负向对照见
+    `tests/api/test_setup_user_message.py::test_missing_id_loses_turn_when_history_compressed`。
+
+    若 setup 这次没写成（DB 瞬时故障 / 存量仍是旧格式），流尾会退化成按 id 定位到
+    上一轮的条目，把本轮 user + AI 一起补上 —— 与改造前一致，不丢数据。
+
+    ## 调用方必须先登记 turn_registry
+
+    删会话端点的护栏查的是 `turn_registry.is_active`。若等 worker 起来才登记，
+    删除请求可以抢在本次预写之前完成 → 我们随后把消息写进一个**已被删除**的会话，
+    留下孤儿行（`session_existed_at_start` 守卫只能拦住"流尾再写"，拦不住这一次）。
+    所以 chat 端点在本函数**之前**就 acquire，见那里的注释。
+    """
+    namespace = ("messages", user_id, session_id)
+    prefix = ".".join(namespace)
+    try:
+        prev_count, _last_id, legacy_rows = await store.aget_message_watermark(prefix)
+    except Exception:
+        logger.exception("[SETUP] 读取消息水位失败，跳过 setup 预写: session=%s", session_id)
+        return False
+
+    if legacy_rows:
+        # 与 _persist_session 同一道部署顺序防线：存量还是旧格式时绝不写入 ——
+        # 新旧格式并存会让迁移脚本的前置守卫拒绝执行，留下需要人工对账的中间态。
+        logger.warning(
+            "[SETUP] 会话 %s 存量仍为旧格式（%d 条），跳过 setup 预写",
+            session_id, legacy_rows,
+        )
+        return False
+
+    entry = {
+        "id": message_id,
+        "role": "user",
+        "content": content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _warn_oversized_items([entry], prefix=prefix)
+    try:
+        await store.awrite_messages(
+            namespace, [(message_key(prev_count + 1), entry)]
+        )
+    except Exception:
+        # 预写失败不阻断本轮：消息最终由流尾的 _persist_session 兜底落盘。
+        logger.exception(
+            "[SETUP] 预写本轮 user 消息失败（不阻断，流尾会兜底）: session=%s", session_id
+        )
+        return False
+
+    logger.warning(
+        "[SETUP] 已预写本轮 user 消息: session=%s key=%d id=%s content=%d 字符",
+        session_id, prev_count + 1, message_id, len(content),
+    )
+    return True
 
 
 async def _aget_state_with_retry(agent, thread_id: str, max_attempts: int = 3):
@@ -1357,6 +1471,28 @@ async def chat(
 
     user_message = f"{path_hint}\n{body.message}{file_hint}"
 
+    # ─── P1-c D5：本轮 user 消息的"预写坐标" ──────────────────────────────────
+    # ① id 由我们生成并显式喂给 LangGraph（下面的 `HumanMessage(id=...)`）。这是 D5
+    #    的承重点：预写之后，流尾水位的 last_stored_id 就变成了"我们刚写的这一条"，
+    #    它必须能在 checkpoint 的 history 里被认出来，否则水印会永久退化成 by_length
+    #    —— 那条专门对抗 SummarizationMiddleware 压缩的 by_id 路径被关掉后，压缩会
+    #    让 len(history) 小于 prev_count，于是判为"无新增"，本轮 AI 回答一条都写不进去
+    #    （无异常、无日志，只有刷新后看不到回答）。
+    #    实测（.workbuddy/_probe_msg_id.py，三组对照）：显式 id 被 LangGraph 原样保留；
+    #    dict 形式（改造前的写法）由框架生成 uuid，控制不了；同 id 重发在 add_messages
+    #    下是替换而非追加。
+    # ② content 走与流尾**完全相同**的清洗（裁剪 + 去 path_hint 前缀）：预写的条目
+    #    之后不会再被流尾改写（水印只追加其后），内容必须一次对、且与改造前一致。
+    # 编辑后重发（continue_from_state）不注入新 user 消息 → 不预写。
+    setup_user_message_id: str | None = (
+        None if body.continue_from_state else str(uuid.uuid4())
+    )
+    setup_user_message_content = (
+        _strip_injected_path_hint(_clip(user_message, settings.persist_max_content_chars))
+        if setup_user_message_id
+        else ""
+    )
+
     # 构造 graph 输入：
     graph_config = {"configurable": {"thread_id": thread_id}}
 
@@ -1396,7 +1532,13 @@ async def chat(
                 {"messages": latest.values.get("messages", [])} if latest else None
             )
     else:
-        graph_input = {"messages": [{"role": "user", "content": user_message}]}
+        # 显式带 id（见上方 setup_user_message_id 注释）：这个 id 是 setup 预写条目
+        # 与 checkpoint 之间唯一的连接点，丢了它流尾就定位不到水印。
+        graph_input = {
+            "messages": [
+                HumanMessage(content=user_message, id=setup_user_message_id)
+            ]
+        }
 
     async def _persist_session(
         agent,
@@ -1526,11 +1668,10 @@ async def chat(
                     reasoning = _clip(reasoning, settings.persist_max_content_chars)
 
                     # 4. 去掉 user 消息中的 path_hint 前缀
-                    if role == "user" and "\n\n" in content:
-                        parts = content.rsplit("\n\n", 1)
-                        content = (
-                            parts[-1].strip() if len(parts) > 1 else parts[0].strip()
-                        )
+                    #    抽成纯函数与 setup 预写共用 —— 预写条目不会被流尾改写，
+                    #    两处判据必须逐字一致，见 _strip_injected_path_hint 文档。
+                    if role == "user":
+                        content = _strip_injected_path_hint(content)
 
                     # 5. 不再跳过中间 AI 消息
                     #    之前跳过的初衷是避免"只有 thinking 折叠块 + 空正文"的奇怪气泡，
@@ -3003,20 +3144,46 @@ async def chat(
                         e, exc_info=True,
                     )
 
-    # ─── 登记 run 并启动 worker（P1-b 的核心：run 不再随连接存活）───────────────
-    # 顺序上刻意放在 setup **之后**：setup 里的失败（沙箱磁盘不足 503 等）要保持 HTTP
-    # 语义 —— 那是"请求能不能开始"，必须同步告诉调用方；而 run 一旦开始，就不该再由
-    # 连接决定生死。
-    run = run_registry.create(user_id=user_id, session_id=session_id, thread_id=thread_id)
-    # 落行，供"刷新后查 active-run"使用（写失败不抛，见 run_registry.persist）
-    await run_registry.persist(store, run)
+    # ─── 登记轮次（P1-c D5：从 worker 提前到端点）─────────────────────────────────
+    # 原来只在 _run_worker 里 acquire。现在 setup 阶段要往 store 预写本轮 user 消息，
+    # 而删会话端点的护栏查的正是这张表 —— 若仍等 worker 起来才登记，删除请求可以抢在
+    # 预写之前完成，我们随后就把消息写进一个**已被删除**的会话（孤儿行）。抢先一步
+    # 登记即可把这个窗口关掉。acquire 是同步 dict 写且幂等，worker 里那句再调一次
+    # 只是刷新时刻戳，无副作用。
+    turn_registry.acquire(thread_id)
 
-    # ⚠ 必须 create_task，**不能**在响应生成器里 await：
-    #   worker 要脱离**请求 task** 的取消作用域 —— 客户端断连时 Starlette 取消的是
-    #   请求 task，而 create_task 出来的任务不在它的 task group 里，取消不会传染。
-    #   这正是"刷新不再杀任务"的落点（同一手法的实证见本文件顶部 _spawn_detached_save
-    #   与 tests/spikes/sse_disconnect_repro.py 的 detached 场景）。
-    _worker = asyncio.create_task(_run_worker(run), name=f"run:{run.run_id}")
+    try:
+        # D5：预写本轮 user 消息（失败只告警，绝不阻断本轮 —— 流尾会兜底）
+        if setup_user_message_id is not None:
+            await _write_setup_user_message(
+                store,
+                user_id=user_id,
+                session_id=session_id,
+                message_id=setup_user_message_id,
+                content=setup_user_message_content,
+            )
+
+        # ─── 登记 run（P1-b 的核心：run 不再随连接存活）──────────────────────────
+        # 顺序上刻意放在 setup **之后**：setup 里的失败（沙箱磁盘不足 503 等）要保持
+        # HTTP 语义 —— 那是"请求能不能开始"，必须同步告诉调用方；而 run 一旦开始，
+        # 就不该再由连接决定生死。
+        run = run_registry.create(user_id=user_id, session_id=session_id, thread_id=thread_id)
+        # 落行，供"刷新后查 active-run"使用（写失败不抛，见 run_registry.persist）
+        await run_registry.persist(store, run)
+
+        # ⚠ 必须 create_task，**不能**在响应生成器里 await：
+        #   worker 要脱离**请求 task** 的取消作用域 —— 客户端断连时 Starlette 取消的是
+        #   请求 task，而 create_task 出来的任务不在它的 task group 里，取消不会传染。
+        #   这正是"刷新不再杀任务"的落点（同一手法的实证见本文件顶部 _spawn_detached_save
+        #   与 tests/spikes/sse_disconnect_repro.py 的 detached 场景）。
+        _worker = asyncio.create_task(_run_worker(run), name=f"run:{run.run_id}")
+    except BaseException:
+        # 还没把 run 交给 worker（上面任何一步炸了，含请求被取消）⇒ 台账必须回退。
+        # 不回退的话这个会话会因为"看起来还有轮次在跑"而在 STALE_MS（5 分钟）内删不掉，
+        # 而实际上根本没有 worker 会来 release 它。
+        turn_registry.release(thread_id)
+        raise
+
     run_registry.attach_task(run.run_id, _worker)
     _worker.add_done_callback(_on_worker_done)
 

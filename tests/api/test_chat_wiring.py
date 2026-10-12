@@ -29,6 +29,16 @@
        不变量：release 让位于持久化、落终态早于 `[DONE]`。
        SSE 帧格式与三个新端点的契约断言在 tests/api/test_run_endpoints.py。
 
+    ⑤ 2026-10-12（P1-c D5）：setup 阶段预写本轮 user 消息。三条断言守的是**顺序与
+       承重点**，都不是"看一眼代码像对的"：
+         · 预写必须发生在 `turn_registry.acquire` **之后** —— 删会话端点的护栏查的
+           就是这张表，先写库再登记会给删除请求留一个"删完之后又被写回来"的窗口；
+         · 预写必须发生在 `run_registry.create` **之前** —— 先让数据可见、再让 run
+           可见，否则刷新撞在中间会看到"有 run 在跑、但本轮提问不存在"；
+         · 喂给图的 `HumanMessage` 必须显式带 `id=setup_user_message_id`。id 对不上
+           时水印会退化成 by_length，压缩场景下**整轮 AI 回答静默丢失**
+           （语义级证据在 tests/api/test_setup_user_message.py 的正/负向对照）。
+
 运行：
     docker run --rm -v D:/workspace/geesun_agent:/mnt -w /mnt \
       -e PYTHONPATH=/mnt/.testdeps --entrypoint /app/.venv/bin/python \
@@ -478,3 +488,189 @@ def test_disconnect_detached_detector_is_sensitive():
     assert _awaits_in(_disconnect_branch(polluted)), (
         "注入 await 后检测器仍然报「无 await」—— 该断言无法捕获「保存改回裸 await」的回归"
     )
+
+
+# ─── ⑤ P1-c D5：setup 预写本轮 user 消息 ─────────────────────────────────────
+
+
+def _callee_name(node: ast.Call) -> str | None:
+    """调用的可读名：``f(...)`` → ``"f"``，``o.m(...)`` → ``"o.m"``，其余 None。"""
+    f = node.func
+    if isinstance(f, ast.Name):
+        return f.id
+    if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+        return f"{f.value.id}.{f.attr}"
+    return None
+
+
+class _CallsInScope(ast.NodeVisitor):
+    """收集「当前函数体」里的调用，**不下钻嵌套函数/类**。
+
+    必须排除嵌套：``chat()`` 里嵌着 ``_run_worker`` / ``_finish_run`` / ``_persist_session``
+    一整套闭包，而 ``_run_worker`` 自己也调 ``turn_registry.acquire``。若把它们算进来，
+    "顺序正确"会被那个更早出现的同名调用**蒙对** —— 检测器就失去意义了（P1-b 之前
+    acquire 确实只在 worker 里，正是这条断言要防的退化）。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str]] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """不下钻（否则会收进嵌套闭包的调用）。"""
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """不下钻。"""
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """不下钻。"""
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _callee_name(node)
+        if name is not None:
+            self.calls.append((node.lineno, name))
+        self.generic_visit(node)
+
+
+def _chat_endpoint_calls(tree: ast.Module) -> list[tuple[int, str]]:
+    """``chat`` 端点**自身**函数体里的调用，按行号排序（不含嵌套闭包）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "chat":
+            v = _CallsInScope()
+            for stmt in node.body:
+                v.visit(stmt)
+            return sorted(v.calls)
+    return []
+
+
+def _index_of(calls: list[tuple[int, str]], name: str) -> int | None:
+    for i, (_line, n) in enumerate(calls):
+        if n == name:
+            return i
+    return None
+
+
+def _acquire_precedes_prewrite(tree: ast.Module) -> bool:
+    calls = _chat_endpoint_calls(tree)
+    i_acq = _index_of(calls, "turn_registry.acquire")
+    i_pre = _index_of(calls, "_write_setup_user_message")
+    return i_acq is not None and i_pre is not None and i_acq < i_pre
+
+
+def _prewrite_precedes_run_create(tree: ast.Module) -> bool:
+    calls = _chat_endpoint_calls(tree)
+    i_pre = _index_of(calls, "_write_setup_user_message")
+    i_run = _index_of(calls, "run_registry.create")
+    return i_pre is not None and i_run is not None and i_pre < i_run
+
+
+def test_setup_prewrite_registers_turn_before_writing():
+    """预写必须晚于台账登记。
+
+    删会话端点的护栏（``turn_registry.is_active``）查的就是这张表。反过来先写库再登记，
+    删除请求可以抢在预写之前完成，我们随后就把消息写进一个**已被删除**的会话 —— 而
+    ``session_existed_at_start`` 守卫只能拦住"流尾再写"，拦不住 setup 这一次。
+    """
+    assert _acquire_precedes_prewrite(_tree()), (
+        "chat 端点的 setup 结构里找不到「先 turn_registry.acquire 再 _write_setup_user_message」"
+        "的顺序 —— 要么预写没接上，要么登记被挪到了预写之后（删除护栏出现窗口）"
+    )
+
+
+def test_setup_prewrite_precedes_run_registration():
+    """预写必须先于 run 登记：先让数据可见，再让 run 可见。
+
+    反过来的话，刷新恰好撞在两者之间会拿到「有 run 在跑、但本轮提问还不存在」的组合 ——
+    前端会订阅到一个没有落点的 run（正文会拼到上一轮的 AI 上）。
+    """
+    assert _prewrite_precedes_run_create(_tree()), (
+        "chat 端点里 _write_setup_user_message 没有排在 run_registry.create 之前"
+    )
+
+
+def test_graph_input_carries_explicit_message_id():
+    """喂给图的 HumanMessage 必须显式带 ``id=setup_user_message_id``。
+
+    这是 D5 的承重点：预写把水位的 ``last_stored_id`` 换成了"刚写的这条"，它必须能被
+    ``_plan_message_append`` 在 checkpoint 的 history 里认出来；认不出来就退化成
+    by_length，而压缩会把 history 变短 ⇒ 判"无新增" ⇒ 本轮 AI 回答静默丢失。
+    实测依据与正/负向对照见 tests/api/test_setup_user_message.py。
+    """
+    found = False
+    for node in ast.walk(_tree()):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != "HumanMessage":
+            continue
+        for kw in node.keywords:
+            if (
+                kw.arg == "id"
+                and isinstance(kw.value, ast.Name)
+                and kw.value.id == "setup_user_message_id"
+            ):
+                found = True
+    assert found, (
+        "graph_input 的 HumanMessage 没有带 id=setup_user_message_id —— "
+        "setup 预写的条目在流尾定位不到，压缩场景下本轮 AI 回答会静默丢失"
+    )
+
+
+class _AcquireDropper(ast.NodeTransformer):
+    """负向对照用：摘掉**函数体顶层**的 ``turn_registry.acquire`` 语句。"""
+
+    @staticmethod
+    def _drop(node):
+        node.body = [
+            n for n in node.body
+            if not (
+                isinstance(n, ast.Expr)
+                and isinstance(n.value, ast.Call)
+                and isinstance(n.value.func, ast.Attribute)
+                and n.value.func.attr == "acquire"
+            )
+        ]
+        return node
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        return self._drop(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self.generic_visit(node)
+        return self._drop(node)
+
+
+def test_acquire_order_detector_is_sensitive():
+    """负向对照：摘掉 acquire 后检测器必须报 False —— 否则本组断言等于空测。"""
+    assert _acquire_precedes_prewrite(_tree())  # 当前实现必须通过
+
+    stripped = _AcquireDropper().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
+    ast.fix_missing_locations(stripped)
+    assert not _acquire_precedes_prewrite(stripped), (
+        "摘掉 acquire 后检测器仍报「顺序正确」—— 该断言无法捕获删除护栏窗口的回归"
+    )
+
+
+class _IdKwargDropper(ast.NodeTransformer):
+    """负向对照用：把 HumanMessage 的 ``id=`` 关键字参数摘掉（模拟改回 dict 形式）。"""
+
+    def visit_Call(self, node: ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id == "HumanMessage":
+            node.keywords = [kw for kw in node.keywords if kw.arg != "id"]
+        return self.generic_visit(node)
+
+
+def test_message_id_detector_is_sensitive():
+    """负向对照：去掉 ``id=`` 后检测器必须报缺失，否则本组断言等于空测。"""
+    def _has_id_kwarg(tree: ast.Module) -> bool:
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            if node.func.id == "HumanMessage" and any(kw.arg == "id" for kw in node.keywords):
+                return True
+        return False
+
+    assert _has_id_kwarg(_tree())
+
+    stripped = _IdKwargDropper().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
+    ast.fix_missing_locations(stripped)
+    assert not _has_id_kwarg(stripped), "摘掉 id= 后检测器仍然报有 —— 本组断言等于空测"
