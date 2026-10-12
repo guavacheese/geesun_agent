@@ -92,10 +92,25 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
+def _turn_start_index(history: list[dict]) -> int:
+    """本轮区间的起点下标（= 最后一条 user 消息的下标 + 1）。
+
+    找不到 user 消息时（history 被摘要压缩截断、或系统续跑没有用户消息）返回 0 ——
+    即退化为「整份 history」= 旧口径。此处刻意保留该退化：无法判定轮次边界时沿用
+    已在生产跑过的旧口径，不会比它更差。
+
+    纯函数，便于 spike 用 ast 提取后直接断言。
+    """
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("role") == "user":
+            return i + 1
+    return 0
+
+
 def _last_ai_index_for_turn(history: list[dict]) -> int | None:
     """「本轮」最后一条 AI 消息在 history 里的下标；本轮没有 AI 产出则返回 None。
 
-    「本轮」= **最后一条 user 消息之后**（不含该 user）的那一段。
+    「本轮」= **最后一条 user 消息之后**（不含该 user）的那一段（见 `_turn_start_index`）。
 
     为什么不能对整份 history 直接倒序找 AI（2026-10-12 修）：`history` 是
     `_persist_session` 从 checkpoint **重建的全量快照**，不止本轮。改前写法是
@@ -104,17 +119,9 @@ def _last_ai_index_for_turn(history: list[dict]) -> int | None:
     **上一轮**的 AI，把本轮耗时写到上一轮那条上——实测：上一轮自己的 4500ms
     被改写成本轮的 1000ms（`tests/spikes/turn_duration_per_turn.py` S3）。
 
-    找不到 user 消息时（history 被摘要压缩截断、或系统续跑没有用户消息）`start`
-    保持 0 → 退化为「整份倒序第一条 AI」= **旧行为**。此处刻意保留该退化：无法
-    判定轮次边界时沿用已在生产跑过的旧口径，不会比它更差。
-
     纯函数，便于 spike 用 ast 提取后直接断言。
     """
-    start = 0
-    for i in range(len(history) - 1, -1, -1):
-        if history[i].get("role") == "user":
-            start = i + 1
-            break
+    start = _turn_start_index(history)
     for i in range(len(history) - 1, -1, -1):
         if i >= start and history[i].get("role") == "ai":
             return i
@@ -141,6 +148,72 @@ def _mark_turn_last_ai(history: list[dict], fields: dict) -> int | None:
         return None
     history[idx].update(fields)
     return idx
+
+
+def _attach_generated_files(
+    history: list[dict], generated_files: list[dict]
+) -> list[dict]:
+    """把本轮产出关联到**发起该工具调用**的那条 AI 上；返回实际写入的条目列表。
+
+    归属优先级（2026-10-12 重写）：
+
+      1. **`tool_call_id` 精确匹配**——本轮区间内某条 AI 的 `tool_calls[].id` 命中，
+         它就是产出该文件的工具调用的发起者。这与流式阶段逐字一致：`file_generated`
+         紧跟 tool_call 之后到达，前端 `attachGeneratedFile` 挂到"当时最后一条 AI"，
+         那条正是发起者（id 同源：ToolMessage.tool_call_id ↔ AIMessage.tool_calls[].id，
+         落盘第一遍建 `tool_results` 映射用的就是同一个键）。
+      2. 无 id / id 匹配不上 → 本轮**最后一条带 tool_calls** 的 AI。
+      3. 本轮完全没有带 tool_calls 的 AI → 本轮最后一条 AI。
+      4. 本轮**没有任何 AI** → 什么都不写（返回空列表），绝不挂到上一轮。
+
+    为什么不用「第一条带 tool_calls 的 AI」（改前实现）：那份 history 是全量快照，
+    「第一条」跨轮会命中**最早那轮**；即使只看本轮，多段工具调用（write_file →
+    download_from_sandbox → …）时它也会把所有文件堆到**第一段**上，而流式阶段是按段
+    分散显示的——刷新后卡片"重排到一条气泡下"就是这么来的（`tests/spikes/
+    turn_duration_per_turn.py` S6 有该场景）。改前的注释声明的意图其实正是
+    「发起 tool_call 的那条」，但实现没做到；本函数是把该意图按 id 精确实现。
+
+    `tool_call_id` 只是**本函数内部**的归属锚，写进 entry 前会剥离，不进入对前端的
+    数据契约（`GeneratedFile` 字段不变）。
+
+    纯函数，便于 spike 用 ast 提取后直接断言。
+    """
+    if not generated_files:
+        return []
+
+    start = _turn_start_index(history)
+    turn_ai_idxs = [
+        i for i in range(start, len(history)) if history[i].get("role") == "ai"
+    ]
+    if not turn_ai_idxs:
+        return []
+
+    # tool_call_id → 本轮 AI 下标（首次出现者，同一 id 不会跨 AI 重复）
+    by_tool_call: dict[str, int] = {}
+    for i in turn_ai_idxs:
+        for tc in history[i].get("tool_calls") or []:
+            tcid = tc.get("id") if isinstance(tc, dict) else None
+            if tcid:
+                by_tool_call.setdefault(str(tcid), i)
+
+    fallback_with_tc = next(
+        (i for i in reversed(turn_ai_idxs) if history[i].get("tool_calls")), None
+    )
+    fallback_any = turn_ai_idxs[-1]
+
+    pending: dict[int, list[dict]] = {}
+    for f in generated_files:
+        tcid = f.get("tool_call_id")
+        idx = by_tool_call.get(str(tcid)) if tcid else None
+        if idx is None:
+            idx = fallback_with_tc if fallback_with_tc is not None else fallback_any
+        entry = {k: v for k, v in f.items() if k != "tool_call_id"}
+        pending.setdefault(idx, []).append(entry)
+
+    for idx, items in pending.items():
+        history[idx].setdefault("generated_files", [])
+        history[idx]["generated_files"].extend(items)
+    return [e for items in pending.values() for e in items]
 
 
 def _plan_message_append(
@@ -1201,25 +1274,19 @@ async def chat(
                             session_id, len(history),
                         )
 
-                # 循环结束后，将 generated_files 关联到合适的 AI 消息
-                # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
-                #  file_generated 事件在 tool_call 后立即到达，前端把文件卡片加到
-                #  当前最后一条 AI 消息，也就是发起 tool_call 的那条）。如果没有任何
-                #  AI 消息带 tool_call（比如文件由其他方式生成），fallback 到最后一条
-                #  AI 消息。
+                # 循环结束后，将 generated_files 关联到合适的 AI 消息。
+                #
+                # 归属判据 2026-10-12 重写（改前是「全文第一条带 tool_calls 的 AI」，
+                # 跨轮会命中**最早那轮**、本轮多段工具调用时会全堆到第一段上——与
+                # 流式阶段按段分散显示不一致）。现在按 tool_call_id 精确匹配到
+                # **发起该工具调用**的那条 AI，回退链见 _attach_generated_files。
                 if generated_files:
-                    target_idx = None
-                    for i, e in enumerate(history):
-                        if e.get("role") == "ai" and e.get("tool_calls"):
-                            target_idx = i
-                            break
-                    if target_idx is None:
-                        for i in range(len(history) - 1, -1, -1):
-                            if history[i].get("role") == "ai":
-                                target_idx = i
-                                break
-                    if target_idx is not None:
-                        history[target_idx]["generated_files"] = list(generated_files)
+                    if not _attach_generated_files(history, generated_files):
+                        logger.warning(
+                            "[DIAG] 本轮无 AI 产出，跳过 generated_files 关联"
+                            "（避免挂到上一轮的 AI 上）: session=%s, files=%d",
+                            session_id, len(generated_files),
+                        )
 
                 # M3 完成门：零产出时在**本轮**最后一条 AI 消息上标记失败状态，
                 # 前端可据此展示"未产出交付物"徽标，避免"状态不明"。
@@ -2107,7 +2174,12 @@ async def chat(
                                                         ensure_ascii=False,
                                                     )
                                                 }\n\n"
-                                        # 同时记录到 _generated_files 列表，保存时关联到对应 AI 消息
+                                        # 同时记录到 _generated_files 列表，保存时按
+                                        # tool_call_id 精确关联到**发起该工具调用**的那条
+                                        # AI（2026-10-12：锚取自 ToolMessage.tool_call_id，
+                                        # 与落盘时 AIMessage.tool_calls[].id 同源）。
+                                        # 该键仅供 _attach_generated_files 内部归属用，
+                                        # 不会写进 entry。
                                         _generated_files.append({
                                             "file_name": file_path_virtual.split('/')[-1],
                                             "file_path": file_path_virtual,
@@ -2115,6 +2187,7 @@ async def chat(
                                             "file_type": _infer_file_type(
                                                 file_path_virtual.split('/')[-1]
                                             ),
+                                            "tool_call_id": tool_call_id,
                                         })
             except ToolLoopAbortError as e:
                 # ─── 工具连续失败超限：预期内主动终止，不打印堆栈（非程序 bug）───
@@ -2227,6 +2300,9 @@ async def chat(
                             continue
                         _emitted_files.add(_sf["file_path"])
                         _files_in_window += 1  # 新交付物计数（非空转信号，与 B① 一致）
+                        # 注意：沙箱兜底拉回**没有**对应的工具调用 ⇒ 不带 tool_call_id，
+                        # 归属走 _attach_generated_files 的回退链（本轮最后一条带 tool_calls
+                        # 的 AI）。这与流式一致：兜底在流尾 emit，前端也挂到当时最后一条 AI。
                         _generated_files.append(_sf)
                         yield f"data: {json.dumps({'type': 'file_generated', **_sf}, ensure_ascii=False)}\n\n"
                     if _salvaged:

@@ -188,9 +188,55 @@ download_from_sandbox(
 - 持久化前 `max(0, ...)` 兜底，防止异常时间戳顺序（end < start）写入负数
 
 **验证**：`python tests/spikes/chat_persist_duration.py` 跑 8 个对照表（全 PASS）。
-跨轮语义与归属判据另见 `tests/spikes/turn_duration_per_turn.py`（2026-10-12 加，35 断言）——
-它覆盖「每轮各自的耗时」「本轮无 AI 产出时不写到上一轮」「`completion` 标记与耗时同源」，
-并用 ast 提取真实函数（非逻辑复刻）。
+跨轮语义与归属判据另见 `tests/spikes/turn_duration_per_turn.py`（2026-10-12 加，**52 断言 / 零复刻**）——
+它覆盖「每轮各自的耗时」「本轮无 AI 产出时不写到上一轮」「`completion` 标记与耗时同源」
+「`generated_files` 按 `tool_call_id` 精确归属」，并用 ast 提取真实函数（非逻辑复刻）。
+
+### 2026-10-12：本轮事实的归属判据统一收敛（history 是全量快照，不是本轮数据）
+
+**症状**：① 上一轮的 AI 被写上**本轮**的耗时（实测 4500ms 被改写成本轮的 1000ms）；
+② 本轮无 AI 产出时，「未产出交付物」/「模型输出截断」徽标打到**上一轮**的 AI 上；
+③ 本轮产出的文件卡片刷新后"重排"到更早的气泡下。
+
+**根因（同一族）**：`_persist_session` 拿到的 `history` 是每轮从 checkpoint **重建的全量快照**，
+而三处「本轮事实」的落点判据各自内联，且都写成了"对整份 history 找 AI"：
+
+| 落点 | 改前判据 | 后果 |
+|---|---|---|
+| `turn_duration_ms` | 整份**倒序**第一条 AI | 跨轮时命中上一轮 |
+| `completion` / `stop_reason` | 整份**倒序**第一条 AI | 徽标挂到上一轮（比耗时更显眼） |
+| `generated_files` | 整份**正序**第一条带 `tool_calls` 的 AI | 跨轮时命中**最早**那轮；本轮多段工具调用时全堆到第一段 |
+
+**修复**：判据收敛为三个纯函数，单一来源：
+- `_turn_start_index(history)` —— 本轮区间起点（最后一条 user 之后）；找不到 user 时返回 0
+  = 退化为"整份 history"= **旧口径刻意保留**（无法判定边界时不比旧行为更差）。
+- `_last_ai_index_for_turn(history)` / `_mark_turn_last_ai(history, fields)` —— 本轮最后一条 AI；
+  本轮无 AI 则**不打点**并留 WARNING（`宁可缺事实，不给错归属`）。
+- `_attach_generated_files(history, generated_files)` —— 按 **`tool_call_id` 精确匹配**到
+  "发起该工具调用的那条 AI"（锚取自 `ToolMessage.tool_call_id`，与落盘时
+  `AIMessage.tool_calls[].id` 同源）；无 id / 匹配不上 → 本轮最后一条带 `tool_calls` 的 AI
+  → 本轮最后一条 AI → 本轮无 AI 则**什么都不写**。`tool_call_id` 仅作内部锚，写进 entry 前剥离，
+  **对前端的 `GeneratedFile` 契约不变**。
+
+**教训**：
+- **一份"全量快照"上的判据，先问"它属于本轮还是整个会话"**。history 是快照，不是本轮 delta。
+- **判据分叉 = 同一个 bug 还有活的路径**。"修了一半"比"没修"更难发现：这次先修了耗时，
+  另两处仍在，于是同类故障换了个位置继续出现。三处落点统一走同一函数后，
+  才没有"只改一处"的空间。
+- **注释声明的意图与实现不符，是下一次误读的源头**：`generated_files` 那段旧注释写的是
+  "与流式阶段一致——挂到发起 tool_call 的那条"，实现却是"第一条带 tool_calls 的"。
+  这种注释比没有注释更危险（本次 10-10 的 `turn_duration_ms` 误判就源于同类误导）。
+- 修这类判据前**必须先读置位分支**，确认"极端情况"是否会变成"功能被改没"：
+  `blocked_no_output` 的常见场景是模型零工具调用纯复述（**本轮有 AI**）、
+  `model_output_truncated` 的 `THINKING_TRUNCATED`/`THINKING_ONLY` 分支必有 AI 条目，
+  只有 `FULLY_EMPTY` 可能没有 ⇒ 修复只影响"连 AI 条目都没有"的极端情形，那时本无载体可挂。
+
+**未修（已知，属文件关联语义之外）**：存量已写入的错位字段不会被自动修正——
+落盘走 `_plan_message_append` 增量追加，已归档条目不重写，故修复只影响此后新写入的轮次。
+
+**验证**：`python tests/spikes/turn_duration_per_turn.py` → **52 PASS / 0 FAIL**
+（S1 跨轮保留 / S2 已知窄缝 / S3 耗时归属 / S3b 不误伤 / S4 轮次边界 7 例 /
+S5 completion 同源 9 例 / S6 产物归属 13 例 / 11 条源码同步断言，含**反证**用例证明闸门有区分力）。
 
 ### 2026-09-08：前端切换 session 不丢内容（与 chat.py 配合）
 

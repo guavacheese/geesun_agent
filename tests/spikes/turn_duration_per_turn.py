@@ -1,4 +1,7 @@
-"""Spike / 回归闸门：`turn_duration_ms` 的轮次归属与跨轮落盘语义。
+"""Spike / 回归闸门：「本轮事实」的归属判据与跨轮落盘语义。
+
+覆盖三处本轮事实（`turn_duration_ms` / `completion`+`stop_reason` / `generated_files`）——
+它们都曾在**全量 history 快照**上找落点，因而跨轮时会落到上一轮甚至最早那轮。
 
 不依赖 pytest，直接：python tests/spikes/turn_duration_per_turn.py
 
@@ -14,9 +17,15 @@ AI 有、中间 AI 没有」），回答不了跨轮问题；`store_incremental_
 增量追加本身，但不含耗时打点。
 
 取向与 `store_incremental_messages.py` 一致：**不做逻辑复刻**。
-`_plan_message_append` / `_last_ai_index_for_turn` / `_mark_turn_last_ai` 用 ast 从
-chat.py 真实源码提取后 exec（测真实代码），store 用内存 FakeStore 模拟，水位查询语义
-对齐 `database.py:343 aget_message_watermark`（8 位定长序号，文本序 == 数值序）。
+`_plan_message_append` / `_turn_start_index` / `_last_ai_index_for_turn` /
+`_mark_turn_last_ai` / `_attach_generated_files` 用 ast 从 chat.py 真实源码提取后 exec
+（测真实代码），store 用内存 FakeStore 模拟，水位查询语义对齐
+`database.py:343 aget_message_watermark`（8 位定长序号，文本序 == 数值序）。
+
+**同一族的第三处**（2026-10-12 追加）：`generated_files` 的落点也曾是
+「整份 history 从头找**第一条**带 tool_calls 的 AI」——跨轮会挂到**最早**那轮，
+本轮多段工具调用时会全堆到第一段（与流式阶段按段分散显示不一致）。
+现改为按 `tool_call_id` 精确落到**发起该工具调用**的那条 AI，见 S6。
 
 **零复刻**：`_mark_turn_last_ai` 抽出后，「取下标 → 写字段」也不再由本脚本复刻
 （此前那 2 行是唯一残留的 inline 复刻）。
@@ -30,6 +39,9 @@ chat.py 真实源码提取后 exec（测真实代码），store 用内存 FakeSt
   S4  判据函数级用例   → 轮次边界：多 AI 段 / tool 在 AI 之后 / 无 user 的退化
   S5  completion 标记  → blocked_no_output / model_output_truncated 的归属
                         （与耗时同源，2026-10-12 一并收敛到 _mark_turn_last_ai）
+  S6  generated_files → 按 tool_call_id 精确落到发起该工具调用的那条 AI；
+                        无 id / 匹配不上 / 无 tool_calls AI 的回退链，以及
+                        「本轮无 AI 则什么都不写」（2026-10-12 重写）
 """
 
 from __future__ import annotations
@@ -98,11 +110,18 @@ def extract(
 
 _chat = extract(
     CHAT_PY,
-    funcs={"_plan_message_append", "_last_ai_index_for_turn", "_mark_turn_last_ai"},
+    funcs={
+        "_plan_message_append",
+        "_turn_start_index",
+        "_last_ai_index_for_turn",
+        "_mark_turn_last_ai",
+        "_attach_generated_files",
+    },
 )
 plan_append = _chat["_plan_message_append"]
 last_ai_index_for_turn = _chat["_last_ai_index_for_turn"]
 mark_turn_last_ai = _chat["_mark_turn_last_ai"]
+attach_generated_files = _chat["_attach_generated_files"]
 
 _db = extract(
     ROOT / "src" / "infra" / "database.py",
@@ -347,6 +366,111 @@ def s5() -> None:
           f"legacy={_legacy_last_ai(h2)} new={last_ai_index_for_turn(h2)}")
 
 
+def s6() -> None:
+    """generated_files 的归属：按 `tool_call_id` 精确落到**发起该工具调用**的那条 AI。
+
+    改前判据是「整份 history 从头找**第一条**带 tool_calls 的 AI」，两个后果：
+      · 跨轮 → 挂到**最早那轮**（本轮文件出现在上一轮气泡下）；
+      · 本轮多段工具调用 → 全堆到**第一段**上，而流式阶段是按段分散显示的
+        ⇒ 刷新后卡片"重排"。
+    改后与流式阶段同义：`file_generated` 紧跟 tool_call 到达，前端挂当时最后一条 AI
+    ——那条正是发起者。
+    """
+    def ai(mid: str, content: str, tc_ids: list[str] | None = None) -> dict:
+        e: dict = {"id": mid, "role": "ai", "content": content}
+        if tc_ids:
+            e["tool_calls"] = [
+                {"id": t, "tool": "write_file", "args": {}, "status": "success"}
+                for t in tc_ids
+            ]
+        return e
+
+    def gf(path: str, tcid: str | None = None) -> dict:
+        d: dict = {
+            "file_name": path.rsplit("/", 1)[-1],
+            "file_path": path,
+            "file_size": 10,
+            "file_type": "other",
+        }
+        if tcid:
+            d["tool_call_id"] = tcid
+        return d
+
+    # 下标：0=u1 1=a1(上一轮) 2=u2 3=a2 4=t1 5=a3 6=t2 7=a4(本轮总结)
+    base = [
+        msg("u1", "user", "问1"), ai("a1", "上一轮的总结", ["old-1"]),
+        msg("u2", "user", "问2"),
+        ai("a2", "先写第一个文件", ["tc-1"]),
+        msg("t1", "tool", "ok"),
+        ai("a3", "再拉回第二个", ["tc-2"]),
+        msg("t2", "tool", "ok"),
+        ai("a4", "两个文件都好了"),
+    ]
+
+    # ① 本轮多段工具调用：每个文件回到各自的发起者（流式阶段也是这样分散的）
+    h = copy.deepcopy(base)
+    written = attach_generated_files(
+        h, [gf("/reports/u/s/一.md", "tc-1"), gf("/reports/u/s/二.json", "tc-2")]
+    )
+    check("精确归属：tc-1 的文件挂到发起它的 a2（下标 3）",
+          [x["file_name"] for x in h[3].get("generated_files", [])] == ["一.md"],
+          f"a2={[x.get('file_name') for x in h[3].get('generated_files', [])]}")
+    check("精确归属：tc-2 的文件挂到 a3（下标 5）",
+          [x["file_name"] for x in h[5].get("generated_files", [])] == ["二.json"],
+          f"a3={[x.get('file_name') for x in h[5].get('generated_files', [])]}")
+    check("本轮总结 AI（a4，无 tool_calls）不挂任何文件", "generated_files" not in h[7])
+    check("上一轮的 a1 不被触碰（改前会挂到这里）", "generated_files" not in h[1])
+    check("tool_call_id 是内部锚，不写进 entry（对前端的契约不变）",
+          all("tool_call_id" not in x for x in h[3]["generated_files"]))
+    check("返回值 = 实际写入的条目数", len(written) == 2, str(len(written)))
+
+    # ② 无归属锚（磁盘差集补全 / 沙箱兜底拉回）→ 本轮最后一条带 tool_calls 的 AI
+    h2 = copy.deepcopy(base)
+    attach_generated_files(h2, [gf("/reports/u/s/磁盘补的.md")])
+    check("无 tool_call_id：回退到本轮最后一条带 tool_calls 的 AI（a3，下标 5）",
+          [x["file_name"] for x in h2[5].get("generated_files", [])] == ["磁盘补的.md"],
+          f"a3={[x.get('file_name') for x in h2[5].get('generated_files', [])]}")
+
+    # ③ id 匹配不上（落盘时 id 退化成 tc-0 之类）→ 同样回退，不退到上一轮
+    h3 = copy.deepcopy(base)
+    attach_generated_files(h3, [gf("/reports/u/s/x.md", "不存在的-id")])
+    check("id 匹配不上：回退到本轮（a3），**不退到上一轮的 a1**",
+          "generated_files" in h3[5] and "generated_files" not in h3[1])
+
+    # ④ 本轮完全没有带 tool_calls 的 AI → 本轮最后一条 AI
+    h4 = [msg("u1", "user", "问1"), ai("a1", "上一轮的总结", ["old-1"]),
+          msg("u2", "user", "问2"), ai("a2", "文件由其他方式生成")]
+    attach_generated_files(h4, [gf("/reports/u/s/y.md", "任意")])
+    check("本轮无 tool_calls AI：挂本轮最后一条 AI（a2，下标 3）",
+          "generated_files" in h4[3] and "generated_files" not in h4[1])
+
+    # ⑤ 本轮没有任何 AI → 什么都不写（改前会挂到上一轮的 a1 上）
+    h5 = [msg("u1", "user", "问1"), ai("a1", "上一轮的总结", ["old-1"]),
+          msg("u2", "user", "问2")]
+    written5 = attach_generated_files(h5, [gf("/reports/u/s/z.md", "tc-1")])
+    check("★ 本轮无 AI：返回空（不落盘）", written5 == [], repr(written5))
+    check("★ 本轮无 AI：上一轮的 a1 不得被污染（改前会挂上）",
+          "generated_files" not in h5[1], repr(h5[1]))
+
+    # ⑥ 同一条 AI 的多个文件聚合到一个字段里；已有字段则追加
+    h6 = copy.deepcopy(base)
+    attach_generated_files(h6, [gf("/reports/u/s/p.md", "tc-1"), gf("/reports/u/s/q.md", "tc-1")])
+    attach_generated_files(h6, [gf("/reports/u/s/r.md", "tc-1")])
+    check("同一 AI 的多个文件聚合、且二次调用为追加（不覆盖）",
+          [x["file_name"] for x in h6[3]["generated_files"]] == ["p.md", "q.md", "r.md"],
+          str([x["file_name"] for x in h6[3]["generated_files"]]))
+
+    # ⑦ 反证：旧判据（从头找第一条带 tool_calls 的 AI）会命中上一轮的 a1
+    def _legacy_target(hh: list[dict]) -> int | None:
+        for i, e in enumerate(hh):
+            if e.get("role") == "ai" and e.get("tool_calls"):
+                return i
+        return None
+
+    check("反证：同一条 history，旧判据指向上一轮的 a1（下标 1）—— 闸门有区分力",
+          _legacy_target(base) == 1, repr(_legacy_target(base)))
+
+
 print("=" * 78)
 print("S1 正常两轮：每轮各自的耗时是否都留在 store 里")
 print("=" * 78)
@@ -376,6 +500,11 @@ print("=" * 78)
 print("S5 completion 标记的归属：与耗时同源（本轮无 AI 时不得打到上一轮）")
 print("=" * 78)
 s5()
+print()
+print("=" * 78)
+print("S6 generated_files 的归属：按 tool_call_id 精确落到发起该工具调用的那条 AI")
+print("=" * 78)
+s6()
 
 
 def source_sync() -> None:
@@ -402,6 +531,15 @@ def source_sync() -> None:
     check("chat.py 落盘仍走 _plan_message_append 增量追加", "_plan_message_append(" in src)
     check("_plan_message_append 仍按 store 序号接续（不按 history 下标）",
           "next_seq = prev_count + 1" in src)
+    check("chat.py generated_files 归属走 _attach_generated_files", (
+        "if not _attach_generated_files(history, generated_files):" in src
+    ))
+    check("chat.py 不再出现「从头找第一条带 tool_calls 的 AI」的归属判据",
+          'e.get("role") == "ai" and e.get("tool_calls")' not in src)
+    check("chat.py 流式阶段给每条产物带上 tool_call_id 归属锚",
+          '"tool_call_id": tool_call_id,' in src)
+    check("chat.py 本轮无 AI 时跳过 generated_files 关联并留 WARNING",
+          "跳过 generated_files 关联" in src)
 
 
 source_sync()
