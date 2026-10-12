@@ -179,7 +179,7 @@ download_from_sandbox(
 - `_persist_session` 函数签名加 4 个时间戳参数；entry 构造时按条件写入 3 个字段：
   - `reasoning_duration_ms`：仅当 AI 消息带 reasoning + 两个时间戳都有值
   - `reasoning_started_at`：ISO 时间戳，前端可锚定
-  - `turn_duration_ms`：仅写到 history 最后一条 AI 消息
+  - `turn_duration_ms`：写到**本轮**最后一条 AI 消息（**2026-10-12 修订**：原文写"仅写到 history 最后一条 AI 消息"，极易被误读成「整个会话只有末尾那条带耗时」——实际那份 history 是每轮从 checkpoint 重建的**全量快照**，落盘走增量追加（已归档条目不重写），故每轮各自保有自己那份。轮次归属判据统一在 `_mark_turn_last_ai()`，见 `tests/spikes/turn_duration_per_turn.py`）
 - 调用点（正常 + 断连）两处都传时间戳
 
 **经验**：
@@ -187,7 +187,10 @@ download_from_sandbox(
 - 断连兜底路径（`reason="interrupted"`）也要持久化——避免"刷新后丢秒数"和"丢内容"同时发生
 - 持久化前 `max(0, ...)` 兜底，防止异常时间戳顺序（end < start）写入负数
 
-**验证**：`python tests/spikes/chat_persist_duration.py` 跑 8 个对照表（全 PASS）
+**验证**：`python tests/spikes/chat_persist_duration.py` 跑 8 个对照表（全 PASS）。
+跨轮语义与归属判据另见 `tests/spikes/turn_duration_per_turn.py`（2026-10-12 加，35 断言）——
+它覆盖「每轮各自的耗时」「本轮无 AI 产出时不写到上一轮」「`completion` 标记与耗时同源」，
+并用 ast 提取真实函数（非逻辑复刻）。
 
 ### 2026-09-08：前端切换 session 不丢内容（与 chat.py 配合）
 

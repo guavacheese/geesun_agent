@@ -121,6 +121,28 @@ def _last_ai_index_for_turn(history: list[dict]) -> int | None:
     return None
 
 
+def _mark_turn_last_ai(history: list[dict], fields: dict) -> int | None:
+    """把 `fields` 写到**本轮**最后一条 AI 条目上，返回其下标；本轮无 AI 产出则返回 None。
+
+    三处「本轮事实」共用这一个落点：`turn_duration_ms`、`completion`
+    （`blocked_no_output` / `model_output_truncated`）、`completion` 配套的 `stop_reason`。
+
+    为什么要收敛到一处（2026-10-12）：这三处原先各自内联「在整份 history 里倒序找
+    第一条 AI」。那份 history 是**全量快照**（见 `_last_ai_index_for_turn` 文档），
+    于是本轮无 AI 产出时三者都会打到**上一轮**的 AI 上。只修其中一处（如只修耗时）
+    会留下「耗时对了、徽标还错位」的半修状态——同一个缺陷面被修了一半，比不修更
+    容易骗过复盘。故统一走本函数，判据单一来源。
+
+    返回 None 时**什么都不写**：宁可这一轮没有耗时值 / 没有徽标，也不给错的归属。
+    调用方应据此留 WARNING 便于观测（`completion` 那样的事实缺失是复盘信号，不该静默）。
+    """
+    idx = _last_ai_index_for_turn(history)
+    if idx is None:
+        return None
+    history[idx].update(fields)
+    return idx
+
+
 def _plan_message_append(
     history: list[dict],
     prev_count: int,
@@ -1165,19 +1187,19 @@ async def chat(
                 #
                 # 归属判据 2026-10-12 修：改前是「在整份 history 里倒序找第一条 AI」——
                 # 那会命中上一轮的 AI（详见 _last_ai_index_for_turn 文档）。
-                # 现在按「最后一条 user 之后」划定本轮区间，区间内没有 AI 就不打点：
-                # 宁可这一轮没有耗时值（前端走内存计时兜底 / 不显示），也不给错的归属。
+                # 现在统一走 _mark_turn_last_ai（按「最后一条 user 之后」划定本轮区间），
+                # 区间内没有 AI 就不写：宁可这一轮没有耗时值（前端走内存计时兜底 / 不显示），
+                # 也不给错的归属。
                 if turn_started_at_ms is not None and turn_ended_at_ms is not None:
                     turn_duration_ms = max(0, turn_ended_at_ms - turn_started_at_ms)
-                    _turn_ai_idx = _last_ai_index_for_turn(history)
-                    if _turn_ai_idx is None:
+                    if _mark_turn_last_ai(
+                        history, {"turn_duration_ms": turn_duration_ms}
+                    ) is None:
                         logger.warning(
                             "[DIAG] 本轮无 AI 产出，跳过 turn_duration_ms 打点"
                             "（避免写到上一轮的 AI 上）: session=%s, history=%d 条",
                             session_id, len(history),
                         )
-                    else:
-                        history[_turn_ai_idx]["turn_duration_ms"] = turn_duration_ms
 
                 # 循环结束后，将 generated_files 关联到合适的 AI 消息
                 # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
@@ -1199,23 +1221,46 @@ async def chat(
                     if target_idx is not None:
                         history[target_idx]["generated_files"] = list(generated_files)
 
-                # M3 完成门：零产出时在最后一条 AI 消息上标记失败状态，
-                # 前端可据此展示"未产出交付物"徽标，避免"状态不明"
+                # M3 完成门：零产出时在**本轮**最后一条 AI 消息上标记失败状态，
+                # 前端可据此展示"未产出交付物"徽标，避免"状态不明"。
+                #
+                # 归属判据 2026-10-12 修：改前同样是「整份 history 倒序找第一条 AI」，
+                # 本轮无 AI 产出时会把徽标打到**上一轮**的 AI 上（与耗时同源的错位，
+                # 且徽标比耗时行更显眼）。现与耗时共用 _mark_turn_last_ai。
+                # 注：本标记为真的常见场景（模型零工具调用纯复述 / 产物缺失耗尽重试）
+                # 本身**有** AI 消息，故正常路径行为不变；只有本轮连 AI 消息都没有
+                #（模型调用失败 / 断连且 checkpoint 无 AI）才不落盘——此时无载体可挂，
+                # 事实由 SSE 事件与 WARNING 日志承载。
                 if completion_blocked:
-                    for i in range(len(history) - 1, -1, -1):
-                        if history[i].get("role") == "ai":
-                            history[i]["completion"] = "blocked_no_output"
-                            break
+                    if _mark_turn_last_ai(
+                        history, {"completion": "blocked_no_output"}
+                    ) is None:
+                        logger.warning(
+                            "[M3] 本轮无 AI 产出，跳过 completion=blocked_no_output 打点"
+                            "（避免写到上一轮的 AI 上）: session=%s, history=%d 条",
+                            session_id, len(history),
+                        )
 
                 # 空响应降级（2026-09-16）：失败点在**模型层**（思考吃满输出上限被截断），
                 # 不是"产物没拉回来"，故不与上面共用 blocked_no_output 标记——两者在
                 # 复盘/取证时要能一眼分开（旧实现会把 de18ad37 这类截断也标成"零交付物"）。
+                #
+                # 归属判据同上（2026-10-12 修）：改前会打到上一轮的 AI 上。
+                # 三个分支里 THINKING_TRUNCATED / THINKING_ONLY 本轮必然有 AI 消息
+                #（带 reasoning 的截断/仅思考条目），FULLY_EMPTY 才可能没有——后者不落盘。
                 if terminal_fallback:
-                    for i in range(len(history) - 1, -1, -1):
-                        if history[i].get("role") == "ai":
-                            history[i]["completion"] = "model_output_truncated"
-                            history[i]["stop_reason"] = terminal_fallback.get("branch")
-                            break
+                    if _mark_turn_last_ai(
+                        history,
+                        {
+                            "completion": "model_output_truncated",
+                            "stop_reason": terminal_fallback.get("branch"),
+                        },
+                    ) is None:
+                        logger.warning(
+                            "[DIAG] 本轮无 AI 产出，跳过 completion=model_output_truncated "
+                            "打点（避免写到上一轮的 AI 上）: session=%s, branch=%s, history=%d 条",
+                            session_id, terminal_fallback.get("branch"), len(history),
+                        )
 
                 # ─── 存入 store：增量追加（2026-09-12 方案 B，替代全量覆盖写）───
                 # 改前：`aput(ns, "messages", {"items": history})` —— 每轮把整份 history

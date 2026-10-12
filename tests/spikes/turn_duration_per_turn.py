@@ -14,10 +14,12 @@ AI 有、中间 AI 没有」），回答不了跨轮问题；`store_incremental_
 增量追加本身，但不含耗时打点。
 
 取向与 `store_incremental_messages.py` 一致：**不做逻辑复刻**。
-`_plan_message_append` / `_last_ai_index_for_turn` 用 ast 从 chat.py 真实源码提取后
-exec（测真实代码），store 用内存 FakeStore 模拟，水位查询语义对齐
-`database.py:343 aget_message_watermark`（8 位定长序号，文本序 == 数值序）。
-只有「把算出来的下标写进 entry」那 2 行是不可避免的 inline 复刻，末尾有源码断言锁同步。
+`_plan_message_append` / `_last_ai_index_for_turn` / `_mark_turn_last_ai` 用 ast 从
+chat.py 真实源码提取后 exec（测真实代码），store 用内存 FakeStore 模拟，水位查询语义
+对齐 `database.py:343 aget_message_watermark`（8 位定长序号，文本序 == 数值序）。
+
+**零复刻**：`_mark_turn_last_ai` 抽出后，「取下标 → 写字段」也不再由本脚本复刻
+（此前那 2 行是唯一残留的 inline 复刻）。
 
 ## 场景
 
@@ -26,6 +28,8 @@ exec（测真实代码），store 用内存 FakeStore 模拟，水位查询语�
   S3  本轮无 AI 产出   → 打点会不会落到**上一轮**的消息上（2026-10-12 修）
   S3b 正常轮不受影响   → 修复不得改变正常轮次行为
   S4  判据函数级用例   → 轮次边界：多 AI 段 / tool 在 AI 之后 / 无 user 的退化
+  S5  completion 标记  → blocked_no_output / model_output_truncated 的归属
+                        （与耗时同源，2026-10-12 一并收敛到 _mark_turn_last_ai）
 """
 
 from __future__ import annotations
@@ -92,9 +96,13 @@ def extract(
     return ns
 
 
-_chat = extract(CHAT_PY, funcs={"_plan_message_append", "_last_ai_index_for_turn"})
+_chat = extract(
+    CHAT_PY,
+    funcs={"_plan_message_append", "_last_ai_index_for_turn", "_mark_turn_last_ai"},
+)
 plan_append = _chat["_plan_message_append"]
 last_ai_index_for_turn = _chat["_last_ai_index_for_turn"]
+mark_turn_last_ai = _chat["_mark_turn_last_ai"]
 
 _db = extract(
     ROOT / "src" / "infra" / "database.py",
@@ -139,13 +147,12 @@ def save_turn(
 ) -> tuple[str, list[dict]]:
     """复刻 `_persist_session` 的「打点 → 水位 → 增量追加」顺序（chat.py）。
 
-    打点目标由**真实函数** `_last_ai_index_for_turn` 给出（判据不是复刻的）。
+    打点目标与「写哪条 entry」全部由**真实函数** `_mark_turn_last_ai` 决定
+    （判据与落点都不是复刻的）。
     """
     history = copy.deepcopy(history)
     if t_start is not None and t_end is not None:
-        idx = last_ai_index_for_turn(history)
-        if idx is not None:                                    # ← 与 chat.py 同判据
-            history[idx]["turn_duration_ms"] = max(0, t_end - t_start)
+        mark_turn_last_ai(history, {"turn_duration_ms": max(0, t_end - t_start)})
 
     prev_count, last_id = store.watermark()
     next_seq, new_items, mode = plan_append(history, prev_count, last_id)
@@ -283,6 +290,63 @@ def s4() -> None:
           f"legacy={_legacy_last_ai(_h)} new={last_ai_index_for_turn(_h)}")
 
 
+def s5() -> None:
+    """completion 标记的归属：与耗时同源（本轮无 AI 产出时不得打到上一轮）。
+
+    触发面事实（读置位分支得出，决定了修复不能"因噎废食"）：
+      · blocked_no_output —— M3 完成门耗尽重试，本轮零**文件**产出，
+        但模型通常有纯文本回复（GY35377/60c64c4f：连续四轮零工具调用纯复述）
+        ⇒ 本轮**有** AI 消息，落点正常，行为不变；
+      · model_output_truncated —— 三分支中 THINKING_TRUNCATED / THINKING_ONLY
+        本轮必然有 AI 条目（带 reasoning 的截断/仅思考），只有 FULLY_EMPTY 可能没有。
+    所以修复只影响「本轮连 AI 条目都没有」的极端情形——那时**没有载体可挂**，
+    正确做法是不写（而不是挂到上一轮去）。
+    """
+    # ① 常见路径：本轮有纯文本 AI → 标记落在本轮，上一轮不受影响
+    h = [
+        msg("u1", "user", "问1"), msg("a1", "ai", "答1"),
+        msg("u2", "user", "问2"), msg("a2", "ai", "模型纯复述了一段话，没产出文件"),
+    ]
+    idx = mark_turn_last_ai(h, {"completion": "blocked_no_output"})
+    check("本轮有 AI：blocked_no_output 落在**本轮**最后一条 AI（下标 3）", idx == 3, repr(idx))
+    check("本轮有 AI：a2 拿到标记",
+          h[3].get("completion") == "blocked_no_output", repr(h[3].get("completion")))
+    check("本轮有 AI：上一轮的 a1 **不受影响**", "completion" not in h[1], repr(h[1]))
+
+    # ② 极端路径：本轮只有 user、没有任何 AI 条目 → 不写（改前会挂到 a1 上）
+    h2 = [msg("u1", "user", "问1"), msg("a1", "ai", "答1"), msg("u2", "user", "问2")]
+    idx2 = mark_turn_last_ai(h2, {"completion": "blocked_no_output"})
+    check("★ 本轮无 AI：返回 None（无载体可挂，不落盘）", idx2 is None, repr(idx2))
+    check("★ 本轮无 AI：**上一轮的 a1 不得被污染**（改前会打上 blocked_no_output）",
+          "completion" not in h2[1], repr(h2[1]))
+
+    # ③ model_output_truncated：两个字段一起落，且同样只落本轮
+    h3 = [
+        msg("u1", "user", "问1"), msg("a1", "ai", "答1"),
+        msg("u2", "user", "问2"), msg("a2", "ai", ""),  # 思考吃满上限被截断，正文为空
+    ]
+    idx3 = mark_turn_last_ai(
+        h3, {"completion": "model_output_truncated", "stop_reason": "thinking_truncated"}
+    )
+    check("truncated：落本轮最后一条 AI（下标 3）", idx3 == 3, repr(idx3))
+    check("truncated：completion 与 stop_reason **同时**落在同一条上",
+          h3[3].get("completion") == "model_output_truncated"
+          and h3[3].get("stop_reason") == "thinking_truncated",
+          f"completion={h3[3].get('completion')!r} stop_reason={h3[3].get('stop_reason')!r}")
+    check("truncated：上一轮的 a1 不被污染", "stop_reason" not in h3[1], repr(h3[1]))
+
+    # ④ 反证：旧判据（整份倒序第一条 AI）在极端路径下会命中上一轮 —— 闸门有区分力
+    def _legacy_last_ai(hh: list[dict]) -> int | None:
+        for i in range(len(hh) - 1, -1, -1):
+            if hh[i].get("role") == "ai":
+                return i
+        return None
+
+    check("反证：同一条 history，旧判据指向 a1（下标 1）而新判据返回 None",
+          _legacy_last_ai(h2) == 1 and last_ai_index_for_turn(h2) is None,
+          f"legacy={_legacy_last_ai(h2)} new={last_ai_index_for_turn(h2)}")
+
+
 print("=" * 78)
 print("S1 正常两轮：每轮各自的耗时是否都留在 store 里")
 print("=" * 78)
@@ -307,6 +371,11 @@ print("=" * 78)
 print("S4 判据函数级用例：轮次边界")
 print("=" * 78)
 s4()
+print()
+print("=" * 78)
+print("S5 completion 标记的归属：与耗时同源（本轮无 AI 时不得打到上一轮）")
+print("=" * 78)
+s5()
 
 
 def source_sync() -> None:
@@ -316,12 +385,20 @@ def source_sync() -> None:
     print("源码同步断言")
     print("=" * 78)
     src = CHAT_PY.read_text(encoding="utf-8")
-    check("chat.py 打点目标走 _last_ai_index_for_turn（不再是裸的「整份倒序第一条 AI」）", (
-        "_turn_ai_idx = _last_ai_index_for_turn(history)" in src
-        and 'history[_turn_ai_idx]["turn_duration_ms"] = turn_duration_ms' in src
+    check("chat.py 打点目标走 _mark_turn_last_ai（不再是裸的「整份倒序第一条 AI」）", (
+        "_mark_turn_last_ai(" in src
+        and '{"turn_duration_ms": turn_duration_ms}' in src
     ))
     check("chat.py 本轮无 AI 产出时跳过打点并留 WARNING（可观测）",
           "本轮无 AI 产出，跳过 turn_duration_ms 打点" in src)
+    check("chat.py completion 标记（两处）同样走 _mark_turn_last_ai（同源同判据）", (
+        '{"completion": "blocked_no_output"}' in src
+        and '"completion": "model_output_truncated",' in src
+    ))
+    check("chat.py completion 标记不再内联「整份倒序找 AI」循环",
+          'history[i]["completion"]' not in src)
+    check("chat.py 两处 completion 标记都留了「本轮无 AI 产出」WARNING",
+          src.count("跳过 completion=") == 2, str(src.count("跳过 completion=")))
     check("chat.py 落盘仍走 _plan_message_append 增量追加", "_plan_message_append(" in src)
     check("_plan_message_append 仍按 store 序号接续（不按 history 下标）",
           "next_seq = prev_count + 1" in src)
