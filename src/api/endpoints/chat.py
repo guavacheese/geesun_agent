@@ -92,6 +92,35 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
+def _last_ai_index_for_turn(history: list[dict]) -> int | None:
+    """「本轮」最后一条 AI 消息在 history 里的下标；本轮没有 AI 产出则返回 None。
+
+    「本轮」= **最后一条 user 消息之后**（不含该 user）的那一段。
+
+    为什么不能对整份 history 直接倒序找 AI（2026-10-12 修）：`history` 是
+    `_persist_session` 从 checkpoint **重建的全量快照**，不止本轮。改前写法是
+    `for i in range(len(history) - 1, -1, -1)` 找第一条 `role == "ai"`，于是本轮
+    没有 AI 产出时（模型未产出即断连 / 被取消，走 interrupted 保存路径）会命中
+    **上一轮**的 AI，把本轮耗时写到上一轮那条上——实测：上一轮自己的 4500ms
+    被改写成本轮的 1000ms（`tests/spikes/turn_duration_per_turn.py` S3）。
+
+    找不到 user 消息时（history 被摘要压缩截断、或系统续跑没有用户消息）`start`
+    保持 0 → 退化为「整份倒序第一条 AI」= **旧行为**。此处刻意保留该退化：无法
+    判定轮次边界时沿用已在生产跑过的旧口径，不会比它更差。
+
+    纯函数，便于 spike 用 ast 提取后直接断言。
+    """
+    start = 0
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("role") == "user":
+            start = i + 1
+            break
+    for i in range(len(history) - 1, -1, -1):
+        if i >= start and history[i].get("role") == "ai":
+            return i
+    return None
+
+
 def _plan_message_append(
     history: list[dict],
     prev_count: int,
@@ -1130,15 +1159,25 @@ async def chat(
                         ).isoformat()
                     history.append(entry)
 
-                # 持久化 turn_duration_ms（整轮耗时）：仅写到 history 最后一条 AI 消息。
+                # 持久化 turn_duration_ms（整轮耗时）：写到**本轮**最后一条 AI 消息上。
                 # turn_start = event_stream 进入时刻；turn_end = while 循环 break / 兜底 now。
                 # 仅当两个时间戳都有值时写入（断连路径兜底时刻已设，正常路径 break 前已设）。
+                #
+                # 归属判据 2026-10-12 修：改前是「在整份 history 里倒序找第一条 AI」——
+                # 那会命中上一轮的 AI（详见 _last_ai_index_for_turn 文档）。
+                # 现在按「最后一条 user 之后」划定本轮区间，区间内没有 AI 就不打点：
+                # 宁可这一轮没有耗时值（前端走内存计时兜底 / 不显示），也不给错的归属。
                 if turn_started_at_ms is not None and turn_ended_at_ms is not None:
                     turn_duration_ms = max(0, turn_ended_at_ms - turn_started_at_ms)
-                    for i in range(len(history) - 1, -1, -1):
-                        if history[i].get("role") == "ai":
-                            history[i]["turn_duration_ms"] = turn_duration_ms
-                            break
+                    _turn_ai_idx = _last_ai_index_for_turn(history)
+                    if _turn_ai_idx is None:
+                        logger.warning(
+                            "[DIAG] 本轮无 AI 产出，跳过 turn_duration_ms 打点"
+                            "（避免写到上一轮的 AI 上）: session=%s, history=%d 条",
+                            session_id, len(history),
+                        )
+                    else:
+                        history[_turn_ai_idx]["turn_duration_ms"] = turn_duration_ms
 
                 # 循环结束后，将 generated_files 关联到合适的 AI 消息
                 # 策略：优先附加到第一条有 tool_calls 的 AI 消息（与流式阶段一致——
