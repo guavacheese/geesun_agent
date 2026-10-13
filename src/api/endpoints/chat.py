@@ -2819,6 +2819,30 @@ async def chat(
         # 一旦触发就要读这两个位，此刻才声明的话收尾自身会 NameError：把"丢一轮消息"
         # 升级成"连收尾都崩、run 行永远停在活跃态"。
         try:
+            # ─── run 转 running：`started_at` 的唯一写入点（P1-c 收口，2026-10-13）───
+            # 端点里的 `persist` 落的是 pending；worker 真正进入执行段时转 running，
+            # `run_registry.mark` 顺带写 `started_at`（只在首次为 None 时写，见其实现）。
+            #
+            # 为什么不是可选项：
+            #   · 前端 `ChatArea.tsx:201` 把 `active.started_at` 直接交给
+            #     `reduceRunFound`（**没有** `?? created_at` 兜底），刷新后恢复的提示条
+            #     靠它显示「已进行 X 分钟」；不写就恒为 null ⇒ 时长不显示。同文件 :350
+            #     那处 `started_at ?? created_at` 的注释写着「PENDING 阶段还是 null
+            #     （run_registry 只在转 RUNNING 时才写）」—— 前端当初就是按"后端会写"
+            #     设计的，是后端漏了这一步。
+            #   · 状态机完整性：不写的话 `ACTIVE_STATUSES` 里的 running 是**死状态**，
+            #     run 行直跳 pending → 终态，「排队中」与「跑起来了」无从区分。
+            #
+            # 位置：刻意放 `try` 体内第一句而非 prologue —— prologue 里那个 await
+            # （沙箱产物基线枚举）在 try 作用域**外**，被取消时 finally 不执行；放在
+            # 这里则取消必走 finally，收尾（含台账 release）完整。
+            #
+            # 不额外包 try/except（与 `_finish_run` 里的 mark 不同）：`run_registry.persist`
+            # 已把唯一的现实失败模式（store 写失败）降级为 ERROR 日志并返回 False；
+            # 若 mark 抛出别的异常，那是代码缺陷，应当**显式暴露**——走下方 except
+            # 标 FAILED 并 logger.exception，而不是吞掉继续跑。
+            await run_registry.mark(store, run_id, run_registry.STATUS_RUNNING)
+
             while True:
                 await _drain_astream(_graph_input)
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)

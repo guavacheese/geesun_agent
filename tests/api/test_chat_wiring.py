@@ -792,3 +792,114 @@ def test_finalize_flag_detector_is_sensitive():
     assert layout is None or layout[0] is None, (
         "把置位包进 if 之后，检测器仍报「无条件置位」—— 该断言无法捕获本次回归"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑥ run 必须真的转 running（`started_at` 的唯一来源，2026-10-13）
+#
+# `run_registry.mark(..., STATUS_RUNNING)` 是 `started_at` 的**唯一**写入点（其实现里
+# 只有 `status == running 且 started_at is None` 才写）。端点里的 `persist` 落的是
+# pending，所以 chat.py 若不在 worker 进入执行段时调这一次 mark，这一列就**恒为 null**。
+#
+# 前端两处消费它，方向相反：
+#   · `ChatArea.tsx:350`  `active.started_at ?? active.created_at` —— 有兜底，且注释
+#     写着「PENDING 阶段还是 null（run_registry 只在转 RUNNING 时才写）」；
+#   · `ChatArea.tsx:201`  直接 `active.started_at ?? null` —— **没有** created_at
+#     兜底，刷新后恢复的提示条靠它显示「已进行 X 分钟」，不写就退化成不显示时长。
+#
+# 为什么用 AST：这是**接线**问题（"这一列有没有人写"）；模块级行为由
+# tests/core/test_run_registry.py::test_mark_records_timestamps_once_and_is_idempotent
+# 覆盖 —— 与本文件其余断言分工一致。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _is_status_running_arg(node: ast.expr) -> bool:
+    """``run_registry.STATUS_RUNNING`` 这个属性访问。"""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "STATUS_RUNNING"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "run_registry"
+    )
+
+
+def _mark_running_calls(node: ast.AST | None) -> list[int]:
+    """收集 ``run_registry.mark(..., run_registry.STATUS_RUNNING)`` 的行号。
+
+    位置参数与 ``status=`` 关键字两种写法都认；状态用**常量**而非字面量 `"running"`
+    （与 ② 的 `LOOP_FORCED_STOP_KEY` 同思路：常量改名时这里立刻报错，不会静默失联）。
+    """
+    if node is None:
+        return []
+    hits: list[int] = []
+    for n in ast.walk(node):
+        if not (isinstance(n, ast.Call) and _callee_name(n) == "run_registry.mark"):
+            continue
+        by_pos = any(_is_status_running_arg(a) for a in n.args)
+        by_kw = any(
+            kw.arg == "status" and _is_status_running_arg(kw.value) for kw in n.keywords
+        )
+        if by_pos or by_kw:
+            hits.append(n.lineno)
+    return hits
+
+
+def test_worker_marks_run_running():
+    """★ ``_run_worker`` 必须把 run 转 running —— 否则 ``started_at`` 恒为 null。"""
+    worker = _func_def(_tree(), "_run_worker")
+    assert worker is not None, "找不到 `_run_worker`"
+    assert _mark_running_calls(worker), (
+        "`_run_worker` 里没有 `run_registry.mark(store, run_id, run_registry.STATUS_RUNNING)` "
+        "—— run 行会直跳 pending → 终态：`started_at` 恒为 null（刷新后恢复的提示条拿不到"
+        "时长，ChatArea.tsx:201 那条路径没有 created_at 兜底），且 ACTIVE_STATUSES 里的 "
+        "running 变成无人使用的死状态"
+    )
+
+
+def test_running_mark_precedes_terminal_mark():
+    """转 running 必须早于任何终态写入。
+
+    顺序反了会**覆盖终态**：``run_registry.mark`` 刻意不幂等（无条件写 status 并
+    persist），一个排在 ``_finish_run`` 之后的 running 写入会把刚落好的
+    completed / failed / interrupted 改回 running —— run 行永远停在活跃态，
+    前端刷新后一直显示「任务进行中」。
+    """
+    worker = _func_def(_tree(), "_run_worker")
+    assert worker is not None
+    runs = _mark_running_calls(worker)
+    terminals = _calls_named(worker, "_finish_run")
+    assert runs and terminals, (
+        f"`_run_worker` 缺少转 running（{runs}）或终态收尾（{terminals}）调用"
+    )
+    assert min(runs) < min(terminals), (
+        f"转 running（行 {runs}）不早于 `_finish_run`（行 {terminals}）—— "
+        "终态会被改回 running（mark 不幂等）"
+    )
+
+
+class _RunningMarkDropper(ast.NodeTransformer):
+    """负向对照：摘掉转 running 的那次 mark（模拟"run 直跳终态"的退化实现）。
+
+    它嵌在 ``try`` 体内的第一句，所以必须重写 ``visit_Try`` ——
+    ``visit_AsyncFunctionDef`` 只看函数体顶层语句，摘不到它。
+    """
+
+    @staticmethod
+    def _is_running_mark_stmt(stmt: ast.stmt) -> bool:
+        return isinstance(stmt, ast.Expr) and bool(_mark_running_calls(stmt))
+
+    def visit_Try(self, node: ast.Try):
+        self.generic_visit(node)
+        node.body = [n for n in node.body if not self._is_running_mark_stmt(n)]
+        return node
+
+
+def test_running_mark_detector_is_sensitive():
+    """负向对照：摘掉转 running 后检测器必须报空 —— 否则本组断言等于空测。"""
+    assert _mark_running_calls(_func_def(_tree(), "_run_worker"))  # 当前实现必须通过
+
+    stripped = _RunningMarkDropper().visit(ast.parse(CHAT_PY.read_text(encoding="utf-8")))
+    ast.fix_missing_locations(stripped)
+    assert not _mark_running_calls(_func_def(stripped, "_run_worker")), (
+        "摘掉转 running 的 mark 后检测器仍然报有 —— 该断言无法捕获「run 直跳终态」的退化"
+    )
