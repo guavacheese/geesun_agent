@@ -94,3 +94,58 @@ def test_same_file_overwrite_not_new(report_dir):
 
     after = snapshot_report_files(root, user, sid)
     assert after - before == frozenset()  # 路径差集为空 → 判定为未新增
+
+
+# ─── list_session_reports（产物清单，2026-10-14 方案 C）─────────────────────
+
+from src.infra.reports import list_session_reports  # noqa: E402
+
+
+def _write(p: Path, content: str, mtime: float | None = None):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    if mtime is not None:
+        import os
+
+        os.utime(p, (mtime, mtime))
+
+
+def test_list_reports_empty_when_dir_missing(tmp_path):
+    assert list_session_reports("u", "s", roots=[str(tmp_path / "nope")]) == []
+
+
+def test_list_reports_collects_files_sorted_by_mtime_desc(tmp_path):
+    root = tmp_path / "reports"
+    base = root / "u1" / "s1"
+    _write(base / "old.md", "a", mtime=1000)
+    _write(base / "new.md", "bb", mtime=3000)
+    _write(base / "sub" / "mid.html", "ccc", mtime=2000)
+
+    items = list_session_reports("u1", "s1", roots=[str(root)])
+    assert [it["rel_path"] for it in items] == ["new.md", "sub/mid.html", "old.md"]
+    assert items[0]["size"] == 2
+    # 相对路径一律 POSIX 风格（前端拼虚拟路径用）
+    assert all("\\" not in it["rel_path"] for it in items)
+
+
+def test_list_reports_dedupes_across_roots_first_wins(tmp_path):
+    """同一相对路径落在两个根（路径漂移期双写残留）→ 先命中的根优先，不重复列。"""
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    _write(root_a / "u" / "s" / "f.md", "from-a", mtime=1000)
+    _write(root_b / "u" / "s" / "f.md", "from-b-dup", mtime=9999)  # 更新也必须让位
+    _write(root_b / "u" / "s" / "g.md", "only-b", mtime=500)
+
+    items = list_session_reports("u", "s", roots=[str(root_a), str(root_b)])
+    by_rel = {it["rel_path"]: it for it in items}
+    assert set(by_rel) == {"f.md", "g.md"}
+    assert by_rel["f.md"]["size"] == len("from-a")  # A 根优先（与下载端点同序）
+    assert by_rel["f.md"]["mtime"] == 1000
+
+
+def test_list_reports_rejects_traversal_identities(tmp_path):
+    """user_id/session_id 来自 URL 路径参数：含分隔符或 .. 一律空清单。"""
+    root = tmp_path / "reports"
+    _write(root / "u" / "s" / "f.md", "x")
+    for bad_u, bad_s in [("../u", "s"), ("u", "../s"), ("a/b", "s"), ("u", "a\\b"), ("", "s"), ("u", "..")]:
+        assert list_session_reports(bad_u, bad_s, roots=[str(root)]) == [], (bad_u, bad_s)

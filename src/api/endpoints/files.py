@@ -3,12 +3,17 @@
 import os
 import logging
 import mimetypes
+from datetime import datetime
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from src.api.deps import get_current_user
-from src.infra.reports import find_session_file, session_file_roots
+from src.infra.reports import (
+    find_session_file,
+    list_session_reports,
+    session_file_roots,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,3 +122,45 @@ async def download_file(
         media_type=mime_type,
         headers={"Content-Disposition": content_disposition},
     )
+
+
+@router.get("/files/{user_id}/{session_id}")
+async def list_files(
+    user_id: str,
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """列出会话的全部报告产物（前端「会话产物」面板数据源，2026-10-14 方案 C）。
+
+    动机：消息气泡下的文件卡片是「轮次级 + 写事件驱动」的——本轮没写文件就没有
+    新卡片，用户想"随时看到/下载这个会话的全部产物"没有确定性入口（实测会话
+    GY23191/3f5d4869：纯查看轮模型只能手打 markdown 表格冒充下载链接）。
+    本端点提供**会话级全量清单**，与轮次卡片双轨并存（对齐 deer-flow 的
+    Artifacts 面板模式）。
+
+    范围与安全：
+      - 只列 **reports** 根（产物），不含 uploads（用户输入文件刻意不提供
+        预览/下载，与 UserAttachmentChip 的"输入只读"设计一致）；
+      - 与下载端点同款鉴权（只能列自己的 user_id）；
+      - 遍历/去重/穿越防御收敛在 `infra.reports.list_session_reports`（纯函数，
+        单测见 tests/infra/test_reports.py）。
+
+    响应：`{"files": [{file_name, file_path(虚拟路径，可直接拼下载 URL),
+    file_size, updated_at(ISO8601)}]}`，按修改时间倒序。file_type 不下发——
+    前端 `inferFileType` 按文件名推导，与 file_generated 事件的推导规则同源。
+    """
+    token_user_id = current_user["user_id"]
+    if token_user_id != user_id:
+        raise HTTPException(status_code=403, detail="无权访问其他用户的文件")
+
+    items = list_session_reports(user_id, session_id)
+    files = [
+        {
+            "file_name": it["rel_path"].split("/")[-1],
+            "file_path": f"/reports/{user_id}/{session_id}/{it['rel_path']}",
+            "file_size": it["size"],
+            "updated_at": datetime.fromtimestamp(it["mtime"]).isoformat(),
+        }
+        for it in items
+    ]
+    return {"files": files}

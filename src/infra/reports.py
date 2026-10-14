@@ -59,6 +59,78 @@ def session_file_roots() -> list[str]:
     return roots
 
 
+def session_report_roots() -> list[str]:
+    """会话**产物**（reports）的磁盘根目录候选——`session_file_roots` 的收窄版。
+
+    产物清单端点（files.py list）只列交付物：用户上传的输入文件（uploads）
+    按「输入只读、输出可操作」原则不进产物面板（前端 UserAttachmentChip 同款
+    设计哲学）。根目录清单与下载端点保持同源，只是不含 uploads 两个根——
+    否则"能列出但下载逻辑不同源"就会演变成两套事实。
+    """
+    from src.core.config import settings
+
+    roots = [settings.report_root]
+    try:
+        ws = os.path.join(settings.agent_workspace, "data", "reports")
+        if all(os.path.normpath(ws) != os.path.normpath(r) for r in roots):
+            roots.append(ws)
+    except Exception:  # noqa: BLE001 — 兜底目录拿不到不影响主路径
+        pass
+    return roots
+
+
+def list_session_reports(
+    user_id: str,
+    session_id: str,
+    roots: list[str] | None = None,
+) -> list[dict]:
+    """列出会话报告目录下的全部产物文件（跨候选根按优先级去重）。
+
+    用途：`GET /api/v1/files/{user}/{sid}` 产物清单——前端「会话产物」面板的数据源
+    （2026-10-14 方案 C：卡片是"轮次级+写事件驱动"，用户需要一个不依赖本轮
+    有没有写文件的、始终可看的全量产物入口）。
+
+    安全（与 find_session_file 同级的两道防御）：
+      - user_id / session_id 含路径分隔符或 `..` → 返回空（它们来自 URL 路径参数，
+        不校验就可能被 `/files/u/../../etc` 这类构造越出报告根）；
+      - 遍历得到的都是 base 之下的相对路径，天然不含穿越段。
+
+    去重：同一相对路径可能同时落在 report_root 与 workspace 兜底根（历史路径
+    漂移期的双写残留），先命中的根优先（= find_session_file 的查找顺序）。
+
+    Returns:
+        [{"rel_path": str, "size": int, "mtime": float}]，按 mtime 倒序（最新在前）。
+        目录不存在/为空 → []。
+    """
+    if (
+        not user_id
+        or not session_id
+        or "/" in user_id
+        or "/" in session_id
+        or "\\" in user_id
+        or "\\" in session_id
+        or ".." in (user_id, session_id)
+    ):
+        return []
+    seen: dict[str, dict] = {}
+    for root in roots if roots is not None else session_report_roots():
+        base = os.path.normpath(os.path.join(root, user_id, session_id))
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirs, files in os.walk(base):
+            for name in files:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, base).replace(os.sep, "/")
+                if rel in seen:
+                    continue
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue  # 遍历与 stat 之间文件被移走：跳过比炸掉清单安全
+                seen[rel] = {"rel_path": rel, "size": st.st_size, "mtime": st.st_mtime}
+    return sorted(seen.values(), key=lambda it: it["mtime"], reverse=True)
+
+
 def find_session_file(
     user_id: str,
     session_id: str,
