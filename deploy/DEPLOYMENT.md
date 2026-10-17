@@ -136,7 +136,7 @@
 
 | 改了哪个仓源码 | 递增的变量 | 当前值（`.env.example`） | compose 引用 |
 | --- | --- | --- | --- |
-| `geesun_agent` | `GEESUN_AGENT_TAG` | `1.0.31`（L213） | `docker-compose.yml:27` |
+| `geesun_agent` | `GEESUN_AGENT_TAG` | `1.0.32`（L213） | `docker-compose.yml:27` |
 | `geesun_mcp_server` | `MCP_TAG` | `1.0.3`（L27） | `docker-compose.mcp.yml:22` |
 | `geesun_agent_web` | `WEB_TAG` | `1.0.16`（L229） | `docker-compose.web.yml:15` |
 
