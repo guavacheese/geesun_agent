@@ -315,22 +315,67 @@ def _stable_tool_key(
     return json.dumps(args, sort_keys=True, default=str)
 
 
+def tool_call_signature(
+    tool_name: str,
+    args: object,
+    schema_fields: frozenset[str] | None = None,
+) -> str:
+    """**单个**工具调用的意图指纹：工具名 + 稳定参数 key。
+
+    这是全项目循环检测的**唯一**指纹口径，图内（LoopDetectionMiddleware）与
+    图外（chat.py 的 P0 无进展检测）都必须走这里，不得各写一套 —— 口径一旦分叉，
+    同一个"空转"在两处会得出相反结论，而两处的止损动作又都不可逆。
+
+    ── 为什么必须是"名 + 参"，不能是"名 + 结果文本"（2026-10-17 生产实锤）──
+    会话 GY24428:4f5ede6a 里，模型连发 10 条**各不相同**的 pymupdf 命令
+    （读总页数 → 读第 1 页 → 读第 2 页 → 搜关键词 → 统计 → …），排查路径完全正确。
+    但 P0 旧实现取的是**工具结果前 60 字符**，而每次 pymupdf 输出的**第一行**恒为
+    那句 98 字符的弃用警告::
+
+        warning: The `fitz` API is deprecated and will be removed in future. ...
+
+    98 > 60 ⇒ 整个取样窗口被这行噪声占满，真正的差异（``总页数: 262`` / ``第2页`` /
+    ``包含光源的页面: [2]``）全在窗口之外 ⇒ 10 次去重后**只有 1 种指纹** ⇒
+    ``_repeat_count`` 必达阈值 ⇒ **必然误报**（不是概率问题）。模型已在收敛
+    （最后一条输出在判断"页面是图"、下一步就该想到 OCR），却在离成功一步之遥时被掐断。
+
+    结果文本是**工具的输出**，被日志噪声、时间戳、进度条、弃用警告污染的渠道太多；
+    参数才是**模型的意图**。deer-flow 的 ``_hash_tool_calls`` 从一开始 hash 的就是
+    args（其 docstring 第 7 行明写 "hash full args to reduce false positives"），
+    本项目的中间件层也是照此移植的 —— 只有 P0 这一处漏改。
+
+    同一模式已发作两次，根因一致（**指纹区分度退化 ⇒ 从概率误报变成必然误报**）：
+    会话 aaf95335 炸在**入参侧**（read_file 字段名契约错位 ⇒ 稳定 key 恒为 ``:0-0``），
+    会话 4f5ede6a 炸在**结果侧**（噪声占满取样窗口）。两次都修了"发现的那一侧"。
+
+    ``schema_fields``：该工具的真实参数名集合（见 ``_extract_schema_fields``）。
+    传 None 走 args 探测兜底 —— 仍是有效 key，不会塌成常量（见 ``_stable_tool_key``）。
+    """
+    norm_args, fallback_key = _normalize_tool_call_args(args)
+    key = _stable_tool_key(norm_args, fallback_key, schema_fields)
+    return f"{tool_name}:{key}"
+
+
 def _hash_tool_calls(
     tool_calls: list[dict],
     schema_lookup: Callable[[str], frozenset[str] | None] | None = None,
 ) -> str:
-    """对一组工具调用（名+稳定 key）做确定性 hash，顺序无关。
+    """对一组工具调用做确定性 hash，顺序无关。
 
     ``schema_lookup`` 把工具名映射到其真实参数名集合（见 _extract_schema_fields）。
     传 None 或查不到时该工具走 args 探测兜底 —— 两个来源都不会退化成常量 key。
+
+    逐条复用 ``tool_call_signature``（而不是在这里再写一遍 name/key 拼装），
+    使"图内 hash"与"API 层 P0 指纹"**物理上同源**，未来改口径不会只改一半。
     """
-    normalized: list[str] = []
-    for tc in tool_calls:
-        name = tc.get("name", "")
-        args, fallback_key = _normalize_tool_call_args(tc.get("args", {}))
-        schema_fields = schema_lookup(name) if schema_lookup is not None else None
-        key = _stable_tool_key(args, fallback_key, schema_fields)
-        normalized.append(f"{name}:{key}")
+    normalized = [
+        tool_call_signature(
+            tc.get("name", ""),
+            tc.get("args", {}),
+            schema_lookup(tc.get("name", "")) if schema_lookup is not None else None,
+        )
+        for tc in tool_calls
+    ]
     normalized.sort()
     blob = json.dumps(normalized, sort_keys=True, default=str)
     return hashlib.md5(blob.encode()).hexdigest()[:12]

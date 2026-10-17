@@ -17,7 +17,7 @@ from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
 from src.core import execution_guard, run_registry, turn_registry
-from src.core.loop_detection import LOOP_FORCED_STOP_KEY
+from src.core.loop_detection import LOOP_FORCED_STOP_KEY, tool_call_signature
 from src.core.mcp import get_mcp_tools
 from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
 from src.core.stream_bridge import (
@@ -710,18 +710,40 @@ async def _aget_state_with_retry(agent, thread_id: str, max_attempts: int = 3):
     raise last_exc
 
 
-def _tool_intent_sig(tool_name: str, result_str: str) -> str:
-    """提取工具调用意图指纹：工具名 + 结果内容的关键特征。
+def _tool_intent_sig(tool_name: str, args: object) -> str | None:
+    """P0 无进展检测的工具调用意图指纹（工具名 + 参数）；参数未知返回 None。
 
-    用于 P0 无进展检测——判断模型是否在重复执行同一件事。
-    - execute：取结果前 60 字符（命令相同 → 结果通常相同，指纹稳定）
-    - 其他工具：取结果前 80 字符
-    结果为空时退化为纯工具名（同工具重复也算重复意图）。
+    ── 为什么改成按「参数」而不是按「结果文本」（2026-10-17 会话 4f5ede6a 实锤）──
+    旧实现取**工具结果前 60 字符**（execute）/ 80 字符（其他），依据是
+    "命令相同 → 结果通常相同，指纹稳定"。这个前提在**结果开头有固定噪声**时崩塌：
+    该会话里模型连发 10 条各不相同的 pymupdf 命令（读总页数 → 读第 1 页 → 读第 2 页
+    → 搜关键词 → 统计 → …），排查路径完全正确、且已在收敛；但每次执行输出的**第一行**
+    恒为那句 98 字符的 `fitz` 弃用警告::
+
+        warning: The `fitz` API is deprecated and will be removed in future. ...
+
+    98 > 60 ⇒ 整个取样窗口被噪声占满，真正的差异（`总页数: 262` / `第2页` /
+    `包含光源的页面: [2]`）全在窗口之外 ⇒ 10 次去重后**只剩 1 种指纹** ⇒
+    `_repeat_count` 必达 `no_progress_repeat_threshold` ⇒ **必然误报**（非概率问题），
+    把离成功一步之遥的任务掐断。
+
+    结果文本是工具的**输出**，会被日志噪声、时间戳、进度条、弃用警告污染；
+    参数才是模型的**意图**。故统一走 `loop_detection.tool_call_signature` ——
+    与图内 `LoopDetectionMiddleware` **同源**（后者一直按 args hash，见其 docstring
+    "hash full args to reduce false positives"），避免两处口径分叉。
+
+    返回 None 表示**参数未知**（AIMessage 未按 tool_call_id 匹配上等）。调用方必须
+    当作"意图不可判定"→ 重置连续计数、跳过本次判定：**宁漏报，不误杀**。
+    误杀会掐断正在收敛的任务（aaf95335 / 4f5ede6a 两次都是这个后果），
+    漏报只是少一层兜底 —— 图内中间件另有 args-hash 与单工具调用频率上限两道防线。
+
+    同一模式已发作两次，根因一致：**指纹区分度退化 ⇒ 从「概率误报」变成「必然误报」**。
+    aaf95335 炸在入参侧（get_or_create 字段名契约错位 ⇒ 稳定 key 恒为 `:0-0`），
+    4f5ede6a 炸在结果侧（噪声占满取样窗口）。两次都只修了当次暴露的那一侧。
     """
-    s = (result_str or "").strip()
-    if tool_name == "execute":
-        return f"{tool_name}:{s[:60]}"
-    return f"{tool_name}:{s[:80]}" if s else tool_name
+    if args is None:
+        return None
+    return tool_call_signature(tool_name, args)
 
 
 def _missing_skill_artifacts(
@@ -2201,6 +2223,12 @@ async def chat(
         _repeat_count = 0
         _files_in_window = 0
         _no_progress_injections = 0
+        # _tool_args_by_id：本批工具调用的 args，按 tool_call_id 索引。
+        # P0 指纹要按**参数**算（见 _tool_intent_sig），而 args 挂在 model 节点的
+        # AIMessage.tool_calls 上、结果挂在紧随其后的 tools 节点 ToolMessage 上，
+        # 两者只能靠 tool_call_id 关联。每次 model 节点 clear 后重填，只留最近一批，
+        # 不随步数增长。原地 clear/赋值不需要 nonlocal。
+        _tool_args_by_id: dict[str, object] = {}
         async def _drain_astream(_input):
             """消费一轮 agent.astream，把事件 publish 进桥；内部吞掉异常不崩本轮。
             M3-v2 继续轮传入 {'messages': [SystemMessage(...)]} 追加系统消息，
@@ -2422,7 +2450,13 @@ async def chat(
                                 and last_msg.tool_calls
                             ):
                                 # LLM 调用了工具
+                                # P0 指纹用：按 tool_call_id 记录本批 args（覆盖式，
+                                # 只留最近一批），供 tools 节点按 id 反查（见 _tool_intent_sig）
+                                _tool_args_by_id.clear()
                                 for tc in last_msg.tool_calls:
+                                    _tc_id = tc.get('id')
+                                    if _tc_id:
+                                        _tool_args_by_id[_tc_id] = tc.get('args')
                                     await _pub({
                                                 'type': 'tool_call',
                                                 'tool': tc['name'],
@@ -2525,9 +2559,20 @@ async def chat(
                                 # Recursion limit 实证：execute 全 OK、报告已生成，模型仍不断
                                 # "重新构建 diff.json"）。连续同一工具意图 + 窗口内零新交付物
                                 # → 判定循环 → 抛 NoProgressAbortError 由外层注入收敛提示。
+                                # 指纹口径见 _tool_intent_sig：按**参数**算，不按结果文本
+                                # （2026-10-17 会话 4f5ede6a 因结果首行噪声占满取样窗口而误杀）。
                                 if not is_error:
-                                    sig = _tool_intent_sig(tool_name, content_str)
-                                    if sig == _last_tool_sig:
+                                    _tc_args = (
+                                        _tool_args_by_id.get(tool_call_id)
+                                        if tool_call_id else None
+                                    )
+                                    sig = _tool_intent_sig(tool_name, _tc_args)
+                                    if sig is None:
+                                        # 参数未知 ⇒ 意图不可判定：重置连续计数并跳过本次判定
+                                        # （宁漏报不误杀 —— 误杀会掐断正在收敛的任务）
+                                        _last_tool_sig = None
+                                        _repeat_count = 0
+                                    elif sig == _last_tool_sig:
                                         _repeat_count += 1
                                     else:
                                         _last_tool_sig = sig

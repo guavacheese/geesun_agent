@@ -43,6 +43,7 @@ from src.core.loop_detection import (
     _hash_tool_calls,
     _resolve_field,
     _stable_tool_key,
+    tool_call_signature,
 )
 
 # langchain 1.4 的 tool_calls 需要 name/args/id/type 四字段
@@ -377,3 +378,112 @@ def test_contract_drift_logged_once(caplog):
             mw._apply(_state_with([_ai(_call("read_file", {"path": "/a"}))]), _RUNTIME)
     hits = [r for r in caplog.records if "契约漂移" in r.getMessage()]
     assert len(hits) == 1, f"漂移告警应限流为 1 次，实际 {len(hits)}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# tool_call_signature：图内中间件与图外 P0 共用的**唯一**指纹口径（2026-10-17）
+#
+# 会话 GY24428:4f5ede6a 实锤：模型连发 10 条各不相同的 pymupdf 命令排查这份
+# 262 页扫描件 PDF，排查路径正确、且已在收敛；但每次执行输出的**第一行**恒为那句
+# 98 字符的 `fitz` 弃用警告，而 P0 旧实现取"结果前 60 字符" ⇒ 98 > 60 ⇒
+# 取样窗口被噪声整行占满，真正的差异全在窗口之外 ⇒ 10 次去重后只剩 1 种指纹
+# ⇒ `_repeat_count` 必达阈值 ⇒ **必然误报**，把任务掐断在离成功一步之遥。
+#
+# 这个模式已发作两次，根因一致（指纹区分度退化 ⇒ 概率误报变必然误报）：
+#   · aaf95335 炸在**入参侧**（read_file 字段名契约错位 ⇒ 稳定 key 恒为 ":0-0"）
+#   · 4f5ede6a 炸在**结果侧**（噪声占满取样窗口）
+# 故本组用例同时断言"旧口径确实会退化"——否则它在新代码上也会是绿的（自证式测试）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 真实日志里每次 pymupdf 执行输出的固定首行（98 字符）
+_FITZ_WARNING = (
+    "warning: The `fitz` API is deprecated and will be removed in future. "
+    "Use `import pymupdf` instead."
+)
+assert len(_FITZ_WARNING) >= 60, "噪声行必须长于旧实现的 60 字符取样窗口"
+
+# 4f5ede6a 里模型真实发出的那批命令（按工具日志还原，内容各不相同）
+_REAL_COMMANDS = [
+    'python3 -c "import fitz; d=fitz.open(\'a.pdf\'); print(%s)"' % expr
+    for expr in (
+        "d.page_count",
+        "d[0].get_text()",
+        "d[1].get_text()",
+        "len(d[0].get_text())",
+        "d[0].get_images()",
+        "[i for i in range(d.page_count) if '光源' in d[i].get_text()]",
+        "sum(len(d[i].get_text()) for i in range(10))",
+        "d[0].get_text('text')[:200]",
+        "d.metadata",
+        "d[2].get_text()",
+    )
+]
+
+
+def _legacy_sig(tool_name: str, result_str: str) -> str:
+    """旧实现（2026-10-17 之前）：取工具结果前 60/80 字符。
+
+    仅用于**负向对照** —— 证明这一组输入在旧代码下会退化，用例才有判别力。
+    """
+    s = (result_str or "").strip()
+    if tool_name == "execute":
+        return f"{tool_name}:{s[:60]}"
+    return f"{tool_name}:{s[:80]}" if s else tool_name
+
+
+def test_signature_distinguishes_commands_despite_identical_result_prefix():
+    """回归锁（会话 4f5ede6a）：结果前缀被噪声占满时，不同命令必须仍是不同指纹。"""
+    assert len(_REAL_COMMANDS) == 10
+
+    # 每次执行输出都以同一行噪声开头（与真实日志一致），差异在 60 字符窗口之外
+    noisy_results = [
+        f"{_FITZ_WARNING}\n总页数: 262\n第{i}页: 文本长度=663" for i in range(10)
+    ]
+
+    # ① 负向对照：旧口径在这组输入下**确实**只剩 1 种指纹（用例判别力的来源）
+    legacy = {_legacy_sig("execute", r) for r in noisy_results}
+    assert len(legacy) == 1, (
+        "负向对照失效：旧口径本应退化成 1 种指纹，用例不再能复现 4f5ede6a"
+    )
+
+    # ② 新口径：10 条不同命令必须算出 10 种指纹
+    new = {tool_call_signature("execute", {"command": c}) for c in _REAL_COMMANDS}
+    assert len(new) == len(_REAL_COMMANDS), (
+        f"10 条不同命令只算出 {len(new)} 种指纹 —— 指纹又退化了（4f5ede6a 复发）"
+    )
+
+
+def test_signature_stable_for_identical_args():
+    """反向守门人：真·空转（同一条命令反复发）仍必须同指纹，否则兜底失效。"""
+    args = {"command": 'python3 -c "print(1)"'}
+    assert tool_call_signature("execute", args) == tool_call_signature("execute", args)
+    # 参数内容真变了 → 指纹必须跟着变（不能是某个常量）
+    other = {"command": 'python3 -c "print(2)"'}
+    assert tool_call_signature("execute", args) != tool_call_signature("execute", other)
+
+
+def test_signature_never_collapses_to_bare_tool_name():
+    """args 为空 dict 也不能塌成裸工具名 —— 那会让"同工具连打 N 次"变成必然误判。"""
+    sig = tool_call_signature("execute", {})
+    assert sig != "execute", "空 args 退化成了裸工具名（aaf95335 的形态）"
+    assert sig.startswith("execute:")
+
+
+def test_hash_tool_calls_reuses_tool_call_signature():
+    """物理同源：`_hash_tool_calls` 的逐条结果必须与 `tool_call_signature` 一致。
+
+    两处若各写一套 name/key 拼装，图内/图外口径会分叉 —— 同一个"空转"在两处
+    得出相反结论，而两处的止损动作都不可逆。
+    """
+    import hashlib
+    import json as _json
+
+    calls = [
+        {"name": "execute", "args": {"command": "ls /reports"}},
+        {"name": "read_file", "args": {"file_path": "/a.py", "offset": 1, "limit": 100}},
+    ]
+    sigs = sorted(tool_call_signature(c["name"], c["args"]) for c in calls)
+    expected = hashlib.md5(
+        _json.dumps(sigs, sort_keys=True, default=str).encode()
+    ).hexdigest()[:12]
+    assert _hash_tool_calls(calls) == expected
