@@ -1105,6 +1105,13 @@ async def create_agent(
                 hard_limit=settings.loop_detect_hard_limit,
                 tool_freq_warn=settings.loop_detect_tool_freq_warn,
                 tool_freq_hard_limit=settings.loop_detect_tool_freq_hard,
+                # ★ 2026-10-17 补：绝对次数阈值会被第二种工具结构性稀释
+                #   （83345f0c：execute 累计 24 次但 20 窗口内最多 16 < hard=20，
+                #    硬停在结构上不可能触发），故加占比 + 交替循环两个形态判据，
+                #    且只在"窗口内零交付物"时生效（防误杀跑 build/批量处理类长任务）。
+                tool_freq_ratio=settings.loop_detect_tool_ratio_threshold,
+                min_window_fill=settings.loop_detect_min_window_fill,
+                alternating_min_run=settings.loop_detect_alternating_min_run,
             ),
             # ★★ 必须在**列表末尾**（LoopDetection 之后）。2026-09-11 新增，
             # 堵「模型吐空响应但流程当正常结束」——生产会话 GY24428:0f6d781d

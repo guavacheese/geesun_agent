@@ -85,6 +85,18 @@ _DEFAULT_TOOL_FREQ_WARN = 12  # 同工具名 ≥12 次警告（deer-flow 默认 
 _DEFAULT_TOOL_FREQ_HARD = 20  # 同工具名 ≥20 次硬剥
 _DEFAULT_MAX_TRACKED_THREADS = 100  # LRU 清理上限
 _MAX_PENDING_WARNINGS_PER_RUN = 4
+# ─── Layer 2 占比/交替判据默认值（2026-10-17 新增）───
+# 存在理由见 config.py loop_detect_tool_ratio_threshold 的长注释：绝对次数阈值
+# 会被"穿插调用任意第二种工具"结构性稀释。83345f0c 实测 execute 累计 24 次、
+# 20 窗口内最多 16 次 < hard=20 ⇒ 硬停在结构上不可能触发。
+_DEFAULT_TOOL_FREQ_RATIO = 0.6  # 窗口内单一工具占比阈值
+_DEFAULT_MIN_WINDOW_FILL = 12  # 窗口至少填满这么多次才做占比判定（防小样本噪声）
+_DEFAULT_ALTERNATING_MIN_RUN = 6  # 交替循环最少连续匹配次数
+#: 交付物目录特征串。窗口内工具结果出现它即视为"有进展"，占比/交替硬停**不生效**。
+#: 与 config.py report_root / chat.py M3 完成门同源（那里也只认 /reports/）。
+_DELIVERABLE_PATH_MARK = "/reports/"
+#: 这个工具名本身即是"交付动作"，出现即视为有进展
+_DELIVERABLE_TOOL_NAME = "download_from_sandbox"
 
 
 # ─── 工具调用稳定性 key 提取 ───────────────────────────────
@@ -398,6 +410,89 @@ _TOOL_FREQ_HARD_STOP_MSG = (
     "[FORCED STOP] 工具 {tool_name} 已调用 {count} 次，超过单个工具安全上限。请用已收集的结果产出最终答案。"
 )
 
+# ★ 占比/交替硬停文案（2026-10-17）。措辞与上面的区别：这里明确告诉模型
+#   "你的调用形态像空转"而不是"某个工具调太多了"——83345f0c 里模型把参数错误
+#   归因成"API 兼容性问题"，通用文案会再次被它误读成环境问题。
+_TOOL_FREQ_PATTERN_HARD_STOP_MSG = (
+    "[FORCED STOP] 检测到工具调用形态异常（{detail}），且期间没有任何新交付物。"
+    "这不是环境或工具故障，而是调用方式没有推进任务。"
+    "请立即停止调用工具，用已收集到的信息直接给出结论或交付物；"
+    "若确实无法完成，明确说明卡点与已尝试的方案。"
+)
+
+# ─── Layer 2 占比 / 交替循环判据（2026-10-17，83345f0c 实证）─────────────
+
+
+def _max_tool_ratio(seq: list[str] | deque[str]) -> tuple[str, int, float]:
+    """窗口内出现次数最多的工具名及其占比。
+
+    返回 (工具名, 次数, 占比)；空序列返回 ("", 0, 0.0)。
+    """
+    if not seq:
+        return "", 0, 0.0
+    counts = Counter(seq)
+    name, n = counts.most_common(1)[0]
+    return name, n, n / len(seq)
+
+
+def _alternating_run(seq: list[str] | deque[str], periods: tuple[int, ...] = (2, 3)) -> int:
+    """检测 A,B,A,B,… 式工具名周期震荡，返回最长连续匹配次数。
+
+    为什么需要它（deer-flow #2590 "detect alternating tool-name cycles"）：
+    占比判据只能抓"一种工具占大头"；而「写脚本 → 跑 → 改 → 跑」这类循环里两种
+    工具各占一半，占比可能都到不了阈值，但周期震荡极其稳定。83345f0c 正是
+    这种形态：`execute` 与 `write_file` 来回穿插 20+ 次，零交付物。
+
+    算法：对每个周期 p，数 `seq[i] == seq[i-p]` 的最长连续段。真交替时该值
+    ≈ len(seq) - p；随机/渐进式探索则很快断掉。
+    """
+    if len(seq) < 4:
+        return 0
+    best = 0
+    for p in periods:
+        run = 0
+        for i in range(p, len(seq)):
+            run = run + 1 if seq[i] == seq[i - p] else 0
+            best = max(best, run)
+    return best
+
+
+def _window_has_deliverable(messages: list[Any], limit: int) -> bool:
+    """窗口内的工具结果里有没有"交付物"信号？
+
+    占比/交替硬停的**误杀闸门**：跑 build、批量处理文件、长流程调试都是
+    「单一工具高频但完全正常」的形态，唯一的区分点是"有没有在向交付物推进"。
+    判据与 M3 完成门同源（chat.py 只认 /reports/），另外把
+    `download_from_sandbox` 本身也视为交付动作。
+
+    只扫最近 `limit` 条消息（与工具频次窗口同量级），避免长历史里一次早期
+    交付把后期空转全程豁免掉。
+    """
+    scanned = 0
+    for msg in reversed(messages):
+        if scanned >= limit:
+            break
+        if getattr(msg, "type", None) != "tool":
+            continue
+        scanned += 1
+        name = getattr(msg, "name", "") or ""
+        if name == _DELIVERABLE_TOOL_NAME:
+            return True
+        content = getattr(msg, "content", None)
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+                elif isinstance(part, str):
+                    texts.append(part)
+        if any(_DELIVERABLE_PATH_MARK in t for t in texts):
+            return True
+    return False
+
+
 # ─── 硬停标记：中间件 → API 层的唯一通道（2026-10-10，②A）──────────────
 # 为什么需要它：硬停（剥空 tool_calls）只让**图**这一轮结束，API 层完全不知道
 # 发生过什么 —— chat.py 的 M3 完成门随后照常按「/reports 有无新产物」判定，
@@ -406,7 +501,8 @@ _TOOL_FREQ_HARD_STOP_MSG = (
 # 约定：常量集中在此，调用方不得硬编码字符串。
 LOOP_FORCED_STOP_KEY = "loop_forced_stop"
 STOP_REASON_REPEAT_CALLS = "repeat_calls"  # Layer 1：同一工具调用组重复
-STOP_REASON_TOOL_FREQUENCY = "tool_frequency"  # Layer 2：同工具名高频
+STOP_REASON_TOOL_FREQUENCY = "tool_frequency"  # Layer 2：同工具名高频（绝对次数）
+STOP_REASON_TOOL_FREQ_PATTERN = "tool_freq_pattern"  # Layer 2：占比/交替（零交付物才生效）
 
 
 class LoopDetectionState(AgentState):
@@ -457,6 +553,9 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         tool_freq_warn: int = _DEFAULT_TOOL_FREQ_WARN,
         tool_freq_hard_limit: int = _DEFAULT_TOOL_FREQ_HARD,
         tool_freq_overrides: dict[str, tuple[int, int]] | None = None,
+        tool_freq_ratio: float = _DEFAULT_TOOL_FREQ_RATIO,
+        min_window_fill: int = _DEFAULT_MIN_WINDOW_FILL,
+        alternating_min_run: int = _DEFAULT_ALTERNATING_MIN_RUN,
     ):
         super().__init__()
         self.warn_threshold = warn_threshold
@@ -465,6 +564,9 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self.max_tracked_threads = max_tracked_threads
         self.tool_freq_warn = tool_freq_warn
         self.tool_freq_hard_limit = tool_freq_hard_limit
+        self.tool_freq_ratio = tool_freq_ratio
+        self.min_window_fill = max(1, min_window_fill)
+        self.alternating_min_run = max(2, alternating_min_run)
         self._tool_freq_overrides = tool_freq_overrides or {}
         self._tool_freq_window = max(
             self.window_size,
@@ -702,6 +804,55 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                         return _TOOL_FREQ_WARNING_MSG.format(tool_name=name, count=freq_count), False
                 else:
                     self._tool_freq_warned[thread_id].discard(name)
+
+            # ─── Layer 2c：占比 / 交替循环（2026-10-17 新增）─────────
+            # 上面那条绝对次数阈值有结构性漏洞：`_tool_freq_window` 是**窗口内同工具
+            # 计数**，模型只要穿插调用任意第二种工具就被稀释。83345f0c 实测：
+            #   execute 累计 24 次，20 窗口内最多 16 次 < hard=20 ⇒ 永不触发。
+            # 换成两个与"绝对次数"无关的形态判据：
+            #   ① 占比：窗口内单一工具占比 ≥ tool_freq_ratio（且次数 ≥ warn 阈值）
+            #   ② 交替循环：工具名周期震荡 ≥ alternating_min_run
+            #      （deer-flow 对应修复 #2590 detect alternating tool-name cycles，
+            #       治的正是「写脚本→跑→改→跑」两种工具各占一半、占比也未必过线的形态）
+            # ★ 必须带**零交付物豁免**：跑 build、批量处理文件、长流程调试都是
+            #   "单一工具高频但完全正常"的形态，唯一区分点是有没有在向交付物推进。
+            #   判据与 M3 完成门同源（chat.py 只认 /reports/），另认
+            #   download_from_sandbox 这个交付动作本身。没有这道闸门，本判据会把
+            #   正常长任务批量误杀——deer-flow 对假阳性的担忧同源。
+            if len(tool_name_history) >= self.min_window_fill:
+                top_name, top_count, top_ratio = _max_tool_ratio(tool_name_history)
+                alt_run = _alternating_run(tool_name_history)
+                by_ratio = (
+                    top_count >= self.tool_freq_warn
+                    and top_ratio >= self.tool_freq_ratio
+                )
+                by_alternating = alt_run >= self.alternating_min_run
+                if (by_ratio or by_alternating) and not _window_has_deliverable(
+                    messages, self._tool_freq_window
+                ):
+                    if by_ratio:
+                        detail = (
+                            f"最近 {len(tool_name_history)} 次调用中 {top_name} "
+                            f"占 {top_count} 次（{top_ratio:.0%}）"
+                        )
+                    else:
+                        detail = (
+                            f"工具调用呈周期震荡（连续匹配 {alt_run} 次，"
+                            f"窗口 {list(tool_name_history)[-8:]}）"
+                        )
+                    logger.error(
+                        "Tool frequency pattern hard limit — forcing stop "
+                        "(thread=%s, detail=%s, ratio=%.2f, alt_run=%d)",
+                        thread_id, detail, top_ratio, alt_run,
+                    )
+                    return _TOOL_FREQ_PATTERN_HARD_STOP_MSG.format(detail=detail), {
+                        "reason": STOP_REASON_TOOL_FREQ_PATTERN,
+                        "tool_name": top_name,
+                        "count": top_count,
+                        "ratio": round(top_ratio, 3),
+                        "alternating_run": alt_run,
+                        "detail": detail,
+                    }
 
         return None, None
 

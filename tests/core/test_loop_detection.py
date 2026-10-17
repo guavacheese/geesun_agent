@@ -487,3 +487,233 @@ def test_hash_tool_calls_reuses_tool_call_signature():
         _json.dumps(sigs, sort_keys=True, default=str).encode()
     ).hexdigest()[:12]
     assert _hash_tool_calls(calls) == expected
+
+
+# ─── Layer 2c：占比 / 交替循环判据（2026-10-17，83345f0c 实证）────────────
+#
+# 背景：绝对次数阈值 `tool_freq_hard=20` 有一个**结构性**漏洞 ——
+# `_tool_freq_window` 是"滑动窗口内的同工具计数"，模型只要穿插调用任意第二种
+# 工具就被稀释。83345f0c 实测：`execute` 累计 24 次，但 20 窗口内最多只有
+# 16 次 < 20 ⇒ 硬停在结构上不可能触发，只能等 recursion_limit=200 烧满。
+#
+# 下面这组测试的第一条**直接复放该会话的真实工具名序列**（execute×8,
+# write_file, execute, write_file, execute×5, write_file, write_file,
+# execute×7, write_file, execute, execute, write_file, execute），
+# 且每次 args 都不同 —— 这正是"Layer 1 抓不到、Layer 2 绝对次数也抓不到"的形态。
+from langchain_core.messages import ToolMessage  # noqa: E402
+
+from src.core.loop_detection import (  # noqa: E402
+    STOP_REASON_TOOL_FREQ_PATTERN,
+    _alternating_run,
+    _max_tool_ratio,
+    _window_has_deliverable,
+)
+
+#: 83345f0c 的真实工具名序列（32 次调用，取自 ex_83345f0c_msgs.jsonl 逐条统计）
+_83345F0C_TOOL_SEQ = (
+    ["read_file", "upload_to_sandbox"]
+    + ["execute"] * 8
+    + ["write_file", "execute", "write_file"]
+    + ["execute"] * 5
+    + ["write_file", "write_file"]
+    + ["execute"] * 7
+    + ["write_file", "execute", "execute", "write_file", "execute"]
+)
+assert len(_83345F0C_TOOL_SEQ) == 32, len(_83345F0C_TOOL_SEQ)
+
+
+def _seq_calls(seq):
+    """把工具名序列变成"每次参数都不同"的调用列表（复现 83345f0c 的异参形态）。"""
+    out = []
+    for i, name in enumerate(seq):
+        if name == "write_file":
+            out.append(_call(name, {"file_path": f"/home/user/s{i}.py",
+                                    "content": f"# variant {i}\nprint({i})"}))
+        else:
+            out.append(_call(name, {"command": f"echo step-{i}", "timeout": "60"}))
+    return out
+
+
+def _tool_results(seq, marker=None):
+    """按序列造对应的 ToolMessage 串；marker 非 None 时写进每条结果正文。"""
+    msgs = []
+    for i, name in enumerate(seq):
+        body = f"result-{i}" if marker is None else f"{marker} step-{i}"
+        msgs.append(ToolMessage(content=body, tool_call_id=f"c{i}", name=name))
+    return msgs
+
+
+def test_83345f0c_real_sequence_is_caught_by_pattern_layer():
+    """复放 83345f0c：异参 + execute/write_file 交错 ⇒ 必须在烧满 32 次前硬停。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=3, hard_limit=5,
+        tool_freq_warn=12, tool_freq_hard_limit=20,   # 生产默认
+        tool_freq_ratio=0.6, min_window_fill=12, alternating_min_run=6,
+    )
+    calls = _seq_calls(_83345F0C_TOOL_SEQ)
+    # 工具结果全部不含 /reports/（复现"零交付物"）
+    results = _tool_results(_83345F0C_TOOL_SEQ)
+
+    first_hard = None
+    for i, call in enumerate(calls):
+        state = _state_with([*results[:i], _ai(call)])
+        res = mw._apply(state, _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            first_hard = (i + 1, res[LOOP_FORCED_STOP_KEY])
+            break
+
+    assert first_hard is not None, "32 次异参交错调用竟无任何硬停 —— 正是 83345f0c 的形态"
+    n, marker = first_hard
+    assert marker["reason"] == STOP_REASON_TOOL_FREQ_PATTERN, marker
+    # 必须远早于 32 次（recursion_limit=200 的容量），否则止损没有意义
+    assert n <= 24, f"硬停来得太晚（第 {n} 次），省不下步数"
+
+
+def test_pattern_hard_stop_reason_distinct_from_absolute_count():
+    """占比/交替硬停的原因码必须与绝对次数可区分（复盘时能分辨是哪种判据开火）。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=12, tool_freq_hard_limit=20,
+        tool_freq_ratio=0.6, min_window_fill=12, alternating_min_run=6,
+    )
+    res = None
+    for i, call in enumerate(_seq_calls(_83345F0C_TOOL_SEQ)):
+        res = mw._apply(_state_with([_ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            break
+    assert res is not None
+    marker = res[LOOP_FORCED_STOP_KEY]
+    assert marker["reason"] == STOP_REASON_TOOL_FREQ_PATTERN
+    assert marker["ratio"] >= 0.6
+    assert marker["tool_name"] in ("execute", "write_file")
+
+
+def test_no_pattern_hard_stop_when_deliverable_present():
+    """零交付物豁免：同样高频，但只要窗口内出现过 /reports/ 交付物就不得硬停。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=12, tool_freq_hard_limit=20,
+        tool_freq_ratio=0.6, min_window_fill=12, alternating_min_run=6,
+    )
+    results = _tool_results(_83345F0C_TOOL_SEQ, marker="/reports/u/s/out.xlsx")
+    for i, call in enumerate(_seq_calls(_83345F0C_TOOL_SEQ)):
+        res = mw._apply(_state_with([*results[: i + 1], _ai(call)]), _RUNTIME)
+        assert res is None or LOOP_FORCED_STOP_KEY not in res, f"第 {i+1} 次误杀：有交付物仍硬停"
+
+
+def test_alternating_cycle_caught_even_when_ratio_below_threshold():
+    """两种工具各占一半（占比不过线）但周期震荡 ⇒ 仍须硬停（deer-flow #2590 的洞）。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=99,                    # 关掉绝对次数与占比的次数前提
+        tool_freq_hard_limit=99,
+        tool_freq_ratio=0.99,                 # 占比几乎不可能达到
+        min_window_fill=12, alternating_min_run=6,
+    )
+    seq = ["execute", "write_file"] * 10     # 完美交替，占比 0.5
+    for i, call in enumerate(_seq_calls(seq)):
+        res = mw._apply(_state_with([_ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            marker = res[LOOP_FORCED_STOP_KEY]
+            assert marker["reason"] == STOP_REASON_TOOL_FREQ_PATTERN
+            assert marker["alternating_run"] >= 6, marker
+            return
+    raise AssertionError("A,B,A,B 周期震荡未被捕获")
+
+
+def test_pattern_requires_min_window_fill():
+    """窗口未填满不得判定（防开局小样本噪声把正常开头当成循环）。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=1, tool_freq_hard_limit=99,
+        tool_freq_ratio=0.5, min_window_fill=12, alternating_min_run=99,
+    )
+    # 6 次同一工具、零交付物 —— 形态像循环，但窗口没填满
+    for call in _seq_calls(["execute"] * 6):
+        res = mw._apply(_state_with([_ai(call)]), _RUNTIME)
+        assert res is None or LOOP_FORCED_STOP_KEY not in res
+
+
+def test_absolute_count_hard_stop_still_works():
+    """回归：纯同工具 20 次仍走原绝对次数硬停（新判据是补充，不是替换）。
+
+    注意：纯同工具 + 零交付物时，**占比判据会更早开火**（100% 占比，窗口一满即停），
+    这是期望行为。要单独验证老的绝对次数路径，必须让占比判据被"有交付物"豁免掉 ——
+    此时工具仍在被高频锤（deer-flow 原语义：单工具调用量本身就该有上限）。
+    """
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=12, tool_freq_hard_limit=20,
+        tool_freq_ratio=0.6, min_window_fill=12, alternating_min_run=6,
+    )
+    seq = ["execute"] * 20
+    results = _tool_results(seq, marker="/reports/u/s/out.txt")  # 有交付物 ⇒ 占比判据豁免
+    res = None
+    for i, call in enumerate(_seq_calls(seq)):
+        res = mw._apply(_state_with([*results[: i + 1], _ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            break
+    assert res is not None
+    assert res[LOOP_FORCED_STOP_KEY]["reason"] == STOP_REASON_TOOL_FREQUENCY
+    assert res[LOOP_FORCED_STOP_KEY]["count"] == 20
+
+
+def test_pattern_layer_preempts_absolute_count_on_pure_single_tool():
+    """纯同工具 + 零交付物：占比判据应先于绝对次数开火（更早止损，且原因码不同）。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=12, tool_freq_hard_limit=20,
+        tool_freq_ratio=0.6, min_window_fill=12, alternating_min_run=6,
+    )
+    res = None
+    n = 0
+    for i, call in enumerate(_seq_calls(["execute"] * 20)):
+        n = i + 1
+        res = mw._apply(_state_with([_ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            break
+    assert res is not None
+    assert res[LOOP_FORCED_STOP_KEY]["reason"] == STOP_REASON_TOOL_FREQ_PATTERN
+    assert n < 20, f"占比判据应早于绝对次数开火，实际第 {n} 次"
+
+
+def test_max_tool_ratio_helper():
+    assert _max_tool_ratio([]) == ("", 0, 0.0)
+    name, n, ratio = _max_tool_ratio(["a", "b", "a", "a", "b"])
+    assert (name, n) == ("a", 3)
+    assert abs(ratio - 0.6) < 1e-9
+
+
+def test_alternating_run_helper():
+    assert _alternating_run([]) == 0
+    assert _alternating_run(["a", "b", "a", "b"]) == 0 or _alternating_run(["a", "b", "a", "b"]) >= 1
+    # 真周期震荡：run 应接近序列长度
+    assert _alternating_run(["a", "b"] * 8) >= 12
+    # 周期 3 也能抓到
+    assert _alternating_run(["a", "b", "c"] * 6) >= 12
+    # 渐进式探索不应被判为震荡
+    assert _alternating_run([f"t{i}" for i in range(20)]) == 0
+    # 短序列不判
+    assert _alternating_run(["a", "b"]) == 0
+
+
+def test_window_has_deliverable_helper():
+    """交付物判据：/reports/ 正文、download_from_sandbox 工具名、以及"两者皆无"。"""
+    plain = [ToolMessage(content="ok", tool_call_id="c", name="execute")]
+    assert _window_has_deliverable(plain, 20) is False
+
+    with_path = [ToolMessage(content="saved /reports/u/s/a.txt", tool_call_id="c", name="execute")]
+    assert _window_has_deliverable(with_path, 20) is True
+
+    dl = [ToolMessage(content="ok", tool_call_id="c", name="download_from_sandbox")]
+    assert _window_has_deliverable(dl, 20) is True
+
+    # list 形态 content（MCP 工具常返回 list[{'type','text'}]）
+    rich = [ToolMessage(content=[{"type": "text", "text": "path=/reports/u/s/x"}],
+                        tool_call_id="c", name="download_from_sandbox")]
+    assert _window_has_deliverable(rich, 20) is True
+
+    # 超出扫描上限的早期交付物不应豁免后期空转
+    old = [ToolMessage(content="/reports/early", tool_call_id="c0", name="execute")]
+    late = [ToolMessage(content="nothing", tool_call_id="c1", name="execute")]
+    assert _window_has_deliverable(old + late, 1) is False

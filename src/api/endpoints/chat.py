@@ -2223,6 +2223,14 @@ async def chat(
         _repeat_count = 0
         _files_in_window = 0
         _no_progress_injections = 0
+        # C 交付物停滞检测（2026-10-17 新增）：
+        # _stagnation_calls  —— 距上次新交付物的**工具结果数**（与参数无关）
+        # _stagnation_injections —— 已软注入次数（上限 config.no_progress_stagnation_max_injections）
+        # 与上面 P0 的分工：P0 看「同一意图连续重复」，C 看「一直没交东西」。
+        # 83345f0c 里 P0 全程失明（32 次调用 args 全不同 ⇒ _repeat_count 恒 1），
+        # 但「同一个脚本重写 5 次、零交付物」这件事在 C 的判据下是稳定的。
+        _stagnation_calls = 0
+        _stagnation_injections = 0
         # _tool_args_by_id：本批工具调用的 args，按 tool_call_id 索引。
         # P0 指纹要按**参数**算（见 _tool_intent_sig），而 args 挂在 model 节点的
         # AIMessage.tool_calls 上、结果挂在紧随其后的 tools 节点 ToolMessage 上，
@@ -2236,6 +2244,7 @@ async def chat(
             """
             nonlocal _last_debug_step, thinking_emitted, generating_emitted, _generated_files, _consecutive_tool_failures, _reasoning_started_at_ms, _reasoning_ended_at_ms
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
+            nonlocal _stagnation_calls, _stagnation_injections
             nonlocal _loop_forced_stop
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # ─── 清洗：messages 里不应有 SystemMessage ───
@@ -2261,12 +2270,31 @@ async def chat(
                 ],
             }
             # 使用 try/except 保护，防止 agent.astream 内部异常导致 SSE 流中断
+            # ─── recursion_limit：从 settings 读 + 服务端钳制（2026-10-17 配置化）───
+            # 原来是这里的硬编码字面量 200。实测生产 middleware 链下 6.12 super-step /
+            # 次工具调用（裸 deepagents 只要 3 步），200 的真实容量仅 ≈32 次调用，
+            # 会话 GY24428:83345f0c 恰好 32 次 ⇒ 一撞就死，且改一次要重新构建镜像。
+            # 对照 deer-flow：recursion_limit 是配置项并有 max_recursion_limit 硬上限
+            # （Gateway 按 run clamp，防 LLM 成本/DoS）。此处同样钳制，被钳制必须
+            # 显式告警——静默改小会让"调大了却没生效"这类问题再次隐形。
+            _recursion_limit = settings.recursion_limit
+            if _recursion_limit > settings.max_recursion_limit:
+                logger.warning(
+                    "[CONFIG] recursion_limit=%d 超过 max_recursion_limit=%d，已钳制",
+                    _recursion_limit, settings.max_recursion_limit,
+                )
+                _recursion_limit = settings.max_recursion_limit
+            if _recursion_limit < 1:
+                logger.warning(
+                    "[CONFIG] recursion_limit=%d 非法（<1），回退为 200", _recursion_limit,
+                )
+                _recursion_limit = 200
             try:
                 _stream = agent.astream(
                     _input,
                     config={
                         **graph_config,
-                        "recursion_limit": 200,  # ← 最多 200 步（原 100）：大文档任务（80+页×2 PDF 逐章节提取）实测 100 步不够，报告都没来得及写；正常流程 25-35 步，200 是 5-8 倍余量
+                        "recursion_limit": _recursion_limit,
                     },
                     stream_mode=["messages", "updates"],
                     **invoke_kwargs,
@@ -2554,6 +2582,13 @@ async def chat(
                                 else:
                                     _consecutive_tool_failures = 0
 
+                                # ─── C：交付物停滞计数（2026-10-17）───
+                                # 每个工具结果都计数，无论成败 —— 模型烧的是**步数**，
+                                # 失败循环同样在烧（那种另有 sandbox_tool_failure_threshold
+                                # 管，这里是"成功但一直不交付"的形态）。
+                                # 清零点只有两处：下方检测到新交付物（_files_in_window += 1）。
+                                _stagnation_calls += 1
+
                                 # ─── P0 无进展循环检测：工具成功但反复同一意图 ───
                                 # 模型在"工具全成功但任务未收敛"时空转（2026-08-17/18 两次
                                 # Recursion limit 实证：execute 全 OK、报告已生成，模型仍不断
@@ -2609,6 +2644,57 @@ async def chat(
                                                 f"仍未收敛（最近: {tool_name} 连续 {_repeat_count} 次重复），"
                                                 "判定任务无法继续，已提前终止"
                                             )
+
+                                # ─── C：交付物停滞检测（2026-10-17 新增）─────────
+                                # 与上面 P0 的**分工**（不是重复）：
+                                #   P0 看「同一意图连续重复」——要求指纹相同；
+                                #   C   看「距上次新交付物的工具结果数」——**与参数无关**。
+                                # 为什么必须补这条（会话 GY24428:83345f0c 实证）：
+                                #   该会话 32 次调用 args 全不同（每次 `python3 -c "..."`
+                                #   内容都不同、`write_file` content 不同），P0 的
+                                #   `_repeat_count` 恒为 1 ⇒ **全程失明**；同一脚本被重写
+                                #   5 次、`rm` 后再写、pytesseract↔paddleocr 来回横跳，
+                                #   最后烧满 recursion_limit=200。这正是 deer-flow
+                                #   RFC #2820 定义的 false negative：
+                                #   "the agent varies tool arguments just enough to
+                                #    avoid detection, but still fails to make progress
+                                #    and eventually hits the recursion limit"。
+                                # ★ 防误杀三件套（deer-flow 对假阳性的担忧同源：
+                                #   误杀会把"先深搜 20 次再写报告"的正常长任务掐断）：
+                                #   ① 只软注入一次，且提示里带安全阀"若本轮无需文件请直接文字作答"；
+                                #   ② 交付物一出现立即清零重计（见下方两处 _files_in_window += 1）；
+                                #   ③ 只有**第二次**攒满阈值才硬终止。
+                                if (
+                                    _stagnation_calls
+                                    >= settings.no_progress_stagnation_calls
+                                ):
+                                    if (
+                                        _stagnation_injections
+                                        < settings.no_progress_stagnation_max_injections
+                                    ):
+                                        _stagnation_injections += 1
+                                        _stagnation_calls = 0  # 重新计数，给一次收敛机会
+                                        logger.warning(
+                                            "[C] 交付物停滞: 距上次新交付物已 %d 次工具调用"
+                                            "（最近: %s）→ 注入收敛提示 (user=%s, session=%s)",
+                                            settings.no_progress_stagnation_calls,
+                                            tool_name, user_id, session_id,
+                                        )
+                                        raise NoProgressAbortError(
+                                            f"已连续 {settings.no_progress_stagnation_calls} 次工具调用"
+                                            f"未产生任何新交付物（最近一次：{tool_name}）"
+                                        )
+                                    logger.warning(
+                                        "[C] 交付物停滞且收敛提示无效: 再攒满 %d 次仍无交付物 → 终止"
+                                        " (user=%s, session=%s)",
+                                        settings.no_progress_stagnation_calls,
+                                        user_id, session_id,
+                                    )
+                                    raise ToolLoopAbortError(
+                                        f"已两次出现连续 {settings.no_progress_stagnation_calls} 次"
+                                        "工具调用无任何新交付物，且收敛提示无效，"
+                                        "判定任务已无法继续，已提前终止"
+                                    )
 
                                 # ─── 检测工具返回的文件信息，提取生成/下载的文件 ───
                                 # 不限定工具名，任何返回 /reports/ 路径的工具都能触发
@@ -2789,6 +2875,7 @@ async def chat(
                                     else:
                                         _emitted_files.add(file_path_virtual)
                                         _files_in_window += 1  # P0：新交付物计数（非空转信号）
+                                        _stagnation_calls = 0  # C：交付物一出现立即重计
                                         await _pub({
                                                             'type': 'file_generated',
                                                             'file_name': file_path_virtual.split(
@@ -2821,30 +2908,37 @@ async def chat(
                 logger.warning("工具连续失败超限提前终止: %s", e)
                 await _pub({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'})
             except NoProgressAbortError as e:
-                # ─── P0 无进展循环：中断本轮，注入收敛提示让模型收敛 ───
-                # 触发后 _graph_input 被替换为收敛提示，外层 while 循环继续跑一轮；
-                # 收敛轮再触发（超 no_progress_max_injections）则不再注入，
+                # ─── 无进展循环 / 交付物停滞：中断本轮，注入收敛提示让模型收敛 ───
+                # 两个来源共用本分支：P0（同一意图连续重复）与 C（交付物停滞，
+                # 2026-10-17 新增）。触发后 _graph_input 被替换为收敛提示，
+                # 外层 while 循环继续跑一轮；收敛轮再触发（超注入上限）则不再注入，
                 # 由 except Exception 兜底转 error 终止（防无限收敛轮）。
                 # 注意：必须用 HumanMessage 而非 SystemMessage——vLLM 要求所有
                 # system 消息连续位于开头，本提示与 checkpoint 恢复的历史消息合并
                 # 后不保证位置（2026-08-19 09:44:54 实测 400 'System message must
                 # be at the beginning'；资源清单 13dab48→f093303 同款教训）。
                 _no_progress_triggered = True  # 标记：收敛轮跳过 M3 零产出拦截
-                logger.warning("[P0] 无进展循环，注入收敛提示: %s", e)
+                logger.warning("[P0/C] 无进展或交付物停滞，注入收敛提示: %s", e)
                 await _pub({'type': 'agent_status', 'status': 'no_progress', 'content': f'{str(e)[:200]}'})
-                # 收敛提示：让模型停止重复，验证已有产出并交付
+                # 收敛提示：让模型停止空转，验证已有产出并交付。
+                # ★ 第 4 条是 C 的**安全阀**（2026-10-17）：没有它，"一直没有新交付物"
+                #   会把「本轮本就是问答/分析、不该有文件」的正常任务一起误杀 ——
+                #   模型收到提醒后会硬凑一个文件出来。明确告诉它"没有文件也是合法终点"，
+                #   误杀时它就能直接用文字收尾。
                 _graph_input = {"messages": [HumanMessage(
-                    f"系统检测到无进展循环：你已连续多轮重复相同操作（{str(e)[:150]}）"
-                    "且未产生新交付物。请立即收敛："
+                    f"系统检测到任务长时间没有推进：{str(e)[:150]}。请立即收敛："
                     "1) 检查 /reports/{user_id}/{session_id}/ 下是否已有可交付的报告文件，"
                     "   如有则直接确认交付，停止重新生成；"
                     "2) 若确需重跑，先说明与上一轮的具体差异，一次完成，不要重复相同命令；"
-                    "3) 若无法收敛，明确向用户说明卡点和已完成的产出。"
+                    "3) 若无法收敛，明确向用户说明卡点和已完成的产出；"
+                    "4) 若本轮任务本就是问答/分析类、**不需要产出文件**，"
+                    "   请直接用文字给出完整结论——没有文件也是合法的终点，不要再调用工具。"
                 )]}
                 # 重置无进展计数（收敛轮重新统计），基线重设
                 _last_tool_sig = None
                 _repeat_count = 0
                 _files_in_window = 0
+                _stagnation_calls = 0  # C：收敛轮重新计（_stagnation_injections 不清，上限仍生效）
                 _before_files = snapshot_report_files(settings.report_root, user_id, session_id)
             except Exception as e:
                 # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
@@ -2951,6 +3045,7 @@ async def chat(
                             continue
                         _emitted_files.add(_sf["file_path"])
                         _files_in_window += 1  # 新交付物计数（非空转信号，与 B① 一致）
+                        _stagnation_calls = 0  # C：兜底拉回也算交付物（同 B① 语义）
                         # 注意：沙箱兜底拉回**没有**对应的工具调用 ⇒ 不带 tool_call_id，
                         # 归属走 _attach_generated_files 的回退链（本轮最后一条带 tool_calls
                         # 的 AI）。这与流式一致：兜底在流尾 emit，前端也挂到当时最后一条 AI。

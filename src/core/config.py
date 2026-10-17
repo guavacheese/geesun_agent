@@ -107,6 +107,22 @@ class Settings(BaseSettings):
     # 工具连续失败阈值：单轮内连续失败（error/超时）达到该次数即提前终止，
     # 避免模型在错误循环里空转直到烧满 recursion_limit（100 步，约几分钟白等）
     sandbox_tool_failure_threshold: int = 5
+    # ─── LangGraph 步数预算（2026-10-17 配置化）───
+    # 背景：会话 GY24428:83345f0c 撞 `Recursion limit of 200 reached`。实测生产
+    #   middleware 链下 **6.12 super-step / 次工具调用**（model + TodoList/after_model
+    #   + LoopDetection/after_model + TerminalResponse/after_model + tools），
+    #   裸 deepagents 只要 3 步 ⇒ 200 的真实容量只有 ≈32 次工具调用，
+    #   而该会话恰好用了 32 次。此前是 chat.py 里的硬编码字面量，既不可按任务
+    #   调整、也没有服务端上限保护（deer-flow 同类字段见其 app_config.py：
+    #   recursion_limit default=100 + max_recursion_limit default=1000，Gateway 按
+    #   run 钳制，超出即 clamp，防 LLM 成本/DoS）。
+    # ★ 单位是 **super-step 不是工具调用次数**：调大前先按 6 步/次折算容量。
+    # ★ RFC #2820 明确"只提高上限不够，会放大噪声"——本项只把旋钮交出来，
+    #   真正的止损仍靠 B（占比/交替硬停）与 C（交付物停滞）。
+    #: 每轮 astream 的 recursion_limit。300 ≈ 50 次工具调用容量。
+    recursion_limit: int = 300
+    #: 服务端硬上限：任何来源（默认值/环境变量/未来客户端传入）超出即钳制
+    max_recursion_limit: int = 1000
     # ─── P0 无进展循环检测（2026-08-19 新增）───
     # 工具"成功但无进展"死循环兜底：同一工具调用意图（工具名+参数指纹）
     # 连续出现 N 次且期间零新交付物 → 判定循环，注入收敛 SystemMessage。
@@ -116,6 +132,26 @@ class Settings(BaseSettings):
     no_progress_max_injections: int = 1
     # 无进展窗口判定：重复 N 次内是否有新交付物（file_generated / reports 新文件）
     no_progress_window_files: int = 3
+    # ─── C：交付物停滞检测（2026-10-17 新增）───
+    # 上面 P0 的判据是「**同一意图连续重复**」，83345f0c 暴露了它的盲区：
+    #   模型 32 次调用 args 全不同（每次 `python3 -c "..."` 内容都不同、
+    #   `write_file` content 不同），`_repeat_count` 恒为 1 ⇒ 永不触发。
+    #   这正是 deer-flow RFC #2820 定义的 **false negative**：
+    #   "the agent varies tool arguments just enough to avoid detection,
+    #    but still fails to make progress and eventually hits the recursion limit"。
+    # 本项换一个**与参数无关**的判据：距上次新交付物的工具结果数。同一脚本被
+    #   重写 5 次、`rm` 后再写、pytesseract→paddleocr→pytesseract 来回横跳，
+    #   参数都不一样，但「一直没交东西」这件事是稳定的。
+    # ★ 防误杀设计（deer-flow 同款顾虑：假阳性会掐断正常长任务）：
+    #   ① 只**软注入**一次，且提示里带安全阀——"若本轮任务本就是问答/分析类
+    #      无需文件，请直接用文字作答"；
+    #   ② 交付物一出现立即清零重计，正常任务（先深搜 20 次再写报告）最多挨一句
+    #      提醒，随后该干嘛干嘛；
+    #   ③ 只有**第二次**停滞（再攒满阈值）才硬终止。
+    #: 距上次新交付物的工具结果数阈值（软注入触发）
+    no_progress_stagnation_calls: int = 15
+    #: 软注入次数上限；超限后再次停滞 ⇒ 硬终止
+    no_progress_stagnation_max_injections: int = 1
     # ─── LoopDetectionMiddleware（2026-09-08 移植 deer-flow，防烧满 recursion_limit）───
     # 已写码并通过单测：src/core/loop_detection.py + tests/core/test_loop_detection.py
     # Layer 1（hash 级）：同一组工具调用（名+参数摘要）重复 N 次 → 注入软提醒
@@ -127,6 +163,22 @@ class Settings(BaseSettings):
     loop_detect_tool_freq_warn: int = 12
     # Layer 2 硬剥阈值：同工具名高频达 N 次后剥离 tool_calls
     loop_detect_tool_freq_hard: int = 20
+    # ─── Layer 2 占比/交替判据（2026-10-17 新增，83345f0c 实证）───
+    # 绝对次数阈值有一个结构性漏洞：`_tool_freq_window` 是**滑动窗口内的同工具
+    #   计数**，只要模型穿插调用**任意第二种工具**，计数就被稀释。83345f0c 实测：
+    #   `execute` 累计 24 次，但 20 窗口内最多只有 16 次 < hard=20 ⇒ 硬停
+    #   **在结构上不可能触发**（累计数再高也没用）。
+    # 因此补两个与"绝对次数"无关的判据，且**必须带零交付物豁免**（否则跑 build、
+    #   批量处理文件等正常长任务会被误杀——deer-flow 对误杀的担忧同源）：
+    #   ① 占比：窗口内单一工具占比 ≥ ratio_threshold；
+    #   ② 交替循环：工具名呈 A,B,A,B… 周期震荡（deer-flow 对应修复 #2590
+    #      "detect alternating tool-name cycles"，正是被稀释掉的那个洞）。
+    #: 窗口内单一工具占比阈值（0.6 = 20 窗口里 12 次同一工具）
+    loop_detect_tool_ratio_threshold: float = 0.6
+    #: 窗口至少填满这么多次才允许占比判定（防开局小样本噪声）
+    loop_detect_min_window_fill: int = 12
+    #: 交替循环最少连续匹配次数（周期 2 或 3）
+    loop_detect_alternating_min_run: int = 6
     # ─── TerminalResponseMiddleware（2026-09-11 新增，堵「空响应被当正常结束」）───
     # 已写码并通过单测：src/core/terminal_response.py + tests/spikes/terminal_response_guard.py
     # 背景：生产会话 GY24428:0f6d781d 末次模型调用耗时 336s 后返回**完全空响应**
