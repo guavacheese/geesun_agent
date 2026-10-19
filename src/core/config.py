@@ -240,6 +240,17 @@ class Settings(BaseSettings):
     # 对齐 deer-flow / deepseek-harness 的 run_streaming 空闲超时护长任务，解决 600s 墙钟
     # 误杀 200k 报告的问题。0/None 可关（依赖上方 model_call_timeout_sec 灾难性兜底）。
     model_stream_chunk_timeout_sec: int = 240
+    # ─── MCP 工具调用超时（2026-10-19 新增，方案 3 工具侧背压）───
+    # 事故 653d8515：同步 e2b 调用堵死事件循环，工具调用 55 分钟不返回，
+    # run 挂死 38 小时无人收尸。MCP 侧已修（asyncio.to_thread + submit-and-poll），
+    # 但 agent 侧对"工具调用水久不返回"仍无上限——httpx read 超时只管两次读
+    # 之间（keepalive 流可无限续），服务端真挂住时无任何边界。
+    # 本值给单次 MCP 工具调用封顶：到点抛 TimeoutError → shield 转
+    # ToolInvocationError 回灌模型自纠（提交轮询类工具可原参重试续查）。
+    # 600s = 2× MCP 客户端 300s read 超时，给 ocr_pdf_to_text 的
+    # wait_seconds≤300 + 上传/预处理留足空间，不误杀合法长调用。
+    # <=0 表示不设限（仅排障用）。
+    mcp_tool_call_timeout_sec: int = 600
     # ─── model 单次调用输出上限 ───
     # 2026-08-27 修正：从 200000 降到 65536。
     # 原 200000 把 input 安全空间压到仅 45960（262144-200000-16384），

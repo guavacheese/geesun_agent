@@ -384,7 +384,33 @@ class _MCPErrorShieldTool(BaseTool):
 
     async def ainvoke(self, input, config=None, **kwargs):
         try:
+            # 单次工具调用墙钟封顶（mcp_tool_call_timeout_sec，2026-10-19 方案 3）：
+            # 653d8515 实锤 agent 侧无工具超时时，服务端挂住 = run 永久 running。
+            # httpx read 超时只管"两次读之间"，keepalive 流可无限续期——只有
+            # 调用侧的 wait_for 能兜底。超时抛 TimeoutError → 下方转
+            # ToolInvocationError 回灌模型（submit-and-poll 工具可原参重试续查）。
+            timeout = settings.mcp_tool_call_timeout_sec
+            if timeout and timeout > 0:
+                return await asyncio.wait_for(
+                    self._inner.ainvoke(input, config, **kwargs), timeout=timeout
+                )
             return await self._inner.ainvoke(input, config, **kwargs)
+        except asyncio.TimeoutError as e:
+            logger.warning(
+                "MCP 工具 [%s] 调用超过 %ss 未返回（已按墙钟封顶取消，"
+                "服务端任务可能仍在跑）",
+                self.name, settings.mcp_tool_call_timeout_sec,
+            )
+            raise _shield_error(
+                self.name,
+                TimeoutError(
+                    f"工具调用超过 {settings.mcp_tool_call_timeout_sec}s 未返回，"
+                    "已中止等待（服务端后台任务可能仍在运行）。"
+                    "若是 ocr_pdf_to_text 等提交-轮询工具，请用完全相同的参数"
+                    "再调一次续查/取结果；若是其他工具，请检查参数或稍后重试。"
+                ),
+                input if isinstance(input, dict) else {},
+            ) from e
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "MCP 工具 [%s] 执行失败（已包装 ToolInvocationError 回灌模型自纠）: %s",
