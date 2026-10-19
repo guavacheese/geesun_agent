@@ -251,6 +251,21 @@ class Settings(BaseSettings):
     # wait_seconds≤300 + 上传/预处理留足空间，不误杀合法长调用。
     # <=0 表示不设限（仅排障用）。
     mcp_tool_call_timeout_sec: int = 600
+    # ─── run 看门狗（2026-10-19 方案 4）───
+    # 事故 653d8515：worker 的事件循环被同步 e2b 调用堵死 55 分钟，asyncio
+    # beat 任务停摆 ⇒ 没有任何机制发现"这个 run 已经不会动了"，run 挂死
+    # 38 小时、前端永远转圈、同会话后续消息全被 409 挡掉。
+    # 机制：worker 的 asyncio beat 任务每 30s 写 run_registry 心跳（loop
+    # 绑定——循环堵死则心跳停，停即判据）；看门狗 daemon 线程（不受 loop
+    # 阻塞影响）每 run_watchdog_interval_sec 扫一遍，活跃 run 超过
+    # run_stale_timeout_sec 没有心跳 ⇒ 取消 worker task 并代行收尾
+    # （release + 落 failed + publish_end），前端拿到 [DONE] 解封。
+    # 两个阈值都对齐 turn_registry 既有语义（BEAT 30s / STALE 5min）。
+    run_stale_timeout_sec: int = 300
+    run_watchdog_interval_sec: int = 60
+    #: 看门狗取消 worker 后等它自行收尾的宽限（s）。取消收尾含消息落盘，正常
+    #: 秒级完成；30s 防大会话持久化慢。测试可置 0。
+    run_watchdog_grace_sec: int = 30
     # ─── model 单次调用输出上限 ───
     # 2026-08-27 修正：从 200000 降到 65536。
     # 原 200000 把 input 安全空间压到仅 45960（262144-200000-16384），

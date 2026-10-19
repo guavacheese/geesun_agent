@@ -6,6 +6,7 @@ import time
 import uuid
 import logging
 import psycopg
+import threading
 from contextlib import aclosing
 from datetime import datetime, timezone
 
@@ -293,6 +294,130 @@ def _log_reap_done(task: asyncio.Task) -> None:
             )
     except BaseException:
         logger.exception("[RUN] 回收结果回调自身异常")
+
+
+# ─────────────────────────── run 看门狗（2026-10-19 方案 4）───────────────────────────
+# 事故 653d8515：worker 的事件循环被 MCP 同步 e2b 调用堵死 55 分钟，asyncio
+# beat 停摆、无任何机制发现"这个 run 不会动了"——挂死 38 小时，前端永远转圈，
+# 同会话后续消息全被 409 挡掉。详见 config.run_stale_timeout_sec 注释与
+# src/core/run_registry.py 的 beat() / stale_active_runs()。
+#
+# 线程模型（关键设计，别改）：
+#   · 心跳 = worker 内的 asyncio beat 任务（loop 绑定）⇒ 循环被堵则心跳停，
+#     停摆即 wedge 判据。**不能**改用 daemon 线程续心跳——那会把判据本身
+#     一起堵掉，永远测不出挂死；
+#   · 看门狗 = daemon 线程 ⇒ 循环被堵它照跑，能发现并处置 wedge；
+#   · 处置动作必须回 loop 执行（run_coroutine_threadsafe）：mark/publish_end
+#     都是 async。循环堵着时协程入队排队，循环恢复瞬间执行——届时 worker 多
+#     已被取消并自行收尾，_watchdog_finalize 的"仍活跃"校验会让看门狗让位。
+#
+# 宽限（取消 worker 后等它自行收尾的秒数）取 settings.run_watchdog_grace_sec。
+
+_WATCHDOG_STARTED = False
+_WATCHDOG_LOCK = threading.Lock()
+#: 已升级处置的 run_id。循环堵住期间每轮扫描都会再见到同一个停摆 run，
+#: 靠它防重复入队；run 恢复心跳 / 终态 / 被回收时自动清除（自愈）。
+_WATCHDOG_ESCALATED: set[str] = set()
+
+
+def _start_run_watchdog(request) -> None:
+    """（首次 chat 时）启动 run 看门狗 daemon 线程。幂等，线程安全。"""
+    global _WATCHDOG_STARTED
+    with _WATCHDOG_LOCK:
+        if _WATCHDOG_STARTED:
+            return
+        _WATCHDOG_STARTED = True
+    loop = asyncio.get_running_loop()
+    store = request.app.state.store
+    bridge = request.app.state.stream_bridge
+    t = threading.Thread(
+        target=_watchdog_loop,
+        args=(loop, store, bridge),
+        name="run-watchdog",
+        daemon=True,
+    )
+    t.start()
+    logger.info(
+        "[WATCHDOG] run 看门狗已启动（扫描间隔 %ss，判死阈值 %ss，宽限 %ss）",
+        settings.run_watchdog_interval_sec,
+        settings.run_stale_timeout_sec,
+        settings.run_watchdog_grace_sec,
+    )
+
+
+def _watchdog_loop(loop, store, bridge) -> None:
+    """看门狗主循环：扫停摆心跳 → 升级处置。永不抛出（daemon 线程裸奔会静默死掉）。"""
+    interval = max(5, settings.run_watchdog_interval_sec)
+    stale_ms = settings.run_stale_timeout_sec * 1000
+    while True:
+        try:
+            time.sleep(interval)
+            stale = run_registry.stale_active_runs(stale_ms=stale_ms)
+            stale_ids = {rec.run_id for rec in stale}
+            # 自愈：恢复心跳 / 已终态 / 已回收的 run 清除升级标记，未来再 wedge
+            # 还能重新升级（一次性升级只对应"这一轮挂死 episode"）。
+            # 注：dict/set 的 get/add/discard 在 CPython 下均为 GIL 原子操作，
+            # 与 loop 线程的 _runs 变更并发安全（值的读取也是原子引用赋值）。
+            for rid in list(_WATCHDOG_ESCALATED):
+                rec = run_registry.get(rid)
+                if rec is None or not rec.is_active or rid not in stale_ids:
+                    _WATCHDOG_ESCALATED.discard(rid)
+            for rec in stale:
+                if rec.run_id in _WATCHDOG_ESCALATED:
+                    continue
+                _WATCHDOG_ESCALATED.add(rec.run_id)
+                logger.error(
+                    "[WATCHDOG] run 心跳停摆超过 %ss，判定挂死（事件循环疑似被堵）: "
+                    "run=%s user=%s session=%s thread=%s",
+                    settings.run_stale_timeout_sec, rec.run_id, rec.user_id,
+                    rec.session_id, rec.thread_id,
+                )
+                # 处置回 loop 上跑。循环堵着时协程入队等待，循环恢复瞬间执行——
+                # 那时 worker 多已被取消并自行收尾，让位逻辑在 _watchdog_finalize。
+                asyncio.run_coroutine_threadsafe(
+                    _watchdog_finalize(rec.run_id, store, bridge), loop
+                )
+        except Exception:
+            logger.exception("[WATCHDOG] 扫描循环异常（已吞，继续下一轮）")
+
+
+async def _watchdog_finalize(run_id: str, store, bridge) -> None:
+    """看门狗代行收尾：取消 worker → 宽限 → 仍活跃则自行 release + 落终态 + [DONE]。
+
+    与 worker 自己的收尾（chat() 里的 _finish_run 闭包）刻意重复而非复用：
+    那份闭包绑在端点作用域；且看门狗必须先取消 task 再给宽限。顺序语义与
+    _finish_run 相同（release → 落终态 → publish_end），落态失败同样不阻断 [DONE]。
+    """
+    rec = run_registry.get(run_id)
+    if rec is None or not rec.is_active:
+        _WATCHDOG_ESCALATED.discard(run_id)
+        return  # worker 已自行收尾（或已被回收），让位
+    # 1) 取消 worker task：循环健康时 finally 链立即走设计好的取消收尾（含落盘）；
+    #    循环刚恢复时取消在下一个 await 点生效，同样走那条路。
+    if rec.task is not None and not rec.task.done():
+        rec.task.cancel()
+    # 2) 宽限：给 worker 的取消收尾留时间（它的 finally 会落盘 + 终态 + [DONE]）
+    await asyncio.sleep(settings.run_watchdog_grace_sec)
+    # 3) 仍活跃 ⇒ worker 没救活，看门狗代行
+    rec = run_registry.get(run_id)
+    if rec is None or not rec.is_active:
+        _WATCHDOG_ESCALATED.discard(run_id)
+        return
+    logger.error(
+        "[WATCHDOG] worker 宽限 %ss 后仍未收尾，看门狗代行终止: run=%s session=%s",
+        settings.run_watchdog_grace_sec, run_id, rec.session_id,
+    )
+    turn_registry.release(rec.thread_id)
+    try:
+        await run_registry.mark(
+            store, run_id, run_registry.STATUS_FAILED,
+            error=f"watchdog: 心跳停摆超过 {settings.run_stale_timeout_sec}s，"
+                  "判定事件循环挂死，已代行终止",
+        )
+    except Exception:
+        logger.exception("[WATCHDOG] 代行落终态失败: run=%s", run_id)
+    await bridge.publish_end(run_id)
+    _WATCHDOG_ESCALATED.discard(run_id)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -1329,6 +1454,11 @@ async def chat(
     session_id = body.session_id
     thread_id = f"{user_id}:{session_id}"
 
+    # ─── run 看门狗（2026-10-19 方案 4）：幂等启动，首个请求即就位 ───
+    # 必须早于本函数任何 run_registry.create：看门狗扫描的是全进程活跃 run，
+    # 启动晚一步就可能漏掉刚 create 还没心跳的 run 的整个挂死窗口。
+    _start_run_watchdog(request)
+
     # ─── D2 护栏：同一会话已有活跃 run → 409，不并存 ─────────────────────────
     # 为什么必须拒绝而不是顶掉旧 run（interrupt）：刷新后前端可能重发一次，而旧 run
     # 仍在后台跑。"顶掉"会丢掉用户已经等待的那一轮进度；"并存"会让两条流往同一个
@@ -2080,10 +2210,18 @@ async def chat(
         turn_registry.acquire(thread_id)
 
         async def _beat_forever() -> None:
-            """worker 自带的周期 beat（与有没有订阅者无关）。"""
+            """worker 自带的周期 beat（与有没有订阅者无关）。
+
+            两本账都记：turn_registry（轮次台账）+ run_registry（run 级心跳，
+            2026-10-19 方案 4）。后者是看门狗的判据——**必须是 asyncio 任务**：
+            事件循环被同步调用堵死时它必然停摆，停摆超过 run_stale_timeout_sec
+            即判该 run 挂死（事故 653d8515 的形态）。换成 daemon 线程续心跳
+            反而永远测不出 wedge，那是把判据本身堵掉。
+            """
             while True:
                 await asyncio.sleep(BEAT_INTERVAL_SECONDS)
                 turn_registry.beat(thread_id)
+                run_registry.beat(run_id)
 
         _beat_task = asyncio.create_task(_beat_forever(), name=f"beat:{run_id}")
 

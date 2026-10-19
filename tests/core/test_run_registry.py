@@ -251,6 +251,7 @@ def test_to_row_snapshot_shape():
         "ended_at",
         "error",
         "boot_id",
+        "last_heartbeat_at",  # 2026-10-19 方案 4：看门狗判据，落盘供跨刷新观测
         "updated_at",
     }
 
@@ -417,3 +418,64 @@ def test_end_to_end_refresh_scenario():
     assert after is None
     assert last["status"] == rr.STATUS_INTERRUPTED
     assert last["started_at"] is not None and last["ended_at"] is not None
+
+
+# ─────────────────────────── 6. run 级心跳 / 看门狗判据（2026-10-19 方案 4）───────────────────────────
+
+
+def test_mark_running_initializes_heartbeat():
+    """mark(RUNNING) 即写首次心跳基准：beat 任务首跳在 30s 后，
+    空窗期不能没有判据（stale_active_runs 的 ref 回退链已兜底，这里是显式语义）。"""
+    rec = _make_run()
+    assert rec.last_heartbeat_at is None
+    asyncio.run(rr.mark(FakeStore(), rec.run_id, rr.STATUS_RUNNING))
+    assert rec.last_heartbeat_at is not None
+
+
+def test_beat_updates_heartbeat_only_while_active():
+    """活跃 run 收心跳；终态 run 不收（worker finally 会取消 beat 任务，
+    迟到的心跳是噪音，且会把已回收边缘的 run 拉回判活视野）。"""
+    rec = _make_run()
+    asyncio.run(rr.mark(FakeStore(), rec.run_id, rr.STATUS_RUNNING))
+    t0 = rec.last_heartbeat_at
+    rr.beat(rec.run_id)
+    assert rec.last_heartbeat_at >= t0
+    asyncio.run(rr.mark(FakeStore(), rec.run_id, rr.STATUS_COMPLETED))
+    t1 = rec.last_heartbeat_at
+    rr.beat(rec.run_id)
+    assert rec.last_heartbeat_at == t1, "终态 run 不得再收心跳"
+    rr.beat("不存在的 run")  # 不得抛
+
+
+def test_stale_active_runs_detects_heartbeat_stall():
+    """停摆超过阈值的活跃 run 被扫出；有心跳/已终态的不误判。"""
+    fresh = _make_run(session_id="s-fresh")
+    stale = _make_run(session_id="s-stale")
+    done = _make_run(session_id="s-done")
+    asyncio.run(rr.mark(FakeStore(), fresh.run_id, rr.STATUS_RUNNING))
+    asyncio.run(rr.mark(FakeStore(), stale.run_id, rr.STATUS_RUNNING))
+    asyncio.run(rr.mark(FakeStore(), done.run_id, rr.STATUS_RUNNING))
+    asyncio.run(rr.mark(FakeStore(), done.run_id, rr.STATUS_COMPLETED))
+    rr.beat(fresh.run_id)
+    # 手工把 stale 的心跳拨到阈值之前（模拟 5 分钟没跳）
+    stale.last_heartbeat_at = rr._now_ms() - (rr.STALE_MS + 1000)
+    found = {r.run_id for r in rr.stale_active_runs()}
+    assert stale.run_id in found, "心跳停摆的活跃 run 必须被扫出"
+    assert fresh.run_id not in found, "有心跳的活跃 run 不得误判"
+    assert done.run_id not in found, "终态 run 不得误判"
+
+
+def test_stale_check_falls_back_to_created_at_before_first_heartbeat():
+    """PENDING 且从未心跳的 run：判据回退到 created_at——
+    真挂在这种窗口的 run（worker 没起来）同样该被扫出来。"""
+    rec = _make_run()  # 未 mark，last_heartbeat_at 为 None
+    rec.created_at = rr._now_ms() - (rr.STALE_MS + 1000)
+    assert rec.run_id in {r.run_id for r in rr.stale_active_runs()}
+
+
+def test_heartbeat_is_persisted_in_row():
+    """last_heartbeat_at 进 to_row：刷新后/跨进程可观测停摆轨迹。"""
+    rec = _make_run()
+    asyncio.run(rr.mark(FakeStore(), rec.run_id, rr.STATUS_RUNNING))
+    rr.beat(rec.run_id)
+    assert rec.to_row()["last_heartbeat_at"] == rec.last_heartbeat_at

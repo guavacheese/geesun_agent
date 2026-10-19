@@ -64,6 +64,17 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
 #: 用 uuid 而非 pid：容器重启后 pid 可能复用（1 号进程尤其）。
 BOOT_ID = uuid.uuid4().hex[:12]
 
+# ─────────────────────────── run 级心跳 / 看门狗（2026-10-19 方案 4）───────────────────────────
+#: 心跳间隔（ms）。由 worker 的 asyncio beat 任务写入 last_heartbeat_at ——
+#: **必须是 loop 绑定的 asyncio 任务**：事件循环被同步调用堵死时（事故 653d8515：
+#: MCP 同步 e2b 调用堵循环 55 分钟），asyncio 心跳必然停摆，这正是"挂死"的判据。
+#: 反直觉点：若用 daemon 线程续心跳，循环堵死时它照样跳 ⇒ 永远测不出 wedge。
+HEARTBEAT_INTERVAL_MS = 30_000
+#: 活跃 run 超过该值没有心跳 ⇒ 判挂死（=10 个心跳周期，对齐 turn_registry.STALE_MS）。
+#: 正常最长的合法工具调用 = mcp_tool_call_timeout_sec(600s)？不——心跳与工具调用
+#: 并发：工具在跑时 loop 仍健康，心跳照跳。只有 loop 真被堵住心跳才停。
+STALE_MS = 300_000
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -91,6 +102,10 @@ class RunRecord:
     ended_at: int | None = None
     error: str | None = None
     boot_id: str = BOOT_ID
+    #: 最近一次心跳（ms，epoch）。worker 的 asyncio beat 任务每 30s 写一次；
+    #: 停摆超过 STALE_MS 的活跃 run 被看门狗判"挂死"（事件循环被堵死的信号）。
+    #: 不参与进程内相等比较（compare=False），落盘供刷新后观测。
+    last_heartbeat_at: int | None = field(default=None, repr=False, compare=False)
     #: worker 的 asyncio.Task 句柄（取消用）。不参与落盘。
     task: asyncio.Task[Any] | None = field(default=None, repr=False, compare=False)
 
@@ -109,6 +124,7 @@ class RunRecord:
             "ended_at": self.ended_at,
             "error": self.error,
             "boot_id": self.boot_id,
+            "last_heartbeat_at": self.last_heartbeat_at,
             "updated_at": _now_ms(),
         }
 
@@ -163,6 +179,35 @@ def attach_task(run_id: str, task: asyncio.Task[Any]) -> None:
     rec = _runs.get(run_id)
     if rec is not None:
         rec.task = task
+
+
+def beat(run_id: str) -> None:
+    """写一次 run 级心跳（worker 的 asyncio beat 任务调用，loop 绑定）。
+
+    终态 run 不收心跳：worker 的 finally 会取消 beat 任务，此后任何迟到的
+    心跳都是噪音（且会把已回收边缘的 run 又拉回判活视野）。
+    """
+    rec = _runs.get(run_id)
+    if rec is not None and rec.is_active:
+        rec.last_heartbeat_at = _now_ms()
+
+
+def stale_active_runs(*, stale_ms: int = STALE_MS) -> list[RunRecord]:
+    """心跳停摆超过 stale_ms 的**活跃** run（看门狗扫描用，纯读、线程安全）。
+
+    判据取 `last_heartbeat_at or started_at or created_at`：刚 create 还没
+    mark(RUNNING) 的 run 没有心跳，用 created_at 兜底——真挂在这种窗口的
+    run 同样该被扫出来（worker 没起来 = 永远不会有心跳）。
+    """
+    now = _now_ms()
+    out: list[RunRecord] = []
+    for rec in _runs.values():
+        if not rec.is_active:
+            continue
+        ref = rec.last_heartbeat_at or rec.started_at or rec.created_at
+        if now - ref > stale_ms:
+            out.append(rec)
+    return out
 
 
 def drop(run_id: str) -> None:
@@ -221,6 +266,10 @@ async def mark(
     now = _now_ms()
     if status == STATUS_RUNNING and rec.started_at is None:
         rec.started_at = now
+        # 起步即有心跳基准：beat 任务首跳在 30s 后，空窗期用 started_at 兜底
+        # （stale_active_runs 的 ref 回退链已覆盖，这里显式写只是让语义直白）
+        if rec.last_heartbeat_at is None:
+            rec.last_heartbeat_at = now
     if status in TERMINAL_STATUSES and rec.ended_at is None:
         rec.ended_at = now
     await persist(store, rec)
