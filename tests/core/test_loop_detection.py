@@ -873,3 +873,102 @@ def test_progress_payload_status_is_single_source_of_truth():
             "两处判据漂移：text=%r status=%r 但 _is_progress_payload=%r"
             % (text, got, _is_progress_payload(text))
         )
+
+
+# ────────── 跨越「探查调用」的续查豁免（P2，2026-10-20 add0229b 实测序列）──────────
+# 生产真事（15:54:58 / 15:55:02）：C 判据在同一毫秒正确豁免后，P0 抛 NoProgressAbort
+# 取消了在飞的 tool 结果 ⇒ 模型丢掉 `pages_ocred=24/30` 的 JSON，转去 execute 自己
+# 看目录、看 err.log（各一次），再发起第 6 次同参续查。middleware 此时因为
+# 「紧邻上一条带 tool_calls 的 AI 是 execute」而 return False ⇒ count=6 ≥ hard=5
+# 硬停。同一轮内天然 A/B：count=5（无插入）豁免成功、count=6（插 2 次）被硬停。
+# 结论：豁免判据不能要求"紧邻"，必须允许跨越**不同工具**的探查调用。
+
+_EXEC_LS = _call("execute", {"command": "ls -la /home/user/_ocr"})
+_EXEC_TAIL = _call("execute", {"command": "tail -5 /home/user/_ocr/err.log"})
+
+
+def test_progress_exempt_crosses_exploration_calls():
+    """OCR(running) → execute 探查 ×2 → OCR(同参) 仍算"同一任务在推进"。"""
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+    ocr = _call("ocr_pdf_to_text", dict(_OCR_ARGS))
+    hash_ocr = _hash_tool_calls([ocr], mw._schema_fields_for)
+
+    msgs = [
+        _ai(ocr),
+        _tool_result({"status": "running", "pages_ocred": 24}),
+        _ai(_EXEC_LS),
+        _tool_result({"output": "err.log result.json done.flag=0"}),
+        _ai(_EXEC_TAIL),
+        _tool_result({"output": "[ocr_run] page 24/30"}),
+        _ai(ocr),
+    ]
+    assert mw._last_same_call_had_progress(
+        msgs, hash_ocr, {"ocr_pdf_to_text"}
+    ) is True, "插了 execute 自查就失去豁免 ⇒ 第 6 次续查必被硬停（add0229b 原样复现）"
+
+
+def test_progress_exempt_crossing_same_tool_retry_is_rejected():
+    """跨越的调用里出现**本次同工具**（换参数换策略）⇒ 不豁免。
+
+    这是与"探查调用"的关键分界：execute 看目录是同一个任务的旁证，
+    而 OCR 换 pages 区间是换策略重试，不是续查。
+    """
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+    ocr = _call("ocr_pdf_to_text", dict(_OCR_ARGS))
+    hash_ocr = _hash_tool_calls([ocr], mw._schema_fields_for)
+
+    msgs = [
+        _ai(_call("ocr_pdf_to_text", dict(_OCR_ARGS, pages="1-5"))),
+        _tool_result({"status": "running", "pages_ocred": 3}),
+        _ai(ocr),
+    ]
+    assert mw._last_same_call_had_progress(
+        msgs, hash_ocr, {"ocr_pdf_to_text"}
+    ) is False, "同工具换参数被当作续查 ⇒ 换策略试错也能无限免死"
+
+
+def test_progress_exempt_explore_hops_are_bounded():
+    """探查跨越必须有跳数上限（防"在无关任务之间来回横跳"也算续查）。"""
+    from src.core.loop_detection import _MAX_EXPLORE_HOPS
+
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+    ocr = _call("ocr_pdf_to_text", dict(_OCR_ARGS))
+    hash_ocr = _hash_tool_calls([ocr], mw._schema_fields_for)
+
+    def _chain(hops):
+        msgs = [_ai(ocr), _tool_result({"status": "running", "pages_ocred": 9})]
+        for i in range(hops):
+            msgs.append(_ai(_call(f"explore_{i}", {"step": i})))
+            msgs.append(_tool_result({"output": "ok"}))
+        msgs.append(_ai(ocr))
+        return msgs
+
+    assert mw._last_same_call_had_progress(
+        _chain(_MAX_EXPLORE_HOPS), hash_ocr, {"ocr_pdf_to_text"}
+    ) is True, "上限内的探查应允许跨越（_MAX_EXPLORE_HOPS=%d）" % _MAX_EXPLORE_HOPS
+    assert mw._last_same_call_had_progress(
+        _chain(_MAX_EXPLORE_HOPS + 1), hash_ocr, {"ocr_pdf_to_text"}
+    ) is False, "超过上限必须放弃豁免，否则跨任务横跳永远免死"
+
+
+def test_replay_resumes_with_exploration_never_intervened():
+    """端到端重放：8 次同参续查 + 中间插 2 次 execute 自查，全程不得介入。
+
+    插入位置对齐生产实测（15:54:58 / 15:55:02，即第 5 次续查被 P0 打掉之后）：
+    旧逻辑必须在 **count=6** 硬停 —— 与生产日志
+    `Loop hard limit reached ... count=6` 逐字吻合，重放器才算可信
+    （实测旧代码：`count=5` / `count=6` 两次硬停，介入轮次 [5, 6, 7]）。
+    """
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+    ocr = _call("ocr_pdf_to_text", dict(_OCR_ARGS))
+    msgs: list = []
+    results: list = []
+    for i in range(8):
+        msgs.append(_ai(ocr))
+        results.append(mw._apply(_state_with(list(msgs)), _RUNTIME))
+        msgs.append(_tool_result({"status": "running", "pages_ocred": i + 1}))
+        if i in (4, 5):
+            msgs.append(_ai(_EXEC_LS if i == 4 else _EXEC_TAIL))
+            msgs.append(_tool_result({"output": "err.log result.json"}))
+    intervened = [i for i, r in enumerate(results) if r is not None]
+    assert not intervened, "有进展的续查即便插了 execute 自查也不得被介入，被介入轮次：%s" % intervened

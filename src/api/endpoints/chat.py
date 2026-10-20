@@ -2754,16 +2754,29 @@ async def chat(
                                 )
                                 if _bg_status is not None:
                                     _bg_job_running = _bg_status == "running"
-                                if (
+                                # ★ 「本结果带客观进展」的**唯一**判定点：C 与 P0 共用。
+                                # 2026-10-20 add0229b 第三次同类裂缝：1.0.35 把豁免接到了
+                                # C 分支和 middleware，唯独 P0 没接 —— 生产日志里
+                                # `[C] 后台任务有客观进展 → 不注入收敛提示`（15:54:54.294343）
+                                # 与 `[P0] 连续 5 次同一意图 → 抛 NoProgressAbortError`
+                                # （15:54:54.294426）出现在**同一毫秒**：C 放行、P0 照样开枪。
+                                # P0 抛错还会取消在飞的 tool 结果，模型因此丢掉
+                                # `status=running, pages_ocred=24/30` 的 JSON，被收敛提示
+                                # 推去 execute 自查，再下一次续查就撞上 middleware 硬停。
+                                # 判定条件必须包含额度闸门（防"后台已死但每轮照样回
+                                # running"被无限豁免）。
+                                _bg_progress_ok = (
                                     _bg_status is not None
                                     and _progress_exempt_count
                                     < settings.loop_detect_progress_exempt_max
-                                ):
+                                )
+                                if _bg_progress_ok:
                                     _progress_exempt_count += 1
                                     _stagnation_calls = 0
                                     logger.info(
                                         "[C] 后台任务有客观进展（status=%s，连续豁免 %d/%d 次）"
-                                        "→ 交付物停滞计数清零，不注入收敛提示"
+                                        "→ 交付物停滞计数清零，不注入收敛提示；"
+                                        "P0 同一意图计数同步压住"
                                         " (tool=%s, user=%s, session=%s)",
                                         _bg_status,
                                         _progress_exempt_count,
@@ -2775,7 +2788,7 @@ async def chat(
                                         # 超上限：可能是"后台已死但每轮照样回 running"
                                         logger.error(
                                             "[C] 后台任务连续 %d 轮报推进却始终无交付物，"
-                                            "豁免额度用尽 → 按停滞处理"
+                                            "豁免额度用尽 → 按停滞处理（P0 同样不再豁免）"
                                             " (tool=%s, user=%s, session=%s)",
                                             _progress_exempt_count,
                                             tool_name, user_id, session_id,
@@ -2809,6 +2822,22 @@ async def chat(
                                     if _files_in_window >= settings.no_progress_window_files:
                                         _files_in_window = 0
                                         _repeat_count = 0
+                                    # ★ P0 也吃进展豁免（2026-10-20 add0229b）：
+                                    # 本轮结果带结构化进展（status=running / pages_ocred>0）
+                                    # ⇒ 这不是"同一意图空转"，是 submit-and-poll 在推进，
+                                    # 累计计数压回 1（保持"下一轮仍是同一意图可继续累计"，
+                                    # 真死了没 progress payload 时自然恢复计数）。
+                                    # 放在交付物重置**之后**：有交付物时 `_repeat_count`
+                                    # 已被清 0，此处不得覆盖成 1。
+                                    if _bg_progress_ok and _repeat_count > 1:
+                                        logger.info(
+                                            "[P0] 后台任务有客观进展（status=%s）"
+                                            "→ 同一意图计数 %d→1，不判无进展循环"
+                                            " (tool=%s, user=%s, session=%s)",
+                                            _bg_status, _repeat_count,
+                                            tool_name, user_id, session_id,
+                                        )
+                                        _repeat_count = 1
                                     if (
                                         _repeat_count >= settings.no_progress_repeat_threshold
                                     ):

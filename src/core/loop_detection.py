@@ -437,12 +437,21 @@ _TOOL_FREQ_PATTERN_HARD_STOP_MSG = (
 
 #: 「有客观进展的重复调用」允许的最大重复次数（2026-10-20 add0229b）。
 #: submit-and-poll 型工具（ocr_pdf_to_text）的正常形态就是同参反复续查：
-#: 262 页 × 30s/页 ≈ 110 分钟，每次 wait_seconds=300 ⇒ 约 22 次。而 Layer1
-#: 的 hard_limit=5 会在第 5 次就硬剥 tool_calls——110 分钟的任务必然失败，
-#: 尽管它每一轮都在真实推进（pages_ocred 在涨）。
+#: 实测 70s/页（康视达 262 页扫描件，200~611 texts/页）⇒ 单本约 5.1 小时，
+#: 每次 wait_seconds=300 ⇒ 62+ 次续查。而 Layer1 的 hard_limit=5 会在第 5 次
+#: 就硬剥 tool_calls——5 小时的任务必然失败，尽管它每一轮都在真实推进
+#: （pages_ocred 在涨）。
 #: 上限 40 是兜底：防「后台任务其实死了、但每轮照样返回 running」的空转
 #: （那种形态没有进展增长，or 直接超过上限）。
 _DEFAULT_PROGRESS_EXEMPT_MAX = 40
+
+#: 续查之间允许插入的「探查调用」跳数上限（2026-10-20 add0229b）。
+#: 实测形态：OCR(running) → execute(看目录) → OCR(同参续查)。模型插一两次
+#: execute 自查是完全合理的行为，但原逻辑要求「紧邻上一条带 tool_calls 的 AI
+#: 指纹相同」，插一次就 return False ⇒ 同一轮内天然 A/B：count=5（无插入）
+#: 豁免成功，count=6（插了 2 次 execute）被硬停。
+#: 封顶是为了防止「在毫不相干的任务之间来回横跳」也被算成同一任务在推进。
+_MAX_EXPLORE_HOPS = 3
 
 #: 「任务在推进」的状态值。submit-and-poll 的返回形如
 #: {"success":true,"status":"running","pages_ocred":12,...}
@@ -817,15 +826,31 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
 
     # ─── 有进展的重复调用豁免（2026-10-20 add0229b）───────────────
 
-    def _last_same_call_had_progress(self, messages: list, call_hash: str) -> bool:
+    def _last_same_call_had_progress(
+        self,
+        messages: list,
+        call_hash: str,
+        tool_names: set[str] | None = None,
+    ) -> bool:
         """上一次「同指纹工具调用」的结果是否表明任务仍在推进。
 
         形态（submit-and-poll）：
             AI(tool_calls=OCR) → Tool(running) → AI(tool_calls=同一 OCR) → …
-        从末尾往前跳过本次 AIMessage，找上一条**带 tool_calls 的 AI**。
-        若其指纹不是同一个（模型在换参数重试，而不是续查同一任务），
-        不适用豁免——那不是"同一任务在推进"，而是真的在反复试错。
+        从末尾往前找上一条**带 tool_calls 且指纹相同**的 AI。
+
+        2026-10-20 add0229b：允许跨越中间的「探查调用」。
+        实测序列（15:54:58 / 15:55:02）：
+            AI(OCR) → Tool(running 24/30) → AI(execute 看目录)
+                    → Tool(ls 输出) → AI(execute 看 err.log) → Tool(...)
+                    → AI(OCR 同参) ← 这里已 count=6，原逻辑因"紧邻上一条 AI
+                      是 execute"直接 return False ⇒ 硬停。
+        跨越规则：
+          ① 跨越的调用**不得包含本次同工具**（`tool_names`）—— 同一工具换参数
+             是「换策略重试」，不是同一任务在推进，仍然 return False；
+          ② 连续跨越不得超过 ``_MAX_EXPLORE_HOPS`` 跳（防无关任务横跳）。
         """
+        same_tools = set(tool_names or ())
+        hops = 0
         prev_idx = None
         for i in range(len(messages) - 2, -1, -1):
             m = messages[i]
@@ -834,10 +859,16 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
             tcs = getattr(m, "tool_calls", None) or []
             if not tcs:
                 continue
-            prev_idx = i
-            if _hash_tool_calls(tcs, self._schema_fields_for) != call_hash:
+            if _hash_tool_calls(tcs, self._schema_fields_for) == call_hash:
+                prev_idx = i
+                break
+            # 指纹不同：只有「不同工具」的探查调用才允许跨越
+            names = {str(tc.get("name") or "") for tc in tcs}
+            if names & same_tools:
                 return False
-            break
+            hops += 1
+            if hops > _MAX_EXPLORE_HOPS:
+                return False
         if prev_idx is None:
             return False
         for m in messages[prev_idx + 1:]:
@@ -848,16 +879,22 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         return False
 
     def _progress_exempt(
-        self, thread_id: str, messages: list, call_hash: str, count: int
+        self,
+        thread_id: str,
+        messages: list,
+        call_hash: str,
+        count: int,
+        tool_names: set[str] | None = None,
     ) -> bool:
         """同指纹重复但每轮都有客观进展 ⇒ 视为「同一任务在推进」，豁免硬停。
 
         2026-10-20 add0229b：ocr_pdf_to_text 是 submit-and-poll，262 页需要
-        ~22 次同参续查（每次 wait_seconds=300）。Layer1 的 hard_limit=5 会在
-        第 5 次硬剥 tool_calls，110 分钟的任务必然失败——而它一直在推进
-        （pages_ocred 逐轮增长）。真死循环不满足本豁免：输出是立即报错/
-        空返回，既无 status=running 也无 pages_ocred 增长。
+        60+ 次同参续查（实测 70s/页 ≈ 5.1 小时，每次 wait_seconds=300）。
+        Layer1 的 hard_limit=5 会在第 5 次硬剥 tool_calls，5 小时的任务必然
+        失败——而它一直在推进（pages_ocred 逐轮增长）。真死循环不满足本豁免：
+        输出是立即报错/空返回，既无 status=running 也无 pages_ocred 增长。
 
+        `tool_names` 用于跨越探查调用时区分「同一工具换参数」（不豁免）。
         count > progress_exempt_max 仍会硬停：那是「后台任务死了但每轮照样
         返回 running」的形态，不能无限续下去。
         """
@@ -868,7 +905,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                 self.progress_exempt_max,
             )
             return False
-        if not self._last_same_call_had_progress(messages, call_hash):
+        if not self._last_same_call_had_progress(messages, call_hash, tool_names):
             return False
         with self._lock:
             key = (thread_id, call_hash)
@@ -944,7 +981,9 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
 
             if count >= self.hard_limit:
                 # ★ 有客观进展的重复不算空转（add0229b：submit-and-poll 续查）
-                if self._progress_exempt(thread_id, messages, call_hash, count):
+                if self._progress_exempt(
+                    thread_id, messages, call_hash, count, set(tool_names)
+                ):
                     pass
                 else:
                     logger.error(
@@ -969,7 +1008,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                     #   「请停止调用工具，立即产出最终答案」就能让模型放弃
                     #   110 分钟的 OCR，转去解析文本层，最终零交付。
                     if self._progress_exempt(
-                        thread_id, messages, call_hash, count
+                        thread_id, messages, call_hash, count, set(tool_names)
                     ):
                         pass
                     else:
@@ -1009,7 +1048,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                     #   「请停止调用工具并产出最终答案」是纯误导，会直接把
                     #   长任务劝退（模型会转去解析文本层，最终零交付）。
                     if self._progress_exempt(
-                        thread_id, messages, call_hash, freq_count
+                        thread_id, messages, call_hash, freq_count, set(tool_names)
                     ):
                         continue
 
@@ -1071,7 +1110,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                     #   「同工具占比 100%」的形态，按纯形态判据必被误杀
                     #   （2026-10-20 add0229b：OCR 262 页需 ~22 次同参续查）。
                     if not self._progress_exempt(
-                        thread_id, messages, call_hash, top_count
+                        thread_id, messages, call_hash, top_count, set(tool_names)
                     ):
                         if by_ratio:
                             detail = (

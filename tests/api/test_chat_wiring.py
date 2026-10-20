@@ -1061,3 +1061,109 @@ def test_exemption_quota_not_reset_on_convergence():
                         "except NoProgressAbortError 里重置了豁免额度（行 %d）—— "
                         "会让长任务在'收敛轮'里无限续命" % n.lineno
                     )
+
+
+def _raise_lines(node: ast.AST, exc_name: str) -> list[int]:
+    out = []
+    for n in ast.walk(node):
+        if not isinstance(n, ast.Raise) or n.exc is None:
+            continue
+        target = n.exc.func if isinstance(n.exc, ast.Call) else n.exc
+        if isinstance(target, ast.Name) and target.id == exc_name:
+            out.append(n.lineno)
+    return out
+
+
+def _name_lines(node: ast.AST, name: str) -> list[int]:
+    return [
+        n.lineno for n in ast.walk(node) if isinstance(n, ast.Name) and n.id == name
+    ]
+
+
+def _assign_const_lines(node: ast.AST, target: str, value) -> list[int]:
+    """`target = <常量 value>` 的行号（用于定位"压回 1"这类重置点）。"""
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Constant)
+        and n.value.value == value
+        for t in n.targets
+        if isinstance(t, ast.Name) and t.id == target
+    ]
+
+
+def test_p0_no_progress_shares_progress_exemption_judge():
+    """P0 无进展判据必须吃「本结果带客观进展」豁免（2026-10-20 add0229b）。
+
+    生产实证（同一毫秒，会话 add0229b）：
+        15:54:54.294343  [C] 后台任务有客观进展（status=running，豁免 5/40）
+                         → 交付物停滞计数清零，不注入收敛提示
+        15:54:54.294426  [P0] 连续 5 次同一意图 → 抛 NoProgressAbortError
+    1.0.35 把豁免接到了 C 和 middleware，**唯独 P0 没接**（P0 只累计
+    `_repeat_count`，从不读 `_bg_status`）。后果：submit-and-poll 第 5 次必被打掉，
+    且 P0 抛错会取消在飞的 tool 结果 → 模型丢掉 `pages_ocred=24/30` 的 JSON，
+    被收敛提示推去 execute 自查，再下一次续查撞上 middleware 硬停。
+
+    本测试锁两件事：
+      ① 存在 `_bg_progress_ok` 这个共用判定（唯一实现，不再各写一套）；
+      ② P0 的 `_repeat_count` 压回点在抛 NoProgressAbortError **之前**，且由它驱动。
+    """
+    node = _drain_astream()
+
+    ok_lines = _name_lines(node, "_bg_progress_ok")
+    assert ok_lines, (
+        "_drain_astream 里没有 `_bg_progress_ok` —— P0 与 C 又各写一套进展判据，"
+        "下次修一处必然漏另一处（这正是 add0229b 的第三次同类裂缝）"
+    )
+
+    raises = _raise_lines(node, "NoProgressAbortError")
+    assert raises, "找不到 P0 的 NoProgressAbortError 抛出点 —— 断言前提失效"
+
+    # P0 的"压回 1"必须存在，且早于抛错
+    resets = [ln for ln in _assign_const_lines(node, "_repeat_count", 1) if ln < min(raises)]
+    assert resets, (
+        "P0 段没有 `_repeat_count = 1`（进展豁免后压回计数）—— "
+        "P0 仍会数满 no_progress_repeat_threshold 并抛错"
+    )
+    p0_reset = max(resets)
+    assert p0_reset < min(raises), (
+        "进展豁免（行 %d）必须早于 P0 抛错（行 %d）" % (p0_reset, min(raises))
+    )
+    assert any(abs(p0_reset - ln) <= 8 for ln in ok_lines), (
+        "P0 的计数压回点（行 %d）附近没有引用 `_bg_progress_ok`（引用点 %r）—— "
+        "说明压回不是由进展判据驱动，而是另写的条件" % (p0_reset, ok_lines)
+    )
+
+
+def test_p0_exemption_is_bounded_by_same_quota():
+    """P0 复用的豁免判定必须带额度闸门，不能绕开 `loop_detect_progress_exempt_max`。
+
+    没有闸门 ⇒「后台已死但每轮照样回 running」的任务被 P0 无限续查，
+    豁免从"修正误杀"变成永久免死金牌。
+    """
+    node = _drain_astream()
+
+    gate_lines = [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Attribute) and n.attr == "loop_detect_progress_exempt_max"
+    ]
+    assert gate_lines, (
+        "_drain_astream 未引用 settings.loop_detect_progress_exempt_max —— 豁免无上限"
+    )
+
+    assign = [
+        n
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name) and t.id == "_bg_progress_ok"
+    ]
+    assert assign, "找不到 `_bg_progress_ok` 的赋值语句"
+    span = (assign[0].lineno, max(getattr(assign[0], "end_lineno", assign[0].lineno), assign[0].lineno))
+    assert any(span[0] <= ln <= span[1] + 1 for ln in gate_lines), (
+        "额度闸门（行 %r）不在 `_bg_progress_ok` 的定义区间内（行 %d-%d）—— "
+        "P0/C 共用的判定可能绕过了闸门"
+        % (gate_lines, span[0], span[1])
+    )
