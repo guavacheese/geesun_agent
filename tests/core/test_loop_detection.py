@@ -842,3 +842,34 @@ def test_progress_payload_requires_structured_fields():
     assert _is_progress_payload('{"success": false, "error": "x"}') is False
     assert _is_progress_payload("status: running") is False
     assert _is_progress_payload("") is False
+
+
+def test_progress_payload_status_is_single_source_of_truth():
+    """`progress_payload_status` 与 `_is_progress_payload` 必须同源、不可各写一套。
+
+    为什么需要（2026-10-20 add0229b / 84433a68 残留）：
+    「什么算推进」有两个消费者——middleware 的 Layer1/2/2c，和 chat.py 的 C
+    （交付物停滞）。此前只有 middleware 那份，C 只认 /reports/ 交付物 ⇒
+    middleware 已经豁免成功，C 仍在第 15 次注入「不需要文件就直接给结论」，
+    把 262 页任务劝停。判据一旦各写一套，就必然出现这种"一半修好"的裂缝。
+    """
+    from src.core.loop_detection import _is_progress_payload, progress_payload_status
+
+    cases = [
+        ('{"status": "running", "pages_ocred": 0}', "running"),
+        ('{"status": "completed", "pages_ocred": 3}', "completed"),
+        ('[{"type": "text", "text": "{\\"status\\": \\"running\\"}"}]', "running"),
+        ('{"pages_ocred": 3}', "running"),                     # 有计数、无 status
+        ('{"status": "error", "error": "x"}', None),           # error 不算推进
+        ('{"success": false, "step": "read"}', None),          # OCR 失败返回
+        ("status: running", None),                             # 非 JSON，禁子串匹配
+        ("", None),
+    ]
+    for text, expected in cases:
+        got = progress_payload_status(text)
+        assert got == expected, "progress_payload_status(%r) = %r，期望 %r" % (text, got, expected)
+        # 两个消费者口径必须一致：布尔判据只能是它的投影
+        assert _is_progress_payload(text) is (expected is not None), (
+            "两处判据漂移：text=%r status=%r 但 _is_progress_payload=%r"
+            % (text, got, _is_progress_payload(text))
+        )

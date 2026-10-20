@@ -18,7 +18,11 @@ from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
 from src.core import execution_guard, run_registry, turn_registry
-from src.core.loop_detection import LOOP_FORCED_STOP_KEY, tool_call_signature
+from src.core.loop_detection import (
+    LOOP_FORCED_STOP_KEY,
+    progress_payload_status,
+    tool_call_signature,
+)
 from src.core.mcp import get_mcp_tools
 from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
 from src.core.stream_bridge import (
@@ -2369,6 +2373,19 @@ async def chat(
         # 但「同一个脚本重写 5 次、零交付物」这件事在 C 的判据下是稳定的。
         _stagnation_calls = 0
         _stagnation_injections = 0
+        # C 的进展豁免（2026-10-20，add0229b / 84433a68 事故残留）：
+        # _progress_exempt_count —— 连续被判「后台任务在推进」而清零的次数，
+        #                          超过 settings.loop_detect_progress_exempt_max
+        #                          后不再豁免（防"后台死了但每轮照样回 running"）；
+        # _bg_job_running        —— 最近一条 progress payload 是否仍在 running，
+        #                          只用于给收敛提示分流文案。
+        # 为什么必须补：C 原先只认 /reports/ 交付物，submit-and-poll 的
+        # `status=running + pages_ocred 增长` 不算进展 ⇒ 262 页任务（≈22 次续查）
+        # 第 15 次就注入软提醒，而模板第 4 条写着"不需要产出文件就直接用文字给
+        # 结论"——足以让模型放弃一个还要跑 110 分钟的任务（84433a68 实证：模型在
+        # 第 15 次附近放弃续查、转去自己写 pymupdf/paddleocr 脚本）。
+        _progress_exempt_count = 0
+        _bg_job_running = False
         # _tool_args_by_id：本批工具调用的 args，按 tool_call_id 索引。
         # P0 指纹要按**参数**算（见 _tool_intent_sig），而 args 挂在 model 节点的
         # AIMessage.tool_calls 上、结果挂在紧随其后的 tools 节点 ToolMessage 上，
@@ -2383,6 +2400,7 @@ async def chat(
             nonlocal _last_debug_step, thinking_emitted, generating_emitted, _generated_files, _consecutive_tool_failures, _reasoning_started_at_ms, _reasoning_ended_at_ms
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             nonlocal _stagnation_calls, _stagnation_injections
+            nonlocal _progress_exempt_count, _bg_job_running
             nonlocal _loop_forced_stop
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
             # ─── 清洗：messages 里不应有 SystemMessage ───
@@ -2720,12 +2738,49 @@ async def chat(
                                 else:
                                     _consecutive_tool_failures = 0
 
-                                # ─── C：交付物停滞计数（2026-10-17）───
+                                # ─── C：交付物停滞计数（2026-10-17，2026-10-20 补进展豁免）───
                                 # 每个工具结果都计数，无论成败 —— 模型烧的是**步数**，
                                 # 失败循环同样在烧（那种另有 sandbox_tool_failure_threshold
                                 # 管，这里是"成功但一直不交付"的形态）。
-                                # 清零点只有两处：下方检测到新交付物（_files_in_window += 1）。
-                                _stagnation_calls += 1
+                                # 清零点：① 下方检测到新交付物；② 本结果本身就是后台长
+                                # 任务的结构化进度（submit-and-poll 的 running/completed）。
+                                # 判据与 middleware 同源（progress_payload_status），只认
+                                # 结构化字段；`not is_error` 是必要的——"报错里带进度字样"
+                                # 不该算推进。
+                                _bg_status = (
+                                    progress_payload_status(content_str)
+                                    if not is_error and content_str
+                                    else None
+                                )
+                                if _bg_status is not None:
+                                    _bg_job_running = _bg_status == "running"
+                                if (
+                                    _bg_status is not None
+                                    and _progress_exempt_count
+                                    < settings.loop_detect_progress_exempt_max
+                                ):
+                                    _progress_exempt_count += 1
+                                    _stagnation_calls = 0
+                                    logger.info(
+                                        "[C] 后台任务有客观进展（status=%s，连续豁免 %d/%d 次）"
+                                        "→ 交付物停滞计数清零，不注入收敛提示"
+                                        " (tool=%s, user=%s, session=%s)",
+                                        _bg_status,
+                                        _progress_exempt_count,
+                                        settings.loop_detect_progress_exempt_max,
+                                        tool_name, user_id, session_id,
+                                    )
+                                else:
+                                    if _bg_status is not None:
+                                        # 超上限：可能是"后台已死但每轮照样回 running"
+                                        logger.error(
+                                            "[C] 后台任务连续 %d 轮报推进却始终无交付物，"
+                                            "豁免额度用尽 → 按停滞处理"
+                                            " (tool=%s, user=%s, session=%s)",
+                                            _progress_exempt_count,
+                                            tool_name, user_id, session_id,
+                                        )
+                                    _stagnation_calls += 1
 
                                 # ─── P0 无进展循环检测：工具成功但反复同一意图 ───
                                 # 模型在"工具全成功但任务未收敛"时空转（2026-08-17/18 两次
@@ -3014,6 +3069,11 @@ async def chat(
                                         _emitted_files.add(file_path_virtual)
                                         _files_in_window += 1  # P0：新交付物计数（非空转信号）
                                         _stagnation_calls = 0  # C：交付物一出现立即重计
+                                        # 交付物出现 = 进入新阶段，进展豁免额度重新给
+                                        # （OCR 完成 → 开始生成 Excel 这类阶段切换）。
+                                        # 注意：except NoProgressAbortError 分支**不**重置
+                                        # 本额度，否则"每次收敛又送 40 次"会让豁免无限续。
+                                        _progress_exempt_count = 0
                                         await _pub({
                                                             'type': 'file_generated',
                                                             'file_name': file_path_virtual.split(
@@ -3063,20 +3123,38 @@ async def chat(
                 #   会把「本轮本就是问答/分析、不该有文件」的正常任务一起误杀 ——
                 #   模型收到提醒后会硬凑一个文件出来。明确告诉它"没有文件也是合法终点"，
                 #   误杀时它就能直接用文字收尾。
+                # ★ 2026-10-20 分流：进程里存在 **running 的后台长任务** 时，安全阀必须
+                #   换成"继续续查"而不是"用文字给结论"。原模板那句话对 262 页 OCR
+                #   （≈110 分钟）是致命的：模型读到"不需要文件就直接给结论"就真的放弃了
+                #   （84433a68 实证）。判断依据 `_bg_job_running` 来自结构化 progress
+                #   payload，不是文本猜测。
+                if _bg_job_running:
+                    _tail = (
+                        "4) 本轮有**后台任务仍在运行**（工具返回 status=running、"
+                        "带 progress_hint）：请继续用**完全相同的参数**调用该工具续查/取结果，"
+                        "不要重启任务、不要重新上传文件、也不要改用 execute 自己写脚本重跑；"
+                        "只有在收到明确的完成或失败信号后才能判定该任务结束。"
+                    )
+                else:
+                    _tail = (
+                        "4) 若本轮任务本就是问答/分析类、**不需要产出文件**，"
+                        "   请直接用文字给出完整结论——没有文件也是合法的终点，不要再调用工具。"
+                    )
                 _graph_input = {"messages": [HumanMessage(
                     f"系统检测到任务长时间没有推进：{str(e)[:150]}。请立即收敛："
                     "1) 检查 /reports/{user_id}/{session_id}/ 下是否已有可交付的报告文件，"
                     "   如有则直接确认交付，停止重新生成；"
                     "2) 若确需重跑，先说明与上一轮的具体差异，一次完成，不要重复相同命令；"
                     "3) 若无法收敛，明确向用户说明卡点和已完成的产出；"
-                    "4) 若本轮任务本就是问答/分析类、**不需要产出文件**，"
-                    "   请直接用文字给出完整结论——没有文件也是合法的终点，不要再调用工具。"
+                    + _tail
                 )]}
                 # 重置无进展计数（收敛轮重新统计），基线重设
                 _last_tool_sig = None
                 _repeat_count = 0
                 _files_in_window = 0
                 _stagnation_calls = 0  # C：收敛轮重新计（_stagnation_injections 不清，上限仍生效）
+                # 进展豁免额度刻意**不**清零：否则每次收敛都白送 40 次豁免，
+                # 「后台已死但每轮照样回 running」的任务会被无限续下去。
                 _before_files = snapshot_report_files(settings.report_root, user_id, session_id)
             except Exception as e:
                 # ─── 异常保护：任何 agent.astream 内的异常都被捕获，不崩掉 SSE 流 ───
@@ -3184,6 +3262,7 @@ async def chat(
                         _emitted_files.add(_sf["file_path"])
                         _files_in_window += 1  # 新交付物计数（非空转信号，与 B① 一致）
                         _stagnation_calls = 0  # C：兜底拉回也算交付物（同 B① 语义）
+                        _progress_exempt_count = 0  # C：新交付物 = 新阶段，豁免额度重置
                         # 注意：沙箱兜底拉回**没有**对应的工具调用 ⇒ 不带 tool_call_id，
                         # 归属走 _attach_generated_files 的回退链（本轮最后一条带 tool_calls
                         # 的 AI）。这与流式一致：兜底在流尾 emit，前端也挂到当时最后一条 AI。

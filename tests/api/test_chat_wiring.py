@@ -903,3 +903,161 @@ def test_running_mark_detector_is_sensitive():
     assert not _mark_running_calls(_func_def(stripped, "_run_worker")), (
         "摘掉转 running 的 mark 后检测器仍然报有 —— 该断言无法捕获「run 直跳终态」的退化"
     )
+
+
+# ─── ⑥ 2026-10-20：C（交付物停滞）的进展豁免必须真的接上 ─────────────────────
+# 背景：84433a68 / add0229b。LoopDetectionMiddleware 那份修好了（10-20 实测日志
+# 有「同指纹调用 3 次但每轮都有客观进展——豁免硬停」），但 chat.py 的 C 判据
+# 只认 /reports/ 交付物 ⇒ submit-and-poll 的 status=running 不算进展 ⇒
+# 262 页任务（≈22 次续查）第 15 次就注入软提醒，且模板第 4 条写着
+# 「不需要产出文件就直接用文字给结论」——足以让模型放弃还要跑 110 分钟的任务。
+# 这一节守的不是"逻辑写得对"（那是 test_loop_detection.py 的活），而是**接上了**：
+# 判据被调用、调用点在计数自增之前、豁免额度有闸门、文案真的分流。
+
+
+def _drain_astream() -> ast.AsyncFunctionDef:
+    node = _func_def(_tree(), "_drain_astream")
+    assert isinstance(node, ast.AsyncFunctionDef), (
+        "找不到 _drain_astream —— 断言目标函数被改名/搬走了，本文件的前提失效"
+    )
+    return node
+
+
+def _calls_by_name(node: ast.AST, name: str) -> list[int]:
+    """只认 ``<name>(...)`` 形式的真实调用节点（注释/字符串不会命中）。"""
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
+    ]
+
+
+def _augassign_lines(node: ast.AST, target: str) -> list[int]:
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.AugAssign)
+        and isinstance(n.target, ast.Name)
+        and n.target.id == target
+    ]
+
+
+def _assign_lines(node: ast.AST, target: str) -> list[int]:
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name) and t.id == target
+    ]
+
+
+def _if_on(node: ast.AST, name: str) -> list[ast.If]:
+    return [
+        n
+        for n in ast.walk(node)
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == name
+    ]
+
+
+def _const_text(node: ast.AST) -> str:
+    """把一个 if 分支里的字符串常量拼起来（文案是隐式拼接的多个 Constant）。"""
+    return "".join(
+        n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    )
+
+
+def test_stagnation_exemption_judge_is_wired_before_counting():
+    """进展判据必须在 `_stagnation_calls += 1` **之前**生效（顺序契约）。
+
+    位置反了会怎样：先自增再清零，等于永远清零 —— 表面上"豁免已接上"，
+    实际上 C 从此永不触发（比误杀更隐蔽的假绿）。
+    """
+    node = _drain_astream()
+    judge = _calls_by_name(node, "progress_payload_status")
+    assert judge, (
+        "chat.py 的 _drain_astream 里没有 progress_payload_status 调用 —— "
+        "C 的进展豁免没接上（只有 middleware 那份，C 仍会劝停长任务）"
+    )
+    bumps = _augassign_lines(node, "_stagnation_calls")
+    assert bumps, "找不到 `_stagnation_calls += 1` —— 断言前提失效"
+    assert min(judge) < min(bumps), (
+        "进展判据（行 %d）必须早于停滞计数自增（行 %d）" % (min(judge), min(bumps))
+    )
+
+
+def test_stagnation_exemption_is_bounded_by_config():
+    """豁免必须有额度闸门（settings.loop_detect_progress_exempt_max）。
+
+    没有闸门 ⇒「后台已死但每轮照样回 running」的任务被无限续下去，
+    豁免从"修正误杀"变成"永久免死金牌"。
+    """
+    node = _drain_astream()
+    attrs = [
+        n.attr
+        for n in ast.walk(node)
+        if isinstance(n, ast.Attribute) and n.attr == "loop_detect_progress_exempt_max"
+    ]
+    assert attrs, (
+        "_drain_astream 未引用 settings.loop_detect_progress_exempt_max —— "
+        "进展豁免没有上限，后台死掉的任务会被无限续查"
+    )
+
+
+def test_convergence_prompt_branches_on_background_job():
+    """收敛提示必须按 `_bg_job_running` 分流，且两支文案语义相反。
+
+    原模板第 4 条是 C 的安全阀（防误杀"本轮本就该用文字作答"的任务），
+    但对正在跑的后台长任务它是**毒药**（84433a68 实测：模型读到就放弃续查）。
+    因此 running 支必须说"继续续查、不要重新上传"，且**不得**出现
+    "不需要产出文件"这种劝退句。
+    """
+    node = _drain_astream()
+    branches = _if_on(node, "_bg_job_running")
+    assert branches, "收敛提示没有按 _bg_job_running 分流（长任务仍会被劝放弃）"
+    running_txt = "".join(_const_text(b) for b in branches[0].body)
+    fallback_txt = "".join(_const_text(b) for b in branches[0].orelse)
+    assert "续查" in running_txt and "不要重新上传" in running_txt, (
+        "running 支文案缺失续查指引：%r" % running_txt[:200]
+    )
+    assert "不需要产出文件" not in running_txt, (
+        "running 支不得出现劝退句「不需要产出文件」：%r" % running_txt[:200]
+    )
+    assert "不需要产出文件" in fallback_txt, (
+        "非后台任务支必须保留原安全阀（否则问答类任务被硬凑文件）：%r" % fallback_txt[:200]
+    )
+
+
+def test_exemption_quota_not_reset_on_convergence():
+    """收敛轮**不得**重置豁免额度，只有交付物出现才重置。
+
+    否则「豁免 40 次 → 触发软提醒 → 收敛轮白送 40 次 → 无限循环」，
+    长任务永远等不到"该判失败"的那一刻。
+    """
+    tree = _tree()
+    # 1) 交付物清零处（≥2 处）必须重置额度
+    stagnation_zeros = _assign_lines(tree, "_stagnation_calls")
+    exempt_zeros = _assign_lines(tree, "_progress_exempt_count")
+    assert len(exempt_zeros) >= 2, (
+        "只有 %d 处重置 _progress_exempt_count —— 交付物 emit 与兜底拉回两处都要重置"
+        % len(exempt_zeros)
+    )
+    near = [z for z in exempt_zeros if any(abs(z - s) <= 8 for s in stagnation_zeros)]
+    assert len(near) >= 2, (
+        "重置点未与 `_stagnation_calls = 0` 成对出现（实际 %r vs %r）"
+        % (exempt_zeros, stagnation_zeros)
+    )
+    # 2) except NoProgressAbortError 分支内不得出现对它的写
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler):
+            continue
+        if not (isinstance(handler.type, ast.Name) and handler.type.id == "NoProgressAbortError"):
+            continue
+        for n in ast.walk(handler):
+            if isinstance(n, (ast.Assign, ast.AugAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in targets:
+                    assert not (isinstance(t, ast.Name) and t.id == "_progress_exempt_count"), (
+                        "except NoProgressAbortError 里重置了豁免额度（行 %d）—— "
+                        "会让长任务在'收敛轮'里无限续命" % n.lineno
+                    )

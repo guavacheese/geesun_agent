@@ -495,12 +495,18 @@ def _parse_tool_payload(text: str) -> dict | None:
     return None
 
 
-def _is_progress_payload(text: str) -> bool:
-    """工具结果是否表示「任务在推进」（后台在跑 / 这一批已出结果）。
+def progress_payload_status(text: str) -> str | None:
+    """工具结果若是「后台长任务」的结构化返回，返回其 status；否则 None。
 
-    判据（任一命中）：
+    判据（任一命中，口径与 `_is_progress_payload` 完全一致）：
       · status ∈ {running, completed}（submit-and-poll 的续查/收口返回）
-      · pages_ocred > 0（有客观进展计数）
+      · pages_ocred > 0（有客观进展计数，status 缺省按 running）
+
+    ★ 为什么单独暴露这个函数而不是让调用方自己判：
+      `loop_detection.py` 的 Layer1/2/2c 与 `chat.py` 的 C（交付物停滞）是两套
+      判据，但「什么算推进」必须是**同一份实现**——否则改一处忘一处，就又出现
+      「middleware 修好了、chat.py 还在误杀」的裂缝（2026-10-20 add0229b:
+      middleware 已豁免成功，C 仍会在第 15 次注入劝退文案）。
 
     ★ 只认**结构化字段**，不做宽松子串匹配：真死循环里重复读文件/重复
       execute 的输出也可能出现 "status" 字样，宽松匹配会把它们一起放过，
@@ -508,13 +514,25 @@ def _is_progress_payload(text: str) -> bool:
     """
     data = _parse_tool_payload(text)
     if data is None:
-        return False
-    if str(data.get("status") or "") in _PROGRESS_STATUS_VALUES:
-        return True
+        return None
+    status = str(data.get("status") or "")
+    if status in _PROGRESS_STATUS_VALUES:
+        return status
     try:
-        return int(data.get("pages_ocred") or 0) > 0
+        if int(data.get("pages_ocred") or 0) > 0:
+            return status or "running"
     except (TypeError, ValueError):
-        return False
+        pass
+    return None
+
+
+def _is_progress_payload(text: str) -> bool:
+    """工具结果是否表示「任务在推进」（后台在跑 / 这一批已出结果）。
+
+    实现委托给 `progress_payload_status`：两处判据必须同源，避免 chat.py 的
+    C 与 middleware 三道判据各自演化出不同口径。
+    """
+    return progress_payload_status(text) is not None
 
 
 def _max_tool_ratio(seq: list[str] | deque[str]) -> tuple[str, int, float]:
