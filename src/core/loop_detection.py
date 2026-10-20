@@ -406,6 +406,18 @@ _HARD_STOP_MSG = (
     "[FORCED STOP] 重复工具调用已超过安全上限。请用已收集的结果产出最终答案。"
 )
 
+#: 硬停时若「最后一条工具结果仍是 running」改用这条（2026-10-20 add0229b）。
+#: 两件事必须区分：真空转该逼模型收口；而长任务（OCR 262 页 ≈110 分钟）被
+#: 误判时后台**还在跑**、产物在沙箱里——这时叫模型"用已有结果作答"，它会
+#: 宣布"文件没上传 / 任务失败"，把正在推进的任务说死，用户拿到的结论完全错。
+_HARD_STOP_RUNNING_MSG = (
+    "[FORCED STOP] 已停止继续调用工具。注意：**后台任务仍在运行**，"
+    "之前调用返回的 sandbox_path 指向的文件依然有效。"
+    "请向用户说明当前进度与已确认的信息，明确告知结果仍在生成中、"
+    "后续可用完全相同的参数再次调用该工具取回完整结果；"
+    "不要声称任务失败、文件不存在或需要重新上传。"
+)
+
 _TOOL_FREQ_HARD_STOP_MSG = (
     "[FORCED STOP] 工具 {tool_name} 已调用 {count} 次，超过单个工具安全上限。请用已收集的结果产出最终答案。"
 )
@@ -421,6 +433,88 @@ _TOOL_FREQ_PATTERN_HARD_STOP_MSG = (
 )
 
 # ─── Layer 2 占比 / 交替循环判据（2026-10-17，83345f0c 实证）─────────────
+
+
+#: 「有客观进展的重复调用」允许的最大重复次数（2026-10-20 add0229b）。
+#: submit-and-poll 型工具（ocr_pdf_to_text）的正常形态就是同参反复续查：
+#: 262 页 × 30s/页 ≈ 110 分钟，每次 wait_seconds=300 ⇒ 约 22 次。而 Layer1
+#: 的 hard_limit=5 会在第 5 次就硬剥 tool_calls——110 分钟的任务必然失败，
+#: 尽管它每一轮都在真实推进（pages_ocred 在涨）。
+#: 上限 40 是兜底：防「后台任务其实死了、但每轮照样返回 running」的空转
+#: （那种形态没有进展增长，or 直接超过上限）。
+_DEFAULT_PROGRESS_EXEMPT_MAX = 40
+
+#: 「任务在推进」的状态值。submit-and-poll 的返回形如
+#: {"success":true,"status":"running","pages_ocred":12,...}
+_PROGRESS_STATUS_VALUES = ("running", "completed")
+
+
+def _msg_text(msg: object) -> str:
+    """把消息 content 归一成字符串（str / list[part] / 其他）。"""
+    content = getattr(msg, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _parse_tool_payload(text: str) -> dict | None:
+    """从工具结果文本里取出结构化 JSON（dict）；取不到返回 None。
+
+    MCP 工具返回可能被包成 `[{"type":"text","text":"{...}"}]`，也可能已解包
+    成纯 JSON——两种形态都试一遍。只接受以 `{` 开头的候选：正文里随手出现
+    的 `status` 字样不该被当成结构化信号。
+    """
+    if not text:
+        return None
+    raw = text.strip()
+    candidates = [raw]
+    if raw.startswith("[") and '"text"' in raw:
+        try:
+            for part in json.loads(raw):
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    candidates.append(part["text"].strip())
+        except (ValueError, TypeError):
+            pass
+    for cand in candidates:
+        if not cand.startswith("{"):
+            continue
+        try:
+            data = json.loads(cand)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _is_progress_payload(text: str) -> bool:
+    """工具结果是否表示「任务在推进」（后台在跑 / 这一批已出结果）。
+
+    判据（任一命中）：
+      · status ∈ {running, completed}（submit-and-poll 的续查/收口返回）
+      · pages_ocred > 0（有客观进展计数）
+
+    ★ 只认**结构化字段**，不做宽松子串匹配：真死循环里重复读文件/重复
+      execute 的输出也可能出现 "status" 字样，宽松匹配会把它们一起放过，
+      豁免就变成了"永久免死金牌"。
+    """
+    data = _parse_tool_payload(text)
+    if data is None:
+        return False
+    if str(data.get("status") or "") in _PROGRESS_STATUS_VALUES:
+        return True
+    try:
+        return int(data.get("pages_ocred") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _max_tool_ratio(seq: list[str] | deque[str]) -> tuple[str, int, float]:
@@ -556,6 +650,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         tool_freq_ratio: float = _DEFAULT_TOOL_FREQ_RATIO,
         min_window_fill: int = _DEFAULT_MIN_WINDOW_FILL,
         alternating_min_run: int = _DEFAULT_ALTERNATING_MIN_RUN,
+        progress_exempt_max: int = _DEFAULT_PROGRESS_EXEMPT_MAX,
     ):
         super().__init__()
         self.warn_threshold = warn_threshold
@@ -567,13 +662,18 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self.tool_freq_ratio = tool_freq_ratio
         self.min_window_fill = max(1, min_window_fill)
         self.alternating_min_run = max(2, alternating_min_run)
+        #: 有客观进展的重复调用允许的最大重复次数（见 _DEFAULT_PROGRESS_EXEMPT_MAX）
+        self.progress_exempt_max = max(1, progress_exempt_max)
         self._tool_freq_overrides = tool_freq_overrides or {}
         self._tool_freq_window = max(
             self.window_size,
             self.tool_freq_hard_limit,
             *(hard for _, hard in self._tool_freq_overrides.values()),
         )
-        self._lock = threading.Lock()
+        # ★ RLock 而非 Lock：_progress_exempt 会在 _track_and_check 已持锁的
+        #   路径里再次加锁（它要更新豁免日志限流集合）。用不可重入的 Lock
+        #   会自死锁，而这类死锁在单测里表现为"测试挂住"，极难定位。
+        self._lock = threading.RLock()
         self._history: dict[str, list[str]] = {}  # thread_id -> [hash,...]
         self._warned: dict[str, set[str]] = defaultdict(set)
         self._tool_name_history: dict[str, deque[str]] = defaultdict(deque)
@@ -584,6 +684,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self._tool_fields: dict[str, frozenset[str] | None] = {}
         # 契约漂移告警限流：(工具名, 越界字段名) 只报一次
         self._drift_warned: set[tuple[str, str]] = set()
+        # 豁免日志限流：(thread_id, call_hash) 只打一次——续查会命中很多轮
+        self._exempt_logged: set[tuple[str, str]] = set()
 
     # ─── thread/run 定位（适配点 2/3）───────────────
 
@@ -695,6 +797,91 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
 
     # ─── 检测核心 ─────────────────────────────
 
+    # ─── 有进展的重复调用豁免（2026-10-20 add0229b）───────────────
+
+    def _last_same_call_had_progress(self, messages: list, call_hash: str) -> bool:
+        """上一次「同指纹工具调用」的结果是否表明任务仍在推进。
+
+        形态（submit-and-poll）：
+            AI(tool_calls=OCR) → Tool(running) → AI(tool_calls=同一 OCR) → …
+        从末尾往前跳过本次 AIMessage，找上一条**带 tool_calls 的 AI**。
+        若其指纹不是同一个（模型在换参数重试，而不是续查同一任务），
+        不适用豁免——那不是"同一任务在推进"，而是真的在反复试错。
+        """
+        prev_idx = None
+        for i in range(len(messages) - 2, -1, -1):
+            m = messages[i]
+            if getattr(m, "type", None) != "ai":
+                continue
+            tcs = getattr(m, "tool_calls", None) or []
+            if not tcs:
+                continue
+            prev_idx = i
+            if _hash_tool_calls(tcs, self._schema_fields_for) != call_hash:
+                return False
+            break
+        if prev_idx is None:
+            return False
+        for m in messages[prev_idx + 1:]:
+            if getattr(m, "type", None) != "tool":
+                continue
+            if _is_progress_payload(_msg_text(m)):
+                return True
+        return False
+
+    def _progress_exempt(
+        self, thread_id: str, messages: list, call_hash: str, count: int
+    ) -> bool:
+        """同指纹重复但每轮都有客观进展 ⇒ 视为「同一任务在推进」，豁免硬停。
+
+        2026-10-20 add0229b：ocr_pdf_to_text 是 submit-and-poll，262 页需要
+        ~22 次同参续查（每次 wait_seconds=300）。Layer1 的 hard_limit=5 会在
+        第 5 次硬剥 tool_calls，110 分钟的任务必然失败——而它一直在推进
+        （pages_ocred 逐轮增长）。真死循环不满足本豁免：输出是立即报错/
+        空返回，既无 status=running 也无 pages_ocred 增长。
+
+        count > progress_exempt_max 仍会硬停：那是「后台任务死了但每轮照样
+        返回 running」的形态，不能无限续下去。
+        """
+        if count > self.progress_exempt_max:
+            logger.error(
+                "[LOOP] 有进展的重复调用超过豁免上限（count=%d > %d），按空转处理",
+                count,
+                self.progress_exempt_max,
+            )
+            return False
+        if not self._last_same_call_had_progress(messages, call_hash):
+            return False
+        with self._lock:
+            key = (thread_id, call_hash)
+            first = key not in self._exempt_logged
+            if first:
+                self._exempt_logged.add(key)
+        if first:
+            logger.info(
+                "[LOOP] 同指纹调用 %d 次但每轮都有客观进展（后台任务在推进）"
+                "——豁免硬停，继续续查（thread=%s, hash=%s）",
+                count,
+                thread_id,
+                call_hash,
+            )
+        return True
+
+    @staticmethod
+    def _last_tool_still_running(messages: list) -> bool:
+        """最后一条工具结果是否表示「后台任务仍在运行」（status=running）。
+
+        硬停文案据此分流：真死循环 vs 长任务被误判。见 _HARD_STOP_RUNNING_MSG。
+        """
+        for m in reversed(messages):
+            if getattr(m, "type", None) != "tool":
+                continue
+            data = _parse_tool_payload(_msg_text(m))
+            if data is None:
+                return False
+            return str(data.get("status") or "") == "running"
+        return False
+
     def _track_and_check(
         self, state: LoopDetectionState, runtime: Runtime
     ) -> tuple[str | None, dict[str, Any] | None]:
@@ -738,26 +925,42 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
             tool_names = [tc.get("name", "?") for tc in tool_calls]
 
             if count >= self.hard_limit:
-                logger.error(
-                    "Loop hard limit reached — forcing stop (thread=%s, call_hash=%s, count=%d, tools=%s)",
-                    thread_id, call_hash, count, tool_names,
-                )
-                return _HARD_STOP_MSG, {
-                    "reason": STOP_REASON_REPEAT_CALLS,
-                    "call_hash": call_hash,
-                    "count": count,
-                    "tool_names": tool_names,
-                }
+                # ★ 有客观进展的重复不算空转（add0229b：submit-and-poll 续查）
+                if self._progress_exempt(thread_id, messages, call_hash, count):
+                    pass
+                else:
+                    logger.error(
+                        "Loop hard limit reached — forcing stop (thread=%s, call_hash=%s, count=%d, tools=%s)",
+                        thread_id, call_hash, count, tool_names,
+                    )
+                    return (
+                        _HARD_STOP_RUNNING_MSG
+                        if self._last_tool_still_running(messages)
+                        else _HARD_STOP_MSG
+                    ), {
+                        "reason": STOP_REASON_REPEAT_CALLS,
+                        "call_hash": call_hash,
+                        "count": count,
+                        "tool_names": tool_names,
+                    }
 
             if count >= self.warn_threshold:
                 warned = self._warned[thread_id]
                 if call_hash not in warned:
-                    warned.add(call_hash)
-                    logger.warning(
-                        "Repetitive tool calls detected — injecting warning (thread=%s, count=%d, tools=%s)",
-                        thread_id, count, tool_names,
-                    )
-                    return _WARNING_MSG, False
+                    # ★ 有客观进展的续查不该被劝退（add0229b）：一句
+                    #   「请停止调用工具，立即产出最终答案」就能让模型放弃
+                    #   110 分钟的 OCR，转去解析文本层，最终零交付。
+                    if self._progress_exempt(
+                        thread_id, messages, call_hash, count
+                    ):
+                        pass
+                    else:
+                        warned.add(call_hash)
+                        logger.warning(
+                            "Repetitive tool calls detected — injecting warning (thread=%s, count=%d, tools=%s)",
+                            thread_id, count, tool_names,
+                        )
+                        return _WARNING_MSG, False
 
             # Layer 2：频次级（同工具名）
             tool_name_history = self._tool_name_history[thread_id]
@@ -782,12 +985,28 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                 else:
                     eff_warn, eff_hard = self.tool_freq_warn, self.tool_freq_hard_limit
 
+                if freq_count >= eff_warn:
+                    # ★ 有客观进展的重复不算空转（add0229b：submit-and-poll 续查）。
+                    #   一次判定同时管软提醒与硬停：对"每轮都在推进"的续查来说，
+                    #   「请停止调用工具并产出最终答案」是纯误导，会直接把
+                    #   长任务劝退（模型会转去解析文本层，最终零交付）。
+                    if self._progress_exempt(
+                        thread_id, messages, call_hash, freq_count
+                    ):
+                        continue
+
                 if freq_count >= eff_hard:
                     logger.error(
                         "Tool frequency hard limit — forcing stop (thread=%s, tool=%s, count=%d)",
                         thread_id, name, freq_count,
                     )
-                    return _TOOL_FREQ_HARD_STOP_MSG.format(tool_name=name, count=freq_count), {
+                    return (
+                        _HARD_STOP_RUNNING_MSG
+                        if self._last_tool_still_running(messages)
+                        else _TOOL_FREQ_HARD_STOP_MSG.format(
+                            tool_name=name, count=freq_count
+                        )
+                    ), {
                         "reason": STOP_REASON_TOOL_FREQUENCY,
                         "tool_name": name,
                         "count": freq_count,
@@ -830,29 +1049,39 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                 if (by_ratio or by_alternating) and not _window_has_deliverable(
                     messages, self._tool_freq_window
                 ):
-                    if by_ratio:
-                        detail = (
-                            f"最近 {len(tool_name_history)} 次调用中 {top_name} "
-                            f"占 {top_count} 次（{top_ratio:.0%}）"
+                    # ★ 有客观进展的重复不算空转：submit-and-poll 的续查正是
+                    #   「同工具占比 100%」的形态，按纯形态判据必被误杀
+                    #   （2026-10-20 add0229b：OCR 262 页需 ~22 次同参续查）。
+                    if not self._progress_exempt(
+                        thread_id, messages, call_hash, top_count
+                    ):
+                        if by_ratio:
+                            detail = (
+                                f"最近 {len(tool_name_history)} 次调用中 {top_name} "
+                                f"占 {top_count} 次（{top_ratio:.0%}）"
+                            )
+                        else:
+                            detail = (
+                                f"工具调用呈周期震荡（连续匹配 {alt_run} 次，"
+                                f"窗口 {list(tool_name_history)[-8:]}）"
+                            )
+                        logger.error(
+                            "Tool frequency pattern hard limit — forcing stop "
+                            "(thread=%s, detail=%s, ratio=%.2f, alt_run=%d)",
+                            thread_id, detail, top_ratio, alt_run,
                         )
-                    else:
-                        detail = (
-                            f"工具调用呈周期震荡（连续匹配 {alt_run} 次，"
-                            f"窗口 {list(tool_name_history)[-8:]}）"
-                        )
-                    logger.error(
-                        "Tool frequency pattern hard limit — forcing stop "
-                        "(thread=%s, detail=%s, ratio=%.2f, alt_run=%d)",
-                        thread_id, detail, top_ratio, alt_run,
-                    )
-                    return _TOOL_FREQ_PATTERN_HARD_STOP_MSG.format(detail=detail), {
-                        "reason": STOP_REASON_TOOL_FREQ_PATTERN,
-                        "tool_name": top_name,
-                        "count": top_count,
-                        "ratio": round(top_ratio, 3),
-                        "alternating_run": alt_run,
-                        "detail": detail,
-                    }
+                        return (
+                            _HARD_STOP_RUNNING_MSG
+                            if self._last_tool_still_running(messages)
+                            else _TOOL_FREQ_PATTERN_HARD_STOP_MSG.format(detail=detail)
+                        ), {
+                            "reason": STOP_REASON_TOOL_FREQ_PATTERN,
+                            "tool_name": top_name,
+                            "count": top_count,
+                            "ratio": round(top_ratio, 3),
+                            "alternating_run": alt_run,
+                            "detail": detail,
+                        }
 
         return None, None
 

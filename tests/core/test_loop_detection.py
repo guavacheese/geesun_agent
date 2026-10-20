@@ -717,3 +717,128 @@ def test_window_has_deliverable_helper():
     old = [ToolMessage(content="/reports/early", tool_call_id="c0", name="execute")]
     late = [ToolMessage(content="nothing", tool_call_id="c1", name="execute")]
     assert _window_has_deliverable(old + late, 1) is False
+
+
+# ────────── 有客观进展的续查豁免（2026-10-20 add0229b）──────────
+# 背景：ocr_pdf_to_text 是 submit-and-poll，262 页 ≈110 分钟 ⇒ 约 22 次同参
+# 续查（每次 wait_seconds=300）。而 Layer1 的 hard_limit=5、Layer2 的
+# tool_freq_warn=12 都只看"调用形态"，会在第 5/12 次掐死一个正在推进的任务。
+# 生产后果（add0229b）：模型被硬停后回答"PDF 还没上传，让我先上传"，
+# 而实际上后台 OCR 一直在跑、文件早在沙箱里。
+
+_OCR_ARGS = {
+    "sandbox_id": "sbx-1",
+    "sandbox_pdf_path": "/home/user/_ocr/x.pdf",
+    "pages": "all",
+    "dpi": 150,
+    "wait_seconds": 300,
+}
+
+
+def _tool_result(payload):
+    import json as _json
+
+    from langchain_core.messages import ToolMessage
+
+    return ToolMessage(
+        content=_json.dumps(payload, ensure_ascii=False), tool_call_id="call_x"
+    )
+
+
+def _replay_resume_loop(mw, rounds, payloads, args=None):
+    """重放 submit-and-poll 续查：AI(call) → Tool(result) → AI(同一 call)…
+
+    返回每轮 _apply 的结果（None = 未介入）。
+    """
+    args = args or _OCR_ARGS
+    msgs = []
+    results = []
+    for i in range(rounds):
+        msgs.append(_ai(_call("ocr_pdf_to_text", dict(args))))
+        results.append(mw._apply(_state_with(list(msgs)), _RUNTIME))
+        msgs.append(_tool_result(payloads[i] if i < len(payloads) else {}))
+    return results
+
+
+def test_running_resume_is_exempt_from_hard_stop():
+    """同参续查、每轮有客观进展（status=running + pages_ocred 增长）⇒ 不介入。
+
+    这是 add0229b 的正解：让模型按 progress_hint 反复续查直到 done。
+    """
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+    payloads = [
+        {"success": True, "status": "running", "pages_ocred": i * 10}
+        for i in range(10)
+    ]
+    results = _replay_resume_loop(mw, 10, payloads)
+    intervened = [i for i, r in enumerate(results) if r is not None]
+    assert not intervened, (
+        "有进展的续查不得软提醒/硬停，被介入的轮次：%s" % intervened
+    )
+
+
+def test_real_loop_without_progress_still_hard_stops():
+    """真死循环（结果立即报错、零进展）仍必须在第 5 次硬剥。"""
+    mw = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)
+    payloads = [{"success": False, "error": "file not found"}] * 8
+    results = _replay_resume_loop(mw, 6, payloads)
+    hard = [i for i, r in enumerate(results) if r is not None and r.get("messages")]
+    assert hard, "零进展的重复调用必须被硬停"
+    assert hard[0] == 4, "第 5 次（下标 4）应硬剥，实际：%s" % hard
+
+
+def test_progress_exempt_respects_max():
+    """超过 progress_exempt_max 仍硬停（防"后台死了但每轮照样 running"）。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=3, hard_limit=5, progress_exempt_max=5
+    )
+    payloads = [{"success": True, "status": "running", "pages_ocred": 1}] * 12
+    results = _replay_resume_loop(mw, 12, payloads)
+    hard = [i for i, r in enumerate(results) if r is not None and r.get("messages")]
+    assert hard, "超过 progress_exempt_max 必须硬停"
+    assert hard[0] >= 5, "上限 5 ⇒ 至少第 6 次（下标 5）才硬停，实际下标 %s" % hard[0]
+
+
+def test_hard_stop_text_says_backend_still_running():
+    """硬停文案必须说"后台仍在运行"，否则模型会宣布任务失败/文件没上传。"""
+    mw = LoopDetectionMiddleware(
+        warn_threshold=3, hard_limit=5, progress_exempt_max=1
+    )
+    payloads = [{"success": True, "status": "running", "pages_ocred": 3}] * 8
+    results = _replay_resume_loop(mw, 8, payloads)
+    hard = [r for r in results if r is not None and r.get("messages")]
+    assert hard, "progress_exempt_max=1 时应很快硬停"
+    text = hard[0]["messages"][0].content
+    assert "后台任务仍在运行" in text, text[:200]
+    assert "不要声称任务失败" in text, text[:200]
+
+
+def test_progress_exempt_requires_same_fingerprint():
+    """只有"上次同指纹调用"的结果参与豁免；换参重试不豁免。"""
+    mw = LoopDetectionMiddleware()
+    call_a = _call("ocr_pdf_to_text", dict(_OCR_ARGS, pages="all"))
+    call_b = _call("ocr_pdf_to_text", dict(_OCR_ARGS, pages="1-5"))
+    hash_a = _hash_tool_calls([call_a], mw._schema_fields_for)
+    running = {"status": "running", "pages_ocred": 9}
+
+    switched = [_ai(call_b), _tool_result(running), _ai(call_a)]
+    assert mw._last_same_call_had_progress(switched, hash_a) is False, (
+        "上一次调用指纹不同（换参数重试）⇒ 不构成续查，不得豁免"
+    )
+
+    resumed = [_ai(call_a), _tool_result(running), _ai(call_a)]
+    assert mw._last_same_call_had_progress(resumed, hash_a) is True
+
+
+def test_progress_payload_requires_structured_fields():
+    """进度判据只认结构化字段，不做宽松子串匹配（防豁免变免死金牌）。"""
+    from src.core.loop_detection import _is_progress_payload
+
+    assert _is_progress_payload('{"status": "running"}') is True
+    assert _is_progress_payload('{"pages_ocred": 3}') is True
+    assert _is_progress_payload(
+        '[{"type": "text", "text": "{\\"status\\": \\"completed\\"}"}]'
+    ) is True
+    assert _is_progress_payload('{"success": false, "error": "x"}') is False
+    assert _is_progress_payload("status: running") is False
+    assert _is_progress_payload("") is False

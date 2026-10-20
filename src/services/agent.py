@@ -1112,6 +1112,14 @@ async def create_agent(
                 tool_freq_ratio=settings.loop_detect_tool_ratio_threshold,
                 min_window_fill=settings.loop_detect_min_window_fill,
                 alternating_min_run=settings.loop_detect_alternating_min_run,
+                # ★ 2026-10-20 补：以上判据都只看「调用形态」，而 submit-and-poll
+                #   型工具（ocr_pdf_to_text）的正常形态**就是**同参反复续查
+                #   （262 页 ≈110 分钟 ⇒ 约 22 次 wait_seconds=300 的续查）。
+                #   只看形态必然把大任务误杀在第 5 次（add0229b 实测：模型被
+                #   硬停后只能回答"PDF 没上传/任务失败"）。豁免判据看**结果侧**
+                #   有没有客观进展（status=running / pages_ocred 增长），真死
+                #   循环的输出是立即报错或空返回，区分度清晰。
+                progress_exempt_max=settings.loop_detect_progress_exempt_max,
             ),
             # ★★ 必须在**列表末尾**（LoopDetection 之后）。2026-09-11 新增，
             # 堵「模型吐空响应但流程当正常结束」——生产会话 GY24428:0f6d781d

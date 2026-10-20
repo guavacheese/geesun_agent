@@ -179,6 +179,15 @@ class Settings(BaseSettings):
     loop_detect_min_window_fill: int = 12
     #: 交替循环最少连续匹配次数（周期 2 或 3）
     loop_detect_alternating_min_run: int = 6
+    #: 有客观进展的重复调用豁免上限（2026-10-20 add0229b）。
+    #: submit-and-poll 型工具（ocr_pdf_to_text）的正常形态就是同参反复续查：
+    #: 262 页 × 30s/页 ≈ 110 分钟、每次 wait_seconds=300 ⇒ 约 22 次。Layer1
+    #: 的 hard=5 会在第 5 次就把大任务掐死，而它每轮都在推进（pages_ocred
+    #: 在涨）。参数 40 是兜底：防「后台任务其实死了、却每轮照样返回 running」
+    #: 的空转。
+    #: ★ 判据只看工具结果里的结构化字段（status=running/completed、
+    #:   pages_ocred>0），不做宽松子串匹配——否则真死循环也会被放过。
+    loop_detect_progress_exempt_max: int = 40
     # ─── TerminalResponseMiddleware（2026-09-11 新增，堵「空响应被当正常结束」）───
     # 已写码并通过单测：src/core/terminal_response.py + tests/spikes/terminal_response_guard.py
     # 背景：生产会话 GY24428:0f6d781d 末次模型调用耗时 336s 后返回**完全空响应**
