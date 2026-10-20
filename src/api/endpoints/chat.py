@@ -2403,6 +2403,10 @@ async def chat(
             nonlocal _progress_exempt_count, _bg_job_running
             nonlocal _loop_forced_stop
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
+            # 待抛的收敛异常（P0/C 命中后挂起，等下一轮 model 开始再抛，见 async for 头部）。
+            # 就地声明而不是外层 nonlocal：它只在单次 _drain_astream 调用内有效，
+            # 跨轮复用旧值会让下一轮一进来就中断。
+            _pending_abort: Exception | None = None
             # ─── 清洗：messages 里不应有 SystemMessage ───
             # 主 system 由 deepagents 的 system_message 字段承载（factory 最内层
             # 前置 + memory middleware append_to_system_message），messages 中出现
@@ -2464,6 +2468,24 @@ async def chat(
                 async for mode, data in _astream_with_heartbeat(_stream, 15.0):
                     if mode == "__heartbeat__":
                         turn_registry.beat(thread_id)
+                        continue
+
+                    # ─── 延迟中断（2026-10-20 add0229b，收敛提示不得取消在飞 tool 结果）───
+                    # P0/C 判定命中后**不能就地 raise**：raise 会让 `async for` 退出，
+                    # `_astream_with_heartbeat` 的 finally 会 `_anext.cancel()`（chat.py:2191），
+                    # 被取消的正是 `agent.astream.__anext__()` —— 若此刻工具节点还没提交，
+                    # 那条 ToolMessage 会被 ToolNode 改写成
+                    # `Tool call ... was cancelled - another message came in`
+                    # （add0229b 15:54:54 实证：模型因此丢掉 `pages_ocred=24/30` 的进度
+                    # JSON，只能自己 execute 去翻 err.log）。
+                    # 正确做法：先把待抛异常挂起，继续消费事件直到**下一轮 model 开始**
+                    # （收到 model 节点的 messages 流 = 上一 super-step 已提交，tools 结果
+                    # 已落 checkpoint），此时再 break + raise，取消只落在模型生成上。
+                    if _pending_abort is not None:
+                        if mode == "messages":
+                            _pmd = data[1] if isinstance(data, tuple) and len(data) > 1 else {}
+                            if (_pmd or {}).get("langgraph_node") == "model":
+                                break
                         continue
 
                     if (
@@ -2851,10 +2873,11 @@ async def chat(
                                                 "（最近结果: %s）→ 注入收敛提示",
                                                 tool_name, _repeat_count, content_str[:120],
                                             )
-                                            raise NoProgressAbortError(
+                                            _pending_abort = NoProgressAbortError(
                                                 f"检测到无进展循环：工具 {tool_name} 连续 "
                                                 f"{_repeat_count} 次重复相同操作且无新产出"
                                             )
+                                            break
                                         else:
                                             # 收敛注入已耗尽仍未收敛 → 直接终止（防烧满 recursion_limit）
                                             logger.warning(
@@ -2902,10 +2925,11 @@ async def chat(
                                             settings.no_progress_stagnation_calls,
                                             tool_name, user_id, session_id,
                                         )
-                                        raise NoProgressAbortError(
+                                        _pending_abort = NoProgressAbortError(
                                             f"已连续 {settings.no_progress_stagnation_calls} 次工具调用"
                                             f"未产生任何新交付物（最近一次：{tool_name}）"
                                         )
+                                        break
                                     logger.warning(
                                         "[C] 交付物停滞且收敛提示无效: 再攒满 %d 次仍无交付物 → 终止"
                                         " (user=%s, session=%s)",
@@ -3129,6 +3153,11 @@ async def chat(
                                             ),
                                             "tool_call_id": tool_call_id,
                                         })
+                # P0/C 命中后挂起的异常：到此为止工具结果一定已随 super-step 提交
+                # （要么收到了下一轮 model 的第一个 chunk 才 break，要么流已自然结束），
+                # 抛出去交给下面的 except 注入收敛提示，不会再把 ToolMessage 打成 cancelled。
+                if _pending_abort is not None:
+                    raise _pending_abort
             except ToolLoopAbortError as e:
                 # ─── 工具连续失败超限：预期内主动终止，不打印堆栈（非程序 bug）───
                 # 只向前端发 error 事件（比 GraphRecursionError 快几十步）

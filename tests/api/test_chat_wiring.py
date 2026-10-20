@@ -1117,18 +1117,23 @@ def test_p0_no_progress_shares_progress_exemption_judge():
         "下次修一处必然漏另一处（这正是 add0229b 的第三次同类裂缝）"
     )
 
-    raises = _raise_lines(node, "NoProgressAbortError")
-    assert raises, "找不到 P0 的 NoProgressAbortError 抛出点 —— 断言前提失效"
+    # 2026-10-20 起 P0/C 不再裸 raise，而是挂起到 `_pending_abort`（见下一个测试
+    # `test_convergence_abort_is_deferred_until_superstep_committed`），
+    # 所以"抛错点"改按 pending 赋值定位。
+    triggers = _pending_abort_lines(node)
+    assert triggers, (
+        "找不到 `_pending_abort = NoProgressAbortError(...)` —— P0 的触发点不见了"
+    )
 
-    # P0 的"压回 1"必须存在，且早于抛错
-    resets = [ln for ln in _assign_const_lines(node, "_repeat_count", 1) if ln < min(raises)]
+    # P0 的"压回 1"必须存在，且早于触发
+    resets = [ln for ln in _assign_const_lines(node, "_repeat_count", 1) if ln < min(triggers)]
     assert resets, (
         "P0 段没有 `_repeat_count = 1`（进展豁免后压回计数）—— "
-        "P0 仍会数满 no_progress_repeat_threshold 并抛错"
+        "P0 仍会数满 no_progress_repeat_threshold 并触发收敛"
     )
     p0_reset = max(resets)
-    assert p0_reset < min(raises), (
-        "进展豁免（行 %d）必须早于 P0 抛错（行 %d）" % (p0_reset, min(raises))
+    assert p0_reset < min(triggers), (
+        "进展豁免（行 %d）必须早于 P0 触发（行 %d）" % (p0_reset, min(triggers))
     )
     assert any(abs(p0_reset - ln) <= 8 for ln in ok_lines), (
         "P0 的计数压回点（行 %d）附近没有引用 `_bg_progress_ok`（引用点 %r）—— "
@@ -1167,3 +1172,124 @@ def test_p0_exemption_is_bounded_by_same_quota():
         "P0/C 共用的判定可能绕过了闸门"
         % (gate_lines, span[0], span[1])
     )
+
+
+def _pending_abort_lines(node: ast.AST) -> list[int]:
+    """`_pending_abort = NoProgressAbortError(...)` 的行号（P0/C 的收敛触发点）。"""
+    return [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+        and n.value.func.id == "NoProgressAbortError"
+        for t in n.targets
+        if isinstance(t, ast.Name) and t.id == "_pending_abort"
+    ]
+
+
+def _pending_abort_waits(node: ast.AST) -> list[ast.If]:
+    """`if _pending_abort is not None:` 且分支里 break 的语句（= 等待 super-step 提交）。
+
+    注意同形出现两次：async for 头部的等待分支（body 含 Break）与消费循环之后
+    的 `raise _pending_abort` 分支（body 含 Raise）。只取前者。
+    """
+    out = []
+    for n in ast.walk(node):
+        if not (
+            isinstance(n, ast.If)
+            and isinstance(n.test, ast.Compare)
+            and isinstance(n.test.left, ast.Name)
+            and n.test.left.id == "_pending_abort"
+        ):
+            continue
+        if any(isinstance(x, ast.Break) for x in ast.walk(ast.Module(body=n.body, type_ignores=[]))):
+            out.append(n)
+    return out
+
+
+def test_convergence_abort_is_deferred_until_superstep_committed():
+    """收敛中断必须**延迟**到工具结果提交之后（2026-10-20 add0229b，P3①）。
+
+    事故原样：P0 在工具结果处理中途 `raise` ⇒ `async for` 退出 ⇒
+    `_astream_with_heartbeat` 的 finally `_anext.cancel()`（chat.py:2191）⇒
+    正在跑的 `agent.astream.__anext__()` 被取消 ⇒ 那条 ToolMessage 被 ToolNode
+    改写成 `Tool call ... was cancelled - another message came in`。
+    模型因此丢掉 `status=running, pages_ocred=24/30` 的进度 JSON，只能自己
+    execute 去翻 err.log，再下一次续查就撞 middleware 硬停。
+
+    本测试锁四件事：
+      ① `_drain_astream` 里**不得**再裸 `raise NoProgressAbortError`；
+      ② 触发点必须是 `_pending_abort = NoProgressAbortError(...)` + 紧随 break；
+      ③ async for 头部必须有 `if _pending_abort is not None` 的等待分支；
+      ④ `raise _pending_abort` 必须在 async for **之后**（离开消费循环才抛）。
+    """
+    node = _drain_astream()
+
+    assert not _raise_lines(node, "NoProgressAbortError"), (
+        "仍有裸 `raise NoProgressAbortError` —— 就地抛会取消在飞 tool 结果"
+        "（add0229b：ToolMessage 被改写成 cancelled，模型丢失进度 JSON）"
+    )
+
+    triggers = _pending_abort_lines(node)
+    assert len(triggers) >= 2, (
+        "P0 与 C 两处触发点都应改成挂起 `_pending_abort`，实际找到 %d 处" % len(triggers)
+    )
+
+    # ② 每个触发点之后几行内必须有 break（跳出 node 循环，交给 async for 头部处理）。
+    #    容差 8 行：触发语句是多行构造（`_pending_abort = NoProgressAbortError(` +
+    #    跨行 f-string + `)`），break 落在 `)` 之后，与起始行号天然隔开 4~6 行。
+    breaks = [n.lineno for n in ast.walk(node) if isinstance(n, ast.Break)]
+    for ln in triggers:
+        assert any(0 < b - ln <= 8 for b in breaks), (
+            "触发点（行 %d）后面没有紧跟 break —— 会继续在当前事件里往下跑"
+            "（文件解析、卡片 emit 等），与「立即停止本节点处理」的语义不符" % ln
+        )
+
+    # ③ async for 头部的等待分支
+    waits = _pending_abort_waits(node)
+    assert waits, (
+        "async for 里没有 `if _pending_abort is not None` 的等待分支 —— "
+        "挂起后没人等 super-step 提交，等于放弃了延迟中断"
+    )
+
+    # ④ 抛出点在 async for 之后
+    raises_pending = [
+        n.lineno
+        for n in ast.walk(node)
+        if isinstance(n, ast.Raise)
+        and isinstance(n.exc, ast.Name)
+        and n.exc.id == "_pending_abort"
+    ]
+    assert raises_pending, "找不到 `raise _pending_abort` —— 挂起后永远不抛，收敛提示不会注入"
+    assert min(raises_pending) > waits[0].lineno, (
+        "`raise _pending_abort`（行 %d）必须在等待分支（行 %d）之后"
+        % (min(raises_pending), waits[0].lineno)
+    )
+
+
+def test_deferred_abort_waits_for_model_node_not_any_event():
+    """等待分支必须认准 **model 节点**的 messages 事件才 break。
+
+    随便哪个事件就 break 的话，可能在 tools 节点还没提交时离开消费循环，
+    取消照样会落到在飞的 tool 调用上——等于没修。
+    """
+    node = _drain_astream()
+    waits = _pending_abort_waits(node)
+    assert waits, "找不到 `_pending_abort` 等待分支"
+    body = waits[0].body
+    text = "".join(
+        n.value for n in ast.walk(ast.Module(body=body, type_ignores=[]))
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    )
+    has_model_guard = any(
+        isinstance(n, ast.Constant) and n.value == "langgraph_node"
+        for n in ast.walk(waits[0])
+    )
+    assert has_model_guard, (
+        "等待分支没有判断 `langgraph_node` —— 可能在非 model 事件上提前 break，"
+        "此时 tools 节点未必已提交，取消仍会打到在飞的 tool 结果"
+    )
+    assert "model" in text or any(
+        isinstance(n, ast.Constant) and n.value == "model" for n in ast.walk(waits[0])
+    ), "等待分支的节点判据不是 model"
