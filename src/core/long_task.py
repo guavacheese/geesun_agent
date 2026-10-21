@@ -154,6 +154,20 @@ def result_text(result: Any) -> str:
             if isinstance(parsed, (list, tuple)) and parsed != result:
                 return result_text(list(parsed))
         return result
+    # ★ ToolMessage / 其它 BaseMessage：真正的载荷在 .content 里。
+    #   langgraph 的 ToolNode 会带 tool_call_id 调工具，langchain 此时返回
+    #   ToolMessage 而不是裸内容（2026-10-21 1.0.38 e2e 实证：漏掉这条，
+    #   str(ToolMessage) 首字符是 'c'，payload_status 判 None ⇒ drive 把
+    #   running 误判成"无结构化返回"在 round-1 就交回模型，自动续查失效，
+    #   退化回模型自己轮询）。探针裸调 ainvoke 不带 tool_call_id 拿到的是
+    #   list，恰好绕开了这条路径——所以单测必须用 ToolMessage 形态锁死。
+    if not isinstance(result, (str, list, dict)) and hasattr(result, "content"):
+        inner = getattr(result, "content", None)
+        if isinstance(inner, (str, list)):
+            text = result_text(inner)
+            if text:
+                return text
+        return str(inner or "")
     if isinstance(result, list):
         parts: list[str] = []
         for part in result:
@@ -377,14 +391,22 @@ async def drive(
         # status 缺失必须直接返回而不是重试：参数错误、工具不存在这类
         # "确定性失败"重试多少次都是同一个结果，会白烧整个预算。
         if status != "running":
-            if rounds > 1:
-                logger.info(
-                    "[DURABLE] %s 结束：status=%s，共 %d 轮、耗时 %.0fs",
-                    tool_name, status or "无结构", rounds, time.monotonic() - started_at,
-                )
+            # ★ 2026-10-21 插桩：round-1 静默返回曾导致"drive 看似没接管"
+            #   的假象（1.0.38 e2e 实证：running 结果被交回模型）。任何
+            #   提前返回都必须留下判型证据，否则只能黑盒猜。
+            logger.info(
+                "[DURABLE] %s 第 %d 轮返回即结束：status=%r result_type=%s "
+                "text_head=%r",
+                tool_name, rounds, status, type(result).__name__,
+                result_text(result)[:160],
+            )
             return result
 
         data = result_payload(result) or {}
+        logger.info(
+            "[DURABLE] %s 第 %d 轮 status=running（已等 %.0fs），继续续查",
+            tool_name, rounds, time.monotonic() - started_at,
+        )
         report_sig, last_ts = await _maybe_report(
             tool_name, data,
             rounds=rounds, started_at=started_at,

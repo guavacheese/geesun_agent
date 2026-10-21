@@ -399,3 +399,49 @@ def test_shield_leaves_non_durable_tools_untouched(monkeypatch):
 
     assert json.loads(result)["status"] == "running", "非白名单工具不该被续查"
     assert len(inner.calls) == 1
+
+
+# ─── 2026-10-21 生产实证补丁：ToolMessage 形态 ────────────────────────────
+# langgraph ToolNode 带 tool_call_id 调工具 ⇒ langchain 返回 ToolMessage
+# 而不是裸 str/list。1.0.38 e2e 实证：result_text(ToolMessage) 落到
+# str() 兜底（首字符 'c'）⇒ payload_status=None ⇒ drive 把 running 误判成
+# "无结构化返回"在 round-1 就交回模型，自动续查整条失效。
+# 裸调 ainvoke（不带 tool_call_id）拿到的是 list，恰好绕开——所以这里的
+# 桩必须真实还原 langgraph 的调用形态（带 tool_call_id），不能只用裸 dict。
+
+def _tm(pages_status: str, pages: int = 5) -> "object":
+    """构造生产形态：langchain 在带 tool_call_id 调用时返回的 ToolMessage。"""
+    from langchain_core.messages import ToolMessage
+
+    return ToolMessage(
+        content=[{"type": "text",
+                  "text": json.dumps({"success": True, "status": pages_status,
+                                      "pages_ocred": pages, "pages_total": 30})}],
+        tool_call_id="chatcmpl-tool-test",
+    )
+
+
+def test_result_text_unwraps_tool_message():
+    """ToolMessage 的载荷在 .content 里；str(ToolMessage) 首字符是 'c'。"""
+    tm = _tm("running")
+    assert not lt.result_text(tm).startswith("content="), "content 未解包"
+    assert lt.payload_status(tm) == "running"
+
+
+def test_shield_drive_survives_toolmessage_inner():
+    """端到端还原生产事故：inner 返回 ToolMessage 时 drive 必须继续续查。
+
+    修法前：round-1 的 running ToolMessage 被判"无结构化"直接返回，
+    模型看到 running 后自己再调一次（1.0.38 e2e 实测 ocr_tool_calls=2）。
+    """
+    from src.core.mcp import _MCPErrorShieldTool
+
+    inner = _Inner("ocr_pdf_to_text",
+                   [_tm("running", 5), _tm("running", 19), _tm("completed", 30)],
+                   args_schema=_WaitSchema)
+    tool = _MCPErrorShieldTool(inner)
+    # ★ 模拟 langgraph：带 tool_call_id 调用（这正是触发 ToolMessage 形态的开关）
+    result = asyncio.run(tool.ainvoke({"file_path": "/data/x.pdf"},
+                                      tool_call_id="chatcmpl-tool-test"))
+    assert lt.payload_status(result) == "completed"
+    assert len(inner.calls) == 3, "ToolMessage 形态没有接住，drive 提前返回"
