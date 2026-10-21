@@ -17,7 +17,7 @@ from src.infra.database import message_key
 from src.infra.sandbox import create_sandbox, get_env_snapshot
 from src.infra.reports import snapshot_report_files
 from src.services.agent import create_agent
-from src.core import execution_guard, run_registry, turn_registry
+from src.core import execution_guard, long_task, run_registry, turn_registry
 from src.core.loop_detection import (
     LOOP_FORCED_STOP_KEY,
     progress_payload_status,
@@ -2249,6 +2249,16 @@ async def chat(
             """发一段**逐增量**文本（token / reasoning），走桥的尾部累积器。"""
             await bridge.publish_delta(run_id, kind, text)
 
+        # ─── 长任务进度上报器（2026-10-21 方案，见 core/long_task.py）───
+        # 白名单工具（默认 ocr_pdf_to_text）的续查循环沉到工具内部后，一个
+        # 工具调用可能持续数小时。若不在这里绑定通道，前端在这段时间收不到
+        # 任何信号，只能看着"运行中"转圈。
+        # ★ 必须在 worker 这个 asyncio.Task **内部** set：Task 会复制当前
+        #   context，之后该 task 内所有 await 链（含工具调用）才读得到。
+        #   先置 None 再绑定：finally 里无条件 reset，不能让 NameError 打断收尾。
+        _progress_token = None
+        _progress_token = long_task.bind_progress(_pub)
+
         # ─── 收尾状态位：必须在**第一个 await 之前**就位 ───
         # 理由：本函数靠 finally 兜底收尾，而它可能在任意 await 点被取消后触发。若那时
         # 某个状态位还没绑定，收尾自己会 NameError —— 就从"丢一轮消息"升级成"收尾也
@@ -3536,6 +3546,8 @@ async def chat(
             raise
         finally:
             _beat_task.cancel()
+            # 长任务进度通道复位（纯 contextvar 操作，不阻塞、不影响收尾）
+            long_task.reset_progress(_progress_token)
             # detach 是非阻塞的纯 contextvar 复位，先做：观测侧动作不能拖住后面的收尾。
             if _ctx_token is not None:
                 try:

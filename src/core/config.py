@@ -260,6 +260,24 @@ class Settings(BaseSettings):
     # wait_seconds≤300 + 上传/预处理留足空间，不误杀合法长调用。
     # <=0 表示不设限（仅排障用）。
     mcp_tool_call_timeout_sec: int = 600
+    # ─── 长任务（durable）自动续查（2026-10-21 新增，方案见 core/long_task.py）───
+    # 背景：单次 MCP 调用被上一项封顶 600s，MCP 侧只能每 300s 返回一次
+    # status=running，由**模型**再调一次同参工具续查。262 页 OCR 要 5 小时
+    # ⇒ 模型连续调同一工具 30~70 次，与死循环同形，三套判据全部误杀
+    # （add0229b 第 5 轮 79%、第 6 轮 95% 工具占比被硬停，140 页结果全丢）。
+    # 改为：模型只发 1 次调用，续查循环沉到工具内部（对齐 deer-flow
+    # task_tool::_await_subagent_terminal 的「1 次调用 + 工具内轮询」形态）。
+    #
+    # 白名单（逗号分隔的工具名）。空 = 全关（回到旧行为）。
+    # 只点名确实需要几小时的工具：把 execute 之类也放进来会掩盖真挂死。
+    mcp_durable_task_tools: str = "ocr_pdf_to_text"
+    # 自动续查的**总**预算（s），与单次 RPC 封顶互相独立。
+    # 262 页 × 70s ≈ 5.1h；开启方向/去畸变预处理后估 6~7h，取 8h 留余量。
+    # 到点返回最后一次 running 结果，由模型决定是否再调一次（兜底而非主路径）。
+    mcp_durable_task_budget_sec: int = 28800
+    # 每轮希望服务端等待多久（会覆盖模型传的 wait_seconds）。=MCP 侧 _OCR_WAIT_MAX。
+    # 不抬高的话模型给 90（默认值），续查轮次直接翻三倍。
+    mcp_durable_poll_wait_sec: int = 300
     # ─── run 看门狗（2026-10-19 方案 4）───
     # 事故 653d8515：worker 的事件循环被同步 e2b 调用堵死 55 分钟，asyncio
     # beat 任务停摆 ⇒ 没有任何机制发现"这个 run 已经不会动了"，run 挂死

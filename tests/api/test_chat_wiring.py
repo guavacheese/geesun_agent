@@ -1293,3 +1293,134 @@ def test_deferred_abort_waits_for_model_node_not_any_event():
     assert "model" in text or any(
         isinstance(n, ast.Constant) and n.value == "model" for n in ast.walk(waits[0])
     ), "等待分支的节点判据不是 model"
+
+
+# ─────────────────────────── ⑥ 长任务自动续查（2026-10-21）───────────────────────────
+#
+# 事故背景 add0229b：262 页 OCR 要 5 小时，单次 MCP 调用被封顶 600s ⇒ MCP 侧每
+# 300s 返回 status=running，**模型**再调一次同参工具。模型因此连续调同一工具
+# 30~70 次，与死循环同形，三套判据全部误杀（第 6 轮 95% 工具占比硬停，140 页
+# 结果全丢）。修法：续查循环沉到工具内部（core/long_task.py::drive），
+# 模型只发 1 次调用（对齐 deer-flow task_tool::_await_subagent_terminal）。
+#
+# 这组断言守的是**接线**——逻辑单测（tests/core/test_long_task.py）全绿也可能
+# 根本没接上，本项目已有先例（1.0.13 漏 import shlex，实现全绿、上线即崩）。
+
+
+def _mcp_source() -> str:
+    from pathlib import Path
+
+    return Path("src/core/mcp.py").read_text("utf-8")
+
+
+def _ainvoke_node(class_name: str):
+    """取出 mcp.py 里某个包装类的 ainvoke 函数节点。"""
+    tree = ast.parse(_mcp_source())
+    for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+        if cls.name != class_name:
+            continue
+        for fn in cls.body:
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == "ainvoke":
+                return fn
+    raise AssertionError("在 %s 里找不到 ainvoke 方法" % class_name)
+
+
+def _attr_calls(node, module: str, func: str) -> list:
+    return [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == func
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == module
+    ]
+
+
+def test_durable_drive_is_wired_into_mcp_shield():
+    """_MCPErrorShieldTool 必须真的调用 long_task.drive / is_durable_tool。
+
+    为什么挂在 shield 里而不是 ToolNode：所有 MCP 工具都已被 shield 包过，
+    这里是最窄的落点——不动 MCP 侧契约、不动 langgraph 图结构。
+    """
+    node = _ainvoke_node("_MCPErrorShieldTool")
+    assert _attr_calls(node, "long_task", "is_durable_tool"), (
+        "ainvoke 里没有 long_task.is_durable_tool —— 白名单机制没接上"
+    )
+    assert _attr_calls(node, "long_task", "drive"), (
+        "ainvoke 里没有 long_task.drive —— 自动续查没接上，模型仍会自己续查"
+    )
+
+
+def test_durable_drive_is_inside_try_so_errors_stay_shielded():
+    """drive 必须在 try 块体内。
+
+    ★ 这是本组最要紧的一条：drive 会抛出「连续 RPC 失败」「RPC 超时」等异常，
+      它们必须走下面统一的 except → `_shield_error` → ToolInvocationError。
+      裸放在 try 外面的话，异常直接冒出 ainvoke ⇒ langgraph 按未处理错误
+      **整轮崩流**（2026-09-09 paddleocr_vl 实证）。
+    """
+    node = _ainvoke_node("_MCPErrorShieldTool")
+    drive_calls = _attr_calls(node, "long_task", "drive")
+    assert drive_calls, "没有 long_task.drive 调用，本测试无意义"
+
+    # 收集所有 try 块体里的节点行号范围，判断 drive 调用点是否落在其中
+    protected: list[tuple[int, int]] = []
+    for t in [n for n in ast.walk(node) if isinstance(n, ast.Try)]:
+        for stmt in t.body:
+            start = getattr(stmt, "lineno", 0)
+            end = getattr(stmt, "end_lineno", start)
+            protected.append((start, end))
+    for call in drive_calls:
+        ln = call.lineno
+        assert any(s <= ln <= e for s, e in protected), (
+            "long_task.drive（行 %d）不在任何 try 块体内 —— 异常会绕过 "
+            "_shield_error 直接崩流" % ln
+        )
+
+
+def test_durable_progress_reporter_is_bound_in_worker():
+    """进度上报器必须在 **worker 内** 绑定，且 finally 里复位。
+
+    ① `bind_progress` 是 contextvar.set：只有在 worker 这个 asyncio.Task 内部
+       调用，才对该 task 后续所有 await 链（含工具调用）可见。写在模块级或
+       task 外面，工具读到的是另一个 context 副本 ⇒ 永远 None ⇒ 几小时的
+       工具调用期间前端零信号。
+    ② finally 必须 reset（纯 contextvar 操作，不阻塞收尾），否则同一进程内
+       不同 run 的 reporter 可能串味。
+    """
+    src = Path("src/api/endpoints/chat.py").read_text("utf-8")
+    tree = ast.parse(src)
+
+    worker = None
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        if fn.name == "_run_worker":
+            worker = fn
+            break
+    assert worker is not None, "找不到 _run_worker"
+
+    bound = [
+        n for n in ast.walk(worker)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "bind_progress"
+    ]
+    assert bound, "_run_worker 里没有 long_task.bind_progress —— 长任务期间前端无进度"
+
+    reset_calls = [
+        n for n in ast.walk(worker)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "reset_progress"
+    ]
+    assert reset_calls, "_run_worker 里没有 long_task.reset_progress —— 上报器会跨 run 残留"
+
+    # reset 必须在某个 finally 块体内
+    finally_bodies: list[tuple[int, int]] = []
+    for t in [n for n in ast.walk(worker) if isinstance(n, ast.Try)]:
+        for stmt in t.finalbody or []:
+            start = getattr(stmt, "lineno", t.lineno)
+            end = getattr(stmt, "end_lineno", start)
+            finally_bodies.append((start, end))
+    assert any(
+        s <= c.lineno <= e for c in reset_calls for s, e in finally_bodies
+    ), "reset_progress 不在 finally 里 —— 取消/异常路径会漏复位"

@@ -31,6 +31,7 @@ from langchain.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from pydantic import PrivateAttr
+from src.core import long_task
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -382,8 +383,49 @@ class _MCPErrorShieldTool(BaseTool):
         )
         self._inner = inner
 
+    def _supports_wait_seconds(self) -> bool:
+        """该工具参数表里是否有 `wait_seconds`（决定要不要帮模型抬到上限）。
+
+        为什么需要：MCP 侧 `ocr_pdf_to_text(wait_seconds=90)` 的默认值只有 90s，
+        而单次可等的上限是 300s。模型不显式传时，自动续查每轮只睡 90s ⇒
+        续查轮次翻三倍（多出来的都是空转 RPC）。这里读一次 schema 判断，
+        有就抬到 `mcp_durable_poll_wait_sec`。
+
+        pydantic v2 的 `args_schema.model_fields` 是 dict；MCP 工具 schema 由
+        langchain_mcp_adapters 动态生成，个别版本可能是 v1 风格 —— 两种都试，
+        取不到就当"不支持"（保守：退化为用模型原参数，仍然能用）。
+        """
+        schema = getattr(self._inner, "args_schema", None)
+        if schema is None:
+            return False
+        fields = getattr(schema, "model_fields", None)
+        if isinstance(fields, dict):
+            return "wait_seconds" in fields
+        fields = getattr(schema, "__fields__", None)
+        if isinstance(fields, dict):
+            return "wait_seconds" in fields
+        return False
+
     async def ainvoke(self, input, config=None, **kwargs):
+        # 长任务自动续查（2026-10-21）：白名单工具（默认 ocr_pdf_to_text）
+        # 在这里把「模型连续调 30~70 次同参工具」压成「模型调 1 次、工具内部
+        # 循环续查」。理由与收益见 core/long_task.py 模块 docstring。
+        #
+        # ★ 必须套在下方统一的 try 里：drive 抛出的任何异常（连续 RPC 失败、
+        #   参数错）同样要走 _shield_error → ToolInvocationError，否则 langgraph
+        #   按未处理错误整轮崩流（2026-09-09 paddleocr_vl 实证）。
+        durable = long_task.is_durable_tool(self.name)
         try:
+            if durable:
+                return await long_task.drive(
+                    self.name,
+                    input,
+                    lambda args: self._inner.ainvoke(args, config, **kwargs),
+                    budget_sec=settings.mcp_durable_task_budget_sec,
+                    rpc_timeout_sec=settings.mcp_tool_call_timeout_sec,
+                    poll_wait_sec=settings.mcp_durable_poll_wait_sec,
+                    supports_wait=self._supports_wait_seconds(),
+                )
             # 单次工具调用墙钟封顶（mcp_tool_call_timeout_sec，2026-10-19 方案 3）：
             # 653d8515 实锤 agent 侧无工具超时时，服务端挂住 = run 永久 running。
             # httpx read 超时只管"两次读之间"，keepalive 流可无限续期——只有
@@ -396,6 +438,23 @@ class _MCPErrorShieldTool(BaseTool):
                 )
             return await self._inner.ainvoke(input, config, **kwargs)
         except asyncio.TimeoutError as e:
+            if durable:
+                # durable 分支的单次 RPC 超时已在 drive 内部重试过；
+                # 走到这里 = 连续多次 RPC 挂住，语义是"服务端一直无响应"，
+                # 不是"任务跑得久"（任务时长由 budget_sec 管）。
+                logger.warning(
+                    "MCP 长任务工具 [%s] 连续多次单次调用超时（每次 %ss），放弃续查",
+                    self.name, settings.mcp_tool_call_timeout_sec,
+                )
+                raise _shield_error(
+                    self.name,
+                    TimeoutError(
+                        f"长任务工具连续多次单次调用超时（每次封顶 "
+                        f"{settings.mcp_tool_call_timeout_sec}s），已停止等待。"
+                        "服务端任务可能仍在后台运行，请稍后用完全相同的参数再调一次。"
+                    ),
+                    input if isinstance(input, dict) else {},
+                ) from e
             logger.warning(
                 "MCP 工具 [%s] 调用超过 %ss 未返回（已按墙钟封顶取消，"
                 "服务端任务可能仍在跑）",
