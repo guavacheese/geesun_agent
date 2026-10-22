@@ -95,7 +95,17 @@ _DEFAULT_ALTERNATING_MIN_RUN = 6  # 交替循环最少连续匹配次数
 # 结果质量豁免上限（2026-10-22 方案 b：1ab81d10/c7500a84 误杀修正）——
 # 「新信息豁免」在单个 run 内最多放行 N 次，超过仍硬停（防"每轮输出都
 # 有点不一样"的慢空转无限续下去）。
-_DEFAULT_NEW_INFO_EXEMPT_MAX = 20
+#
+# 为什么是 40 而不是 20（2026-10-22 19:xx 生产修正）：
+#   cd164bd7（chenzhuowei）实测量级——rar 解压 + 依赖探测 + 解析产物，光
+#   `execute` 就跑了 25 次（unrar 缺 → apt-get 失败 → pip 试 unrar/pyliblz4/
+#   patool → wget 下载二进制 → libarchive-c 成功提取 242 个 XML → openpyxl
+#   读 8704 行 xlsx → 定位 StructuredTextModel），第 20 次撞线被杀。这类
+#   「环境探测型」任务的动作量级天然在 20~30 次，20 一定是误杀。
+#   放宽到 40 不会放走真循环：空转由 `_same_tool_new_info` 的参数/结果判据
+#   拦（同参近重复输出 8 连就开火），本上限只是「慢空转」的最后兜底；
+#   与 `progress_exempt_max` 同量级便于运维建立单一心智模型。
+_DEFAULT_NEW_INFO_EXEMPT_MAX = 40
 #: 交付物目录特征串。窗口内工具结果出现它即视为"有进展"，占比/交替硬停**不生效**。
 #: 与 config.py report_root / chat.py M3 完成门同源（那里也只认 /reports/）。
 _DELIVERABLE_PATH_MARK = "/reports/"
@@ -816,6 +826,13 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self._pending_warnings: dict[str, list[str]] = defaultdict(list)
         # 「新信息豁免」计数（thread_id -> 本 run 已放行次数；开轮清零）
         self._new_info_exempt_count: dict[str, int] = defaultdict(int)
+        # ★ 本轮记账去重：thread_id -> 最近一次已记账的「工具调用标识」。
+        #   为什么需要：_new_info_gate 挂在 Layer2 绝对计数与 Layer2c 两处，
+        #   同一次工具调用被两处各查一次就会各记一次账（cd164bd7 实测：
+        #   18:25:02.660 与 .661 相隔 1ms 成对 +1，额度被双倍消耗 ⇒ 名义
+        #   20 实际只抵 10 次）。这里用本轮 AI 消息的 tool_call ids 作键，
+        #   同一轮无论被查几次只 +1，保证「上限」的语义与字面一致。
+        self._gate_round_key: dict[str, str] = {}
         # 工具名 → 真实参数名集合（契约反查结果；None = 契约未知，见 _extract_schema_fields）
         self._tool_fields: dict[str, frozenset[str] | None] = {}
         # 契约漂移告警限流：(工具名, 越界字段名) 只报一次
@@ -1014,6 +1031,35 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                 return _is_progress_payload(_msg_text(msg))
         return False
 
+    @staticmethod
+    def _current_round_key(messages: list) -> str:
+        """本轮（最近一条 AI 消息发出的工具调用）的稳定标识。
+
+        用于 `_new_info_gate` 的记账去重：同一次工具调用会被 Layer2 与
+        Layer2c 两处各查一次闸门，若两处都 +1，名义上限就被砍半
+        （cd164bd7 实测 20 → 实际只抵 10 次）。
+
+        ★ 键 = `len(messages)` + 本轮 tool_call ids，两者缺一不可：
+          · 只看 ids 会被「重复 id」打穿——测试 harness 与某些 vLLM 实现
+            都会给每次调用发同一个 id（如 `call_x`），那样去重键恒等，
+            等于永久放行、上限永不生效（首版实测：28 次调用一次没硬停）。
+          · 只看长度会被「同一轮里多处硬停点」以外的场景误并；带上 ids
+            后语义明确 = 「同一条 messages 快照 + 同一批调用」。
+          两处硬停点在同一次 `_apply` 里查的是同一份 messages（长度与 ids
+          都相同）⇒ 命中去重；下一次真实调用必然多出 AI+Tool 两条 ⇒ 不命中。
+        """
+        ids: list[str] = []
+        for msg in reversed(messages):
+            if getattr(msg, "type", None) != "ai":
+                continue
+            ids = [
+                str(tc.get("id") or "")
+                for tc in (getattr(msg, "tool_calls", None) or [])
+                if isinstance(tc, dict)
+            ]
+            break
+        return "%d|%s" % (len(messages), ",".join(x for x in ids if x))
+
     def _new_info_gate(
         self,
         thread_id: str,
@@ -1032,7 +1078,21 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
           「真死循环」和「合法调试短连发」，只有结果质量能区分。
           deer-flow 用 ToolProgress（Jaccard 近重复），deepseek-harness 用
           「同参才计数、换参重置」；本闸门两条判据取并集（_same_tool_new_info）。
+
+        ★ 记账去重（2026-10-22 19:xx 修）：两处硬停点各查一次 ⇒ 必须保证
+          **同一次工具调用只记一次账**，否则 `new_info_exempt_max` 的语义
+          与字面差一倍（cd164bd7：日志 18:25:02.660/+1 与 .661/+1 相距 1ms
+          成对出现，20 的额度在第 10 次真实调用就用光了）。
         """
+        round_key = self._current_round_key(messages)
+        if round_key:
+            # 带上工具名：一轮里可能并行发多个不同工具的调用，去重键必须
+            # 区分工具，否则后一个工具会白拿前一个的豁免结论。
+            round_key = "%s|%s" % (tool_name, round_key)
+        if round_key and self._gate_round_key.get(thread_id) == round_key:
+            # 本轮已记过账（另一处硬停点刚查过）：直接沿用上次结论放行，
+            # 不再累加。判据是纯函数，同一条 messages 重复判定结果相同。
+            return True
         if self._new_info_exempt_count[thread_id] >= self.new_info_exempt_max:
             logger.error(
                 "[LOOP] 新信息豁免达到上限（%d），按空转处理 (thread=%s, tool=%s)",
@@ -1042,6 +1102,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         if not _same_tool_new_info(messages, tool_name, window):
             return False
         self._new_info_exempt_count[thread_id] += 1
+        if round_key:
+            self._gate_round_key[thread_id] = round_key
         logger.warning(
             "[LOOP] 新信息豁免：同工具高频但参数互异/结果互不重复，"
             "降级为提醒不硬停 (%d/%d, thread=%s, tool=%s)",
@@ -1474,6 +1536,9 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         thread_id = self._get_thread_id(runtime)
         with self._lock:
             self._new_info_exempt_count.pop(thread_id, None)
+            # 去重键必须与计数同步清零：残留旧键会让新一轮的第一次调用
+            # 被误判成「本轮已记过账」而白拿一次豁免（少记一次账）。
+            self._gate_round_key.pop(thread_id, None)
         # ─── 开轮清零硬停标记（②A 生命周期铁律）───
         # 标记的语义是「**本轮**被强停」。langgraph 每个 run 开头都会跑一次
         # before_agent，正是清零时机：若让上一 run 的标记残留，chat.py 会把一轮

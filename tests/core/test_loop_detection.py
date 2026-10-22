@@ -1307,3 +1307,158 @@ def test_new_info_gate_call_sites():
         "_new_info_gate 调用点数量变了（%d）——新增硬停判据必须同步挂质量闸门"
         % len(sites)
     )
+
+
+# ── 方案 b 修正（2026-10-22 19:xx）：豁免额度记账去重 + 上限 20→40 ──
+# 背景：cd164bd7（chenzhuowei）rar 解压任务，25 次 execute 全在推进，
+# 第 20 次撞「新信息豁免上限」被硬停。取证发现两处硬停点各记一次账
+# （日志 18:25:02.660/+1 与 .661/+1 相隔 1ms 成对出现）⇒ 名义 20 实际
+# 只抵 10 次真实豁免。
+
+# cd164bd7 真实序列（store 取证，26 条，含报错输出）
+_CD164_CMDS = [
+    "cd /home/user && unrar x project.rar /home/user/ 2>&1 | tail -20",
+    "cd /home/user && python3 -c \"import rarfile; print('ok')\" 2>&1 || pip install rarfile 2>&1 | tail -5",
+    "which 7z 2>&1 || which 7za 2>&1 || echo \"no 7z\"",
+    "cd /home/user && python3 -c \"import rarfile;rf=rarfile.RarFile('project.rar');print(len(rf.namelist()))\"",
+    "apt-get install -y unrar 2>&1 | tail -5",
+    "apt-get update 2>&1 | tail -3 && apt-get install -y unrar-free 2>&1 | tail -5",
+    "pip install unrar 2>&1 | tail -5",
+    "pip install pyliblz4 2>&1 | tail -3",
+    "python3 -c \"import unrar;print(dir(unrar))\" 2>&1",
+    "python3 -c \"from unrar import rarfile; rf=rarfile.RarFile('project.rar'); print(len(rf.namelist()))\"",
+    "python3 -c \"import zipfile; print('check zip')\"",
+    "cd /tmp && wget -q https://example.invalid/unrar.tar.gz -O unrar.tar.gz 2>&1",
+    "pip install patool 2>&1 | tail -5",
+    "cd /home/user && python3 -c \"import patoolib; patoolib.extract_archive('project.rar', outdir='/home/user/')\" 2>&1",
+    "python3 -c \"import urllib.request; print('net probe')\" 2>&1",
+    "python3 -c \"import struct; f=open('/home/user/project.rar','rb'); print(f.read(7))\"",
+    "pip install unrar 2>&1 | tail -3; python3 -c \"print(2)\"",
+    "pip install libarchive-c 2>&1 | tail -3; python3 -c \"import libarchive;print('libarchive ok')\" 2>&1",
+    "python3 -c \"import libarchive; import libarchive.public; print('public ok')\"",
+    "python3 -c \"import libarchive; print(dir(libarchive))\" 2>&1",
+    "python3 -c \"import libarchive; print([e.pathname for e in libarchive.public.file_reader('project.rar')])\"",
+    "python3 -c \"import libarchive; print([e.pathname for e in libarchive.public.file_reader('project.rar') if e.pathname.endswith('.xml')])\"",
+    "python3 -c \"import libarchive, os; os.makedirs('/home/user/project', exist_ok=True); print('mk ok')\"",
+    "python3 -c \"import openpyxl; wb=openpyxl.load_workbook('/uploads/x.xlsx'); print(wb.sheetnames)\"",
+    "python3 -c \"import os; print([f for f in os.listdir('/home/user/project')][:5])\"",
+    "python3 -c \"import json; print('scan st model')\"",
+]
+
+_CD164_RESULTS = [
+    "/bin/bash: unrar: command not found exit 127",
+    "ModuleNotFoundError: No module named 'rarfile'",
+    "no 7z",
+    "Traceback AttributeError rarfile backend missing",
+    "E: Unable to locate package unrar",
+    "Reading package lists Done unrar-free is already newest version",
+    "Successfully installed unrar-0.4",
+    "Successfully installed pyliblz4-0.8.1",
+    "['RarFile', 'RarInfo', 'tool_setup', 'UNRAR_TOOL']",
+    "Traceback Need a password or unrar tool for compressed entries",
+    "check zip",
+    "wget: unable to resolve host address example.invalid",
+    "Successfully installed patool-2.4",
+    "patoolib.util.PatoolError: could not find an executable for rar",
+    "net probe",
+    "b'Rar!\\x1a\\x07\\x00\\xcf' RAR5 magic confirmed",
+    "Successfully installed unrar-0.4 and print 2",
+    "Successfully installed libarchive-c-5.3 libarchive ok",
+    "public ok",
+    "['module', 'public', 'exception', 'extract']",
+    "['docProps/app.xml', 'xl/workbook.xml', 'xl/sharedStrings.xml']",
+    "242 XML entries ending with .xml",
+    "mk ok",
+    "['报警']",
+    "['tag_data_1.xml', 'tag_data_2.xml', 'tag_data_3.xml']",
+    "scan st model",
+]
+
+
+def test_cd164_rar_task_full_sequence_not_killed():
+    """cd164bd7 复放：26 次换参 execute（rar 解压+依赖探测+解析）零硬停。
+
+    修法前：第 20 次 execute 撞豁免上限被杀（libarchive 已成功、xlsx 已读，
+    只差最后一步定位 StructuredTextModel）。修法后：单计 + 上限 40 ⇒ 通过。
+    """
+    mw = LoopDetectionMiddleware()
+    kills = []
+    for i, cmd in enumerate(_CD164_CMDS):
+        history = []
+        for j in range(i):
+            history.append(_ai(_call("execute",
+                                     {"command": _CD164_CMDS[j], "timeout": 30})))
+            history.append(_exec_msg(_CD164_RESULTS[j]))
+        res = mw._apply(
+            _state_with([*history,
+                         _ai(_call("execute",
+                                   {"command": cmd, "timeout": 30}))]),
+            _RUNTIME,
+        )
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kills.append((i + 1, res[LOOP_FORCED_STOP_KEY]["reason"]))
+    assert not kills, "cd164bd7 真实序列仍被硬停：%s" % kills
+    # 记账数 = 「闸门开火后的真实调用数」：前 min_window_fill 次窗口未填满，
+    # 占比/交替判据根本不开火（也就不记账），此后每次真实调用恰好记 1 次。
+    # 修法前同一轮被两处硬停点各记一次 ⇒ 会翻倍到 ~28，必须挡死。
+    expected = len(_CD164_CMDS) - mw.min_window_fill
+    assert mw._new_info_exempt_count["test_thread"] == expected, (
+        "豁免记账数应为 %d（%d 次调用 - %d 次窗口填充），实际 %d —— 双计未修好"
+        % (expected, len(_CD164_CMDS), mw.min_window_fill,
+           mw._new_info_exempt_count["test_thread"])
+    )
+
+
+def test_gate_counts_once_per_round():
+    """同一条 messages 反复查闸门只记一次账（两处硬停点共用结论）。"""
+    mw = LoopDetectionMiddleware()
+    history = []
+    for j in range(12):
+        history.append(_ai(_call("execute",
+                                 {"command": "probe%d" % j, "timeout": 30})))
+        history.append(_exec_msg("probe result %d with several words here" % j))
+    msgs = [*history, _ai(_call("execute",
+                                {"command": "next-step", "timeout": 30}))]
+    # 模拟 Layer2 与 Layer2c 各查一次（真实路径下同一 _apply 内会出现多次）
+    for _ in range(5):
+        assert mw._new_info_gate("t_once", msgs, "execute", 20) is True
+    assert mw._new_info_exempt_count["t_once"] == 1, (
+        "同一轮被查 5 次应只记 1 次账，实际 %d"
+        % mw._new_info_exempt_count["t_once"]
+    )
+    # 下一次真实调用（messages 变长）必须再记一次
+    msgs2 = [*msgs, _exec_msg("next step result with several words in it"),
+             _ai(_call("execute", {"command": "third-step", "timeout": 30}))]
+    assert mw._new_info_gate("t_once", msgs2, "execute", 20) is True
+    assert mw._new_info_exempt_count["t_once"] == 2
+
+
+def test_gate_round_key_immune_to_duplicate_ids():
+    """去重键必须免疫「重复 tool_call id」——否则上限永不生效。
+
+    测试 harness 与部分 vLLM 实现会给每次调用发同一个 id（如 call_x）。
+    若去重键只看 id，键恒等 ⇒ 永久放行。首版实测：28 次调用一次没硬停。
+    """
+    mw = LoopDetectionMiddleware(new_info_exempt_max=3)
+    hist = []
+    for i in range(10):
+        msgs = [*hist, _ai(_call("execute",
+                                 {"command": "step%d" % i, "timeout": 30}))]
+        mw._new_info_gate("t_dup", msgs, "execute", 20)
+        hist.append(_ai(_call("execute",
+                              {"command": "step%d" % i, "timeout": 30})))
+        hist.append(_exec_msg("step %d produced new output words here" % i))
+    assert mw._new_info_exempt_count["t_dup"] == 3, (
+        "重复 id 下记账数应达上限 3（说明去重键区分了不同轮），实际 %d"
+        % mw._new_info_exempt_count["t_dup"]
+    )
+
+
+def test_gate_round_key_cleared_on_new_run():
+    """before_agent 必须同步清理去重键：残留旧键会让新一轮首调白拿豁免。"""
+    mw = LoopDetectionMiddleware()
+    mw._gate_round_key["test_thread"] = "stale|key"
+    mw._new_info_exempt_count["test_thread"] = 7
+    mw.before_agent({}, _RUNTIME)
+    assert "test_thread" not in mw._gate_round_key, "去重键未随开轮清零"
+    assert "test_thread" not in mw._new_info_exempt_count
