@@ -972,3 +972,148 @@ def test_replay_resumes_with_exploration_never_intervened():
             msgs.append(_tool_result({"output": "err.log result.json"}))
     intervened = [i for i, r in enumerate(results) if r is not None]
     assert not intervened, "有进展的续查即便插了 execute 自查也不得被介入，被介入轮次：%s" % intervened
+
+
+# ─── 方案 B（2026-10-22）：同工具换参数的分段推进豁免（recoverable_by_model）───
+
+
+import ast as _ast
+import json as _json
+
+
+def _ocr_call(pages: str):
+    """一次分段 ocr 调用：同工具、每段新页范围。"""
+    return _call("ocr_pdf_to_text",
+                 {"file_path": "/data/kangshida.pdf", "pages": pages})
+
+
+def _ocr_result(pages_done: int):
+    """分段完成的结构化进展载荷（_is_progress_payload 认可的形态）。"""
+    return ToolMessage(
+        content=_json.dumps({"success": True, "status": "completed",
+                             "pages_total": 20, "pages_ocred": pages_done,
+                             "total_texts": 8561}),
+        tool_call_id="c", name="ocr_pdf_to_text",
+    )
+
+
+def _ocr_error():
+    return ToolMessage(content='{"success": false, "error": "OCR 失败"}',
+                       tool_call_id="c", name="ocr_pdf_to_text")
+
+
+_PAGES = ["%d-%d" % (a, a + 6) for a in range(9, 9 + 18 * 7, 7)]
+
+
+def test_segmented_ocr_same_tool_new_args_survives_l2c():
+    """add0229b 复放：模型侧分段 OCR（同工具换页段、结果都 completed、零交付物）。
+
+    修法前：第 12 次调用撞 L2c（占比 100% / alt_run 达线）被硬停——
+    分段结果全丢。修法后：最近一次结果是结构化进展 ⇒ 合法分段续跑。
+    """
+    mw = LoopDetectionMiddleware()  # 生产默认：warn=12/hard=20/ratio=.6/fill=12/alt=6
+    kills = []
+    calls = [_ocr_call(p) for p in _PAGES]
+    for i, call in enumerate(calls):
+        results = [_ocr_result(7 * (j + 1)) for j in range(i)]
+        res = mw._apply(_state_with([*results, _ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kills.append((i + 1, res[LOOP_FORCED_STOP_KEY]["reason"]))
+    assert not kills, "分段推进被硬停：%s —— 正是 add0229b 第 8~12 次误杀的形态" % kills
+
+
+def test_segmented_ocr_stops_when_latest_result_is_error():
+    """豁免只由**最新证据**支撑：最近一次同工具结果是 error ⇒ 不再豁免。
+
+    这条锁住 fallback 的边界：换参重试的合法性 = 「最近一次成功在推进」，
+    一旦最新一轮失败（真死循环形态），硬停必须照常开火。
+
+    ★ 形态说明：`pages` 不进指纹（生产实证，34 次调用 hash 全同），所以
+      段落式调用的 hash 全部相同 —— 最新结果失败时**先开火的是 Layer1**
+      （repeat_calls），不是 L2c。断言「恰好在错误证据进入上下文的下一枪
+      硬停」，reason 不限定层（哪层先到都是正确止损）。
+    """
+    mw = LoopDetectionMiddleware()
+    kills = []
+    for i, call in enumerate([_ocr_call(p) for p in _PAGES]):
+        # 错误放在第 11 次调用的结果上（j=10）⇒ 第 12 次调用（i=11）时
+        # 它是"最近一次同工具结果"，豁免必须失效
+        results = [_ocr_error() if j == 10 else _ocr_result(7 * (j + 1))
+                   for j in range(i)]
+        res = mw._apply(_state_with([*results, _ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kills.append((i + 1, res[LOOP_FORCED_STOP_KEY]["reason"]))
+        if kills:
+            break
+    assert kills, "最新结果已失败仍继续豁免 —— 豁免失去最新证据支撑"
+    n, reason = kills[0]
+    assert n == 12, "硬停应恰好在错误证据进入上下文后的第一次调用（got %s）" % n
+    assert reason in (STOP_REASON_REPEAT_CALLS, STOP_REASON_TOOL_FREQ_PATTERN), reason
+
+
+def test_fallback_exemption_respects_progress_exempt_max():
+    """降级豁免同样受 progress_exempt_max 上限：超过即按空转处理。
+
+    把绝对计数阈值调到 99，让 L2c 成为唯一开火判据 —— 这样断言的
+    是「上限在 L2c 路径同样生效」，而不是被绝对计数提前拦截。
+    """
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=99, tool_freq_hard_limit=99,
+        tool_freq_ratio=0.6, min_window_fill=12, alternating_min_run=6,
+        progress_exempt_max=4,
+    )
+    kill = None
+    for i, call in enumerate([_ocr_call(p) for p in _PAGES]):
+        results = [_ocr_result(7 * (j + 1)) for j in range(i)]
+        res = mw._apply(_state_with([*results, _ai(call)]), _RUNTIME)
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kill = (i + 1, res[LOOP_FORCED_STOP_KEY])
+            break
+    assert kill is not None, "超过豁免上限仍不硬停 —— 上限失效"
+    assert kill[1]["reason"] == STOP_REASON_TOOL_FREQ_PATTERN, kill
+
+
+def test_same_tool_last_result_progressing_latest_only():
+    """latest-only 语义单测：只看最近一次该工具结果，老成功不给新空转背书。"""
+    msgs = [
+        _ai(_ocr_call("1-7")),
+        _ocr_result(7),                      # 旧的成功
+        _ai(_ocr_call("8-14")),
+        _ocr_error(),                        # 最新失败
+        AIMessage(content="想想"),
+        _ai(_ocr_call("15-21")),
+    ]
+    mw = LoopDetectionMiddleware()
+    assert mw._same_tool_last_result_progressing(msgs, "ocr_pdf_to_text") is False
+    # 去掉最新失败 ⇒ 最近一次是成功 ⇒ True
+    assert mw._same_tool_last_result_progressing(msgs[:-3], "ocr_pdf_to_text") is True
+    # 该工具从未出现 ⇒ False（无证据不豁免）
+    assert mw._same_tool_last_result_progressing([_ai(_call("execute", {}))],
+                                                 "ocr_pdf_to_text") is False
+
+
+def test_progress_exempt_call_sites_pass_tool_name():
+    """AST 接线断言：_progress_exempt 的全部调用点必须显式传 tool_name。
+
+    2026-10-20 教训（add0229b 第 5 次）：「修的那个判据对了、没点名的那个
+    还在」——豁免改造必须逐个调用点核对。用 AST 把这件事锁死，防止将来
+    新增调用点漏传 tool_name 而静默走不到降级路径。
+    """
+    import src.core.loop_detection as _ld
+    src = open(_ld.__file__, encoding="utf-8").read()
+    tree = _ast.parse(src)
+    sites = [
+        n for n in _ast.walk(tree)
+        if isinstance(n, _ast.Call)
+        and isinstance(n.func, _ast.Attribute)
+        and n.func.attr == "_progress_exempt"
+    ]
+    assert len(sites) == 4, "调用点数量变了（%d）——请同步更新本测试并逐一核对" % len(sites)
+    for n in sites:
+        kw = {k.arg for k in n.keywords}
+        assert "tool_name" in kw, (
+            "第 %d 行的 _progress_exempt 调用缺 tool_name —— "
+            "该调用点将走不到方案 B 降级豁免（正是 P0 漏接事故的模式）"
+            % n.lineno
+        )

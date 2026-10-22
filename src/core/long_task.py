@@ -294,12 +294,21 @@ async def drive(
     rpc_timeout_sec: int,
     poll_wait_sec: int | None = None,
     supports_wait: bool = False,
+    status_invoke: Callable[[dict], Awaitable[Any]] | None = None,
 ) -> Any:
     """反复调用同一工具直到它不再返回 running，返回**最后一次原始结果**。
 
     ★ 关键语义：本函数在 `BaseTool.ainvoke` **内部**循环，不产生新的
       `AIMessage.tool_calls`。模型与循环检测层都只看到一次工具调用 ——
       这正是「模型续查次数」从 30~70 次降到 1 次的地方。
+
+    ★ 任务句柄化（2026-10-22 方案 D，对照 deer-flow tasks 契约）：首轮结果
+      带 `job_id` 时，后续轮询改走 `status_invoke`，只传
+      ``{"sandbox_id", "job_id", "wait_seconds"}`` —— 不再重发全量参数。
+      为什么重要：重发参数会让 MCP 重走「定位 + DLP 解密上传判据」，256MB
+      加密文件每轮白传一次（add0229b 实测 4 段 × 5 轮 ≈ 20 次无效传输）。
+      **降级**：`status_invoke` 为 None（MCP 无该工具）或首轮结果无 job_id
+      （旧版 MCP）时，维持原行为（同参复调原工具），双端独立发版互不阻断。
 
     ★ 为什么单次 RPC 仍要独立 `wait_for`：`mcp_tool_call_timeout_sec`
       防的是「MCP 连接挂住」而不是「任务跑得久」。任务总时长由本函数的
@@ -314,6 +323,7 @@ async def drive(
         rpc_timeout_sec: 单次调用封顶（<=0 不限）。
         poll_wait_sec: 每轮希望服务端等多久。
         supports_wait: 该工具参数表里是否有 `wait_seconds`。
+        status_invoke: 轻量续查工具的调用协程工厂（如 ocr_status）；None = 降级。
 
     Returns:
         最后一次调用的原始返回值（completed/failed/停滞/预算耗尽/参数错）。
@@ -342,21 +352,29 @@ async def drive(
     stale_rounds = 0
     rpc_errors = 0
     rounds = 0
+    # 任务句柄（方案 D）：首轮结果带 job_id 即切换轻量续查；None = 原路径。
+    handle: dict | None = None
 
     logger.info(
-        "[DURABLE] %s 进入自动续查（预算 %ss，单次 RPC 封顶 %ss）",
+        "[DURABLE] %s 进入自动续查（预算 %ss，单次 RPC 封顶 %ss，轻量续查=%s）",
         tool_name, budget_sec or "不限", rpc_timeout_sec or "不限",
+        getattr(settings, "mcp_durable_status_tool", "") or "无",
     )
 
     while True:
         rounds += 1
         try:
-            if rpc_timeout_sec and rpc_timeout_sec > 0:
-                result = await asyncio.wait_for(
-                    invoke(call_args), timeout=rpc_timeout_sec
-                )
+            if handle is not None and status_invoke is not None:
+                poll_args = dict(handle)
+                if poll_wait_sec and poll_wait_sec > 0:
+                    poll_args["wait_seconds"] = poll_wait_sec
+                call = status_invoke(poll_args)
             else:
-                result = await invoke(call_args)
+                call = invoke(call_args)
+            if rpc_timeout_sec and rpc_timeout_sec > 0:
+                result = await asyncio.wait_for(call, timeout=rpc_timeout_sec)
+            else:
+                result = await call
             rpc_errors = 0
         except asyncio.CancelledError:
             # ★ 必须原样抛出：run 被用户取消 / 看门狗取消时，取消要能穿透。
@@ -403,6 +421,20 @@ async def drive(
             return result
 
         data = result_payload(result) or {}
+        # 2026-10-22 方案 D：拿到任务句柄后切轻量续查。
+        # sandbox_id 优先取返回回显（MCP 保证有），退回原始参数里的。
+        # 只在首轮切换；此后 handle 不再变（ocr_status 返回同一 job_id）。
+        if handle is None and status_invoke is not None:
+            jid = data.get("job_id")
+            sid = data.get("sandbox_id") or (
+                call_args.get("sandbox_id") if isinstance(call_args, dict) else None
+            )
+            if isinstance(jid, str) and jid.strip() and sid:
+                handle = {"sandbox_id": sid, "job_id": jid.strip()}
+                logger.info(
+                    "[DURABLE] %s 拿到任务句柄 %s，后续轮询改走 %s（不再重发参数）",
+                    tool_name, jid, settings.mcp_durable_status_tool,
+                )
         logger.info(
             "[DURABLE] %s 第 %d 轮 status=running（已等 %.0fs），继续续查",
             tool_name, rounds, time.monotonic() - started_at,

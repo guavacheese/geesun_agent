@@ -445,3 +445,126 @@ def test_shield_drive_survives_toolmessage_inner():
                                       tool_call_id="chatcmpl-tool-test"))
     assert lt.payload_status(result) == "completed"
     assert len(inner.calls) == 3, "ToolMessage 形态没有接住，drive 提前返回"
+
+
+# ─────────────────── 任务句柄化（2026-10-22 方案 D）───────────────────
+
+
+class _StatusInner:
+    """ocr_status stub：按脚本返回，并记录每次收到的参数。"""
+
+    def __init__(self, script: list):
+        self.name = "ocr_status"
+        self._script = list(script)
+        self.calls: list = []
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        self.calls.append(dict(input))
+        step = self._script.pop(0) if self._script else {"status": "completed"}
+        return json.dumps(step) if isinstance(step, dict) else step
+
+
+def test_drive_switches_to_status_invoke_after_job_id():
+    """首轮结果带 job_id ⇒ 后续轮询只传句柄，不再重发全量参数。
+
+    这是「每轮重传 256MB 加密文件」缺陷的 agent 侧终结点：
+    ocr_status 只收 {sandbox_id, job_id, wait_seconds}，连 file_path 都没有。
+    """
+    async def _case():
+        inner = _Inner("ocr_pdf_to_text", [
+            _running(3) | {"job_id": "ocrj-aabbccddeeff", "sandbox_id": "sbx-1"},
+        ])
+        status = _StatusInner([
+            _running(9),
+            _completed(30),
+        ])
+        result = await _drive(
+            inner,
+            supports_wait=True,
+            status_invoke=status.ainvoke,
+        )
+        assert lt.payload_status(result) == "completed"
+        assert len(inner.calls) == 1, "拿到句柄后原工具绝不能再被调用（=重传还魂）"
+        assert len(status.calls) == 2
+        first_poll = status.calls[0]
+        assert first_poll == {"sandbox_id": "sbx-1",
+                              "job_id": "ocrj-aabbccddeeff",
+                              "wait_seconds": 300}
+        assert "file_path" not in first_poll, "轻量续查不得携带全量参数"
+
+    asyncio.run(_case())
+
+
+def test_drive_degrades_without_job_id():
+    """旧版 MCP 不回 job_id ⇒ 完整降级到原路径，status_invoke 一次都不碰。"""
+    async def _case():
+        inner = _Inner("ocr_pdf_to_text", [_running(3), _running(9), _completed(30)])
+        status = _StatusInner([])
+        result = await _drive(inner, supports_wait=True, status_invoke=status.ainvoke)
+        assert lt.payload_status(result) == "completed"
+        assert len(inner.calls) == 3
+        assert status.calls == [], "无句柄时绝不能调 ocr_status（它没有可查的任务）"
+
+    asyncio.run(_case())
+
+
+def test_drive_degrades_without_status_invoke():
+    """status_invoke=None（旧 agent 配置/工具缺失）⇒ 原行为原样保留。"""
+    async def _case():
+        inner = _Inner("ocr_pdf_to_text", [
+            _running(3) | {"job_id": "ocrj-aabbccddeeff"},
+            _completed(30),
+        ])
+        result = await _drive(inner, supports_wait=True, status_invoke=None)
+        assert lt.payload_status(result) == "completed"
+        assert len(inner.calls) == 2, "降级路径必须复调原工具"
+
+    asyncio.run(_case())
+
+
+def test_drive_handle_sandbox_id_prefers_echo():
+    """sandbox_id 优先取返回回显——MCP 保证回显，args 里可能没有/不可信。"""
+    async def _case():
+        inner = _Inner("ocr_pdf_to_text", [
+            _running(3) | {"job_id": "ocrj-112233445566",
+                           "sandbox_id": "sbx-echo"},
+        ])
+        status = _StatusInner([_completed(30)])
+        await _drive(inner, supports_wait=True, status_invoke=status.ainvoke)
+        assert status.calls[0]["sandbox_id"] == "sbx-echo"
+        assert status.calls[0]["sandbox_id"] != "/data/x.pdf"
+
+    asyncio.run(_case())
+
+
+def test_shield_tools_attaches_status_tool_and_degrades():
+    """_shield_tools 接线：durable shield 挂上 ocr_status 内层；缺失时为 None。
+
+    ★ 断言的是 mcp.py 侧真实装配行为——drive 拿到 None 就自动降级，
+      拿到内层就直接调用（不再过一层 shield 的墙钟封顶）。
+    """
+    from src.core.mcp import _MCPErrorShieldTool, _shield_tools
+    from src.core.config import settings as cfg
+
+    durable_inner = _Inner("ocr_pdf_to_text", [], args_schema=_WaitSchema)
+    status_inner = _Inner("ocr_status", [])
+    other_inner = _Inner("execute", [])
+
+    shields = _shield_tools([durable_inner, status_inner, other_inner])
+    by_name = {s.name: s for s in shields}
+    assert all(isinstance(s, _MCPErrorShieldTool) for s in shields)
+    assert isinstance(by_name["ocr_pdf_to_text"]._status_tool, _Inner), (
+        "durable shield 必须挂上 ocr_status 的内层引用（不是 shield）"
+    )
+    assert by_name["ocr_status"]._status_tool is None, "ocr_status 自己不是 durable 工具"
+    assert by_name["execute"]._status_tool is None
+    # 降级路径：白名单里点名的工具不在列表（旧版 MCP）⇒ None ⇒ drive 降级
+    assert by_name["ocr_pdf_to_text"]._make_status_invoke() is not None
+    old = cfg.mcp_durable_status_tool
+    try:
+        cfg.mcp_durable_status_tool = "ocr_status_v9_not_exist"
+        shields2 = _shield_tools([_Inner("ocr_pdf_to_text", [])])
+        assert shields2[0]._status_tool is None, "缺失的 status 工具必须降级为 None"
+        assert shields2[0]._make_status_invoke() is None
+    finally:
+        cfg.mcp_durable_status_tool = old

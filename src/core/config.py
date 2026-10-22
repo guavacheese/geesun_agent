@@ -278,6 +278,13 @@ class Settings(BaseSettings):
     # 每轮希望服务端等待多久（会覆盖模型传的 wait_seconds）。=MCP 侧 _OCR_WAIT_MAX。
     # 不抬高的话模型给 90（默认值），续查轮次直接翻三倍。
     mcp_durable_poll_wait_sec: int = 300
+    # 轻量续查工具名（2026-10-22 方案 D，任务句柄化）：durable 工具首次返回
+    # 带 job_id 时，drive 后续轮询改调该工具只传 {sandbox_id, job_id}，
+    # 不再重发全量参数（重发 = MCP 侧重走定位/解密上传判据，256MB 文件每轮
+    # 白传一次，add0229b 实测 4 段 × 5 轮 ≈ 20 次无效传输）。
+    # 对照 deer-flow tasks 契约：status 只传 task_id。工具不存在（旧 MCP）或
+    # 返回无 job_id 时自动退回原路径（同参复调），双端独立发版互不阻断。
+    mcp_durable_status_tool: str = "ocr_status"
     # ─── run 看门狗（2026-10-19 方案 4）───
     # 事故 653d8515：worker 的事件循环被同步 e2b 调用堵死 55 分钟，asyncio
     # beat 任务停摆 ⇒ 没有任何机制发现"这个 run 已经不会动了"，run 挂死

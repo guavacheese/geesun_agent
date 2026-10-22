@@ -878,6 +878,33 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                 return True
         return False
 
+    def _same_tool_last_result_progressing(self, messages: list, tool_name: str) -> bool:
+        """该工具**最近一次**返回是否是结构化进展载荷（status=running/completed）。
+
+        方案 B（2026-10-22，deer-flow ``recoverable_by_model`` 思想）：
+        模型侧分段 OCR = 同工具**换参数**连续调用（每段新页范围），
+        `_last_same_call_had_progress` 规则①恰好把它判成「换策略重试」拒绝豁免
+        —— add0229b 实证：模型连续 ocr(9-15)→ocr(16-32)→ocr(33-52)，每段都
+        completed，第 8 次纯同工具调用就会撞上 L2c 交替判据（alt_run≥6）。
+        而这类换参是**可自救的合法重试**：结果都是结构化 completed/running。
+        真死循环（错误重试）的结果是 error/空/非结构化，到不了这里。
+
+        只认**最近一次**该工具结果（不是窗口扫描）：一旦最近一次失败，
+        豁免立即失效 —— 换参重试的合法性必须由最新证据支撑，不能拿
+        十轮前的成功给当前的空转背书。判据复用 `_is_progress_payload`
+        （与 chat.py C 判据/drive 同源，禁止另写一套）。
+        """
+        scanned = 0
+        for msg in reversed(messages):
+            scanned += 1
+            if scanned > 400:  # 防御性上限：正常窗口内必然命中，防超长历史
+                break
+            if getattr(msg, "type", None) != "tool":
+                continue
+            if (getattr(msg, "name", "") or "") == tool_name:
+                return _is_progress_payload(_msg_text(msg))
+        return False
+
     def _progress_exempt(
         self,
         thread_id: str,
@@ -885,6 +912,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         call_hash: str,
         count: int,
         tool_names: set[str] | None = None,
+        tool_name: str | None = None,
     ) -> bool:
         """同指纹重复但每轮都有客观进展 ⇒ 视为「同一任务在推进」，豁免硬停。
 
@@ -897,6 +925,14 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         `tool_names` 用于跨越探查调用时区分「同一工具换参数」（不豁免）。
         count > progress_exempt_max 仍会硬停：那是「后台任务死了但每轮照样
         返回 running」的形态，不能无限续下去。
+
+        方案 B 降级路径（2026-10-22，deer-flow ``recoverable_by_model``）：
+        同指纹判据对「同工具换参数的分段推进」必然 False（规则①）——这条
+        规则对 submit-and-poll 的同参续查是对的，但对**模型侧分段续跑**
+        （每段新页范围 = 新 hash）是敌对的。降级豁免：``tool_name`` 的
+        最近一次结果是结构化进展载荷 ⇒ 合法换参续跑，同样受
+        progress_exempt_max 上限约束。``tool_name=None``（并行多工具调用
+        等歧义形态）不启用降级 —— 豁免必须能点名到具体工具。
         """
         if count > self.progress_exempt_max:
             logger.error(
@@ -906,7 +942,23 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
             )
             return False
         if not self._last_same_call_had_progress(messages, call_hash, tool_names):
-            return False
+            if tool_name is None or not self._same_tool_last_result_progressing(
+                messages, tool_name
+            ):
+                return False
+            with self._lock:
+                key = (thread_id, "fallback:%s" % tool_name)
+                first = key not in self._exempt_logged
+                if first:
+                    self._exempt_logged.add(key)
+            if first:
+                logger.info(
+                    "[LOOP] 同工具换参数推进豁免（recoverable_by_model）："
+                    "%s 最近一次返回为结构化进展载荷，视为合法分段续跑，"
+                    "不判空转（count=%d, thread=%s）",
+                    tool_name, count, thread_id,
+                )
+            return True
         with self._lock:
             key = (thread_id, call_hash)
             first = key not in self._exempt_logged
@@ -982,7 +1034,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
             if count >= self.hard_limit:
                 # ★ 有客观进展的重复不算空转（add0229b：submit-and-poll 续查）
                 if self._progress_exempt(
-                    thread_id, messages, call_hash, count, set(tool_names)
+                    thread_id, messages, call_hash, count, set(tool_names),
+                    tool_name=tool_names[0] if len(tool_calls) == 1 else None,
                 ):
                     pass
                 else:
@@ -1008,7 +1061,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                     #   「请停止调用工具，立即产出最终答案」就能让模型放弃
                     #   110 分钟的 OCR，转去解析文本层，最终零交付。
                     if self._progress_exempt(
-                        thread_id, messages, call_hash, count, set(tool_names)
+                        thread_id, messages, call_hash, count, set(tool_names),
+                        tool_name=tool_names[0] if len(tool_calls) == 1 else None,
                     ):
                         pass
                     else:
@@ -1048,7 +1102,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                     #   「请停止调用工具并产出最终答案」是纯误导，会直接把
                     #   长任务劝退（模型会转去解析文本层，最终零交付）。
                     if self._progress_exempt(
-                        thread_id, messages, call_hash, freq_count, set(tool_names)
+                        thread_id, messages, call_hash, freq_count, set(tool_names),
+                        tool_name=name,
                     ):
                         continue
 
@@ -1110,7 +1165,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                     #   「同工具占比 100%」的形态，按纯形态判据必被误杀
                     #   （2026-10-20 add0229b：OCR 262 页需 ~22 次同参续查）。
                     if not self._progress_exempt(
-                        thread_id, messages, call_hash, top_count, set(tool_names)
+                        thread_id, messages, call_hash, top_count, set(tool_names),
+                        tool_name=top_name,
                     ):
                         if by_ratio:
                             detail = (

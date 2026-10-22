@@ -373,6 +373,11 @@ class _MCPErrorShieldTool(BaseTool):
     """
 
     _inner: BaseTool = PrivateAttr()
+    # 方案 D（2026-10-22）：轻量续查工具（如 ocr_status）的**内层**引用，
+    # 由 _shield_tools 批量挂到 durable shield 上。None = MCP 没这个工具
+    # （旧版）⇒ drive 走原路径（同参复调），双端独立发版互不阻断。
+    # 存内层而不是 shield：drive 自己管超时/重试，再过一层 shield 语义重复。
+    _status_tool: BaseTool | None = PrivateAttr(default=None)
 
     def __init__(self, inner: BaseTool):
         super().__init__(
@@ -406,6 +411,18 @@ class _MCPErrorShieldTool(BaseTool):
             return "wait_seconds" in fields
         return False
 
+    def _make_status_invoke(self):
+        """构造轻量续查协程工厂（方案 D）；未挂 status 工具时返回 None = 降级。
+
+        只闭包内层工具：drive 自己套 wait_for（rpc_timeout_sec）与重试，
+        这里不再叠加 shield 的墙钟封顶（语义重复且超时口径可能不一致）。
+        """
+
+        async def _invoke_status(args: dict):
+            return await self._status_tool.ainvoke(args)
+
+        return _invoke_status if self._status_tool is not None else None
+
     async def ainvoke(self, input, config=None, **kwargs):
         # 长任务自动续查（2026-10-21）：白名单工具（默认 ocr_pdf_to_text）
         # 在这里把「模型连续调 30~70 次同参工具」压成「模型调 1 次、工具内部
@@ -425,6 +442,7 @@ class _MCPErrorShieldTool(BaseTool):
                     rpc_timeout_sec=settings.mcp_tool_call_timeout_sec,
                     poll_wait_sec=settings.mcp_durable_poll_wait_sec,
                     supports_wait=self._supports_wait_seconds(),
+                    status_invoke=self._make_status_invoke(),
                 )
             # 单次工具调用墙钟封顶（mcp_tool_call_timeout_sec，2026-10-19 方案 3）：
             # 653d8515 实锤 agent 侧无工具超时时，服务端挂住 = run 永久 running。
@@ -499,11 +517,33 @@ def _shield_tools(tools: list[BaseTool]) -> list[BaseTool]:
 
     download_from_sandbox 的参数修正 guard 在内层、shield 在外层兜错误
     （guard 内层 MCP 调用失败同样会被 shield 接住，不崩流）。
+
+    方案 D（2026-10-22）：把轻量续查工具（settings.mcp_durable_status_tool，
+    默认 ocr_status）的**内层**引用挂到每个 durable shield 上——drive 首轮
+    返回带 job_id 时改走它续查（只传句柄，不重发全量参数 = 不再每轮重传
+    256MB 加密文件）。工具不在列表里（旧版 MCP）时不挂 ⇒ drive 自动降级
+    走原路径。⚠ 挂在 shield 而不是在 ainvoke 里现查全局缓存：工具列表是
+    按 server 集合缓存/逐用户透传的，shield 实例自带引用最直接、无并发歧义。
     """
-    return [
+    shields = [
         _MCPErrorShieldTool(t) if not isinstance(t, _MCPErrorShieldTool) else t
         for t in tools
     ]
+    status_name = (getattr(settings, "mcp_durable_status_tool", "") or "").strip()
+    if status_name:
+        status_inner = next(
+            (t for t in tools if getattr(t, "name", "") == status_name), None
+        )
+        if status_inner is None:
+            logger.info(
+                "durable 轻量续查工具 [%s] 不在本次 MCP 工具列表，"
+                "自动续查将走原路径（同参复调）",
+                status_name,
+            )
+        for s in shields:
+            if long_task.is_durable_tool(s.name):
+                s._status_tool = status_inner
+    return shields
 
 
 async def get_mcp_tools(names: list[str] | None = None) -> list[BaseTool]:
