@@ -1117,3 +1117,193 @@ def test_progress_exempt_call_sites_pass_tool_name():
             "该调用点将走不到方案 B 降级豁免（正是 P0 漏接事故的模式）"
             % n.lineno
         )
+
+
+# ── 方案 b（2026-10-22）：结果质量闸门——合法调试短连发不硬停 ──
+# 背景：1ab81d10 / c7500a84 两起 execute 调试序列（探测→装包→试错→改参）
+# 在 43~45 秒内被 L2c 交替判据杀掉。deer-flow（无占比判据 + ToolProgress
+# Jaccard）与 deepseek-harness（repeat-tool-reminder 同参才计数）都不会杀。
+
+import src.core.loop_detection as _ld2
+
+
+def _exec_msg(content: str) -> ToolMessage:
+    return ToolMessage(content=content, tool_call_id="c", name="execute")
+
+
+def _exec_history(i: int) -> list:
+    """前 i 次调用的完整历史：AI(tool_calls) + ToolMessage 成对出现。
+
+    ★ 生产形态（store 取证）：每步工具调用 = 一条 AIMessage(tool_calls) +
+      一条 ToolMessage 结果。测试若只放 ToolMessage，_same_tool_new_info
+      的参数互异判据就看不到历史 AI 的 args（arg_keys 只剩当前 1 条），
+      leg ① 恒 False —— 正是首版测试假阴性的根因。
+    """
+    msgs = []
+    for j in range(i):
+        msgs.append(_ai(_call("execute",
+                     {"command": _EXEC_CMDS[j], "timeout": 30})))
+        msgs.append(_exec_msg(_EXEC_RESULTS[j]))
+    return msgs
+
+
+# 1ab81d10 真实序列（store 取证）+ 合理延续：每次换命令、每次有新信息
+_EXEC_CMDS = [
+    "cd /home/user && file test.rar && echo --- && ls -lh test.rar",
+    "cd /home/user && head -c 4 test.rar | xxd | head -1",
+    "cd /home/user && python3 -c \"h=open('test.rar','rb').read(8);print(h.hex())\"",
+    "cd /home/user && python3 -c \"import rarfile; print('ok')\" 2>&1 || echo NEED_INSTALL",
+    "pip install rarfile unrar 2>&1 | tail -5",
+    "which unrar 2>/dev/null || echo NO_UNRAR",
+    "cd /home/user && python3 -c \"import rarfile;rf=rarfile.RarFile('test.rar');print(rf.version)\"",
+    "cd /home/user && python3 -c \"rf=rarfile.RarFile('test.rar');print(len(rf.infolist()))\"",
+    "cd /home/user && python3 -c \"rarfile.RarFile('test.rar').extractall('/home/user/')\" 2>&1",
+    "cd /home/user && ls -la /home/user/ | head -5",
+    "cd /home/user && python3 -c \"rf=rarfile.RarFile('test.rar');print([i.filename for i in rf.infolist()[:5]])\"",
+    "cd /home/user && python3 -c \"rarfile.RarFile('test.rar').extract('1122-0930.smc2')\" 2>&1",
+    "cd /home/user && python3 -c \"import unrar; print('unrar lib ok')\" 2>&1",
+    "apt-get install -y unrar-free 2>&1 | tail -3",
+]
+
+_EXEC_RESULTS = [
+    "/bin/bash: line 1: file: command not found [exit 127]",
+    "/bin/bash: line 1: xxd: command not found",
+    "header: 526172211a0700cf raw: Rar! signature RAR5 confirmed",
+    "Traceback ModuleNotFoundError: No module named 'rarfile'",
+    "Successfully installed rarfile-4.5 unrar-0.4 warning running pip as root",
+    "NO_UNRAR no unrar binary on PATH",
+    "AttributeError: 'RarFile' object has no attribute 'version'",
+    "File count: 3168 1122-0930.smc2 179 bytes dated 2026-09-30",
+    "Traceback PermissionError in extractall dst self._extract_one path pw",
+    "total 40 drwxr-xr-x test.rar 32321387 bytes root root",
+    "['1122-0930.smc2', '32321387.txt', 'readme.md', 'data.bin', 'log.txt']",
+    "Traceback rarfile.RarWrongPassword wrong password for encrypted entry",
+    "unrar lib ok backend installed",
+    "Reading package lists Done building tree unrar-free is already newest",
+]
+
+
+def test_execute_debug_burst_not_killed():
+    """1ab81d10 复放：换参调试短连发（含报错输出）绝不被 L2c/绝对计数硬停。
+
+    修法前：纯 execute 连发在 alt_run 达线（连续 8 次）即被 tool_freq_pattern
+    硬停——14 次调试命令全部死于第 ~13 次调用。修法后：参数互异 = 新信息
+    （deepseek-harness「换参重置」思想），降级为一次性提醒继续跑。
+    """
+    mw = LoopDetectionMiddleware()
+    kills = []
+    for i, cmd in enumerate(_EXEC_CMDS):
+        res = mw._apply(
+            _state_with([*_exec_history(i),
+                         _ai(_call("execute",
+                                   {"command": cmd, "timeout": 30}))]),
+            _RUNTIME,
+        )
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kills.append((i + 1, res[LOOP_FORCED_STOP_KEY]["reason"]))
+    assert not kills, "合法调试短连发被硬停：%s" % kills
+
+
+def test_true_spin_same_args_near_duplicate_output_still_killed():
+    """真空转（同参 + 输出近重复）必须照常硬停——闸门不得放过真循环。
+
+    抬高所有计数阈值让 L2c 成为唯一开火层：同参同输出的 execute 连发
+    参数互异判据失败、结果 Jaccard=1.0 近重复 ⇒ 闸门 False ⇒ 硬停。
+    """
+    mw = LoopDetectionMiddleware(
+        warn_threshold=99, hard_limit=99,
+        tool_freq_warn=99, tool_freq_hard_limit=99,
+    )
+    out = " ".join("token%d" % k for k in range(40))
+    kill = None
+    for i in range(20):
+        history = []
+        for _ in range(i):
+            history.append(_ai(_call("execute",
+                               {"command": "python3 build.py", "timeout": 30})))
+            history.append(_exec_msg(out))
+        res = mw._apply(
+            _state_with([*history,
+                         _ai(_call("execute",
+                                   {"command": "python3 build.py",
+                                    "timeout": 30}))]),
+            _RUNTIME,
+        )
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kill = (i + 1, res[LOOP_FORCED_STOP_KEY]["reason"])
+            break
+    assert kill is not None, "真空转未被硬停 —— 质量闸门放过真循环"
+    assert kill[1] == STOP_REASON_TOOL_FREQ_PATTERN, kill
+
+
+def test_new_info_gate_cap_enforced():
+    """新信息豁免受单 run 上限：超过 new_info_exempt_max 仍硬停。
+
+    换参调试放行 N 次后（慢空转 / 超长调试），熔断必须生效。
+    """
+    mw = LoopDetectionMiddleware(new_info_exempt_max=3)
+    kill = None
+    for i, cmd in enumerate(_EXEC_CMDS * 2):  # 28 次调用
+        history = []
+        for j in range(i):
+            history.append(_ai(_call("execute",
+                               {"command": _EXEC_CMDS[j % len(_EXEC_CMDS)],
+                                "timeout": 30})))
+            history.append(_exec_msg(_EXEC_RESULTS[j % len(_EXEC_RESULTS)]))
+        res = mw._apply(
+            _state_with([*history,
+                         _ai(_call("execute",
+                                   {"command": cmd, "timeout": 30}))]),
+            _RUNTIME,
+        )
+        if res is not None and LOOP_FORCED_STOP_KEY in res:
+            kill = (i + 1, res[LOOP_FORCED_STOP_KEY]["reason"])
+            break
+    assert kill is not None, "超过豁免上限仍不硬停 —— 熔断失效"
+    assert kill[1] == STOP_REASON_TOOL_FREQ_PATTERN, kill
+    assert kill[0] > 12, "上限生效点应晚于窗口填满（got call %d）" % kill[0]
+
+
+def test_same_tool_new_info_unit():
+    """_same_tool_new_info 四象限：换参/同参异果/同参同果/同参短果。"""
+    ai_a = _ai(_call("execute", {"command": "a", "timeout": 30}))
+    ai_b = _ai(_call("execute", {"command": "b", "timeout": 30}))
+    # ① 换参 ⇒ True（deepseek-harness：换参重置）
+    msgs = [ai_a, _exec_msg("ok " * 20), ai_b]
+    assert _ld2._same_tool_new_info(msgs, "execute", 20) is True
+    # ② 同参 + 结果近重复（Jaccard=1.0）⇒ False
+    out = " ".join("word%d" % k for k in range(30))
+    msgs = [ai_a, _exec_msg(out), ai_a,
+            ToolMessage(content=out, tool_call_id="c2", name="execute")]
+    assert _ld2._same_tool_new_info(msgs, "execute", 20) is False
+    # ③ 同参 + 结果明显不同 ⇒ True（deer-flow：不近重复 = 新信息）
+    msgs = [ai_a, _exec_msg(" ".join("alpha%d" % k for k in range(30))), ai_a,
+            ToolMessage(content=" ".join("beta%d" % k for k in range(30)),
+                        tool_call_id="c2", name="execute")]
+    assert _ld2._same_tool_new_info(msgs, "execute", 20) is True
+    # ④ 同参 + 结果过短不可判（<10 词）⇒ False（证据不足不豁免）
+    msgs = [ai_a, _exec_msg("NO_UNRAR"), ai_a,
+            ToolMessage(content="NO_UNRAR", tool_call_id="c2", name="execute")]
+    assert _ld2._same_tool_new_info(msgs, "execute", 20) is False
+    # ⑤ 该工具从未出现 ⇒ False
+    assert _ld2._same_tool_new_info([_ai(_call("ls", {}))], "execute", 20) is False
+
+
+def test_new_info_gate_call_sites():
+    """AST 接线断言：_new_info_gate 必须恰接在两处硬停点（绝对计数 + L2c）。
+
+    「修的那个判据对了、没点名的那个还在」教训（2026-10-20 P0 漏接）——
+    新增硬停点时必须同步挂闸门，本测试把调用点数量锁死。
+    """
+    src = open(_ld2.__file__, encoding="utf-8").read()
+    tree = _ast.parse(src)
+    sites = [
+        n for n in _ast.walk(tree)
+        if isinstance(n, _ast.Call)
+        and isinstance(n.func, _ast.Attribute)
+        and n.func.attr == "_new_info_gate"
+    ]
+    assert len(sites) == 2, (
+        "_new_info_gate 调用点数量变了（%d）——新增硬停判据必须同步挂质量闸门"
+        % len(sites)
+    )

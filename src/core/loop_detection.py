@@ -92,6 +92,10 @@ _MAX_PENDING_WARNINGS_PER_RUN = 4
 _DEFAULT_TOOL_FREQ_RATIO = 0.6  # 窗口内单一工具占比阈值
 _DEFAULT_MIN_WINDOW_FILL = 12  # 窗口至少填满这么多次才做占比判定（防小样本噪声）
 _DEFAULT_ALTERNATING_MIN_RUN = 6  # 交替循环最少连续匹配次数
+# 结果质量豁免上限（2026-10-22 方案 b：1ab81d10/c7500a84 误杀修正）——
+# 「新信息豁免」在单个 run 内最多放行 N 次，超过仍硬停（防"每轮输出都
+# 有点不一样"的慢空转无限续下去）。
+_DEFAULT_NEW_INFO_EXEMPT_MAX = 20
 #: 交付物目录特征串。窗口内工具结果出现它即视为"有进展"，占比/交替硬停**不生效**。
 #: 与 config.py report_root / chat.py M3 完成门同源（那里也只认 /reports/）。
 _DELIVERABLE_PATH_MARK = "/reports/"
@@ -578,6 +582,106 @@ def _alternating_run(seq: list[str] | deque[str], periods: tuple[int, ...] = (2,
     return best
 
 
+def _canonical_args_key(args: Any) -> str:
+    """工具调用参数的规范化 key：深度 key-sort + JSON。
+
+    deepseek-harness repeat-tool-reminder 同款规范化——参数对象仅属性
+    顺序不同视为相同；「同参重复」与「换参重试」的分界线由此确定。
+    """
+    def _sort(v: Any) -> Any:
+        if isinstance(v, list):
+            return [_sort(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _sort(v[k]) for k in sorted(v)}
+        return v
+    return json.dumps(_sort(args), ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _content_text(content: Any) -> str:
+    """content（str 或多模态 parts 列表）→ 纯文本。
+
+    ★ 与既有 _msg_text(msg)（收消息对象）不同：本函数收裸 content。
+      两者不得合并签名——调用方形态不同，合并会静默错位。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+            elif isinstance(p, str):
+                parts.append(p)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """词集 Jaccard 相似度；两集合皆空时返回 1.0（视为无差异）。"""
+    if not a and not b:
+        return 1.0
+    union = a | b
+    return len(a & b) / len(union) if union else 1.0
+
+
+def _same_tool_new_info(messages: list[Any], tool_name: str, window: int) -> bool:
+    """窗口内该工具的调用是否呈现「新信息」证据（L2c/绝对计数的质量闸门）。
+
+    2026-10-22 方案 b（1ab81d10 / c7500a84 两起 execute 调试误杀修正）。
+    形态判据（占比/交替/绝对计数）分不清两种「同工具连发」：
+      - 真空转：同参重试、输出近重复（如同一命令反复同报错）；
+      - 合法调试：探测→装包→试错→改参，每次换命令、每次有新收获。
+    只有读「参数与结果的内容」才能区分。两条判据（取并集）：
+
+    ① 参数互异：该工具在窗口内的调用 canonical args 互不相同
+       （deepseek-harness 思想：换参即重置——调试换参天然满足）；
+    ② 结果互异：最近可判定（≥10 词）的结果中至少一对 Jaccard < 0.8
+       （deer-flow ToolProgress 思想：近重复才是空转的证据）。
+
+    两条都不满足（同参 + 结果近重复 / 无可判定结果）⇒ 返回 False，
+    硬停照常开火。
+    """
+    if not tool_name:
+        return False
+    arg_keys: list[str] = []
+    result_texts: list[str] = []
+    scanned = 0
+    scan_limit = window * 2 + 10  # 每次调用约 2 条消息 + 冗余
+    for msg in reversed(messages):
+        if scanned >= scan_limit:
+            break
+        mtype = getattr(msg, "type", None)
+        if mtype == "ai":
+            scanned += 1
+            for tc in (getattr(msg, "tool_calls", None) or []):
+                if (tc.get("name", "") or "") == tool_name:
+                    arg_keys.append(_canonical_args_key(tc.get("args") or {}))
+        elif mtype == "tool":
+            scanned += 1
+            if (getattr(msg, "name", "") or "") == tool_name:
+                result_texts.append(_content_text(getattr(msg, "content", None)))
+
+    # ① 换参即新信息（deepseek-harness：同参连发才计数，换参重置）
+    if len(arg_keys) >= 2 and len(set(arg_keys)) == len(arg_keys):
+        return True
+
+    # ② 结果近重复判定（deer-flow ToolProgress：近 3~4 次两两比较）
+    judgeable: list[set[str]] = []
+    for text in result_texts:
+        words = set(text.lower().split())
+        if len(words) >= 10:
+            judgeable.append(words)
+        if len(judgeable) >= 4:
+            break
+    if len(judgeable) >= 2:
+        for i in range(len(judgeable)):
+            for j in range(i + 1, len(judgeable)):
+                if _jaccard(judgeable[i], judgeable[j]) < 0.8:
+                    return True  # 至少一对不近重复 = 有新信息
+        return False  # 全部近重复 = 空转证据确凿
+    return False  # 证据不足（同参且结果过短不可判）⇒ 不豁免
+
+
 def _window_has_deliverable(messages: list[Any], limit: int) -> bool:
     """窗口内的工具结果里有没有"交付物"信号？
 
@@ -678,6 +782,7 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         min_window_fill: int = _DEFAULT_MIN_WINDOW_FILL,
         alternating_min_run: int = _DEFAULT_ALTERNATING_MIN_RUN,
         progress_exempt_max: int = _DEFAULT_PROGRESS_EXEMPT_MAX,
+        new_info_exempt_max: int = _DEFAULT_NEW_INFO_EXEMPT_MAX,
     ):
         super().__init__()
         self.warn_threshold = warn_threshold
@@ -691,6 +796,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self.alternating_min_run = max(2, alternating_min_run)
         #: 有客观进展的重复调用允许的最大重复次数（见 _DEFAULT_PROGRESS_EXEMPT_MAX）
         self.progress_exempt_max = max(1, progress_exempt_max)
+        #: 「新信息豁免」单 run 放行上限（见 _DEFAULT_NEW_INFO_EXEMPT_MAX）
+        self.new_info_exempt_max = max(1, new_info_exempt_max)
         self._tool_freq_overrides = tool_freq_overrides or {}
         self._tool_freq_window = max(
             self.window_size,
@@ -707,6 +814,8 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
         self._tool_name_counter: dict[str, Counter[str]] = defaultdict(Counter)
         self._tool_freq_warned: dict[str, set[str]] = defaultdict(set)
         self._pending_warnings: dict[str, list[str]] = defaultdict(list)
+        # 「新信息豁免」计数（thread_id -> 本 run 已放行次数；开轮清零）
+        self._new_info_exempt_count: dict[str, int] = defaultdict(int)
         # 工具名 → 真实参数名集合（契约反查结果；None = 契约未知，见 _extract_schema_fields）
         self._tool_fields: dict[str, frozenset[str] | None] = {}
         # 契约漂移告警限流：(工具名, 越界字段名) 只报一次
@@ -904,6 +1013,42 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
             if (getattr(msg, "name", "") or "") == tool_name:
                 return _is_progress_payload(_msg_text(msg))
         return False
+
+    def _new_info_gate(
+        self,
+        thread_id: str,
+        messages: list,
+        tool_name: str,
+        window: int,
+    ) -> bool:
+        """硬停前的「结果质量」降级闸门（2026-10-22 方案 b）。
+
+        返回 True = 降级放行（调用点改发提醒/静默继续），False = 照常硬停。
+        只接在 Layer2 绝对计数硬停与 Layer2c 占比/交替硬停两处——Layer1
+        （同 hash）本身就是「同参重复」，不需要质量闸门。
+
+        ★ 误杀链背景：1ab81d10 / c7500a84 两起 execute 调试序列（探测→装包
+          →试错→改参）在 43~45 秒内被交替判据杀掉——形态判据分不清
+          「真死循环」和「合法调试短连发」，只有结果质量能区分。
+          deer-flow 用 ToolProgress（Jaccard 近重复），deepseek-harness 用
+          「同参才计数、换参重置」；本闸门两条判据取并集（_same_tool_new_info）。
+        """
+        if self._new_info_exempt_count[thread_id] >= self.new_info_exempt_max:
+            logger.error(
+                "[LOOP] 新信息豁免达到上限（%d），按空转处理 (thread=%s, tool=%s)",
+                self.new_info_exempt_max, thread_id, tool_name,
+            )
+            return False
+        if not _same_tool_new_info(messages, tool_name, window):
+            return False
+        self._new_info_exempt_count[thread_id] += 1
+        logger.warning(
+            "[LOOP] 新信息豁免：同工具高频但参数互异/结果互不重复，"
+            "降级为提醒不硬停 (%d/%d, thread=%s, tool=%s)",
+            self._new_info_exempt_count[thread_id], self.new_info_exempt_max,
+            thread_id, tool_name,
+        )
+        return True
 
     def _progress_exempt(
         self,
@@ -1108,6 +1253,18 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                         continue
 
                 if freq_count >= eff_hard:
+                    # ★ 结果质量闸门（2026-10-22 方案 b）：合法调试短连发
+                    #   （换参/结果互异）降级为一次性提醒，不硬停。
+                    if self._new_info_gate(
+                        thread_id, messages, name, self._tool_freq_window
+                    ):
+                        freq_warned = self._tool_freq_warned[thread_id]
+                        if name not in freq_warned:
+                            freq_warned.add(name)
+                            return _TOOL_FREQ_WARNING_MSG.format(
+                                tool_name=name, count=freq_count
+                            ), False
+                        continue  # 已提醒过：静默放行，让后续轮次继续观察
                     logger.error(
                         "Tool frequency hard limit — forcing stop (thread=%s, tool=%s, count=%d)",
                         thread_id, name, freq_count,
@@ -1168,33 +1325,46 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
                         thread_id, messages, call_hash, top_count, set(tool_names),
                         tool_name=top_name,
                     ):
-                        if by_ratio:
-                            detail = (
-                                f"最近 {len(tool_name_history)} 次调用中 {top_name} "
-                                f"占 {top_count} 次（{top_ratio:.0%}）"
-                            )
+                        # ★ 结果质量闸门（2026-10-22 方案 b）：占比/交替判据
+                        #   分不清「真死循环」和「合法调试短连发」（1ab81d10/
+                        #   c7500a84 两起误杀），参数互异或结果互不重复时降级。
+                        if self._new_info_gate(
+                            thread_id, messages, top_name, self._tool_freq_window
+                        ):
+                            freq_warned = self._tool_freq_warned[thread_id]
+                            if top_name not in freq_warned:
+                                freq_warned.add(top_name)
+                                return _TOOL_FREQ_WARNING_MSG.format(
+                                    tool_name=top_name, count=top_count
+                                ), False
                         else:
-                            detail = (
-                                f"工具调用呈周期震荡（连续匹配 {alt_run} 次，"
-                                f"窗口 {list(tool_name_history)[-8:]}）"
+                            if by_ratio:
+                                detail = (
+                                    f"最近 {len(tool_name_history)} 次调用中 {top_name} "
+                                    f"占 {top_count} 次（{top_ratio:.0%}）"
+                                )
+                            else:
+                                detail = (
+                                    f"工具调用呈周期震荡（连续匹配 {alt_run} 次，"
+                                    f"窗口 {list(tool_name_history)[-8:]}）"
+                                )
+                            logger.error(
+                                "Tool frequency pattern hard limit — forcing stop "
+                                "(thread=%s, detail=%s, ratio=%.2f, alt_run=%d)",
+                                thread_id, detail, top_ratio, alt_run,
                             )
-                        logger.error(
-                            "Tool frequency pattern hard limit — forcing stop "
-                            "(thread=%s, detail=%s, ratio=%.2f, alt_run=%d)",
-                            thread_id, detail, top_ratio, alt_run,
-                        )
-                        return (
-                            _HARD_STOP_RUNNING_MSG
-                            if self._last_tool_still_running(messages)
-                            else _TOOL_FREQ_PATTERN_HARD_STOP_MSG.format(detail=detail)
-                        ), {
-                            "reason": STOP_REASON_TOOL_FREQ_PATTERN,
-                            "tool_name": top_name,
-                            "count": top_count,
-                            "ratio": round(top_ratio, 3),
-                            "alternating_run": alt_run,
-                            "detail": detail,
-                        }
+                            return (
+                                _HARD_STOP_RUNNING_MSG
+                                if self._last_tool_still_running(messages)
+                                else _TOOL_FREQ_PATTERN_HARD_STOP_MSG.format(detail=detail)
+                            ), {
+                                "reason": STOP_REASON_TOOL_FREQ_PATTERN,
+                                "tool_name": top_name,
+                                "count": top_count,
+                                "ratio": round(top_ratio, 3),
+                                "alternating_run": alt_run,
+                                "detail": detail,
+                            }
 
         return None, None
 
@@ -1298,6 +1468,12 @@ class LoopDetectionMiddleware(AgentMiddleware[LoopDetectionState]):
 
     @override
     def before_agent(self, state: LoopDetectionState, runtime: Runtime) -> dict | None:
+        # ─── 开轮清零「新信息豁免」计数（方案 b，2026-10-22）───
+        # 豁免上限的语义是「单个 run 内」最多放行 N 次：调试短连发通常集中在
+        # 一轮用户消息里。不按 run 清零的话，多轮正常调试会累计触发上限。
+        thread_id = self._get_thread_id(runtime)
+        with self._lock:
+            self._new_info_exempt_count.pop(thread_id, None)
         # ─── 开轮清零硬停标记（②A 生命周期铁律）───
         # 标记的语义是「**本轮**被强停」。langgraph 每个 run 开头都会跑一次
         # before_agent，正是清零时机：若让上一 run 的标记残留，chat.py 会把一轮
