@@ -51,7 +51,12 @@ def ws(tmp_path, monkeypatch):
 
 
 def test_list_skills_splits_by_origin(ws):
-    """agent 建的与用户传的都物理在 `__user_u1__/`，但必须分到不同展示分组。"""
+    """四个展示分组按**归属**分：shared（全局冻结）/ agent（我的·agent 建）/ user（我的·上传）。
+
+    这是会话 bf6874b2 误读的直接修复：用户目录里 agent 新建的 skill 若与全局历史层
+    混在同一个 "agent" 分组，侧栏标题会显示「Agent 自创 (13)」，看起来像"又写回了
+    __agent__"。
+    """
     _mk_skill(ws / "__system__", "sys1")
     _mk_skill(ws / "__agent__", "legacy")
     _mk_skill(ws / "__user_u1__", "agent-made", origin=skill_origin.ORIGIN_AGENT)
@@ -61,30 +66,34 @@ def test_list_skills_splits_by_origin(ws):
     resp = asyncio.run(skills_api.list_skills(user_id="u1"))
 
     assert [s["name"] for s in resp["system"]] == ["sys1"]
-    # agent 组 = 全局历史层 + 本用户目录下 agent 自创的
-    assert {s["name"] for s in resp["agent"]} == {"legacy", "agent-made"}
+    # 全局历史层单独成组，且与"我的"互不混杂
+    assert [s["name"] for s in resp["shared"]] == ["legacy"]
+    assert {s["name"] for s in resp["agent"]} == {"agent-made"}
     assert {s["name"] for s in resp["user"]} == {"mine", "old-no-marker"}
 
     by_name = {s["name"]: s for s in resp["all"]}
     assert by_name["agent-made"]["owned"] is True
     assert by_name["agent-made"]["origin"] == skill_origin.ORIGIN_AGENT
-    # 全局历史层不可删
+    # 全局历史层不可删，且归到 shared
     assert by_name["legacy"]["owned"] is False
-    assert by_name["legacy"]["source"] == "agent"
+    assert by_name["legacy"]["source"] == "shared"
 
 
-def test_resolve_skill_dir_falls_back_to_user_dir(ws):
-    """`source=agent` 要能从用户目录里找到 agent 自创的 skill（否则文件列表 404）。"""
+def test_resolve_skill_dir_routes_by_group(ws):
+    """各分组要能定位到自己的物理目录。"""
     user_dir = _mk_skill(ws / "__user_u1__", "agent-made", origin=skill_origin.ORIGIN_AGENT)
     _mk_skill(ws / "__agent__", "legacy")
 
-    # 生产代码用 f-string 拼 "/" 再 os.path.join，Windows 下会混出两种分隔符，
-    # 故比较前统一 normpath（Linux 上无影响）
+    # 展示代码：分辨率无关的 normpath（生产用 f-string 拼 "/" 再 join，Windows 会混分隔符）
     resolved = skills_api._resolve_skill_dir("agent-made", "u1", "agent")
     assert os.path.normpath(resolved) == os.path.normpath(str(user_dir))
 
-    legacy = skills_api._resolve_skill_dir("legacy", "u1", "agent")
-    assert os.path.normpath(legacy) == os.path.normpath(str(ws / "__agent__" / "legacy"))
+    resolved_shared = skills_api._resolve_skill_dir("legacy", "u1", "shared")
+    assert os.path.normpath(resolved_shared) == os.path.normpath(str(ws / "__agent__" / "legacy"))
+
+    # 滚动发布兼容：旧前端仍用 source=agent 请求全局层条目
+    legacy_via_agent = skills_api._resolve_skill_dir("legacy", "u1", "agent")
+    assert os.path.normpath(legacy_via_agent) == os.path.normpath(str(ws / "__agent__" / "legacy"))
 
     # 别的用户看不到 u1 目录里的东西（物理隔离的兜底验证）
     assert skills_api._resolve_skill_dir("agent-made", "u2", "agent") is None

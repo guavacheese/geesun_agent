@@ -49,31 +49,44 @@ def _user_skill_root(user_id: str) -> str:
 # ─── 分组 → 物理目录解析 ───
 
 def _skill_source_roots(user_id: str) -> dict[str, str]:
+    """展示分组 → 物理根目录。
+
+    `agent` 与 `user` 指向**同一个**用户目录（靠 `.origin` 区分两类），
+    `shared` 指向已冻结的全局历史层 `__agent__`。
+    """
+    user_root = _user_skill_root(user_id)
     return {
         "system": f"{settings.agent_workspace}/skills/__system__",
-        "agent": f"{settings.agent_workspace}/skills/__agent__",
-        "user": _user_skill_root(user_id),
+        "shared": f"{settings.agent_workspace}/skills/__agent__",
+        "agent": user_root,
+        "user": user_root,
     }
 
 
 def _resolve_skill_dir(skill_name: str, user_id: str, source: str) -> str | None:
-    """按**展示分组**定位 skill 的物理目录，支持跨目录回退。
+    """按**展示分组**定位 skill 的物理目录，带跨目录回退。
 
-    为什么需要回退：`agent` 分组里同时有两类东西 ——
-    - 全局历史层 `__agent__/`（2026-10-23 起冻结只读）
-    - 当前用户目录下由 agent 自动创建的（`.origin == agent`）
+    为什么需要回退：
+    - `shared` 组可能还残留用户目录里的同名 skill（历史上 agent 自创曾写全局层，
+      迁移前建的同名 skill 在两个目录都存在），优先取用户自己的那份；
+    - 滚动发布期间旧前端仍会用 `source=agent` 请求全局层的条目。
 
-    前端只传展示分组（source），物理位置由后端判定，避免前端为「同名 skill 在哪个
-    目录」写第二份推断逻辑。找不到返回 None，由调用方转 404。
+    找不到返回 None，由调用方转 404。
     """
     roots = _skill_source_roots(user_id)
     if source not in roots:
         return None
 
     candidates = [roots[source]]
-    if source == "agent":
-        # agent 自创已迁到用户目录：先查用户目录，再落全局历史层
-        candidates.insert(0, roots["user"])
+    if source == "shared":
+        # 用户目录优先：自己那份才是"活的"，全局层是冻结历史
+        candidates = [roots["agent"], roots["shared"]]
+    elif source == "agent":
+        # 回退到全局层只为滚动发布兼容：旧前端把 `__agent__` 里的条目也塞在
+        # agent 组里，刷新页面（新前端）之前仍会用 source=agent 发起请求。
+        candidates = [roots["agent"], roots["shared"]]
+    elif source == "user":
+        candidates = [roots["user"]]
 
     for root in candidates:
         candidate = os.path.join(root, skill_name)
@@ -291,15 +304,20 @@ async def list_skills(
     """
     列出当前用户可用的所有 skill。
 
-    三个展示分组：
-    - system：系统预装（`__system__`）
-    - agent：Agent 自创 —— **全局历史层** `__agent__`（2026-10-23 起冻结，只读）
-             + 当前用户目录下由 agent 自动创建的（`.origin == agent`）
-    - user：当前用户目录下用户自己上传的
+    四个展示分组（2026-10-23 起按**归属**分，不再按物理目录分）：
+    - system：系统预装（`__system__`），只读
+    - shared：共享历史层（`__agent__`），只读 —— 所有用户的公共沉淀，已冻结不再新增
+    - agent：我的 · Agent 创建（`__user_{user_id}__` 下 `.origin == agent`），可删
+    - user：我的 · 手动上传（`__user_{user_id}__` 下 `.origin == upload`），可删
 
-    ⚠️ 分组键（source）是**展示语义**，不再等于物理目录：agent 自创的 skill 现在
-    物理上落在 `__user_{user_id}__/`。`/skill/{name}/files` 等接口靠
-    `_resolve_skill_dir` 做目录回退，调用方无需感知这层差异。
+    为什么要拆 shared / agent 两组：agent 自创 skill 从 2026-10-23 起落**用户自己**
+    目录，物理上已不是全局共享层。若仍把它们混在同一个 "agent" 分组里，侧栏会出现
+    「Agent 自创 (13)」——12 个全员共享的历史 skill 和 1 个用户新建的混在同一个标题
+    下，用户会误以为自己刚建的 skill 又写回了 `__agent__`（会话 bf6874b2 实际就是这么
+    被误读的）。分组标题必须表达归属，不是目录。
+
+    ⚠️ 分组键（source）是**展示语义**：`/skill/{name}/files` 等接口靠
+    `_resolve_skill_dir` 做目录回退，调用方无需感知 agent 组物理在哪。
     """
     skill_dirs = {
         "system": f"{settings.agent_workspace}/skills/__system__",
@@ -307,7 +325,7 @@ async def list_skills(
         "user": _user_skill_root(user_id),
     }
 
-    result = {"system": [], "agent": [], "user": [], "all": []}
+    result = {"system": [], "shared": [], "agent": [], "user": [], "all": []}
 
     for source, root_dir in skill_dirs.items():
         if not os.path.isdir(root_dir):
@@ -339,9 +357,11 @@ async def list_skills(
                     meta["source"] = target_key
                     result[target_key].append(meta)
                 else:
-                    # 全局层（__system__ / 冻结的 __agent__）：只读，不可删
+                    # 全局层：`__system__` → system；`__agent__` → shared（历史共享层）
+                    target_key = "shared" if source == "agent" else "system"
+                    meta["source"] = target_key
                     meta["owned"] = False
-                    result[source].append(meta)
+                    result[target_key].append(meta)
                 result["all"].append(meta)
         except PermissionError:
             continue

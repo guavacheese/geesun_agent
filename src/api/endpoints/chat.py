@@ -1019,6 +1019,39 @@ _SKILL_WRITE_TOOLS = frozenset({"write_file", "write", "create_file", "edit_file
 
 
 
+SKILL_KIND_USER = "user_skill"
+SKILL_KIND_SHARED = "shared_skill"
+SKILL_KIND_NONE = "other"
+
+
+def _classify_skill_path(file_path_virtual: str | None, user_id: str) -> tuple[str, str]:
+    """把虚拟路径归类成「我的 skill / 共享历史 skill / 其它」，并切出目录内相对路径。
+
+    返回 `(kind, rel_path)`，kind ∈ {`user_skill`, `shared_skill`, `other`}；
+    `rel_path` 仅在 skill 类下有意义（如 `读后感撰写/SKILL.md`），其它情况为 ""。
+
+    为什么单独抽出来：skill 有**两个**落点，历史上前端红框 404 就是因为只认了其中一个
+    （2026-08-11 只认 `__agent__`、2026-10-23 只认 `__user_*__`，各错一次）。这个判定
+    是全链路的单点，必须能被单元测试直接钉住，而不是只能靠读那一大段内联代码。
+    """
+    if not file_path_virtual:
+        return SKILL_KIND_NONE, ""
+    user_prefix = f"/skills/__user_{user_id}__/"
+    if file_path_virtual.startswith(user_prefix):
+        return SKILL_KIND_USER, file_path_virtual[len(user_prefix) :]
+    shared_prefix = "/skills/__agent__/"
+    if file_path_virtual.startswith(shared_prefix):
+        return SKILL_KIND_SHARED, file_path_virtual[len(shared_prefix) :]
+    return SKILL_KIND_NONE, ""
+
+
+def _skill_disk_root(user_id: str, is_user_skill: bool) -> str:
+    """skill 在宿主磁盘上的根目录（与 `_classify_skill_path` 的分支一一对应）。"""
+    if is_user_skill:
+        return os.path.join(settings.agent_workspace, "skills", f"__user_{user_id}__")
+    return os.path.join(settings.agent_workspace, "skills", "__agent__")
+
+
 def _mark_agent_skill_origin(skill_root: str, skill_name: str) -> None:
     """把「该 skill 由 agent 自动创建」写进技能目录的 `.origin` 标记。
 
@@ -3149,19 +3182,15 @@ async def chat(
                                 #   ② /skills/__agent__/      —— 历史共享层（已冻结只读，存量仍需展示）
                                 # 只认 ① 会漏掉存量、只认 ② 会让新写的 skill 不出卡片
                                 # （前端"文件不可用"红框就是这么来的，别只改一半）。
-                                user_skill_prefix = f"/skills/__user_{user_id}__/"
+                                skill_kind, skill_rel_path = _classify_skill_path(
+                                    file_path_virtual, user_id
+                                )
                                 is_report_path = bool(
                                     file_path_virtual
                                     and file_path_virtual.startswith("/reports/")
                                 )
-                                is_user_skill = bool(
-                                    file_path_virtual
-                                    and file_path_virtual.startswith(user_skill_prefix)
-                                )
-                                is_agent_skill = bool(
-                                    file_path_virtual
-                                    and file_path_virtual.startswith("/skills/__agent__/")
-                                )
+                                is_user_skill = skill_kind == SKILL_KIND_USER
+                                is_agent_skill = skill_kind == SKILL_KIND_SHARED
                                 is_skill_path = is_user_skill or is_agent_skill
                                 if file_path_virtual and (is_report_path or is_skill_path):
                                     filename = None
@@ -3197,18 +3226,8 @@ async def chat(
                                                 user_id, session_id, filename,
                                             )
                                     else:  # skill 文件（用户目录 / 历史 __agent__ 层）
-                                        if is_user_skill:
-                                            skill_prefix = user_skill_prefix
-                                            skill_root = os.path.join(
-                                                settings.agent_workspace, "skills",
-                                                f"__user_{user_id}__",
-                                            )
-                                        else:
-                                            skill_prefix = "/skills/__agent__/"
-                                            skill_root = os.path.join(
-                                                settings.agent_workspace, "skills", "__agent__",
-                                            )
-                                        filename = file_path_virtual[len(skill_prefix):]
+                                        skill_root = _skill_disk_root(user_id, is_user_skill)
+                                        filename = skill_rel_path
                                         try:
                                             disk_path = os.path.join(skill_root, filename)
                                             if os.path.isfile(disk_path):
@@ -3231,6 +3250,44 @@ async def chat(
                                             _mark_agent_skill_origin(
                                                 skill_root, filename.split("/", 1)[0]
                                             )
+
+                                    # ─── skill 不是会话交付物：不走 file_generated（2026-10-23）───
+                                    # 为什么必须分开：`file_generated` 的消费端会按
+                                    # `/api/v1/files/{uid}/{sid}/{filename}` 去 HEAD 探测文件是否存在，
+                                    # 而 skill 落在 /skills/ 下，这个 URL 必然 404 → 聊天里多一张
+                                    # "文件不可用"红框卡；更麻烦的是它还会随 history 落进
+                                    # generated_files，刷新后照样复现（实测会话 bf6874b2 的
+                                    # 17:40:07 `HEAD /api/v1/files/GY24428/bf6874b2/SKILL.md 404`）。
+                                    #
+                                    # 改为独立事件 skill_created：前端只据此刷新技能面板，
+                                    # 不做任何 URL 探测，也不会写进 generated_files。
+                                    if is_skill_path:
+                                        # skill_name 只认「技能目录/文件」两级结构；直接躺在
+                                        # skills 根下的散文件不是 skill，不发事件（但下面照样
+                                        # continue——它同样不能走 file_generated，否则必 404）。
+                                        skill_name = (
+                                            filename.split("/", 1)[0]
+                                            if filename and "/" in filename
+                                            else ""
+                                        )
+                                        # 与 B① 同一护栏：报错结果且磁盘没取到大小 ⇒ 不发
+                                        if skill_name and (not is_error or file_size > 0):
+                                            await _pub({
+                                                'type': 'skill_created',
+                                                'skill_name': skill_name,
+                                                'file_path': file_path_virtual,
+                                                'origin': 'agent' if is_user_skill else 'shared',
+                                            })
+                                            logger.info(
+                                                "[SKILL_GEN] skill 文件已创建，改用 skill_created 事件: %s",
+                                                file_path_virtual,
+                                            )
+                                            # 进展计数沿用旧语义（skill 沉淀也是实打实的进展，
+                                            # 不能让它从 P0/停滞判据里"消失"）
+                                            _files_in_window += 1
+                                            _stagnation_calls = 0
+                                            _progress_exempt_count = 0
+                                        continue
                                     # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
                                     # B① 收窄：报错结果**不采信**"返回值里的 size"——那是
                                     # 工具/模型自称的数字，不是宿主磁盘事实；采信它等于绕过
