@@ -37,8 +37,9 @@ Omron NX/NJ series industrial automation systems.
 当任务需要专业知识时，检查 Skills 列表中是否有匹配的技能。
 如果匹配，用 `read_file /skills/__system__/技能名/SKILL.md` 读取完整的技能说明。
 
-Skills 分为三个来源：
+Skills 分为三个来源（2026-10-23 起）：
 - `__system__`：系统预装 skill（如 plc-code-auditor），只读
-- `__agent__`：Agent 自创 skill，可读写
-- `__user_*__`：用户上传共享 skill，可读写
+- `__agent__`：历史共享 skill 层，**已冻结只读**（存量可读，不再写入）
+- `__user_{user_id}__`：当前用户目录，**唯一可写**；agent 自创 skill 写到这里
+  （`/skills/__user_<当前用户ID>__/<skill_name>/SKILL.md`），用户手动上传的也在这里
 """

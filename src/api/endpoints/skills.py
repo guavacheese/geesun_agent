@@ -6,77 +6,81 @@ import tempfile
 import shutil
 import logging
 
-import yaml
-
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
 from src.core.config import settings
+# 校验本体 2026-10-23 抽到 core：agent 的 write_file 直写 skill 目录也要过同一道闸
+# （services 不能反向 import api，故校验落在 core，此处按原名复用）
+from src.core.skill_md import validate_skill_md as _validate_skill_md
+from src.core.skill_origin import (
+    ORIGIN_AGENT,
+    ORIGIN_UPLOAD,
+    read_origin as _read_origin,
+    write_origin as _write_origin,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-# ─── 校验 SKILL.md 的 YAML frontmatter ───
-
-def _validate_skill_md(content: str) -> dict:
-    """
-    校验 SKILL.md 的 YAML frontmatter，返回解析结果。
-
-    要求：
-    - 开头必须有两行 --- 包裹的 YAML 块
-    - YAML 语法必须可被 yaml.safe_load 解析（与 deepagents 扫描端
-      skills.py:401 同一解析器——2026-08-19 实证：旧版正则逐行解析放过了
-      `description: ... Triggers: "..."` 的 ASCII 冒号+空格，skill 上传
-      成功但永远无法被 deepagents 加载，静默 skip）
-    - 必须包含 name 和 description 字段
-
-    Returns: {"valid": bool, "name": str|None, "description": str|None, "error": str|None}
-    """
-    content_clean = content.lstrip("\ufeff").lstrip()  # 去掉 BOM 和前导空白
-
-    if not content_clean.startswith("---"):
-        return {"valid": False, "name": None, "description": None,
-                "error": "SKILL.md 必须以 --- 开头（YAML frontmatter）"}
-
-    # 找到第二个 ---
-    second_dash = content_clean.find("---", 3)
-    if second_dash == -1:
-        return {"valid": False, "name": None, "description": None,
-                "error": "SKILL.md 的 YAML frontmatter 缺少闭合 ---"}
-
-    yaml_block = content_clean[3:second_dash].strip()
-
-    # 语法级解析（与 deepagents 扫描端一致）；YAMLError 透出具体行/列信息
-    try:
-        data = yaml.safe_load(yaml_block)
-    except yaml.YAMLError as e:
-        return {"valid": False, "name": None, "description": None,
-                "error": f"frontmatter YAML 语法错误: {e}"}
-
-    if not isinstance(data, dict):
-        return {"valid": False, "name": None, "description": None,
-                "error": "frontmatter YAML 解析结果不是键值映射（空块或列表等）"}
-
-    name = str(data.get("name", "")).strip()
-    description = str(data.get("description", "")).strip()
-
-    errors = []
-    if not name:
-        errors.append("frontmatter 缺少 'name' 字段")
-    if not description:
-        errors.append("frontmatter 缺少 'description' 字段")
-
-    if errors:
-        return {"valid": False, "name": name, "description": description,
-                "error": "; ".join(errors)}
-
-    return {"valid": True, "name": name, "description": description, "error": None}
-
+# ─── SKILL.md 的 YAML frontmatter 校验 → src/core/skill_md.py ───
+#
+# 唯一实现见 `src/core/skill_md.py::validate_skill_md`（原 `_validate_skill_md`
+# 已迁出，函数体一份不剩，避免两处解析口径漂移）。
 
 # ─── 获取用户 skill 的物理根目录 ───
 
 def _user_skill_root(user_id: str) -> str:
     return f"{settings.agent_workspace}/skills/__user_{user_id}__"
+
+
+# ─── skill 来源标记（.origin）───
+#
+# 2026-10-23：Agent 自创 skill 的默认落点从全局 `__agent__` 改到 `__user_{id}__`
+# 之后，同一个目录里同时存在「agent 自动建的」和「用户手动上传的」两类 skill。
+# 光看源码目录已无法区分（都在 `__user_{id}__` 下），故每个 skill 目录内落一个
+# 标记文件 `.origin`（内容 `agent` / `upload`），`list_skills` 据此分组。
+#
+# 实现落在 src/core/skill_origin.py：chat.py 的 file_generated 钩子（= agent 写的）
+# 与上传 API（= 用户传的）都是写入方，常量与读写只留一份。
+
+
+
+# ─── 分组 → 物理目录解析 ───
+
+def _skill_source_roots(user_id: str) -> dict[str, str]:
+    return {
+        "system": f"{settings.agent_workspace}/skills/__system__",
+        "agent": f"{settings.agent_workspace}/skills/__agent__",
+        "user": _user_skill_root(user_id),
+    }
+
+
+def _resolve_skill_dir(skill_name: str, user_id: str, source: str) -> str | None:
+    """按**展示分组**定位 skill 的物理目录，支持跨目录回退。
+
+    为什么需要回退：`agent` 分组里同时有两类东西 ——
+    - 全局历史层 `__agent__/`（2026-10-23 起冻结只读）
+    - 当前用户目录下由 agent 自动创建的（`.origin == agent`）
+
+    前端只传展示分组（source），物理位置由后端判定，避免前端为「同名 skill 在哪个
+    目录」写第二份推断逻辑。找不到返回 None，由调用方转 404。
+    """
+    roots = _skill_source_roots(user_id)
+    if source not in roots:
+        return None
+
+    candidates = [roots[source]]
+    if source == "agent":
+        # agent 自创已迁到用户目录：先查用户目录，再落全局历史层
+        candidates.insert(0, roots["user"])
+
+    for root in candidates:
+        candidate = os.path.join(root, skill_name)
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
 
 
 # ─── 检查文件是否是 zip ───
@@ -105,6 +109,11 @@ async def upload_skill(
         raise HTTPException(status_code=400, detail="至少需要上传一个文件")
 
     target_dir = f"{_user_skill_root(user_id)}/{skill_name}"
+
+    # 记「这次是用户主动上传」：同一个 skill 名若此前由 agent 自动创建（.origin=agent），
+    # 用户重新上传即视为接管，分组翻到「用户上传」。放在校验之前是刻意的——校验失败时
+    # 目录本身已创建（既有行为），标记跟着目录走比留下"半成品无标记"更可预期。
+    _write_origin(target_dir, ORIGIN_UPLOAD)
 
     # 只有 1 个文件且是 zip → 解压
     if len(files) == 1:
@@ -281,7 +290,16 @@ async def list_skills(
 ):
     """
     列出当前用户可用的所有 skill。
-    包括：系统预装（__system__）、Agent 自创（__agent__）、用户共享（__user_{user_id}__）
+
+    三个展示分组：
+    - system：系统预装（`__system__`）
+    - agent：Agent 自创 —— **全局历史层** `__agent__`（2026-10-23 起冻结，只读）
+             + 当前用户目录下由 agent 自动创建的（`.origin == agent`）
+    - user：当前用户目录下用户自己上传的
+
+    ⚠️ 分组键（source）是**展示语义**，不再等于物理目录：agent 自创的 skill 现在
+    物理上落在 `__user_{user_id}__/`。`/skill/{name}/files` 等接口靠
+    `_resolve_skill_dir` 做目录回退，调用方无需感知这层差异。
     """
     skill_dirs = {
         "system": f"{settings.agent_workspace}/skills/__system__",
@@ -310,12 +328,26 @@ async def list_skills(
                             meta["description"] = validation["description"]
                     except Exception:
                         pass
-                result[source].append(meta)
+
+                if source == "user":
+                    # 用户目录里混着两类：agent 自动建的 / 用户上传的，按 .origin 分流。
+                    # owned=True ⇒ 物理上在本人目录，可删（前端据此显示删除按钮）。
+                    origin = _read_origin(skill_path)
+                    meta["origin"] = origin
+                    meta["owned"] = True
+                    target_key = "agent" if origin == ORIGIN_AGENT else "user"
+                    meta["source"] = target_key
+                    result[target_key].append(meta)
+                else:
+                    # 全局层（__system__ / 冻结的 __agent__）：只读，不可删
+                    meta["owned"] = False
+                    result[source].append(meta)
                 result["all"].append(meta)
         except PermissionError:
             continue
 
     return result
+
 
 
 # ─── 删除用户的 skill ───
@@ -351,23 +383,23 @@ async def list_skill_files(
 ):
     """
     列出指定 skill 目录下的所有文件（含子目录结构，相对路径）。
+
+    `source` 是**展示分组**：`agent` 组可能命中用户目录下 agent 自动创建的 skill，
+    物理位置由 `_resolve_skill_dir` 回退解析。
     """
-    source_map = {
-        "system": f"{settings.agent_workspace}/skills/__system__",
-        "agent": f"{settings.agent_workspace}/skills/__agent__",
-        "user": _user_skill_root(user_id),
-    }
-    root_dir = source_map.get(source)
-    if not root_dir:
+    if source not in _skill_source_roots(user_id):
         raise HTTPException(status_code=400, detail=f"无效的 source: {source}")
 
-    skill_dir = os.path.join(root_dir, skill_name)
-    if not os.path.isdir(skill_dir):
+    skill_dir = _resolve_skill_dir(skill_name, user_id, source)
+    if not skill_dir:
         raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' 不存在")
 
     files = []
     for dirpath, _, filenames in os.walk(skill_dir):
         for f in filenames:
+            # 隐藏文件（如 .origin 来源标记）是后端内部元数据，不进 UI 文件树
+            if f.startswith("."):
+                continue
             abs_path = os.path.join(dirpath, f)
             rel_path = os.path.relpath(abs_path, skill_dir).replace("\\", "/")
             file_size = os.path.getsize(abs_path)
@@ -398,21 +430,19 @@ async def read_skill_file(
     读取 skill 内单个文本文件的内容。
     只返回文本文件（.md / .py / .txt / .json / .yaml / .yml / .sh），禁止读取二进制。
     """
-    source_map = {
-        "system": f"{settings.agent_workspace}/skills/__system__",
-        "agent": f"{settings.agent_workspace}/skills/__agent__",
-        "user": _user_skill_root(user_id),
-    }
-    root_dir = source_map.get(source)
-    if not root_dir:
+    if source not in _skill_source_roots(user_id):
         raise HTTPException(status_code=400, detail=f"无效的 source: {source}")
+
+    skill_dir = _resolve_skill_dir(skill_name, user_id, source)
+    if not skill_dir:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' 不存在")
 
     # 安全检查
     if ".." in path or path.startswith("/"):
         raise HTTPException(status_code=400, detail=f"非法路径: {path}")
 
-    file_path = os.path.normpath(os.path.join(root_dir, skill_name, path))
-    if not file_path.startswith(os.path.normpath(root_dir)):
+    file_path = os.path.normpath(os.path.join(skill_dir, path))
+    if not file_path.startswith(os.path.normpath(skill_dir)):
         raise HTTPException(status_code=400, detail=f"非法路径: {path}")
 
     if not os.path.isfile(file_path):

@@ -22,8 +22,14 @@ deepagents 自带的 offload 在 14:32:03 被本类拒写
 ------------------------------------------------------
 路由表里有**刻意只读**的条目：``/uploads/``（用户上传的输入素材）、
 ``/workspace/agent-memory/``（平台共享 AGENTS.md）、``/skills/__system__`` 与
-``/skills/__user_*__``（技能目录，写入口是上传 API）。它们的 backend 是
+``/skills/__agent__``（系统预装 / 已冻结的历史共享技能层）。它们的 backend 是
 ``FilesystemBackend`` —— 有路由、但绝不可写，且这是**设计意图**。
+
+而 ``/skills/__user_{user_id}__/``（每个用户各自的技能目录）是**可写**的：agent
+自创 skill 的默认落点（2026-10-23 从全局 ``__agent__`` 迁来）。它按实例的
+``user_id`` 展开，无法写成 ``ALLOWED_WRITE_PREFIXES`` 里的字面量（那样等于对
+所有人放开），故由类属性 ``USER_SKILL_PREFIX_TEMPLATE`` 声明、本文件把模板折叠成
+路由键同形的 ``{...}`` 形式后并入可写集合参与归类。
 
 所以真正的不变式是**归类完备性**：
 
@@ -58,14 +64,18 @@ _EXPECTED_ROUTE_CLASSIFICATION: dict[str, str] = {
     # ── 可写 ──
     "/reports/{...}/{...}/": "writable",  # 会话交付目录（前端据此渲染文件卡片）
     "/workspace/memories/": "writable",  # 跨会话记忆
-    "/skills/__agent__/": "writable",  # agent 自创技能（SKILL.md 需 YAML 校验）
+    # agent 自创技能默认落点（2026-10-23 从全局 __agent__ 迁来，按用户隔离；
+    # 由 USER_SKILL_PREFIX_TEMPLATE 声明，本文件折叠 {user_id} 后并入可写集合）
+    "/skills/__user_{...}__/": "writable",
     "/conversation_history/": "writable",  # SummarizationMiddleware 归档
     "/large_tool_results/": "writable",  # 大工具结果转存（2026-10-10 修复后加入白名单）
     # ── 刻意只读（有路由、绝不可写，且这是设计意图而非遗漏）──
     "/uploads/{...}/{...}/": "readonly",  # 用户上传的输入素材
     "/workspace/agent-memory/": "readonly",  # 平台共享的 AGENTS.md，不由用户修改
     "/skills/__system__/": "readonly",  # 系统预装技能
-    "/skills/__user_{...}__/": "readonly",  # 用户共享技能：写入口是 /api/v1/skill/upload
+    # 历史共享技能层：2026-10-23 起冻结（全局共享导致跨用户串场 / 同名互相覆盖 /
+    # 无法按人清理）。存量仍可读，不再接受写入。
+    "/skills/__agent__/": "readonly",
 }
 
 # 白名单里**故意不设 route**的前缀：写入落到 default backend（沙箱内本机路径），
@@ -117,6 +127,33 @@ def _class_str_set(tree: ast.AST, class_name: str, attr_name: str) -> frozenset[
     return frozenset(
         elt.value for elt in node.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
     )
+
+
+def _class_str_const(tree: ast.AST, class_name: str, attr_name: str) -> str | None:
+    """定位类属性里的**字符串字面量**（如 USER_SKILL_PREFIX_TEMPLATE）。找不到返回 None。
+
+    与 `_class_str_set` 分开的原因：用户 skill 目录按实例 user_id 展开，无法进字面量
+    集合（进了就等于对所有人放开）。它必须仍以字面量形式出现在类属性上，本守门人
+    才看得见 —— 否则 `/skills/__user_*__/` 会退回只读归类，判据与运行时脱节。
+    """
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == class_name):
+            continue
+        for stmt in node.body:
+            targets: list[ast.expr] = []
+            if isinstance(stmt, ast.Assign):
+                targets = list(stmt.targets)
+            elif isinstance(stmt, ast.AnnAssign):
+                targets = [stmt.target]
+            if not any(isinstance(t, ast.Name) and t.id == attr_name for t in targets):
+                continue
+            if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                return stmt.value.value
+            raise AssertionError(
+                f"{class_name}.{attr_name} 不是字符串字面量，守门人无法解析；"
+                "请保持字面量写法（模板里的 {user_id} 由本文件折叠成 {...}）"
+            )
+    return None
 
 
 def _routes_dict_node(tree: ast.AST, func_name: str) -> ast.Dict:
@@ -196,9 +233,18 @@ def _offload_prefix() -> str:
 
 
 def _inputs_from_tree(tree: ast.AST) -> dict:
+    writable = set(_class_str_set(tree, _BACKEND_CLASS, "ALLOWED_WRITE_PREFIXES"))
+
+    # 用户 skill 目录模板（"/skills/__user_{user_id}__/"）折叠成与路由键同形的 {...}
+    # 形式并入可写集合：运行时按实例 user_id 判定，AST 层只能看到模板，两者必须同源，
+    # 否则"路由有承接但判据认为只读"会在这里漏掉。
+    user_skill_tpl = _class_str_const(tree, _BACKEND_CLASS, "USER_SKILL_PREFIX_TEMPLATE")
+    if user_skill_tpl:
+        writable.add(user_skill_tpl.replace("{user_id}", "{...}"))
+
     return {
         "routes": _routes(tree),
-        "writable": _class_str_set(tree, _BACKEND_CLASS, "ALLOWED_WRITE_PREFIXES"),
+        "writable": frozenset(writable),
         "readonly": _class_str_set(tree, _BACKEND_CLASS, "VIRTUAL_READONLY_PREFIXES"),
         "blocked": _class_str_set(tree, _BACKEND_CLASS, "SANDBOX_PATH_PREFIXES"),
         "offload_prefix": _offload_prefix(),
@@ -218,10 +264,11 @@ def _longest_match(route: str, prefixes) -> str | None:
 
 
 def _classify(route: str, writable, readonly, blocked) -> tuple[str, str | None]:
-    """镜像 ``ValidatedCompositeBackend.write()`` 的判定顺序：**先判可写**。
+    """镜像 ``ValidatedCompositeBackend._is_writable()`` 的判定顺序：**先判可写**。
 
-    ``/skills/__agent__/`` 既是白名单项、又落在只读前缀 ``/skills/`` 之下 —— 具体
-    规则优先，运行时也是先看白名单，所以这里必须同序，否则会误报。
+    ``/skills/__user_{...}__/`` 既是白名单项（模板展开后）、又落在只读前缀
+    ``/skills/`` 之下 —— 具体规则优先，运行时也是先看白名单，所以这里必须同序，
+    否则会误报。
     """
     matched = _longest_match(route, writable)
     if matched:
@@ -302,6 +349,10 @@ def test_prefix_sets_are_parseable_and_non_trivial():
     """反空转前置：三个集合都必须解析成功且含已知成员。"""
     inputs = _real_inputs()
     assert "/reports/" in inputs["writable"], "解析白名单失败或 /reports/ 被移除"
+    assert "/skills/__user_{...}__/" in inputs["writable"], (
+        "USER_SKILL_PREFIX_TEMPLATE 未解析出来 —— agent 自创 skill 的唯一写入口会变成"
+        "「有路由但判据认为只读」，本守门人随之空转"
+    )
     assert "/uploads/" in inputs["readonly"]
     assert "/root/" in inputs["blocked"]
     assert len(inputs["routes"]) >= 8, (
@@ -346,9 +397,9 @@ def test_route_classification_is_frozen():
 def test_writable_readonly_blocked_prefix_sets_are_disjoint():
     """三个集合的**精确**重合意味着分类口径打架。
 
-    注意这里比的是集合本身而非前缀包含关系：``/skills/__agent__/``（可写）落在
+    注意这里比的是集合本身而非前缀包含关系：``/skills/__user_{...}__/``（可写）落在
     ``/skills/``（只读）之下是**有意**的（具体规则优先）；但把整个 ``/skills/``
-    放进白名单就会放开系统与用户技能 —— 那是事故，必须被这条拦住。
+    放进白名单就会放开系统预装与冻结的历史共享层 —— 那是事故，必须被这条拦住。
     """
     inputs = _real_inputs()
     assert not (inputs["writable"] & inputs["blocked"]), (
@@ -486,4 +537,45 @@ def test_negative_control_state_backend_route_is_detected():
     assert any("StateBackend" in p for p in problems), (
         "改回 StateBackend() 后未检出：\n  - " + "\n  - ".join(problems)
     )
+    assert _check(**_real_inputs()) == [], "本用例意外改动了磁盘文件 —— 请检查"
+
+
+def test_negative_control_missing_user_skill_template_downgrades_to_readonly():
+    """摘掉 USER_SKILL_PREFIX_TEMPLATE = agent 自创 skill 的唯一写入口"消失"必须报红。
+
+    这正是 2026-10-23 改动最容易踩的坑：把 `/skills/__agent__/` 从白名单摘掉、却忘了
+    声明用户目录模板，则 `/skills/__user_*__/` 会退回 `/skills/`（只读）归类 ——
+    路由表有条目、运行时却在写时被拒，就是 4863afff 那个"第四态"的翻版。
+    """
+    tree = _ast_of(AGENT_PY)
+    removed = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == _BACKEND_CLASS):
+            continue
+        kept = []
+        for stmt in node.body:
+            target = None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+            elif isinstance(stmt, ast.AnnAssign):
+                target = stmt.target
+            if isinstance(target, ast.Name) and target.id == "USER_SKILL_PREFIX_TEMPLATE":
+                removed += 1
+                continue
+            kept.append(stmt)
+        node.body = kept
+    assert removed == 1, "负向对照未能摘掉 USER_SKILL_PREFIX_TEMPLATE，用例本身失效"
+
+    inputs = _inputs_from_tree(tree)
+    actual = {
+        route: _classify(route, inputs["writable"], inputs["readonly"], inputs["blocked"])[0]
+        for route in inputs["routes"]
+    }
+    user_skill_route = "/skills/__user_{...}__/"
+    assert user_skill_route in actual, "路由键模板解析异常，用例本身失效"
+    assert actual[user_skill_route] == "readonly", (
+        f"摘掉模板后 {user_skill_route} 未退回只读（实际 {actual[user_skill_route]!r}），"
+        "说明归类判据没有跟着模板走"
+    )
+    assert actual != _EXPECTED_ROUTE_CLASSIFICATION, "冻结表未感知模板缺失 —— 守门人空转"
     assert _check(**_real_inputs()) == [], "本用例意外改动了磁盘文件 —— 请检查"

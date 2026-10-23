@@ -128,11 +128,15 @@ download_from_sandbox(
 - `/root/`、`/mnt/`、`/code/`、`/var/` 是沙箱内系统级/挂载路径，禁止写入
 - **沙箱内文件不算交付物**：要给用户看的报告必须 `download_from_sandbox` 到 `/reports/{user_id}/{session_id}/`
 
-## Skill 创建（v3.1）
-- Skill 分三层：`/skills/__system__/`（预装，只读）、`/skills/__agent__/`（agent 自创，**可写**）、`/skills/__user_{user_id}__/`（用户上传，归 /api/v1/skill/upload 管，AI 只读）
-- **创建/更新自创 skill**：`write_file /skills/__agent__/<skill_name>/SKILL.md`（YAML frontmatter 需含 name + description，name 与目录名一致；格式不合法该 skill 不会被加载）
-- **用户共享 skill**：通过 `/api/v1/skill/upload` 接口（前端"技能"面板上传），不要直接 write_file 用户目录
-- 不要写 `/skills/__system__/`（系统预装只读）
+## Skill 创建（v3.2，2026-10-23 变更）
+- Skill 分三层：`/skills/__system__/`（预装，只读）、`/skills/__agent__/`（**历史共享层，已冻结只读**，存量仍可读）、`/skills/__user_{user_id}__/`（**当前用户目录，唯一可写**）
+- **创建/更新自创 skill**：`write_file /skills/__user_{user_id}__/<skill_name>/SKILL.md`
+  - YAML frontmatter 必须含 `name` + `description`，且 `name` 与目录名**完全一致**
+  - 后端会在写入时校验：格式不合法直接拒写并给出修正示例（不再"写成功了但永远不加载"）
+  - 写进这里即属于**当前用户私有**，不与他人共享，同名不会互相覆盖
+- **更新已有 SKILL.md**：用 `edit_file`（write_file 对已存在文件会报错）。改的时候必须保住 frontmatter 完整，否则该 skill 会静默失效
+- **不要写 `/skills/__agent__/` 和 `/skills/__system__/`**：前者已冻结（冻结原因：全局共享导致跨用户串场、同名覆盖、无法按人清理），后者是系统预装
+- **用户想共享**：让用户从前端"技能"面板上传（`/api/v1/skill/upload`），不要自己往共享层写
 
 ## Skill 优先使用规则（强制，违反即白烧步数）
 - **接到任务先查 skill**：`ls /skills/__system__/`、`ls /skills/__agent__/`、

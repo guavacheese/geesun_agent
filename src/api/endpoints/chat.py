@@ -24,6 +24,7 @@ from src.core.loop_detection import (
     tool_call_signature,
 )
 from src.core.mcp import get_mcp_tools
+from src.core.skill_origin import ORIGIN_AGENT, write_origin
 from src.core.terminal_response import fallback_notice, pop_fallback_signal, quick_mode_notice
 from src.core.stream_bridge import (
     DELTA_REASONING,
@@ -1012,6 +1013,28 @@ def _tool_result_is_error(
 # 否则会把 JSON 尾巴（`","size":15758`）或 shell 报错的 `':` 一起吞进路径 → 前端 404。
 # 中文不在 \w 里，故用显式字符类而非 \w。
 _REPORTS_PATH_RE = re.compile(r'/reports/[^"\s,}\]]+')
+
+# 会真正落盘写 skill 的工具名（`.origin` 标记只认这些，避免 read/ls 误标）
+_SKILL_WRITE_TOOLS = frozenset({"write_file", "write", "create_file", "edit_file", "edit"})
+
+
+
+def _mark_agent_skill_origin(skill_root: str, skill_name: str) -> None:
+    """把「该 skill 由 agent 自动创建」写进技能目录的 `.origin` 标记。
+
+    用途：agent 自创 skill 与用户上传 skill 现在同处 `__user_{uid}__/`，
+    `/api/v1/skills` 要靠这个标记才能把它们分到「Agent 自创」/「用户上传」两组
+    （约定与读写实现见 src/core/skill_origin.py）。
+
+    为什么放在 file_generated 钩子里：这是**唯一**能同时拿到「真实写盘路径」和
+    「本次写确实成功」的位置。backend 层拿不到 host 绝对路径（它只看虚拟路径），
+    而 skills.py 上传 API 只管用户那条路。
+    """
+    try:
+        write_origin(os.path.join(skill_root, skill_name), ORIGIN_AGENT)
+    except OSError as e:  # write_origin 内部已兜底，这里只防 os.path 拼装异常
+        logger.warning("[skill] 标记 agent 来源失败: %s/%s (%s)", skill_root, skill_name, e)
+
 
 
 def _sanitize_generated_path(file_path: str) -> str:
@@ -3117,18 +3140,30 @@ async def chat(
                                 if file_path_virtual:
                                     file_path_virtual = _sanitize_generated_path(file_path_virtual)
 
-                                # 触发条件：/reports/ 交付物 + /skills/__agent__/ 自创 skill
+                                # 触发条件：/reports/ 交付物 + skill 文件（两种落点）
                                 # （A1：skill 文件也触发 file_generated，否则前端看不到 skill 卡片
                                 #   —— 2026-08-11 15:28 实测 SKILL.md 写成功但前端"文件不可用"）
+                                #
+                                # ⚠️ skill 有两个落点（2026-10-23 改动后）：
+                                #   ① /skills/__user_{uid}__/ —— agent 自创 skill 的**默认**落点
+                                #   ② /skills/__agent__/      —— 历史共享层（已冻结只读，存量仍需展示）
+                                # 只认 ① 会漏掉存量、只认 ② 会让新写的 skill 不出卡片
+                                # （前端"文件不可用"红框就是这么来的，别只改一半）。
+                                user_skill_prefix = f"/skills/__user_{user_id}__/"
                                 is_report_path = bool(
                                     file_path_virtual
                                     and file_path_virtual.startswith("/reports/")
+                                )
+                                is_user_skill = bool(
+                                    file_path_virtual
+                                    and file_path_virtual.startswith(user_skill_prefix)
                                 )
                                 is_agent_skill = bool(
                                     file_path_virtual
                                     and file_path_virtual.startswith("/skills/__agent__/")
                                 )
-                                if file_path_virtual and (is_report_path or is_agent_skill):
+                                is_skill_path = is_user_skill or is_agent_skill
+                                if file_path_virtual and (is_report_path or is_skill_path):
                                     filename = None
                                     file_size = 0
                                     if is_report_path:
@@ -3161,19 +3196,41 @@ async def chat(
                                                 sandbox, file_path_virtual,
                                                 user_id, session_id, filename,
                                             )
-                                    else:  # /skills/__agent__/
-                                        filename = file_path_virtual[
-                                            len("/skills/__agent__/") :
-                                        ]
-                                        try:
-                                            disk_path = os.path.join(
-                                                settings.agent_workspace,
-                                                "skills", "__agent__", filename,
+                                    else:  # skill 文件（用户目录 / 历史 __agent__ 层）
+                                        if is_user_skill:
+                                            skill_prefix = user_skill_prefix
+                                            skill_root = os.path.join(
+                                                settings.agent_workspace, "skills",
+                                                f"__user_{user_id}__",
                                             )
+                                        else:
+                                            skill_prefix = "/skills/__agent__/"
+                                            skill_root = os.path.join(
+                                                settings.agent_workspace, "skills", "__agent__",
+                                            )
+                                        filename = file_path_virtual[len(skill_prefix):]
+                                        try:
+                                            disk_path = os.path.join(skill_root, filename)
                                             if os.path.isfile(disk_path):
                                                 file_size = os.path.getsize(disk_path)
                                         except Exception:
                                             pass
+                                        # 标记「这个 skill 是 agent 自动建的」：与用户手动上传的
+                                        # 同处 `__user_{uid}__/`，只靠源码分不出来（见
+                                        # src/core/skill_origin.py）。写入是幂等的，重复写覆盖即可。
+                                        #
+                                        # ⚠️ 只在**写类工具**命中时标记：本分支对任何工具的结果都
+                                        # 可能解析出路径（JSON 里的 path 字段），若不限定工具，
+                                        # agent 只是读/看了一眼用户上传的 skill，就会把它错标成
+                                        # 「Agent 自创」并从「用户上传」组里挪走。
+                                        if (
+                                            is_user_skill
+                                            and "/" in filename
+                                            and tool_name in _SKILL_WRITE_TOOLS
+                                        ):
+                                            _mark_agent_skill_origin(
+                                                skill_root, filename.split("/", 1)[0]
+                                            )
                                     # 如果磁盘没取到大小，尝试从 JSON 返回值中提取 size
                                     # B① 收窄：报错结果**不采信**"返回值里的 size"——那是
                                     # 工具/模型自称的数字，不是宿主磁盘事实；采信它等于绕过

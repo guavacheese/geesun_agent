@@ -15,6 +15,7 @@ from deepagents.backends import (
     StoreBackend,
 )
 from deepagents.backends.protocol import (
+    EditResult,
     ExecuteResponse,
     FileDownloadResponse,
     GlobResult,
@@ -32,6 +33,7 @@ from deepagents.middleware.skills import (
 )
 from src.core import execution_guard
 from src.core.loop_detection import LoopDetectionMiddleware
+from src.core.skill_md import validate_skill_md
 from src.core.terminal_response import TerminalResponseMiddleware
 
 
@@ -336,7 +338,6 @@ class ValidatedCompositeBackend(CompositeBackend):
 
     # /conversation_history/ 是 SummarizationMiddleware 的 offload 路由（StateBackend，不落盘），
     # 必须允许写，否则历史压缩后无法恢复（实测 2026-08-10 日志：Offloading failed, Older messages will not be recoverable）
-    # /skills/__agent__/：agent 自创 skill 层（三层设计：__system__ 预装 / __agent__ 自创 / __user_{id}__ 用户上传）
     # /home/、/tmp/：沙箱内路径——write_file 走 sandbox backend 的 e2b 上传通道直写沙箱（仅 UTF-8 文本），
     #   让 AI 直接 write_file 写脚本/中间文件，不必绕 execute heredoc（也更安全，无 shell 注入面）
     # /large_tool_results/（2026-10-10 补）：大工具结果转存的**唯一落点**。它此前
@@ -345,12 +346,25 @@ class ValidatedCompositeBackend(CompositeBackend):
     #   `[VALIDATED_CB] 拒绝写入: path=/large_tool_results/chatcmpl-tool-...`），
     #   45.8MB 原文原地留在 state。补上后：ToolOutputBudgetMiddleware 的转存、
     #   以及库自带 offload（若触发）都写这里；路由指向真实磁盘（见 routes 表）。
+    #
+    # ⚠️ skill 写入位置（2026-10-23 变更）：原先白名单里是全局 `/skills/__agent__/`
+    #   —— 所有用户的 agent 自创 skill 都堆进同一个目录：跨用户互相可见/可加载、
+    #   同名互相覆盖、无法按人删除。现改为**每个用户各自一份**，故不能再把
+    #   `__agent__` 留在字面量白名单里（字面量只能表达"所有人共用这个前缀"）。
+    #   用户维度前缀由实例属性 `_user_skill_prefix` 表达，判定见 `_is_writable`。
     ALLOWED_WRITE_PREFIXES = {
         "/reports/", "/workspace/memories/", "/conversation_history/",
-        "/skills/__agent__/",
         "/home/", "/tmp/",
         "/large_tool_results/",
     }
+
+    # 用户 skill 目录模板：实例用 `.format(user_id=...)` 展开成真实前缀。
+    #
+    # 为什么留一个**类级字面量**（而不是只在 __init__ 里拼字符串）：
+    # tests/services/test_backend_route_whitelist.py 是纯 AST 契约测试，只认类属性里的
+    # 字面量；路由表 ↔ 白名单的归类闭合性必须能被它看见，否则 `/skills/__user_*__/`
+    # 会重新变成"有路由、无人认领"的第四态（正是 4863afff 事故的形态）。
+    USER_SKILL_PREFIX_TEMPLATE = "/skills/__user_{user_id}__/"
 
     # 沙箱内仍禁写的路径（/home/ /tmp/ 已放行直写沙箱；这些是系统级/挂载路径，AI 不应碰）
     SANDBOX_PATH_PREFIXES = ("/root/", "/mnt/", "/code/", "/var/")
@@ -417,6 +431,68 @@ class ValidatedCompositeBackend(CompositeBackend):
         # 注意不能从 default backend 反推——本地兜底路径下 default 是 LocalShellBackend。
         self._user_id = user_id
         self._session_id = session_id
+        # 当前用户可写的 skill 根（agent 自创 skill 的默认落点，2026-10-23 起）。
+        # ⚠️ user_id 为空时必须留空串，且 `_is_writable` 要显式判空：
+        #    `"x".startswith("")` 恒为 True —— 不判空等于把整台机器的路径全放行。
+        self._user_skill_prefix = (
+            self.USER_SKILL_PREFIX_TEMPLATE.format(user_id=user_id) if user_id else ""
+        )
+
+    # ─── 写权限判定（单一入口）───
+
+    def _is_writable(self, file_path: str) -> bool:
+        """统一的"这条路径能不能写"判据。
+
+        单一入口的原因：`write` / `awrite` / `edit` / `aedit` 四条通道各自都要判，
+        任何一处漏掉都会留下旁路（`edit_file` 曾因此完全绕过白名单，可改
+        `/skills/__system__/` 系统预装 skill）。
+        """
+        if self._user_skill_prefix and file_path.startswith(self._user_skill_prefix):
+            return True
+        return any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES)
+
+    def _skill_name_of(self, file_path: str) -> str | None:
+        """若路径落在当前用户的 skill 目录内，返回其 skill 名（第一段）；否则 None。"""
+        if not self._user_skill_prefix or not file_path.startswith(self._user_skill_prefix):
+            return None
+        rest = file_path[len(self._user_skill_prefix):]
+        skill_name = rest.split("/", 1)[0]
+        return skill_name or None
+
+    def _validate_skill_md_write(self, file_path: str, content: str) -> str | None:
+        """写 SKILL.md 时校验 frontmatter；返回错误提示（None = 通过）。
+
+        为什么必须在**写入通道**校验：deepagents 扫描端遇到坏 frontmatter 只做
+        静默 skip（`_list_skills_with_errors`），模型会看到 write_file 成功、
+        用户以为建好了，实际这个 skill 永远不会被加载 —— 与 2026-08-19 上传通道
+        那个 bug 同一形态，只是换了个入口。
+
+        只在 `write` 路径校验：更新已有 SKILL.md 走 `edit_file`（FilesystemBackend
+        的 write 对已存在文件直接报错），edit 通道的旧/新片段无法拼出完整 frontmatter，
+        故不做校验（已在 AGENTS.md 中要求编辑时保持 frontmatter 完整）。
+        """
+        if not file_path.endswith("/SKILL.md"):
+            return None
+        skill_name = self._skill_name_of(file_path)
+        if not skill_name:
+            return None
+
+        validation = validate_skill_md(content)
+        if not validation["valid"]:
+            return (
+                f"SKILL.md frontmatter 校验失败（{validation['error']}）。"
+                f"必须写成：'---\\nname: {skill_name}\\ndescription: <一句话说明用途与触发场景>\\n---'，"
+                f"且 name 必须与目录名 '{skill_name}' 完全一致，否则该 skill 不会被加载。"
+                f"请修正后重新 write_file 到 '{file_path}'。"
+            )
+        if validation["name"] != skill_name:
+            return (
+                f"SKILL.md 的 name 字段是 '{validation['name']}'，与目录名 '{skill_name}' 不一致。"
+                f"deepagents 以目录名索引 skill，两者必须完全相同；"
+                f"请把 name 改成 '{skill_name}'，或把文件写到 "
+                f"'{self._user_skill_prefix}{validation['name']}/SKILL.md'。"
+            )
+        return None
 
     def _reject_glob_scan(self, pattern: str, path: str | None) -> str | None:
         """B1: 拦截 '**' 全盘扫描（2026-08-18 根因修复）。
@@ -606,18 +682,25 @@ class ValidatedCompositeBackend(CompositeBackend):
                 f"沙箱内文件请用 write_file 写 '/home/user/<文件名>'（已支持直写沙箱）或 execute 创建；"
                 f"交付物请写入 '{self._report_prefix}<文件名>'"
             )
-        # 用户共享 skill：归上传 API 管（SKILL.md 需 YAML 校验）
+        # 别家用户的 skill 目录（自己的目录在白名单里，根本走不到这里）
         if file_path.startswith("/skills/__user_"):
             return (
-                f"路径 '{file_path}' 是用户共享 skill 目录（只读，SKILL.md 需 YAML 校验）。"
-                f"创建/更新用户 skill 请通过 /api/v1/skill/upload 接口上传；"
-                f"agent 自创 skill 请写入 '/skills/__agent__/<skill_name>/'"
+                f"路径 '{file_path}' 不是当前用户的 skill 目录。"
+                f"skill 只能写入自己的目录：'{self._user_skill_prefix}<skill_name>/SKILL.md'"
+            )
+        # 历史共享 skill 层：2026-10-23 起冻结只读
+        if file_path.startswith("/skills/__agent__"):
+            return (
+                f"路径 '{file_path}' 是历史共享 skill 层（已冻结，只读），不可修改。"
+                f"新建/更新 skill 请写入当前用户目录 "
+                f"'{self._user_skill_prefix}<skill_name>/SKILL.md'"
             )
         # 系统预装 skill：只读
         if file_path.startswith("/skills/__system__"):
             return (
                 f"路径 '{file_path}' 是系统预装 skill（只读），不可修改。"
-                f"如需新技能，agent 自创请写 '/skills/__agent__/<skill_name>/'，用户上传走 /api/v1/skill/upload"
+                f"如需新技能，请写入当前用户目录 "
+                f"'{self._user_skill_prefix}<skill_name>/SKILL.md'"
             )
         if file_path.startswith(self.VIRTUAL_READONLY_PREFIXES):
             return (
@@ -625,7 +708,8 @@ class ValidatedCompositeBackend(CompositeBackend):
                 f"交付物请写入 '{self._report_prefix}<文件名>'"
             )
         return (
-            f"只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}。"
+            f"只能写入到以下路径: {', '.join(sorted(self.ALLOWED_WRITE_PREFIXES))}"
+            f"，以及你自己的 skill 目录 '{self._user_skill_prefix}'。"
             f"当前会话交付目录为 '{self._report_prefix}'"
         )
 
@@ -672,16 +756,15 @@ class ValidatedCompositeBackend(CompositeBackend):
         return None
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+        if not self._is_writable(file_path):
             hint = self._reject_hint(file_path)
             logger.warning(
-                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s) | hint=%s",
-                file_path, self.ALLOWED_WRITE_PREFIXES, hint,
+                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s + %s) | hint=%s",
+                file_path, self.ALLOWED_WRITE_PREFIXES, self._user_skill_prefix, hint,
             )
             return WriteResult(
                 error=f"拒绝写入: {hint}",
                 path=file_path,
-                files_update=None,
             )
         dir_hint = self._reject_directory_write(file_path)
         if dir_hint:
@@ -692,21 +775,29 @@ class ValidatedCompositeBackend(CompositeBackend):
             return WriteResult(
                 error=f"拒绝写入: {dir_hint}",
                 path=file_path,
-                files_update=None,
+            )
+        skill_hint = self._validate_skill_md_write(file_path, content)
+        if skill_hint:
+            logger.warning(
+                "[VALIDATED_CB] 拒绝写入 SKILL.md: path=%s | hint=%s",
+                file_path, skill_hint,
+            )
+            return WriteResult(
+                error=f"拒绝写入: {skill_hint}",
+                path=file_path,
             )
         return super().write(file_path, content)
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
-        if not any(file_path.startswith(p) for p in self.ALLOWED_WRITE_PREFIXES):
+        if not self._is_writable(file_path):
             hint = self._reject_hint(file_path)
             logger.warning(
-                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s) | hint=%s",
-                file_path, self.ALLOWED_WRITE_PREFIXES, hint,
+                "[VALIDATED_CB] 拒绝写入: path=%s (只允许 %s + %s) | hint=%s",
+                file_path, self.ALLOWED_WRITE_PREFIXES, self._user_skill_prefix, hint,
             )
             return WriteResult(
                 error=f"拒绝写入: {hint}",
                 path=file_path,
-                files_update=None,
             )
         dir_hint = self._reject_directory_write(file_path)
         if dir_hint:
@@ -717,9 +808,62 @@ class ValidatedCompositeBackend(CompositeBackend):
             return WriteResult(
                 error=f"拒绝写入: {dir_hint}",
                 path=file_path,
-                files_update=None,
+            )
+        skill_hint = self._validate_skill_md_write(file_path, content)
+        if skill_hint:
+            logger.warning(
+                "[VALIDATED_CB] 拒绝写入 SKILL.md: path=%s | hint=%s",
+                file_path, skill_hint,
+            )
+            return WriteResult(
+                error=f"拒绝写入: {skill_hint}",
+                path=file_path,
             )
         return await super().awrite(file_path, content)
+
+    # ─── edit / aedit：此前完全绕过白名单（2026-10-23 修）───
+    #
+    # 事故形态：tool 层 `edit_file` 走 `middleware/filesystem.py → resolved_backend.aedit`，
+    # `FilesystemBackend.edit/aedit` 自己有独立的读改写逻辑（不调 `write`），而本类只覆写了
+    # write/awrite ⇒ 白名单、目录校验、二进制拦截对 edit 全部失效，模型可以直接改
+    # `/skills/__system__/` 的系统预装 skill、改 `/uploads/` 下的用户原件。
+    # 不修的话「`__agent__` 冻结只读」只是没写到的约束，不是事实。
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if not self._is_writable(file_path):
+            hint = self._reject_hint(file_path)
+            logger.warning(
+                "[VALIDATED_CB] 拒绝编辑: path=%s (只允许 %s + %s) | hint=%s",
+                file_path, self.ALLOWED_WRITE_PREFIXES, self._user_skill_prefix, hint,
+            )
+            return EditResult(error=f"拒绝写入: {hint}", path=file_path, occurrences=0)
+        return super().edit(
+            file_path, old_string, new_string, replace_all=replace_all
+        )
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if not self._is_writable(file_path):
+            hint = self._reject_hint(file_path)
+            logger.warning(
+                "[VALIDATED_CB] 拒绝编辑: path=%s (只允许 %s + %s) | hint=%s",
+                file_path, self.ALLOWED_WRITE_PREFIXES, self._user_skill_prefix, hint,
+            )
+            return EditResult(error=f"拒绝写入: {hint}", path=file_path, occurrences=0)
+        return await super().aedit(
+            file_path, old_string, new_string, replace_all=replace_all
+        )
 
     def read(
         self,

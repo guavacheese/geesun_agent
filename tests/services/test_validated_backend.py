@@ -223,20 +223,108 @@ def test_hint_unknown_path(backend):
     assert "/reports/user-01/sess-02/" in hint
 
 
-def test_allowed_prefixes_not_rejected():
+def test_allowed_prefixes_not_rejected(backend):
+    """白名单内的路径必须放行（含按 user_id 展开的用户 skill 目录）。"""
     allowed = [
         p
         for p in (
             "/reports/user-01/sess-02/out.md",
             "/workspace/memories/prefs.md",
             "/conversation_history/history.md",
-            "/skills/__agent__/my-skill/SKILL.md",
             "/home/user/script.py",  # 直写沙箱通道（2026-08 起放行）
             "/tmp/build/out.log",  # 同上
         )
-        if not any(p.startswith(x) for x in ValidatedCompositeBackend.ALLOWED_WRITE_PREFIXES)
+        if not backend._is_writable(p)
     ]
     assert allowed == []
+    # 用户 skill 目录按实例 user_id 展开，不在类级字面量里，必须走 _is_writable
+    assert backend._is_writable("/skills/__user_user-01__/my-skill/SKILL.md")
+    # 别家用户的目录不放行（前缀按 user_id 精确匹配，不是通配）
+    assert not backend._is_writable("/skills/__user_user-99__/my-skill/SKILL.md")
+
+
+def test_agent_skill_layer_is_frozen():
+    """`__agent__` 全局层 2026-10-23 起冻结只读：写入被拒，且提示指向自己的目录。"""
+    backend = ValidatedCompositeBackend(
+        default=None, routes={}, user_id="user-01", session_id="sess-02"
+    )
+    target = "/skills/__agent__/legacy-skill/SKILL.md"
+    result = backend.write(target, "---\nname: legacy-skill\ndescription: x\n---\n")
+    assert result.error is not None
+    assert "拒绝写入" in result.error
+    assert "冻结" in result.error
+    assert "/skills/__user_user-01__/" in result.error
+
+
+def test_write_skill_md_requires_frontmatter():
+    """直写 SKILL.md 必须过 frontmatter 校验（此前该通道完全不校验）。"""
+    backend = ValidatedCompositeBackend(
+        default=None, routes={}, user_id="user-01", session_id="sess-02"
+    )
+    # 缺 frontmatter：deepagents 会静默 skip，必须在写入端拦下
+    result = backend.write(
+        "/skills/__user_user-01__/demo/SKILL.md", "# 没有 frontmatter\n"
+    )
+    assert result.error is not None
+    assert "frontmatter 校验失败" in result.error
+
+
+def test_write_skill_md_name_must_match_dir():
+    """name 与目录名不一致必须拒写（deepagents 以目录名索引 skill）。"""
+    backend = ValidatedCompositeBackend(
+        default=None, routes={}, user_id="user-01", session_id="sess-02"
+    )
+    result = backend.write(
+        "/skills/__user_user-01__/demo/SKILL.md",
+        "---\nname: other-name\ndescription: 用途\n---\n",
+    )
+    assert result.error is not None
+    assert "与目录名 'demo' 不一致" in result.error
+
+
+def test_edit_rejects_paths_outside_whitelist():
+    """`edit_file` 曾完全绕过白名单（可改系统预装 skill），必须同样被拒。
+
+    事故形态：tool 层走 `backend.aedit`，而 FilesystemBackend.edit 自己有独立写盘
+    逻辑、不经过 `write()`；本类此前只覆写 write/awrite ⇒ 白名单对 edit 失效。
+    """
+    backend = ValidatedCompositeBackend(
+        default=None, routes={}, user_id="user-01", session_id="sess-02"
+    )
+    result = backend.edit("/skills/__system__/plc-code-auditor/SKILL.md", "a", "b")
+    assert result.error is not None
+    assert "拒绝写入" in result.error
+
+    import asyncio
+
+    async_result = asyncio.run(
+        backend.aedit("/skills/__agent__/legacy/SKILL.md", "a", "b")
+    )
+    assert async_result.error is not None
+    assert "拒绝写入" in async_result.error
+
+
+def test_edit_allows_own_skill_dir():
+    """自己的 skill 目录必须可编辑（更新 SKILL.md 走 edit_file 是正常路径）。
+
+    这里只验「不被白名单挡住」：default=None / routes={}，放行后必然 AttributeError。
+    """
+    backend = ValidatedCompositeBackend(
+        default=None, routes={}, user_id="user-01", session_id="sess-02"
+    )
+    assert backend._is_writable("/skills/__user_user-01__/demo/SKILL.md")
+    assert backend._skill_name_of("/skills/__user_user-01__/demo/SKILL.md") == "demo"
+
+
+def test_user_skill_prefix_empty_when_no_user_id():
+    """user_id 为空时前缀必须是空串，且**绝不能**因此放行任意路径。
+
+    `"x".startswith("")` 恒为 True —— 不显式判空等于把整机路径全放行。
+    """
+    backend = ValidatedCompositeBackend(default=None, routes={})
+    assert backend._user_skill_prefix == ""
+    assert not backend._is_writable("/etc/passwd")
+    assert not backend._is_writable("/skills/__user___/x/SKILL.md")
 
 
 # ─── write 拒绝分支 ──────────────────────────────────────────────────────────
