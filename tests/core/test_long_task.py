@@ -378,7 +378,18 @@ def test_shield_loops_durable_tool_end_to_end(monkeypatch):
     tool = _MCPErrorShieldTool(inner)
     result = asyncio.run(tool.ainvoke({"file_path": "/data/x.pdf"}))
 
-    assert json.loads(result)["status"] == "completed"
+    # 2026-10-23 契约升级（589e99f5 事故）：durable 分支必须返回 ToolMessage。
+    # 旧断言是 `json.loads(result)`（裸 str）——正是这个形态进了生产就被
+    # langgraph 判 "invalid element types" 整轮崩掉。
+    from langchain_core.messages import ToolMessage
+
+    assert isinstance(result, ToolMessage), (
+        "durable 返回值必须是 ToolMessage，实际 %s —— 裸 list/str 会被 "
+        "ToolNode._normalize_tool_response 拒绝（589e99f5 事故）"
+        % type(result).__name__
+    )
+    assert json.loads(result.content)["status"] == "completed"
+    assert result.name == "ocr_pdf_to_text"
     assert len(inner.calls) == 3, "shield 没有把续查接起来"
     # schema 有 wait_seconds ⇒ 每轮都抬到 300（否则续查轮次翻三倍）
     assert all(c.get("wait_seconds") == 300 for c in inner.calls)

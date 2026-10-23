@@ -1141,8 +1141,27 @@ _SALVAGE_EXTS = (
 # 沙箱内产物高发目录：execute 的 CWD 默认 /home/user；脚本常写 /tmp；
 # 模型被误导后还会自己 mkdir -p /reports/...（**沙箱内的同名目录**，不是宿主卷）
 _SALVAGE_DIRS = ("/home/user", "/tmp", "/reports")
-# 单轮兜底最多回收几个：避免一次性把沙箱垃圾全搬进来刷屏
-_SALVAGE_MAX_FILES = 5
+# 单轮兜底最多回收几个：避免一次性把沙箱垃圾全搬进来刷屏。
+# 2026-10-23 由 5 提到 10：7 批 OCR 产物（result.txt + 每批 result.json）
+# 就要 8 个槽位，5 个必然截断掉一部分结论。
+_SALVAGE_MAX_FILES = 10
+# 单轮兜底累计落盘上限（2026-10-23）：提升到 10 个槽位后，若候选全是
+# 200MB+ 的原始 PDF，兜底会一次搬 2GB 进报告目录。用**总量**而不是
+# 「大文件个数」封顶：结论类文件通常只有几百 KB，不受影响；大文件凑够
+# 上限就跳过（继续尝试后面更小的候选，不放弃整轮）。
+_SALVAGE_MAX_BYTES = 512 * 1024 * 1024
+
+# 回收优先级（2026-10-23，589e99f5 事故）：
+# 旧实现按「文件大小降序」排——256MB 原 PDF + 4 个 38~52MB 子 PDF 把配额
+# 全吃掉，真正的结论 `result.txt`(~800KB) / `result.json` 一个都没排上，
+# 4h45m 的 OCR 结论就这么丢了。判据改成「扩展名语义优先，同类内按大小降序」：
+# 结论类文件通常小，但正是用户要的东西；原始 PDF/图片/压缩包是输入或脚手架。
+_SALVAGE_PRIORITY_EXTS = (
+    "md", "txt", "csv", "json", "xml", "yaml", "yml",
+    "xlsx", "xls", "docx", "doc", "pptx", "ppt", "html", "htm",
+)
+# 体积大、多为「输入原件或中间产物」的扩展名
+_SALVAGE_BULKY_EXTS = ("zip", "png", "jpg", "jpeg", "svg", "pdf")
 # B①：是否也解析"失败的工具结果"里的交付物路径。
 # 报错文本里的 /reports/... 也可能指向真实产物（cp 因目标目录不存在而失败，源文件仍在），
 # 跳过解析等于连"试着拉回"的机会都没有。安全性由 emit 护栏承担：
@@ -1207,6 +1226,60 @@ def _sandbox_artifact_listing(sandbox) -> dict[str, int]:
     return listed
 
 
+def _salvage_sort_key(path: str, size: int) -> tuple:
+    """收尾兜底的回收优先级排序键（2026-10-23，589e99f5 事故）。
+
+    分桶：
+      0 = 结论类（md/txt/json/csv/xlsx/docx/pptx/html…）—— 用户真正要的东西
+      1 = 图片/压缩包
+      2 = 其它
+      3 = **处理管线脚手架**：OCR/拆页产生的子 PDF（`input.sub.pdf`、
+          `batches/bNNN/*.pdf`）。它们再大也只是中间产物，必须排在最后，
+          否则又会把配额挤满。
+
+    同桶内按大小降序（大报告更可能是正式交付物），再按路径稳定排序
+    （测试与日志可复现）。
+    """
+    base = path.rsplit("/", 1)[-1].lower()
+    ext = base.rsplit(".", 1)[-1] if "." in base else ""
+    if ext in _SALVAGE_PRIORITY_EXTS:
+        bucket = 0
+    elif ext in _SALVAGE_BULKY_EXTS:
+        bucket = 1
+    else:
+        bucket = 2
+    if ext == "pdf" and (
+        ".sub." in base or "/batches/" in path or base.startswith("input.")
+    ):
+        bucket = 3
+    return (bucket, -size, path)
+
+
+def _salvage_disk_name(src: str, used: set[str]) -> str:
+    """生成落盘文件名：重名时**逐级加父目录前缀**，杜绝跨目录同名互相覆盖。
+
+    589e99f5：7 个批次各有 `batches/bNNN/input.sub.pdf`，旧实现只用 basename
+    落盘，7 份互相覆盖成 1 份（宿主最后只剩 b002 那份）。不覆盖的目标比
+    "名字好看"重要得多，所以宁可名字长一点。
+    """
+    parts = [p for p in src.split("/") if p]
+    base = parts[-1] if parts else "artifact"
+    name = base
+    depth = 2
+    while name in used and depth <= len(parts):
+        name = "__".join(parts[-depth:])
+        depth += 1
+    if name in used:  # 父目录前缀也撞（极端情况）：退化为序号
+        stem, dot, ext = name.rpartition(".")
+        for i in range(2, 100):
+            cand = ("%s_%d.%s" % (stem, i, ext)) if dot else ("%s_%d" % (name, i))
+            if cand not in used:
+                name = cand
+                break
+    used.add(name)
+    return name
+
+
 async def _salvage_sandbox_artifacts(
     sandbox, user_id: str, session_id: str, before: dict[str, int] | None
 ) -> list[dict]:
@@ -1235,11 +1308,29 @@ async def _salvage_sandbox_artifacts(
     if not new_paths:
         logger.info("[FILE_GEN] 收尾兜底：沙箱内无本轮新增交付物")
         return []
-    # 大文件优先：正式交付物（报告/表格）通常远比零散小文件更可能是用户要的东西
-    new_paths.sort(key=lambda p: (-after[p], p))
+    # 结论类优先（2026-10-23 起不再「大文件优先」）：589e99f5 里 256MB 原 PDF
+    # 与 4 个 38~52MB 子 PDF 把配额吃光，result.txt/result.json 全被挤掉。
+    new_paths.sort(key=lambda p: _salvage_sort_key(p, after[p]))
+    # 取候选：按排序依次装入，累计字节超上限则跳过该文件（继续看后面的小文件）
+    picked: list[str] = []
+    picked_bytes = 0
+    for cand in new_paths:
+        if len(picked) >= _SALVAGE_MAX_FILES:
+            break
+        size = after.get(cand) or 0
+        if picked_bytes + size > _SALVAGE_MAX_BYTES:
+            logger.info(
+                "[FILE_GEN] 收尾兜底跳过 %s（%d 字节；累计 %d 已达上限 %d）",
+                cand, size, picked_bytes, _SALVAGE_MAX_BYTES,
+            )
+            continue
+        picked.append(cand)
+        picked_bytes += size
     root = os.path.normpath(os.path.join(settings.report_root, user_id, session_id))
     salvaged: list[dict] = []
-    for src in new_paths[:_SALVAGE_MAX_FILES]:
+    # 本轮已占用的落盘名（重名加父目录前缀，防跨目录同名互相覆盖）
+    used_names: set[str] = set()
+    for src in picked:
         try:
             responses = await asyncio.to_thread(sandbox.download_files, [src])
         except Exception as e:  # noqa: BLE001
@@ -1253,7 +1344,9 @@ async def _salvage_sandbox_artifacts(
                 break
         if not content:
             continue
-        base_name = src.rsplit("/", 1)[-1]
+        # 重名（多批次同名子 PDF）加父目录前缀，杜绝互相覆盖；
+        # 名字在拉取前就占用：拉取失败留个空位，比覆盖已落盘文件安全。
+        base_name = _salvage_disk_name(src, used_names)
         # 路径穿越防御（与 _pull_report_from_sandbox 同款）：落盘限制在 report_root/uid/sid 内
         disk_path = os.path.normpath(os.path.join(root, base_name))
         if disk_path != root and not disk_path.startswith(root + os.sep):

@@ -26,10 +26,13 @@ import logging
 import shutil
 import time
 from pathlib import Path
+from typing import Any
 
 from langchain.tools import BaseTool
+from langchain_core.messages import ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt.tool_node import ToolInvocationError
+from langgraph.types import Command
 from pydantic import PrivateAttr
 from src.core import long_task
 from src.core.config import settings
@@ -353,6 +356,64 @@ def _shield_error(
     return ToolInvocationError(tool_name=tool_name, source=inner, tool_kwargs=kw)
 
 
+def _tool_call_id_of(tool_input: Any) -> str:
+    """从工具入参里取 tool_call_id（langgraph 传入的是 tool_call dict）。
+
+    取不到返回空串：探针/单测会直接 `ainvoke({...参数...})` 裸调，没有 id。
+    归一化仍要产出 ToolMessage（空 id 合法），否则调用方拿到的类型不一致。
+    """
+    if isinstance(tool_input, dict):
+        raw = tool_input.get("id")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return ""
+
+
+def _as_tool_output(result: Any, tool_input: Any, tool_name: str) -> Any:
+    """把 durable 长任务的返回值归一成 `ToolMessage` / `Command`（2026-10-23）。
+
+    ★ 事故（589e99f5）：262 页 OCR 跑满 4h45m、第 60 轮 status=completed，
+      0.4 秒后整轮崩在
+      `Tool ocr_pdf_to_text returned a list with invalid element types:
+       expected all Command or ToolMessage`，结论全丢、用户只看到这句异常。
+
+    根因三跳（2026-10-23 逐跳实测，不是推测）：
+      1. `long_task.drive` 的**句柄续查**分支（方案 D）构造
+         `poll_args = {"sandbox_id", "job_id", "wait_seconds"}` —— 纯句柄 dict，
+         既没有 `type="tool_call"` 也没有 `id`，`_is_tool_call()` 判 False ⇒
+         `tool_call_id=None`。首轮 `invoke(call_args)` 是 `dict(tool_call)`
+         浅拷贝、**保留 type/id**，所以「首轮正常、续查轮才出问题」；
+      2. langchain-core `BaseTool._format_output` 有一条硬规则：
+         `if isinstance(content, ToolOutputMixin) or tool_call_id is None:
+          return content` —— 拿不到 id 就**原样返回裸 content**；
+      3. langgraph `ToolNode._normalize_tool_response` 只接受
+         `Command` / `ToolMessage` / `list[Command|ToolMessage]`，
+         见到 MCP 的 `list[{"type":"text",...}]` 直接 TypeError。
+
+    ★ 为什么潜伏了两周才炸：前 59 轮 status=running 全在 `drive` 内部
+      循环、从不外抛，**第 60 轮 completed 才第一次真正把结果交出去**。
+      这条路径自 durable 上线起一次都没走通过（此前长任务要么被循环检测
+      掐死、要么被取消）。e2e 样本在容器内直调 MCP、绕过 tool_node，
+      所以测不到 —— 「桩比实现更宽容」的又一例。
+
+    ★ 归一化必须放在 `drive` **返回之后**：`drive` 内部要靠原始 list 解析
+      status/进度/job_id（`result_text`/`result_payload`），提前包装会让
+      续查逻辑全瞎。
+
+    content 用 `long_task.result_text` 拼（MCP text blocks → 文本），
+    不自己另写一套解析口径：那边已被 drive / 循环检测共用且有单测锁定。
+    非文本块（image/resource）拿不到 text 时整体 `str()` 兜底，不丢信息。
+    """
+    if isinstance(result, (ToolMessage, Command)):
+        return result
+    text = long_task.result_text(result)
+    return ToolMessage(
+        content=text if isinstance(text, str) else str(text),
+        name=tool_name,
+        tool_call_id=_tool_call_id_of(tool_input),
+    )
+
+
 class _MCPErrorShieldTool(BaseTool):
     """通用 MCP 工具错误防护包装（2026-09-09）。
 
@@ -434,7 +495,7 @@ class _MCPErrorShieldTool(BaseTool):
         durable = long_task.is_durable_tool(self.name)
         try:
             if durable:
-                return await long_task.drive(
+                result = await long_task.drive(
                     self.name,
                     input,
                     lambda args: self._inner.ainvoke(args, config, **kwargs),
@@ -444,6 +505,10 @@ class _MCPErrorShieldTool(BaseTool):
                     supports_wait=self._supports_wait_seconds(),
                     status_invoke=self._make_status_invoke(),
                 )
+                # ★ 必须归一化后再返回（589e99f5 事故）：drive 内部把 tool_call
+                #   转成了纯 args dict，内层 `_format_output` 因 tool_call_id=None
+                #   原样返回 MCP 的 list[dict]，langgraph 校验直接 TypeError 崩轮。
+                return _as_tool_output(result, input, self.name)
             # 单次工具调用墙钟封顶（mcp_tool_call_timeout_sec，2026-10-19 方案 3）：
             # 653d8515 实锤 agent 侧无工具超时时，服务端挂住 = run 永久 running。
             # httpx read 超时只管"两次读之间"，keepalive 流可无限续期——只有
