@@ -52,3 +52,35 @@ groups:
         annotations:
           summary: 'cadvisor 不可达（{{ $labels.instance }}）'
           description: '容器级指标采集断开已持续 3 分钟，容器概览看板与容器告警将失效。'
+
+  # ── 磁盘异常增长告警（2026-11-05 新增）──
+  # 事故背景：CH FileChannel 坏死 → 递归刷屏 → Loki chunk 一天涨 13.7G，
+  # 从 50% 冲到 100% 触发 MinIO 拒写 / caddy 502 / 会话列表空白。
+  # 现有 HostDiskUsageHigh(>80%,warning) 太晚且太钝，这里补两条提前量。
+  - name: geesun-disk-anomaly
+    rules:
+      # MinIO 在可用空间 <5% 时拒写（XMinioStorageFull），所以 94% 是真正的红线
+      - alert: HostDiskNearMinioRedLine
+        expr: |
+          (1 - node_filesystem_avail_bytes{device=~"/dev/.*",mountpoint="/"}
+              / node_filesystem_size_bytes{device=~"/dev/.*",mountpoint="/"}) * 100 > 94
+        for: 2m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: '根分区逼近 MinIO 95% 拒写红线：{{ printf "%.1f" $value }}%'
+          description: '可用空间不足 6% 时 MinIO 会拒写 → Langfuse 500 → OTel exporter 刷屏 → caddy 502。立即 df -h / 并按 /var/lib/docker/volumes 排查增量。'
+
+      # 1 小时内可用空间下降超过 3 GiB：无论当前水位多少都说明有异常写入源
+      - alert: HostDiskFillingFast
+        expr: |
+          (node_filesystem_avail_bytes{device=~"/dev/.*",mountpoint="/"} offset 1h
+           - node_filesystem_avail_bytes{device=~"/dev/.*",mountpoint="/"}) / 1073741824 > 3
+        for: 5m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: '根分区 1 小时内减少 {{ printf "%.1f" $value }} GiB'
+          description: '异常写入源。优先测「容器日志 60s 增量速率」与 du -sh /var/lib/docker/volumes/* ，不要只看 du 静态快照。'

@@ -2,6 +2,11 @@
 # 各后端均经 appnet 内网互访，仅 caddy 暴露主机端口。
 # Phoenix(:6006) / Langfuse(:3000) 现已随栈自托管、由各自容器直出主机（ingress 全网卡），不经 Caddy 代理
 # （避免与已发布端口冲突）；本文件只代理前端主入口 :80。
+#
+# ★ lb_try_duration（2026-11-04）：滚动更新 / 容器重建时上游端点会短暂消失，
+#   Caddy 默认 lb_try_duration=0 ⇒ 立刻 502，前端表现为「会话列表空白 / 页面打不开」。
+#   给 5s 重试窗口后，这类瞬断会自动重试到新端点上线，无需人工刷新。
+#   历史证据：09-30~11-04 累计 461 条 502，其中 215 条为 lookup geesun-agent 失败。
 
 {
   admin off
@@ -13,15 +18,27 @@
 # 因此 /api/* 与 API 文档必须在 Caddy 层直连后端，其余才走前端。
 :80 {
   handle /api/* {
-    reverse_proxy geesun-agent:8009
+    reverse_proxy geesun-agent:8009 {
+      lb_try_duration 5s
+      lb_try_interval 250ms
+    }
   }
   handle /docs {
-    reverse_proxy geesun-agent:8009
+    reverse_proxy geesun-agent:8009 {
+      lb_try_duration 5s
+      lb_try_interval 250ms
+    }
   }
   handle /openapi.json {
-    reverse_proxy geesun-agent:8009
+    reverse_proxy geesun-agent:8009 {
+      lb_try_duration 5s
+      lb_try_interval 250ms
+    }
   }
   handle {
-    reverse_proxy geesun-agent-web:3000
+    reverse_proxy geesun-agent-web:3000 {
+      lb_try_duration 5s
+      lb_try_interval 250ms
+    }
   }
 }

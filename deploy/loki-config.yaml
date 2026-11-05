@@ -27,14 +27,21 @@ schema_config:
         period: 24h
 
 limits_config:
-  retention_period: 720h          # 30 天留存（等价于 log4j 的日期滚动留存）
+  # 2026-11-05: 30 天 → 7 天。retention 只删「过期」数据，对当天刷屏无效，
+  # 防复发的主力是 P0 修好 CH + alloy 过滤 + 磁盘告警；这里负责控制长期水位。
+  retention_period: 168h
   reject_old_samples: true
   reject_old_samples_max_age: 168h
   max_query_series: 5000
+  # 防止 level/logger 高基数 label 被 stream sharding 放大成海量小 chunk
+  max_global_streams_per_user: 5000
 
 compactor:
   working_directory: /loki/compactor
+  compaction_interval: 10m
   retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
   delete_request_store: filesystem
 
 ruler:

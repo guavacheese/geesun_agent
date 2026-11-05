@@ -6,6 +6,13 @@
 // agent 侧：PHOENIX_COLLECTOR_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT 均指向 http://alloy:4317（appnet 内统一入口）
 // 镜像版本：.env 的 ALLOY_TAG=v1.19.2（docker-compose.yml 默认值同步）
 // 注意：PHOENIX_OTLP_ENDPOINT 经 env() 函数读取（由 env_file 注入，v1.19 已移除 --config.expand-env）
+//
+// 2026-11-05 防复发：
+//   1) discovery.docker 显式 refresh_interval=60s（原默认 15s 会频繁重建 tailer，重复读历史）
+//   2) 丢弃 ClickHouse FileChannel 坏死时的递归刷屏堆栈（曾造成 24h 写入 15G Loki chunk）
+//   3) 注意：实测 loki.source.docker 的 refresh_interval 不改变
+//      "finished transferring logs" 的 15s 节奏（仍为 ~15s），该日志属采集轮询本身；
+//      真正止血是 P0 修好 CH，写入量已从 13.4G/天降到 ~87MiB/天。
 
 logging {
   level  = "info"
@@ -16,7 +23,8 @@ logging {
 // discovery.docker 发现容器 → discovery.relabel 过滤 appnet2 网络 + 提取容器名
 // → loki.source.docker 读日志（Swarm 实际网络名带 stack 前缀 geesun_appnet2）
 discovery.docker "containers" {
-  host = "unix:///var/run/docker.sock"
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "60s"
 }
 
 discovery.relabel "appnet_only" {
@@ -36,7 +44,8 @@ discovery.relabel "appnet_only" {
 
 // 直接通过 Docker API 读容器日志（无需挂宿主机 /var/lib/docker/containers）
 loki.source.docker "logs" {
-  host       = "unix:///var/run/docker.sock"
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "60s"
   targets    = discovery.relabel.appnet_only.output
   forward_to = [loki.process.stage.receiver]
 }
@@ -45,6 +54,13 @@ loki.source.docker "logs" {
 // v1.19 语法：stage 必须带类型后缀（stage.json / stage.labels），不再支持裸 stage {} 块
 loki.process "stage" {
   forward_to = [loki.write.default.receiver]
+
+  // 2026-11-05: 丢弃 ClickHouse Poco FileChannel 坏死时的递归堆栈。
+  // 该异常每条日志都会触发一次，曾以 ~22 MiB/min 刷屏并被 Loki 放大到 15G/天。
+  stage.drop {
+    expression          = ".*(Cannot log message in OwnAsyncSplitChannel|RotateBySizeStrategy::mustRotate|Poco::FileChannel).*"
+    drop_counter_reason = "clickhouse_broken_logger_stacktrace"
+  }
 
   stage.json {
     expressions = {
