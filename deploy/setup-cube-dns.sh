@@ -76,6 +76,9 @@ DRY_RUN="${DRY_RUN:-0}"
 DAEMON_JSON=/etc/docker/daemon.json
 CUBE_CONF=/etc/dnsmasq.d/cube.conf
 MARK=/tmp/.cube-dns-daemon-changed
+PREVIEW=""
+# dry-run 的预演副本若因中途失败残留，退出时清理（正常流程会先删，重复 rm -f 无害）
+trap 'if [[ -n "$PREVIEW" ]]; then rm -f "$PREVIEW"; fi' EXIT
 
 say() { echo "$@"; }
 run() { if [[ "$DRY_RUN" == "1" ]]; then echo "    [dry-run] $*"; else eval "$@"; fi; }
@@ -154,15 +157,25 @@ print(f"    ✓ 网段自检通过：docker0 {nb} / 地址池 {np}（不重叠�
 PYCHK
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "    [dry-run] 将设置 dns=[$DNSMASQ_LISTEN] bip=$DOCKER_BIP pool=$DOCKER_POOL_BASE/$DOCKER_POOL_SIZE"
-  echo "0" > "$MARK"
+  # dry-run 也真实预演一遍合并：对**副本**跑同一段 python 逻辑，得出真实的"是否变化"
+  # 结论。否则幂等判断只能靠猜，而它决定了要不要重启 dockerd（会停机）。
+  PREVIEW="${DAEMON_JSON}.dryrun.preview"
+  if [[ -f $DAEMON_JSON ]]; then
+    cp -a "$DAEMON_JSON" "$PREVIEW"
+  else
+    : > "$PREVIEW"
+  fi
+  echo "    [dry-run] 对副本预演合并（不改动 $DAEMON_JSON）"
+  TARGET="$PREVIEW"
 else
   if [[ -f $DAEMON_JSON ]]; then
     run "cp -a $DAEMON_JSON ${DAEMON_JSON}.bak.$(date +%Y%m%d%H%M%S)"
     # 只保留最近 3 份备份，避免每次执行都堆积
     ls -1t ${DAEMON_JSON}.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
   fi
-  python3 - "$DAEMON_JSON" "$DNSMASQ_LISTEN" "$DOCKER_BIP" "$DOCKER_POOL_BASE" "$DOCKER_POOL_SIZE" "$MARK" <<'PYEOF'
+  TARGET="$DAEMON_JSON"
+fi
+python3 - "$TARGET" "$DNSMASQ_LISTEN" "$DOCKER_BIP" "$DOCKER_POOL_BASE" "$DOCKER_POOL_SIZE" "$MARK" <<'PYEOF'
 import json, sys, os
 
 path, dns, bip, pool_base, pool_size, mark = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6]
@@ -197,6 +210,10 @@ with open(mark, "w") as f:
     f.write("1" if changed else "0")
 print(f"    已写入（内容{'有' if changed else '无'}变化），原有其它键保留")
 PYEOF
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  rm -f "$PREVIEW"
+  echo "    [dry-run] 预演副本已删除，$DAEMON_JSON 本体未改动"
 fi
 
 echo "==> 5/7 对齐 docker0 网段（必要时才重启 dockerd）"
