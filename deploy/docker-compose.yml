@@ -60,6 +60,15 @@ services:
       # - Singapore 与 Shanghai 数值等价、均无夏令时；中国机器语义上可改 Asia/Shanghai。
       #   统一走 ${TZ:-...} 变量，宿主设 TZ 即全局覆盖。
       TZ: "${TZ:-Asia/Singapore}"
+      # ── 额外预装模型（JSON 数组）─────────────────────────────────────
+      # ⚠ 二段式原因（2026-11-10 实测）：.env 会被 start_stack.sh:71 `set -a; source`
+      # 加载，值若不以引号包裹会被 bash 当数组下标赋值而语法错；但 compose 的
+      # env_file 解析**不剥**外层引号 → 容器内拿到 "'[{...}]'"，models.py 的
+      # json.loads 直接失败（日志：EXTRA_MODELS 解析失败: Expecting value）。
+      # 故 .env 写 EXTRA_MODELS_JSON='[...]'（shell 安全），此处用 compose 变量
+      # 替换（其 .env 解析会剥引号）+ YAML 单引号包裹；environment 优先级高于
+      # env_file，容器最终拿到干净 JSON。缺省 []。
+      extra_models: '${EXTRA_MODELS_JSON:-[]}'
     # 宿主机挂载：报告/上传/工作目录防容器重建丢失（AGENT_DATA_ROOT 见 .env）
     volumes:
       - ${AGENT_DATA_ROOT:-/opt/geesun/data}/agent:/data/agent
