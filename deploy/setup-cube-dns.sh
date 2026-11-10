@@ -8,9 +8,17 @@
 #     1) 检测/安装 dnsmasq，写入 /etc/dnsmasq.d/cube.conf：
 #          address=/cube.app/172.16.66.13      # *.cube.app 本地直答（address= 模式）
 #          server=<resolv.conf 上游>           # 非 cube.app 域名正常外网解析
-#          listen-address=172.17.0.1,127.0.0.1 # docker0 网关，供容器经 daemon dns 访问
-#     2) /etc/docker/daemon.json 设置 "dns": ["172.17.0.1"]（保留原有键，先备份）
+#          listen-address=172.30.10.1,127.0.0.1 # docker0 网关，供容器经 daemon dns 访问
+#     2) /etc/docker/daemon.json 设置 "dns": ["172.30.10.1"]（保留原有键，先备份）
 #     3) 重启 dnsmasq + docker，并验证容器内解析。
+#
+# ⚠️ docker0 网段 2026-11-10 由 172.17.0.0/16 改为 172.30.10.0/24（IT 指定 172.30 段）。
+#   网关刻意取 172.30.10.1 而不是 172.30.0.1：实测 .0.1 已被 10.10.10.66 / 10.10.10.71
+#   两台内网设备 ARP 应答（linux 默认 arp_ignore=0），用它会重演 172.17 的地址冲突。
+#   对应 daemon.json: "bip": "172.30.10.1/24",
+#                     "default-address-pools": [{"base": "172.30.16.0/20", "size": 24}]
+#   改 docker0 网段后必须先重启 dockerd 让新地址就绪，再重启 dnsmasq —— 否则
+#   bind-interfaces 会因地址不存在而 bind 失败，dnsmasq 直接退出、全网容器 DNS 中断。
 #
 # ⚠️ 必须用 address= 直答模式，不要用 server=/cube.app/<IP> 转发模式：
 #   server= 会把查询转发给 <IP>:53 的 DNS 服务；172.16.66.13 上并无 DNS 服务
@@ -34,7 +42,7 @@ fi
 
 CUBE_SANDBOX_IP="${CUBE_SANDBOX_IP:-172.16.66.13}"
 CUBE_DOMAIN="${CUBE_DOMAIN:-cube.app}"
-DNSMASQ_LISTEN="${DNSMASQ_LISTEN:-172.17.0.1}"
+DNSMASQ_LISTEN="${DNSMASQ_LISTEN:-172.30.10.1}"
 
 echo "==> 1/5 检测 dnsmasq"
 if ! command -v dnsmasq >/dev/null 2>&1; then
