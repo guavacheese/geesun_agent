@@ -184,15 +184,28 @@ class _FreshSkillsMiddleware(SkillsMiddleware):
 
 
 class _SummarizationAccurate(SummarizationMiddleware):
-    """精确计数版 Summarization：实现与默认完全一致，仅类名不同。
+    """精确计数版 Summarization：实现与默认完全一致，token_counter 更准。
 
-    langchain factory 按 middleware.name 去重（factory.py:1079）：
-    默认实例（deepagents graph.py:797 创建）name="SummarizationMiddleware"，
-    本子类 name=type(self).__name__="_SummarizationAccurate"，避免 AssertionError。
-    唯一差异：挂载用 model.get_num_tokens 精确计数的 token_counter（中文 token 低估修复）。
+    ⚠ name 必须与默认实例同名（"SummarizationMiddleware"，A 修复 2026-11-17）：
+    deepagents graph.py 主链无条件创建默认 SummarizationMiddleware 实例，用户
+    middleware 经 _apply_custom_middleware 按 .name **原位替换**（graph.py:210
+    "If its .name matches a name still present in base: replace in-place"）。
+    本子类曾改名 "_SummarizationAccurate" 绕 langchain factory 重名断言 → 异名
+    不命中替换 → **两实例并存**，同一步各自触发摘要各自返回 Command →
+    checkpoint_writes 同 task 双写 _summarization_event → LastValue channel 抛
+    InvalidUpdateError 线程 brick（生产 GY35362:3c4b5588 实证，pending writes
+    idx3=默认实例/idx4=本实例）。同名后走替换路径：列表只有一个 Summarization
+    Middleware（本实例，geesun 配置生效），factory 去重断言自然不触发。
+    GY35362 取证与修法结论见 .workbuddy/memory/2026-11-17.md。
+
+    差异：挂载用 model.get_num_tokens 精确计数的 token_counter（中文 token 低估修复）。
     2026-08-17 追加：① cutoff 越界防御（恢复会话时 cutoff > 消息数的 bug）；
     ② 摘要生成后注入"当前会话真实资源清单"，避免 agent 恢复后 read_file 猜路径。
     """
+
+    # 覆盖 AgentMiddleware.name property（默认 type(self).__name__）——
+    # 与 deepagents 默认实例同名才能命中 _apply_custom_middleware 的原位替换
+    name = "SummarizationMiddleware"
 
     def __init__(self, *args, inventory_provider=None, partial_token_counter=None, **kwargs):
         super().__init__(*args, **kwargs)

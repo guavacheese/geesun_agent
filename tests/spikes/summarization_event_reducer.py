@@ -28,6 +28,17 @@ from typing import Annotated, NotRequired
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+# Settings 必填字段兜底（[5] 引入 src.services.agent import 后必需）
+import os
+
+for _k, _v in (
+    ("BASE_URL", "http://fake:8003/v1"),
+    ("OPENAI_API_KEY", "spike-key"),
+    ("MODEL_NAME", "Qwen3.6-35B-A3B"),
+    ("AGENT_WORKSPACE", "./.spike-workspace"),
+):
+    os.environ.setdefault(_k, _v)
+
 from langchain.agents.middleware.types import PrivateStateAttr
 from langgraph.channels.binop import BinaryOperatorAggregate
 from langgraph.channels.last_value import LastValue
@@ -39,6 +50,7 @@ from deepagents.middleware._state import private_state_field_names
 from deepagents.middleware.summarization import (
     SUMMARIZATION_EVENT_KEY,
     SummarizationEvent,
+    SummarizationMiddleware,
     SummarizationState,
 )
 
@@ -205,6 +217,65 @@ check(
     "聚合后 _summarization_event 走 BinaryOperatorAggregate",
     isinstance(channels.get(SUMMARIZATION_EVENT_KEY), BinaryOperatorAggregate),
     f"got {type(channels.get(SUMMARIZATION_EVENT_KEY)).__name__}",
+)
+
+# ── 5. A 修复（2026-11-17）：同名替换消除双实例 ────────────────────────
+# 双写 _summarization_event 的真正根因（GY35362 取证，见 memory/2026-11-17.md）：
+# deepagents 主链无条件创建默认 SummarizationMiddleware，_SummarizationAccurate
+# 曾异名绕 factory 去重断言 → _apply_custom_middleware 不命中替换 → 两实例并存，
+# 同一步各自触发摘要各自写 event。恢复同名后走原位替换，列表只剩一个。
+
+print("\n[5] A 修复：同名替换（deepagents graph.py:210 _apply_custom_middleware）")
+from deepagents.graph import _apply_custom_middleware
+from src.services.agent import _SummarizationAccurate
+
+
+class _StubMW:
+    def __init__(self, n):
+        self._n = n
+
+    @property
+    def name(self):
+        return self._n
+
+
+# 模拟 deepagents 主链：base 含默认 SummarizationMiddleware + 其它 core
+base = [_StubMW("FilesystemMiddleware"), _StubMW("SummarizationMiddleware"), _StubMW("PatchToolCallsMiddleware")]
+check(
+    "_SummarizationAccurate.name == 'SummarizationMiddleware'（同名）",
+    _SummarizationAccurate.__dict__.get("name") == "SummarizationMiddleware"
+    or _SummarizationAccurate.name == "SummarizationMiddleware",
+    f"got {_SummarizationAccurate.name!r}",
+)
+merged = _apply_custom_middleware(base, [_SummarizationAccurate.__new__(_SummarizationAccurate)]) if False else None
+# 用真实实例验证替换（__init__ 参数复杂，绕开：仅验证替换按 name 命中）
+class _SameName(SummarizationMiddleware):
+    name = "SummarizationMiddleware"
+
+
+custom = _SameName.__new__(_SameName)  # 不跑 __init__，只测 name 匹配
+merged = _apply_custom_middleware(base, [custom])
+sm_entries = [(i, m) for i, m in enumerate(merged) if m.name == "SummarizationMiddleware"]
+check(
+    "同名 merge 后只剩一个 SummarizationMiddleware",
+    len(sm_entries) == 1,
+    f"got {len(sm_entries)} entries",
+)
+check(
+    "且是用户实例（原位替换，保留栈序）",
+    len(sm_entries) == 1 and sm_entries[0][1] is custom and sm_entries[0][0] == 1,
+    f"got pos={sm_entries[0][0] if sm_entries else '?'}",
+)
+# 对照：异名（旧行为）→ 并存 → 双写炸
+class _OldName(SummarizationMiddleware):
+    name = "_SummarizationAccurate"
+
+
+merged_old = _apply_custom_middleware(base, [_OldName.__new__(_OldName)])
+check(
+    "对照：异名 merge 后两实例并存（旧行为 = 双写根因）",
+    sum(1 for m in merged_old if "SummarizationMiddleware" in m.name or m.name == "_SummarizationAccurate") == 2,
+    f"got {[m.name for m in merged_old]}",
 )
 
 # ── 总结 ──────────────────────────────────────────────────────────────
