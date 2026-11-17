@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import concurrent.futures
+from typing import Annotated, NotRequired
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +25,64 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.utils import file_data_to_string
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.graph import DeepAgentState
+from deepagents.middleware.summarization import (
+    SummarizationEvent,
+    SummarizationMiddleware,
+)
 from deepagents.middleware.skills import (
     SkillsMiddleware,
     SkillsStateUpdate,
     _alist_skills_with_errors,
     _list_skills_with_errors,
 )
+from langchain.agents.middleware.types import PrivateStateAttr
 from src.core import execution_guard
 from src.core.loop_detection import LoopDetectionMiddleware
 from src.core.skill_md import validate_skill_md
 from src.core.terminal_response import TerminalResponseMiddleware
+
+
+def _summarization_event_last_wins(old, new):
+    """`_summarization_event` 的 last-write-wins reducer（F4，2026-11-17）。
+
+    deepagents 的 SummarizationState 把该字段标为 PrivateStateAttr（langgraph
+    LastValue channel）：同一 super-step 收到两个更新即抛
+    InvalidUpdateError('Can receive only one value per step')。生产 GY35362:3c4b5588
+    在 crash 轮遗留 pending writes 后，恢复/快照读取重放与本次写入撞同一 step →
+    _drain_astream 与 _persist_session→aget_state 全炸，线程永久 brick（2026-11-17
+    15:54-15:57 反复复现）。
+
+    本 reducer 使字段成为 BinaryOperatorAggregate channel（langgraph
+    state.py:_is_field_binop 识别 Annotated meta[-1] 为 2 参数 callable）：
+    同 step 多个更新逐个 fold、最后写入者赢，pending writes 重放不再炸。
+    覆盖路径为 langchain 官方扩展点（factory.py:1229 注释："base_state last
+    so it wins any field conflict... explicit state_schema override middleware
+    annotations"）——自定义 schema 经 create_deep_agent(state_schema=...) 传入，
+    聚合列表中排最后，覆盖 deepagents SummarizationState 的同名字段注解。
+
+    None 防御：deepagents 三个写入点（summarization.py:1613/1752/2091）全部
+    写非 None 的 new_event，从不写 None 清空；None 仅出现在「从未有过 event」的
+    初始 state（BinaryOperatorAggregate 初始 MISSING → 首值直接落位），
+    这里保留旧值仅为防御未来版本行为变化。
+    """
+    return new if new is not None else old
+
+
+class GeesunAgentState(DeepAgentState):
+    """geesun 侧 agent state schema：覆盖 deepagents 的 summarization 事件通道。
+
+    ⚠ 必须经 create_deep_agent(state_schema=GeesunAgentState) 传入才生效——
+    聚合语义见 _summarization_event_last_wins docstring。运行时 import 不可
+    移入 TYPE_CHECKING：private_state_field_names 用 get_type_hints 解析
+    注解，TYPE_CHECKING-only 名字会导致该 schema 被跳过并告警（deepagents
+    _state.py:27-33）。"""
+
+    _summarization_event: Annotated[
+        NotRequired[SummarizationEvent | None],
+        PrivateStateAttr,
+        _summarization_event_last_wins,
+    ]
 
 
 def _strip_system_messages(request):
@@ -1178,6 +1226,13 @@ async def create_agent(
     # 触发用 fraction（见下），不再需要 tokens 阈值推导；summarization_trigger_tokens
     # 仅作为无 profile 时的下限保护（config 值）。
     #
+    # F2（2026-11-17）：trigger 0.8 → 0.6。f508e75c 复盘（PPT 全量迭代工作负载）：
+    # 该会话单轮增量 ~60k token（pptx XML dump / 图片 / 大 md 读取），0.8 阈值下
+    # headroom 仅 0.2×262144≈52k，一轮巨型 tool result 即可跨过 → Summarization
+    # 全程未触发，15:09 cache=205380（距 trigger 仅差 4335），15:18 直接 262145 溢出
+    # 400。0.6 下 headroom≈105k，正常 PPT 负载（+60k/轮）也能在触发点前被拦住。
+    # 代价：压缩频率升高（约每 2-3 轮一次 vs 原来 4-5 轮），换恢复能力，值得。
+    #
     # keep 用 fraction 而非条数（2026-09-12 改）：
     #   ① 框架默认就是这个形态（deepagents summarization.py:282 `("fraction", 0.10)`，
     #      仅在模型无 profile 的退化分支才用 `("messages", 6)`）。本项目有 profile，
@@ -1194,7 +1249,7 @@ async def create_agent(
     summarization_mw = _SummarizationAccurate(
         model=model,
         backend=backend,
-        trigger=("fraction", 0.8),  # 按 model.profile["max_input_tokens"] 的 0.8 触发，多模型自动适配
+        trigger=("fraction", 0.6),  # 按 model.profile["max_input_tokens"] 的 0.6 触发（F2，2026-11-17 由 0.8 下调）
         keep=("fraction", 0.10),    # 最近 10% 窗口原样保留（有硬上界，见上）
         token_counter=_engine_grounded_counter,  # trigger：引擎真实 prompt_tokens 优先，cold 才退化估算
         partial_token_counter=_safe_token_counter,  # keep 二分：必须子集感知，不可沿用引擎值
@@ -1292,6 +1347,12 @@ async def create_agent(
             "read_file": False,
             "edit_file": False,
         },
+        # F4（2026-11-17）：自定义 state schema——_summarization_event 改
+        # last-write-wins（BinaryOperatorAggregate），堵 pending writes 重放
+        # 撞车致 InvalidUpdateError 的线程 brick（GY35362:3c4b5588）。
+        # 官方扩展点：聚合列表中 base_state 排最后、覆盖 middleware 注解
+        # （langchain factory.py:1229 注释明确支持此用法）。
+        state_schema=GeesunAgentState,
         checkpointer=checkpointer,
         # messages_modifier=trim_messages(
         #     max_tokens=200000,

@@ -592,6 +592,112 @@ def _parse_context_error(text: str) -> tuple[int, int] | None:
     return limit, inp
 
 
+# ─── F1（2026-11-17）：400 上下文超限归类 + 确定性恢复 ───
+# 背景：生产 deepagents 0.6.12 的 SummarizationMiddleware 没有 0.7.x 的
+# _is_context_overflow/_acall_with_budget 溢出恢复链（生产容器实测 2026-11-17：
+# 两个符号 MISSING），400 只能靠 model_call_guard 自救。旧兜底
+# 「keep=max(4,len-10*(attempt+1)) 砍最老消息」方向反了——膨胀源（巨型 pptx
+# tool result / 图片）在尾部，砍老消息后 real_input 恒 262145，重试必然无效
+# （f508e75c 实测 5 轮 × 2 次重试全部如此）。
+# 新策略借 deepseek-harness（compaction-basic + llm/error.ts:50-86）与
+# deepagents 0.7.24（_is_context_overflow + _aclip_overflow_tail keep=("tokens",1)）：
+# ① 多模式归类（9+ 文案 marker，不依赖单一 vLLM 文案）；
+# ② 确定性裁剪：大 ToolMessage 头尾保留、中间替换（幂等，不写 state）；
+# ③ 复用 _trim_input_for_budget 丢旧图（视觉 token 本地算 0，只能整条丢）；
+# ④ 失败保留原始错误上抛（不静默吞）。
+# 分层职责：guard=确定性止血（本次请求视图内），Summarization trigger（agent.py
+# 0.6 阈值）=下轮接管真摘要压缩（写 _summarization_event + offload）。
+
+# 上下文超限文案 marker（小写匹配）。前 9 个借 deepagents 0.7.24
+# _is_context_overflow；后 2 个借 deepseek-harness TOO_LARGE_FOR_CONTEXT 变体
+# 与 vLLM 旧版文案。
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "contextwindowexceedederror",
+    "maximum context length",
+    "exceeds the context window",
+    "exceeds the available context size",
+    "context window exceeded",
+    "context limit exceeded",
+    "input tokens exceed the configured limit",
+    "prompt is too long",
+    "too large for the model's context",
+    "too long for this model",
+)
+# 语义上属于「输入超限」的 HTTP 状态码（与 deepagents 0.7.24 一致）
+_CONTEXT_OVERFLOW_STATUS = {400, 413, 422}
+
+
+def _is_context_overflow_exc(exc: Exception) -> bool:
+    """判定异常是否为上下文超限（provider 无关的多模式归类）。
+
+    先看 status_code（langchain/openai 的 BadRequestError 有该属性；异常经多层
+    包装后类身份丢失，不能用 isinstance 精确匹配——2026-08 实测教训）。无
+    status_code 时退化为纯文案匹配（保守：宁可上抛也不误伤普通 400）。
+    """
+    status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    hit = any(m in text for m in _CONTEXT_OVERFLOW_MARKERS)
+    if status is None:
+        # 无状态码可依（已被包装）：仅当文案强特征命中才归类
+        return hit and ("context" in text or "token" in text)
+    return status in _CONTEXT_OVERFLOW_STATUS and hit
+
+
+def _proportional_margin(limit: int) -> int:
+    """F0：输出预留 margin 比例化——min(配置值, 10%×limit)。
+
+    settings.model_max_tokens_margin 默认 16384 是按 262144 窗口定的（6.25%）；
+    对 --max-model-len 32768 部署它是 50%，会把输出空间挤到 floor 1024，
+    回答被截。10% 下限保证小窗口仍有合理输出预算。
+    """
+    return min(settings.model_max_tokens_margin, max(limit // 10, 1))
+
+
+def _trim_large_tool_results(
+    msgs: list,
+    *,
+    threshold: int = 8192,
+    head: int = 4096,
+    tail: int = 1024,
+) -> list:
+    """确定性裁剪超大 ToolMessage content：头 head 字符 + 尾 tail 字符，中间
+    替换为标记。只裁 ToolMessage（工具结果可再生/可重查），Human/AI 消息不动。
+
+    幂等：对已裁剪的消息重复调用结果不变。不修改原对象，返回新列表（无命中时
+    返回原列表）。估算参考 deepseek-harness ToolResultPruner（>8192 → 头 4096/
+    尾 1024）与 deepagents 0.7.24 large_tool_results_prefix。
+    """
+    changed = False
+    out: list = []
+    for m in msgs:
+        if getattr(m, "type", "") != "tool":
+            out.append(m)
+            continue
+        content = getattr(m, "content", None)
+        if not isinstance(content, str) or len(content) <= threshold:
+            out.append(m)
+            continue
+        marker = (
+            f"\n\n[...trimmed {len(content) - head - tail} chars by model_call_guard "
+            f"(context overflow recovery); original tool result kept head {head} "
+            f"+ tail {tail} chars...]\n\n"
+        )
+        trimmed = type(m)(
+            content=content[:head] + marker + content[-tail:],
+            tool_call_id=getattr(m, "tool_call_id", None),
+            name=getattr(m, "name", None),
+        )
+        out.append(trimmed)
+        changed = True
+    if changed:
+        logger.warning(
+            "[DIAG] 400 恢复：裁剪超大 tool result（threshold=%d, head=%d, tail=%d）",
+            threshold, head, tail,
+        )
+    return out if changed else msgs
+
+
 def resolve_max_len(base_url: str, model_name: str, api_key: str) -> int:
     """拿真实上下文上限，按 (base_url, model_name) 缓存（多模型各自独立受益）。
 
@@ -702,7 +808,26 @@ async def model_call_guard(
         len(msgs), total_chars, total_tokens, settings.model_call_timeout_sec,
     )
 
-    # ─── 动态 max_tokens：按输入长度收紧，保证 prompt+max_tokens ≤ model_max_len ───
+    # ─── F0（2026-11-17）：per-model limit，废除全局覆写 ───
+    # 旧实现探活后 `settings.model_max_len = resolved`（:763）和 400 解析后
+    # `settings.model_max_len = real_limit`（:804）直接改写全局 Settings：
+    # 多模型并发时 A 用户连 32k 模型把全局写成 32768，B 用户的 Qwen 会话
+    # 下一调用拿错 limit（跨模型污染）。且 400 修正只写 settings 不写
+    # _MAX_LEN_CACHE → 下次探活用旧缓存回滚修正（竞态）。
+    # 新实现：limit 持有在局部 max_len（per (base_url, model_name) 缓存），
+    # 400 修正同写 _MAX_LEN_CACHE；settings.model_max_len 回归纯配置默认值。
+    # 探活移到动态 max_tokens 之前（旧实现在其后，探活结果下一轮才生效）。
+    _base = getattr(request.model, "openai_api_base", "") or settings.base_url
+    _mname = getattr(request.model, "model_name", "") or settings.model_name
+    _akey = getattr(request.model, "openai_api_key", "") or settings.openai_api_key
+    _max_len_key = (_base, _mname)
+    try:
+        max_len = await asyncio.to_thread(resolve_max_len, _base, _mname, _akey)
+    except Exception:
+        max_len = settings.model_max_len
+    margin = _proportional_margin(max_len)
+
+    # ─── 动态 max_tokens：按输入长度收紧，保证 prompt+max_tokens ≤ max_len ───
     # 优先用引擎真实 prompt_tokens（每会话缓存，含视觉 token，比本地估算准）；
     # 无缓存（首轮/cold）才退化本地估算（get_num_tokens_from_messages 对自定义模型名
     # 会 NotImplementedError，已被 try/except 兜成字符估算，低估图片但 400 兜底会纠正）。
@@ -722,14 +847,14 @@ async def model_call_guard(
             prompt_tokens = total_chars // 2
     effective_max = min(
         settings.model_max_tokens,
-        settings.model_max_len - prompt_tokens - settings.model_max_tokens_margin,
+        max_len - prompt_tokens - margin,
     )
     # 不再 floor 到 1：输入逼近/超上限时不锁死输出空间（曾导致死循环：max_tokens=1
     # → 模型零产出 → 无 AIMessage → 永不结束，见 docs/context-window-fix-draft.md v2）。
     # 改为砍输入（优先图片块）后保底 _MODEL_MIN_OUTPUT_TOKENS 输出空间。
     if effective_max < _MODEL_MIN_OUTPUT_TOKENS:
         msgs, prompt_tokens = _trim_input_for_budget(
-            msgs, settings.model_max_len, settings.model_max_tokens_margin,
+            msgs, max_len, margin,
             _MODEL_MIN_OUTPUT_TOKENS,
         )
         try:
@@ -740,7 +865,7 @@ async def model_call_guard(
             logger.warning("[DIAG] override(messages=...) 不支持，退化仅收紧 max_tokens")
         effective_max = max(
             _MODEL_MIN_OUTPUT_TOKENS,
-            settings.model_max_len - prompt_tokens - settings.model_max_tokens_margin,
+            max_len - prompt_tokens - margin,
         )
     if effective_max < settings.model_max_tokens:
         logger.warning(
@@ -753,23 +878,14 @@ async def model_call_guard(
         "max_tokens": effective_max,
     })
 
-    # 探活真实上限（同步、按 (base_url,model_name) 缓存，失败保留默认，不阻断）
-    try:
-        base = getattr(request.model, "openai_api_base", "") or settings.base_url
-        mname = getattr(request.model, "model_name", "") or settings.model_name
-        akey = getattr(request.model, "openai_api_key", "") or settings.openai_api_key
-        resolved = await asyncio.to_thread(resolve_max_len, base, mname, akey)
-        if resolved != settings.model_max_len:
-            settings.model_max_len = resolved
-    except Exception:
-        pass
-
-    # ─── 400 兜底：上下文超限 → 解析真实上限 → 收紧 max_tokens/trim → 重试 ───
-    # 这是唯一能扛住「token 计数低估中文」+「model_max_len 写死不准」的硬保险：
-    # 直接吃 API 自己的判决，不依赖任何本地假设，也**不依赖 deepagents 的
-    # ContextOverflowError 兜底**（已确认是死代码，见 docs/context-window-fix-draft.md）。
-    # 捕获用 `except Exception` + message 关键字，而非 `from openai import BadRequestError`
-    # 类捕获——避免异常经 langchain 多层包装后类身份丢失。最多重试 2 次，防无限循环。
+    # ─── 400 兜底（F1 重写，2026-11-17）：归类 → per-model limit 修正 →
+    #     确定性恢复（裁大 tool result → 丢旧图）→ 重试 → 失败原样上抛 ───
+    # 这是唯一能扛住「token 计数低估中文/图片」+「limit 探活失败」的硬保险：
+    # 直接吃 API 自己的判决，不依赖任何本地假设。捕获用 `except Exception`
+    # + _is_context_overflow_exc 多模式归类（9+ 文案 marker，不依赖 vLLM 单一
+    # 文案；不用 isinstance——异常经 langchain 多层包装后类身份丢失）。
+    # 旧实现「keep=max(4,len-10*(attempt+1)) 砍最老消息」方向反了：膨胀源在
+    # 尾部（f508e75c 5 轮 × 2 次重试 real_input 恒 262145，全部无效）。
     _MAX_CTX_RETRIES = 2
     attempt = 0
     while True:
@@ -789,42 +905,47 @@ async def model_call_guard(
                 f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
             ) from None
         except Exception as e:
-            parsed = _parse_context_error(str(e))
-            if parsed is None or attempt >= _MAX_CTX_RETRIES:
-                # 非上下文超限错误，或重试耗尽 → 原样上抛（由 chat.py/M3 处理）；
-                # 失败也记 duration（带 error.type），避免"只统计成功"高估耗时均值
+            # 归类：非上下文超限，或重试耗尽 → 原样上抛（保留原始错误，不静默吞）
+            if not _is_context_overflow_exc(e) or attempt >= _MAX_CTX_RETRIES:
                 _record_genai_metrics(
                     model_name=getattr(request.model, "model_name", None),
                     duration_s=time.perf_counter() - t0,
                     error_type=type(e).__name__,
                 )
-                raise  # 非上下文超限错误，或重试耗尽 → 原样上抛（由 chat.py/M3 处理）
-            real_limit, real_input = parsed
-            # 用 API 真实上限修正 settings（后续所有调用永久受益）
-            settings.model_max_len = real_limit
+                raise
+            # 从错误文案提取 (real_limit, real_input)——提取不到也要继续恢复
+            # （文案可能没有数字，但归类已确认是超限，恢复动作不依赖数值）
+            parsed = _parse_context_error(str(e))
+            real_limit, real_input = parsed if parsed else (max_len, 0)
+            # F0：per-model 修正——同写 _MAX_LEN_CACHE（防旧缓存回滚），不动全局 settings
+            _MAX_LEN_CACHE[_max_len_key] = real_limit
+            max_len = real_limit
+            margin = _proportional_margin(real_limit)
             logger.warning(
-                "[DIAG] 400 上下文超限 → 收紧重试 #%d: real_limit=%d, real_input=%d",
-                attempt + 1, real_limit, real_input,
+                "[DIAG] 400 上下文超限 → 确定性恢复 #%d: real_limit=%d, real_input=%d, "
+                "msgs=%d（裁剪 tool result → 丢旧图）",
+                attempt + 1, real_limit, real_input, len(msgs),
             )
-            # 重算 max_tokens：留 margin，保证 input + max_tokens ≤ real_limit
+            # ── 恢复动作（确定性、幂等、只影响本次请求视图，不写 state）──
+            # 第 1 步：裁超大 ToolMessage（头 4096/尾 1024；重试时阈值减半更激进）
+            threshold = 8192 if attempt == 0 else 4096
+            msgs = _trim_large_tool_results(msgs, threshold=threshold)
+            # 第 2 步：仍超预算 → 丢旧图 + 砍老消息（_trim_input_for_budget：
+            # 含图消息优先丢，本地对视觉 token 全瞎，只能整条丢）
+            est = sum(len(str(getattr(m, "content", ""))) // 2 for m in msgs)
+            if est + margin + _MODEL_MIN_OUTPUT_TOKENS > real_limit or attempt > 0:
+                msgs, _ = _trim_input_for_budget(
+                    msgs, real_limit, margin, _MODEL_MIN_OUTPUT_TOKENS,
+                )
+            try:
+                request = request.override(messages=msgs)
+            except Exception:
+                logger.warning("[DIAG] override(messages=...) 不支持，恢复降级")
+            # 重算 max_tokens：留比例化 margin，保证 input + max_tokens ≤ real_limit
             safe_max = max(
                 _MODEL_MIN_OUTPUT_TOKENS,
-                real_limit - real_input - settings.model_max_tokens_margin,
+                real_limit - real_input - margin,
             )
-            # 极端情况：input 本身就逼近/超过总上限，连 safe_max 都 ≤0 → 必须砍 input
-            if safe_max <= _MODEL_MIN_OUTPUT_TOKENS:
-                keep = max(4, len(msgs) - (attempt + 1) * 10)
-                trimmed = msgs[-keep:]
-                try:
-                    request = request.override(messages=trimmed)
-                    msgs = trimmed
-                except Exception:
-                    # ModelRequest.override(messages=...) 不支持时退化为仅收紧 max_tokens
-                    logger.warning("[DIAG] override(messages=...) 不支持，退化仅收紧 max_tokens")
-                safe_max = max(
-                    _MODEL_MIN_OUTPUT_TOKENS,
-                    real_limit - real_input // 2 - settings.model_max_tokens_margin,
-                )
             request = request.override(model_settings={
                 **request.model_settings,
                 "max_tokens": safe_max,
