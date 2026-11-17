@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import concurrent.futures
+from contextvars import ContextVar
 from typing import Annotated, NotRequired
 
 logger = logging.getLogger(__name__)
@@ -25,10 +26,12 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.utils import file_data_to_string
+import deepagents.graph
 from deepagents.graph import DeepAgentState
 from deepagents.middleware.summarization import (
     SummarizationEvent,
     SummarizationMiddleware,
+    SummarizationState,
 )
 from deepagents.middleware.skills import (
     SkillsMiddleware,
@@ -36,7 +39,7 @@ from deepagents.middleware.skills import (
     _alist_skills_with_errors,
     _list_skills_with_errors,
 )
-from langchain.agents.middleware.types import PrivateStateAttr
+from langchain.agents.middleware.types import AgentMiddleware, PrivateStateAttr
 from src.core import execution_guard
 from src.core.loop_detection import LoopDetectionMiddleware
 from src.core.skill_md import validate_skill_md
@@ -186,30 +189,20 @@ class _FreshSkillsMiddleware(SkillsMiddleware):
 class _SummarizationAccurate(SummarizationMiddleware):
     """精确计数版 Summarization：实现与默认完全一致，token_counter 更准。
 
-    ⚠ name 必须与默认实例同名（"SummarizationMiddleware"，A 修复 2026-11-17）：
-    deepagents graph.py 主链无条件创建默认 SummarizationMiddleware 实例，用户
-    middleware 经 _apply_custom_middleware 按 .name **原位替换**（graph.py:210
-    "If its .name matches a name still present in base: replace in-place"）。
-    本子类曾改名 "_SummarizationAccurate" 绕 langchain factory 重名断言 → 异名
-    不命中替换 → **两实例并存**，同一步各自触发摘要各自返回 Command →
-    checkpoint_writes 同 task 双写 _summarization_event → LastValue channel 抛
-    InvalidUpdateError 线程 brick（生产 GY35362:3c4b5588 实证，pending writes
-    idx3=默认实例/idx4=本实例）。同名后走替换路径：列表只有一个 Summarization
-    Middleware（本实例，geesun 配置生效），factory 去重断言自然不触发。
-    GY35362 取证与修法结论见 .workbuddy/memory/2026-11-17.md。
+    ⚠ 挂载机制（2026-11-17 动作二）：本类**不再经 user middleware 传入**——
+    deepagents 0.6.12 graph.py:801 在主链无条件创建默认实例，user middleware
+    再传必然两实例并存（双摘要检查 + pending writes 双写撞车，GY35362 实证）；
+    同名替换依赖 0.7+ 的 _apply_custom_middleware，0.6.12 无此函数（1.0.48
+    生产 500 实证：同名 → factory duplicate 断言全量炸）。现由 monkey-patch
+    deepagents.graph.create_summarization_middleware 在默认实例创建位直接产出
+    本类实例（包在 _SweepThenSummarize 组合件里保 budget 瘦身先序），主链与
+    gp subagent 天然单实例。升级 0.7 时删 patch，恢复 user middleware 传法。
+    取证与演进史见 .workbuddy/memory/2026-11-17.md。
 
     差异：挂载用 model.get_num_tokens 精确计数的 token_counter（中文 token 低估修复）。
     2026-08-17 追加：① cutoff 越界防御（恢复会话时 cutoff > 消息数的 bug）；
     ② 摘要生成后注入"当前会话真实资源清单"，避免 agent 恢复后 read_file 猜路径。
     """
-
-    # ⚠ 不设 name="SummarizationMiddleware"：同名替换依赖 deepagents 0.7+ 的
-    # _apply_custom_middleware；生产 deepagents 0.6.12 无该函数（user middleware
-    # 直接 append），同名会导致默认实例+本实例同名共存 → langchain factory
-    # duplicate 断言 → 每个请求 500（1.0.48 生产事故，2026-11-17）。
-    # 异名 = 双实例并存（每步双摘要烧 token），由 GeesunAgentState 的
-    # last-write-wins reducer 兜底不炸；根治走 patch create_summarization_middleware
-    # 或 deepagents 0.7 升级（另立任务）。
     def __init__(self, *args, inventory_provider=None, partial_token_counter=None, **kwargs):
         super().__init__(*args, **kwargs)
         # 回调返回"当前会话真实资源清单"文本（uploads/reports 文件 + 沙箱状态），
@@ -383,6 +376,118 @@ async def _store_adownload_files(self, paths):
     return responses
 
 StoreBackend.adownload_files = _store_adownload_files
+
+
+# ─── Monkey-patch: deepagents 0.6.12 主链 SummarizationMiddleware 换精确实例 ───
+# 背景（2026-11-17 动作二，动作一 1.0.49 止血后的根治）：
+#   deepagents 0.6.12 graph.py:801 在主链**无条件**创建默认 SummarizationMiddleware
+#   （近似计数 counter + 默认 trigger=("fraction",0.85)，见 summarization.py:34/281），
+#   且 user middleware 在其后 append（graph.py:806）⇒ 用户侧再传一个 Summarization
+#   必然两实例并存（双摘要检查烧 token + pending writes 双写撞车，GY35362 实证）；
+#   同名绕过依赖 0.7+ 的 _apply_custom_middleware 原位替换，0.6.12 无此函数
+#   （1.0.48 生产 500 实证：同名 → langchain factory duplicate 断言全量炸）。
+#   正解：patch deepagents.graph.create_summarization_middleware（名字已 from-import
+#   进 graph 命名空间，graph.py:55 —— patch deepagents.middleware.summarization 无效），
+#   主链创建"默认实例"的位置直接产出我们的精确实例，天然单实例。
+#   升级 deepagents 0.7 时删除本 patch，恢复 user middleware 传 Summarization 的写法
+#   （0.7 的 _apply_custom_middleware 会按 name 原位替换）。
+#
+# 为什么是组合中间件而不是裸 _SummarizationAccurate：
+#   L801 位置在 user middleware 之前 ⇒ wrap 链 first=outermost ⇒ 裸实例会跑到
+#   ToolOutputBudget **外面**，破坏 budget 模块头论证过的位置不变量
+#   （"budget 必须先瘦身，Summarization/guard 才算得准"）。组合件把 budget 的
+#   wrap_model_call（幂等 sweep）与 summarization 的 wrap_model_call 手动按原序
+#   组合，等价于把这两个钩子按原相对位置放在 L801 槽位。
+#   state_schema=SummarizationState：deepagents graph.py:841 的
+#   private_state_field_names 只扫顶层列表 middleware 的 state_schema 属性，
+#   组合件不带会把 SummarizationState 的私有字段（_summarization_event）从
+#   private_state_keys 收集里藏掉。带上后与"裸实例直接在列表里"完全等价；
+#   GeesunAgentState（state_schema= 参数）的 reducer 覆盖依旧后到后赢。
+#
+# gp subagent 副作用（知情接受，方案已批）：graph.py:725 的 general-purpose
+#   subagent 传同一个 model 对象，同样命中 patch ⇒ 它的摘要也升级为精确定数 +
+#   0.6 trigger + budget sweep（原为默认 0.85 + 近似计数、无 budget）。gp 与主链
+#   同会话同沙箱，inventory_provider 闭包语义成立；每次调用新建实例，无共享态。
+#
+# ContextVar 而非模块全局：per-session 配置（trigger/counter/inventory 闭包）由
+#   create_agent 在调 create_deep_agent 前 set、finally reset；asyncio 每任务独立
+#   context，多请求并发构建不串参。未设 ctx（或 model 不匹配）⇒ 原函数透传，
+#   进程内其它 create_deep_agent 调用点行为不变。
+
+_SUMMARY_MW_CTX: ContextVar = ContextVar("geesun_summary_mw_ctx", default=None)
+
+_ORIGINAL_CREATE_SUMMARIZATION_MW = deepagents.graph.create_summarization_middleware
+
+
+def _patched_create_summarization_middleware(model, backend, **kwargs):
+    """替换 deepagents.graph 的默认 SummarizationMiddleware 工厂（见模块头说明）。"""
+    ctx = _SUMMARY_MW_CTX.get()
+    if ctx is not None and model is ctx["model"]:
+        sum_mw = _SummarizationAccurate(model=model, backend=backend, **ctx["kwargs"])
+        return _SweepThenSummarize(ctx["budget"], sum_mw)
+    return _ORIGINAL_CREATE_SUMMARIZATION_MW(model, backend, **kwargs)
+
+
+class _SweepThenSummarize(AgentMiddleware):
+    """wrap_model_call 组合件：budget 瘦身 → summarization（保原链序）。
+
+    只组合这两个钩子；其余钩子（budget 的 wrap_tool_call 等）仍由 user
+    middleware 列表里的同一个 budget 实例提供。budget 实例共享 ⇒ 其
+    wrap_model_call 会在组合件（外层）和 user middleware（内层）各跑一次，
+    sweep 幂等（已 externalize 的 stub 再扫一遍是 no-op），无害。
+    """
+
+    # deepagents graph.py:841 private_state_field_names 扫此属性（见上）；
+    # SummarizationState 的 _summarization_event 注解随后被 GeesunAgentState
+    # 的 reducer 版覆盖（factory 聚合 base_state 排最后）。
+    state_schema = SummarizationState
+
+    def __init__(self, sweep, summarization):
+        self._sweep = sweep
+        self._sum = summarization
+
+    def wrap_model_call(self, request, handler):
+        return self._sweep.wrap_model_call(
+            request,
+            lambda req: self._sum.wrap_model_call(req, handler),
+        )
+
+    async def awrap_model_call(self, request, handler):
+        return await self._sweep.awrap_model_call(
+            request,
+            lambda req: self._sum.awrap_model_call(req, handler),
+        )
+
+
+# 版本闸门（fail-fast，1.0.48 教训：错配必须 import 时炸，不能等运行时静默错行为）：
+# patch 依赖 0.6.12 的 graph.py 结构（L801 无条件调用 + L725 gp 同 model 对象 +
+# 无 _apply_custom_middleware）。0.7+ 有官方替换入口，应删除本 patch 改回
+# user middleware 传法。openai 主仓部署环境的 deepagents 版本以 pyproject 锁定为准。
+# 逃生阀 GEESUN_ALLOW_DEEPAGENTS_MISMATCH=1：仅供本地 0.7+ 开发/测试 venv 跑
+# 单测用（跳过 patch 并 error 级日志，不炸 import）；生产镜像**绝不**设置该变量
+# ——设置后 0.7 下 Summarization 落回默认实例（近似计数 + 0.85 trigger）。
+import importlib.metadata as _im
+
+_deepagents_ver = _im.version("deepagents")
+_major_minor = tuple(int(p) for p in _deepagents_ver.split(".")[:2])
+if _major_minor != (0, 6):
+    _ver_msg = (
+        f"deepagents {_deepagents_ver} 与 SummarizationMiddleware monkey-patch 不兼容："
+        "本 patch 仅适用 0.6.x（graph.py:801 无条件创建默认实例）。升级 0.7+ 时请删除"
+        "agent.py 的 patch 块与 _SUMMARY_MW_CTX，恢复 user middleware 传 Summarization"
+        "（0.7 _apply_custom_middleware 按 name 原位替换）。"
+    )
+    if os.environ.get("GEESUN_ALLOW_DEEPAGENTS_MISMATCH", "").strip() == "1":
+        logger.error("[PATCH-SKIPPED] %s", _ver_msg)
+    else:
+        raise RuntimeError(_ver_msg)
+else:
+    deepagents.graph.create_summarization_middleware = _patched_create_summarization_middleware
+    logger.info(
+        "[PATCH] deepagents %s create_summarization_middleware → _SweepThenSummarize("
+        "budget sweep → _SummarizationAccurate) 已接管主链/gp subagent 默认实例创建",
+        _deepagents_ver,
+    )
 
 # AGENTS.md 虚拟路径，由 memory= 参数始终注入系统提示词（平台通用规则）
 # 注意：使用独立的 agent-memory 路由，所有用户共享同一份 AGENTS.md
@@ -1262,9 +1367,11 @@ async def create_agent(
     #      coding session，本项目单条偏大，故取 0.10 而非 0.16）。
     #   ③ ⚠ 必须同时传 partial_token_counter，否则二分退化（详见
     #      _install_partial_token_counter 与 tests/spikes/summarization_keep_semantics.py）。
-    summarization_mw = _SummarizationAccurate(
-        model=model,
-        backend=backend,
+    # 动作二（2026-11-17）：本实例不再进 user middleware——经 _SUMMARY_MW_CTX
+    # 传给 patched create_summarization_middleware，在 deepagents graph.py:801
+    # 默认实例创建位产出（包 _SweepThenSummarize 组合件，budget 瘦身先序不变），
+    # 主链/gp subagent 单实例（详见 patch 块注释）。
+    summarization_kwargs = dict(
         trigger=("fraction", 0.6),  # 按 model.profile["max_input_tokens"] 的 0.6 触发（F2，2026-11-17 由 0.8 下调）
         keep=("fraction", 0.10),    # 最近 10% 窗口原样保留（有硬上界，见上）
         token_counter=_engine_grounded_counter,  # trigger：引擎真实 prompt_tokens 优先，cold 才退化估算
@@ -1272,6 +1379,112 @@ async def create_agent(
         inventory_provider=_build_inventory_provider(user_id, session_id, sandbox),
     )
 
+    # 工具结果体积闸门实例提前构造（2026-11-17 动作二）：同一实例进 user
+    # middleware（wrap_tool_call 源侧瘦身，位置论证见下）+ 传给 patch 组合件
+    # （wrap_model_call 模型侧瘦身，在 L801 槽位先于 Summarization 执行）。
+    budget_mw = ToolOutputBudgetMiddleware(
+        backend=backend,
+        enabled=settings.tool_output_budget_enabled,
+        externalize_min_chars=settings.tool_output_externalize_min_chars,
+        fallback_max_chars=settings.tool_output_fallback_max_chars,
+    )
+
+    summary_ctx_token = _SUMMARY_MW_CTX.set(
+        {"model": model, "budget": budget_mw, "kwargs": summarization_kwargs}
+    )
+    try:
+        return _build_deep_agent(
+            model=model,
+            tools=tools,
+            backend=backend,
+            skills=skills,
+            middleware=[
+                # ★ 每轮重扫 skill 源（绕过 checkpoint 固化），排在链首：
+                # 其 abefore_agent 先刷新 state["skills_metadata"]，随后默认
+                # SkillsMiddleware.modify_request 注入的就是最新 skill 清单
+                # （2026-08-19 实证：默认固化导致新上传 skill 永不进上下文）
+                _FreshSkillsMiddleware(backend=backend, sources=skills),
+                switch_model,
+                file_to_image,
+                # ★ 工具结果体积闸门（2026-10-10 新增）。位置是**论证过的**，不是随手插的：
+                #   ① wrap_tool_call（源侧瘦身）必须排在这里：相对 deepagents 的
+                #      FilesystemMiddleware 我们必然在内层（用户中间件被插在
+                #      base stack 之后，graph.py:367）—— 内层正是需要的：只有在那里
+                #      改写 result，改写才能随返回上行并写进 state。
+                #      详见 src/core/tool_output_budget.py 模块头。
+                #   ② wrap_model_call（模型侧兜底 sweep）2026-11-17 动作二起由
+                #      同一实例**同时**经 patch 组合件 _SweepThenSummarize 在
+                #      deepagents graph.py:801 槽位执行（先于 Summarization 计数，
+                #      保持"先瘦身再算数"不变量）；本位置的 wrap_model_call 再跑
+                #      一遍是幂等 no-op，留作纵深防御。
+                #   ③ 必须在 file_to_image **之后**：后者把图片 file block 转
+                #      image_url（Qwen 视觉），先转再瘦身，避免把待转的 base64
+                #      文本当超限结果处置。
+                budget_mw,
+                # ★ 按总字符估 prompt_tokens 并动态收紧 max_tokens：budget 已在
+                #   其前（组合件外层 + 本列表）瘦身，guard 才算得准。
+                model_call_guard,
+                # ★ 链尾守卫之一：防"工具全成功但整体不收敛"烧满 recursion_limit。
+                # 两段式：≥warn_threshold 次重复 → 软提醒（wrap_model_call 注入 human msg）；
+                # ≥hard_limit 次 → 剥离 tool_calls 逼模型出纯文本（不抛异常，SSE 不中断）。
+                # 阈值从 settings 读（config.py loop_detect_*）。2026-09-08 移植 deer-flow。
+                LoopDetectionMiddleware(
+                    warn_threshold=settings.loop_detect_warn_threshold,
+                    hard_limit=settings.loop_detect_hard_limit,
+                    tool_freq_warn=settings.loop_detect_tool_freq_warn,
+                    tool_freq_hard_limit=settings.loop_detect_tool_freq_hard,
+                    # ★ 2026-10-17 补：绝对次数阈值会被第二种工具结构性稀释
+                    #   （83345f0c：execute 累计 24 次但 20 窗口内最多 16 < hard=20，
+                    #    硬停在结构上不可能触发），故加占比 + 交替循环两个形态判据，
+                    #   且只在"窗口内零交付物"时生效（防误杀跑 build/批量处理类长任务）。
+                    tool_freq_ratio=settings.loop_detect_tool_ratio_threshold,
+                    min_window_fill=settings.loop_detect_min_window_fill,
+                    alternating_min_run=settings.loop_detect_alternating_min_run,
+                    # ★ 2026-10-20 补：以上判据都只看「调用形态」，而 submit-and-poll
+                    #   型工具（ocr_pdf_to_text）的正常形态**就是**同参反复续查
+                    #   （262 页 ≈110 分钟 ⇒ 约 22 次 wait_seconds=300 的续查）。
+                    #   只看形态必然把大任务误杀在第 5 次（add0229b 实测：模型被
+                    #   硬停后只能回答"PDF 没上传/任务失败"）。豁免判据看**结果侧**
+                    #   有没有客观进展（status=running / pages_ocred 增长），真死
+                    #   循环的输出是立即报错或空返回，区分度清晰。
+                    progress_exempt_max=settings.loop_detect_progress_exempt_max,
+                ),
+                # ★★ 必须在**列表末尾**（LoopDetection 之后）。2026-09-11 新增，
+                # 堵「模型吐空响应但流程当正常结束」——生产会话 GY24428:0f6d781d
+                # 末次调用 336s 后返回完全空响应（content 空 + tool_calls 空），
+                # loop 直接判结束，M3 完成门看到 /reports 为空 → 输出「本轮任务未产出
+                # 任何交付物…请检查是否遗漏 download_from_sandbox / write_file 步骤」，
+                # 把「模型没说话」误报成「你没下载作业」。详见 src/core/terminal_response.py。
+                #
+                # 为什么必须在末尾（非风格问题，是正确性前提）：
+                # langchain 1.3.13 factory.py:1738 `add_edge("model", w_after_model[-1].name)`
+                # + `range(len-1, 0, -1)` → **after_model 逆序执行，最后注册的最先看到模型输出**。
+                # 若注册在 LoopDetection 之前，LoopDetection 会先给消息追加软提醒/硬停文案
+                # （loop_detection.py 的 `_apply` 同款注入），使其 content 非空，
+                # 本中间件的判空即被绕过 → **反而漏掉真正的空响应**。
+                #
+                # 代价（已实测确认可接受）：`jump_to="model"` 会短路 after_model 静态链，
+                # 被判空的那一条消息不会再流经 LoopDetection（实测模型调用 2 次、
+                # LoopDetection 仅 1 次）。两者职责天然不重叠——空响应轮次没有 tool_calls
+                # 参与循环判定，交给本中间件独立处置更干净。
+                TerminalResponseMiddleware(
+                    max_retries=settings.terminal_response_max_retries,
+                ),
+            ],
+            checkpointer=checkpointer,
+        )
+    finally:
+        _SUMMARY_MW_CTX.reset(summary_ctx_token)
+
+
+def _build_deep_agent(*, model, tools, backend, skills, middleware, checkpointer):
+    """create_deep_agent 薄封装：保留原调用参数与位置论证注释（动作二 2026-11-17）。
+
+    拆出来是为了让 create_agent 的 try/finally（ContextVar reset）只包住
+    create_deep_agent 一行调用，middleware 构造注释不缩进变形。
+    SummarizationMiddleware 不在此列表——经 patch 在 deepagents graph.py:801
+    默认实例创建位产出（_SweepThenSummarize 组合件，见模块级 patch 块注释）。
+    """
     return create_deep_agent(
         model=model,
         tools=tools,
@@ -1279,85 +1492,7 @@ async def create_agent(
         system_prompt=PLC_AUDITOR_SYSTEM_PROMPT,
         skills=skills,
         memory=[AGENTS_MD_PATH],
-        middleware=[
-            # ★ 每轮重扫 skill 源（绕过 checkpoint 固化），排在链首：
-            # 其 abefore_agent 先刷新 state["skills_metadata"]，随后默认
-            # SkillsMiddleware.modify_request 注入的就是最新 skill 清单
-            # （2026-08-19 实证：默认固化导致新上传 skill 永不进上下文）
-            _FreshSkillsMiddleware(backend=backend, sources=skills),
-            switch_model,
-            file_to_image,
-            # ★ 工具结果体积闸门（2026-10-10 新增）。位置是**论证过的**，不是随手插的：
-            #   ① 必须在 summarization_mw / model_call_guard **之前**（wrap_* 链
-            #      "first = outermost"，见 langchain factory.py:629 与 AgentMiddleware
-            #      文档 "first in list as outermost layer"）：两者都按
-            #      `request.messages` 的体量算数（Summarization 按 token 触发、
-            #      model_call_guard 按总字符估 prompt_tokens 并动态收紧 max_tokens），
-            #      本中间件先瘦身，它们才算得准；
-            #   ② 必须在 file_to_image **之后**：后者把图片 file block 转 image_url
-            #      （Qwen 视觉），先转再瘦身，避免把待转的 base64 文本当超限结果处置；
-            #   ③ 必须在 LoopDetection / TerminalResponse **之前**：TerminalResponse 的
-            #      正确性前提是"注册在末尾"（见其下方长注释），插在后面会破坏它。
-            #   为什么 wrap_tool_call 侧位置无所谓：本项目没有其它 user middleware
-            #   实现 wrap_tool_call（实测 grep 为空），而相对 deepagents 的
-            #   FilesystemMiddleware 我们必然在内层（用户中间件被插在 base stack 之后，
-            #   graph.py:367）—— 内层正是需要的：只有在那里改写 result，改写才能随返回
-            #   上行并写进 state。详见 src/core/tool_output_budget.py 模块头。
-            ToolOutputBudgetMiddleware(
-                backend=backend,
-                enabled=settings.tool_output_budget_enabled,
-                externalize_min_chars=settings.tool_output_externalize_min_chars,
-                fallback_max_chars=settings.tool_output_fallback_max_chars,
-            ),
-            summarization_mw,
-            model_call_guard,
-            # ★ 链尾最后一道守卫：防"工具全成功但整体不收敛"烧满 recursion_limit。
-            # 两段式：≥warn_threshold 次重复 → 软提醒（wrap_model_call 注入 human msg）；
-            # ≥hard_limit 次 → 剥离 tool_calls 逼模型出纯文本（不抛异常，SSE 不中断）。
-            # 阈值从 settings 读（config.py loop_detect_*）。2026-09-08 移植 deer-flow。
-            LoopDetectionMiddleware(
-                warn_threshold=settings.loop_detect_warn_threshold,
-                hard_limit=settings.loop_detect_hard_limit,
-                tool_freq_warn=settings.loop_detect_tool_freq_warn,
-                tool_freq_hard_limit=settings.loop_detect_tool_freq_hard,
-                # ★ 2026-10-17 补：绝对次数阈值会被第二种工具结构性稀释
-                #   （83345f0c：execute 累计 24 次但 20 窗口内最多 16 < hard=20，
-                #    硬停在结构上不可能触发），故加占比 + 交替循环两个形态判据，
-                #    且只在"窗口内零交付物"时生效（防误杀跑 build/批量处理类长任务）。
-                tool_freq_ratio=settings.loop_detect_tool_ratio_threshold,
-                min_window_fill=settings.loop_detect_min_window_fill,
-                alternating_min_run=settings.loop_detect_alternating_min_run,
-                # ★ 2026-10-20 补：以上判据都只看「调用形态」，而 submit-and-poll
-                #   型工具（ocr_pdf_to_text）的正常形态**就是**同参反复续查
-                #   （262 页 ≈110 分钟 ⇒ 约 22 次 wait_seconds=300 的续查）。
-                #   只看形态必然把大任务误杀在第 5 次（add0229b 实测：模型被
-                #   硬停后只能回答"PDF 没上传/任务失败"）。豁免判据看**结果侧**
-                #   有没有客观进展（status=running / pages_ocred 增长），真死
-                #   循环的输出是立即报错或空返回，区分度清晰。
-                progress_exempt_max=settings.loop_detect_progress_exempt_max,
-            ),
-            # ★★ 必须在**列表末尾**（LoopDetection 之后）。2026-09-11 新增，
-            # 堵「模型吐空响应但流程当正常结束」——生产会话 GY24428:0f6d781d
-            # 末次调用 336s 后返回完全空响应（content 空 + tool_calls 空），
-            # loop 直接判结束，M3 完成门看到 /reports 为空 → 输出「本轮任务未产出
-            # 任何交付物…请检查是否遗漏 download_from_sandbox / write_file 步骤」，
-            # 把「模型没说话」误报成「你没下载作业」。详见 src/core/terminal_response.py。
-            #
-            # 为什么必须在末尾（非风格问题，是正确性前提）：
-            # langchain 1.3.13 factory.py:1738 `add_edge("model", w_after_model[-1].name)`
-            # + `range(len-1, 0, -1)` → **after_model 逆序执行，最后注册的最先看到模型输出**。
-            # 若注册在 LoopDetection 之前，LoopDetection 会先给消息追加软提醒/硬停文案
-            # （loop_detection.py 的 `_apply` 同款注入），使其 content 非空，
-            # 本中间件的判空即被绕过 → **反而漏掉真正的空响应**。
-            #
-            # 代价（已实测确认可接受）：`jump_to="model"` 会短路 after_model 静态链，
-            # 被判空的那一条消息不会再流经 LoopDetection（实测模型调用 2 次、
-            # LoopDetection 仅 1 次）。两者职责天然不重叠——空响应轮次没有 tool_calls
-            # 参与循环判定，交给本中间件独立处置更干净。
-            TerminalResponseMiddleware(
-                max_retries=settings.terminal_response_max_retries,
-            ),
-        ],
+        middleware=middleware,
         interrupt_on={
             "write_file": False,
             "read_file": False,

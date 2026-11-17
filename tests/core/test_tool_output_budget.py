@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -406,8 +407,11 @@ def _agent_tree():
 
 
 def _middleware_order(tree) -> list[str]:
+    # 动作二（2026-11-17）：user middleware 列表构造于 create_agent、经
+    # _build_deep_agent(middleware=[...]) 传入；SummarizationMiddleware 不在
+    # 列表里——经 monkey-patch 挂到 deepagents graph.py:801 默认实例创建位。
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "create_deep_agent":
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_build_deep_agent":
             for kw in node.keywords:
                 if kw.arg != "middleware":
                     continue
@@ -419,21 +423,22 @@ def _middleware_order(tree) -> list[str]:
                         f = elt.func
                         order.append(getattr(f, "id", None) or getattr(f, "attr", None) or "")
                 return order
-    raise AssertionError("create_deep_agent(middleware=[...]) 未找到")
+    raise AssertionError("_build_deep_agent(middleware=[...]) 未找到")
 
 
 def test_middleware_is_registered_in_expected_position():
     order = _middleware_order(_agent_tree())
-    assert "ToolOutputBudgetMiddleware" in order, "中间件未注册 —— 等于没修"
+    assert "budget_mw" in order, "中间件未注册 —— 等于没修"
 
-    idx = order.index("ToolOutputBudgetMiddleware")
+    idx = order.index("budget_mw")
     assert order.index("file_to_image") < idx, (
         "必须在 file_to_image 之后：先让它把图片 file block 转成 image_url，"
         "再做瘦身，否则待转的 base64 文本会被当超限结果处置"
     )
-    assert idx < order.index("summarization_mw"), (
-        "必须在 summarization_mw 之前（wrap_* 链 first=outermost）："
-        "Summarization 按 request.messages 的体量算触发，先瘦身它才算得准"
+    assert "summarization_mw" not in order, (
+        "动作二（2026-11-17）后 Summarization 不得再经 user middleware 传入："
+        "0.6.12 主链 graph.py:801 无条件创建默认实例，再传必然双实例"
+        "（GY35362 双写 brick）。现由 patch 挂到默认实例创建位"
     )
     assert idx < order.index("model_call_guard"), (
         "必须在 model_call_guard 之前：它按总字符估 prompt_tokens 并动态收紧 max_tokens"
@@ -441,6 +446,37 @@ def test_middleware_is_registered_in_expected_position():
     assert idx < order.index("LoopDetectionMiddleware") < order.index("TerminalResponseMiddleware"), (
         "TerminalResponseMiddleware 的正确性前提是注册在末尾（见其源码长注释），"
         "本中间件不得插到它后面"
+    )
+
+
+def test_summarization_patch_preserves_budget_before_summarize_order():
+    """动作二接线的三重契约（AST/文本级，2026-11-17）。
+
+    patch 后 Summarization 挂在 deepagents graph.py:801 槽位（user middleware
+    之前 = wrap 链更外层）。"budget 先瘦身、Summarization 才算得准"的不变量
+    由此改由 _SweepThenSummarize 组合件保证：sweep 的 wrap_model_call 在外层
+    手动包住 summarization 的 wrap_model_call。
+    """
+    src = AGENT_PY.read_text(encoding="utf-8")
+    # ① patch 确实接管了 deepagents.graph 命名空间（graph.py:55 是 from-import，
+    #    patch deepagents.middleware.summarization 无效）
+    assert (
+        "deepagents.graph.create_summarization_middleware = "
+        "_patched_create_summarization_middleware"
+    ) in src, "patch 未落到 deepagents.graph 命名空间"
+    # ② 组合件内 sweep 先于 summarization（保序核心）
+    assert re.search(
+        r"self\._sweep\.wrap_model_call\(\s*request,\s*lambda req: self\._sum\.wrap_model_call",
+        src,
+    ), "_SweepThenSummarize 组合序缺失或顺序颠倒（summarization 必须在 sweep 内层）"
+    assert re.search(
+        r"self\._sweep\.awrap_model_call\(\s*request,\s*lambda req: self\._sum\.awrap_model_call",
+        src,
+    ), "_SweepThenSummarize 异步组合序缺失或顺序颠倒"
+    # ③ create_agent 的 create_deep_agent 调用被 ctx.set/reset 包住
+    #    （否则 patched 透传原工厂，构建回退默认实例）
+    assert "_SUMMARY_MW_CTX.set(" in src and "_SUMMARY_MW_CTX.reset(" in src, (
+        "ContextVar set/reset 缺失：patch 拿不到 per-session 配置"
     )
 
 
