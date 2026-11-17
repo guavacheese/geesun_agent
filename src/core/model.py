@@ -102,8 +102,13 @@ def _extract_tokens(resp) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _capture_usage(resp, request) -> None:
+def _capture_usage(resp, request, *, extra_tokens: int = 0) -> None:
     """每次模型成功回复后，把引擎真实 prompt_tokens 存进每会话缓存（含视觉 token）。
+
+    extra_tokens（2026-11-17 F1 修复②）：400 恢复路径下 usage 对应的是**裁剪后**
+    的请求视图而非真实 state 体量，直接回写会把缓存压小 → trigger 永远够不着 →
+    每步白付一次 400 税。恢复成功后由调用方传入被裁字符的 token 估算做补偿
+    （chars//2 与本地估算同口径，低估方向安全——trigger 宁早勿晚）。
 
     告警策略（2026-09-11 改）：原实现用 `_no_usage_warned` 全局只打一次 WARNING，
     **会把 100% 失败伪装成偶发**——实测生产一条警告、成功分支 0 条，极易被误读成
@@ -142,7 +147,7 @@ def _capture_usage(resp, request) -> None:
             )
         return
     _usage_ok_count += 1
-    _session_prompt_tokens[sid] = real_in
+    _session_prompt_tokens[sid] = real_in + extra_tokens
     # 简单防泄漏：长驻服务会话数不会过千，超限清一次（仅少量会话退化 cold，可接受）
     if len(_session_prompt_tokens) > 2000:
         _session_prompt_tokens.clear()
@@ -888,6 +893,10 @@ async def model_call_guard(
     # 尾部（f508e75c 5 轮 × 2 次重试 real_input 恒 262145，全部无效）。
     _MAX_CTX_RETRIES = 2
     attempt = 0
+    # 恢复路径累计裁掉的字符数：① 用于裁剪后重算 safe_max（400 报的 real_input
+    # 是裁剪前全量值，直接算会把输出 floor 到 1024 截断长回答——2026-11-17 实测
+    # 推演缺陷）；② 成功后补回缓存，防裁剪视图掩盖真实体量（见 _capture_usage）
+    recovered_removed_chars = 0
     while True:
         t0 = time.perf_counter()  # GenAI 指标：仅统计本次尝试的墙钟耗时（重试间不计）
         try:
@@ -927,6 +936,7 @@ async def model_call_guard(
                 attempt + 1, real_limit, real_input, len(msgs),
             )
             # ── 恢复动作（确定性、幂等、只影响本次请求视图，不写 state）──
+            chars_before = sum(len(str(getattr(m, "content", ""))) for m in msgs)
             # 第 1 步：裁超大 ToolMessage（头 4096/尾 1024；重试时阈值减半更激进）
             threshold = 8192 if attempt == 0 else 4096
             msgs = _trim_large_tool_results(msgs, threshold=threshold)
@@ -937,14 +947,28 @@ async def model_call_guard(
                 msgs, _ = _trim_input_for_budget(
                     msgs, real_limit, margin, _MODEL_MIN_OUTPUT_TOKENS,
                 )
+            chars_after = sum(len(str(getattr(m, "content", ""))) for m in msgs)
+            removed_chars = max(0, chars_before - chars_after)
+            recovered_removed_chars += removed_chars
             try:
                 request = request.override(messages=msgs)
             except Exception:
                 logger.warning("[DIAG] override(messages=...) 不支持，恢复降级")
-            # 重算 max_tokens：留比例化 margin，保证 input + max_tokens ≤ real_limit
+            # 重算 max_tokens：input 用「400 真值 − 被裁 token 估算」而不是裁剪前
+            # 的 real_input——后者会让 safe_max 负数 floor 到 1024，长回答被腰斩
+            input_after_trim = max(
+                0, real_input - removed_chars // 2,
+            )
             safe_max = max(
                 _MODEL_MIN_OUTPUT_TOKENS,
-                real_limit - real_input - margin,
+                real_limit - input_after_trim - margin,
+            )
+            logger.warning(
+                "[DIAG] 恢复重试 #%d: 裁剪 %d 字符（≈%d tokens）→ 输入估计 %d → "
+                "max_tokens=%d（旧算法会得 %d）",
+                attempt + 1, removed_chars, removed_chars // 2, input_after_trim,
+                safe_max,
+                max(_MODEL_MIN_OUTPUT_TOKENS, real_limit - real_input - margin),
             )
             request = request.override(model_settings={
                 **request.model_settings,
@@ -952,8 +976,17 @@ async def model_call_guard(
             })
             attempt += 1
             continue
-        # 成功路径（未抛异常）：捕获引擎真实 prompt_tokens 回写每会话缓存，再返回
-        _capture_usage(resp, request)
+        # 成功路径（未抛异常）：捕获引擎真实 prompt_tokens 回写每会话缓存，再返回。
+        # 恢复路径下 usage 对应裁剪后的请求视图，直接回写会把缓存压小、掩盖真实
+        # state 体量 → trigger 永远够不着 → 每步白付一次 400 税（2026-11-17 推演
+        # 缺陷②）。补回被裁字符的 token 估算（chars//2 同口径，低估方向安全）。
+        _capture_usage(resp, request, extra_tokens=recovered_removed_chars // 2)
+        if recovered_removed_chars:
+            logger.warning(
+                "[DIAG] 400 恢复成功：缓存补回 ≈%d tokens（累计裁剪 %d 字符），"
+                "防裁剪视图掩盖 trigger",
+                recovered_removed_chars // 2, recovered_removed_chars,
+            )
         # GenAI 指标打点（标准 semconv 名；metrics 未启用时 no-op 静默，零风险）
         real_in, real_out = _extract_tokens(resp)
         _record_genai_metrics(

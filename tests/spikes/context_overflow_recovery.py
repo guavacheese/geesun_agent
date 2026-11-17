@@ -216,6 +216,22 @@ check(
 )
 check("重试 max_tokens 被收紧到安全值", calls["max_tokens"][-1] < 200000, str(calls["max_tokens"]))
 check(
+    "重试 max_tokens 用裁剪后输入重算（不再 floor 到 1024）",
+    calls["max_tokens"][-1] > m._MODEL_MIN_OUTPUT_TOKENS,
+    f"got {calls['max_tokens']}",
+)
+# 精确值核对：removed = 被裁字符数；expected = limit - (262145 - removed//2) - margin(16384)
+_trimmed_tool_len = len(calls["msgs"][2].content)
+_removed_chars = 50000 - _trimmed_tool_len
+_expected_safe_max = max(
+    m._MODEL_MIN_OUTPUT_TOKENS, 262144 - (262145 - _removed_chars // 2) - 16384
+)
+check(
+    "safe_max 数值 = limit − (real_input − 被裁token估算) − margin",
+    calls["max_tokens"][-1] == _expected_safe_max,
+    f"got {calls['max_tokens'][-1]}, expected {_expected_safe_max}",
+)
+check(
     "per-model 缓存仍为探活值（未被污染）",
     m._MAX_LEN_CACHE[("http://fake:8003/v1", "Qwen3.6-35B-A3B")] == 262144,
 )
@@ -285,6 +301,44 @@ check(
     "400 解析的 real_limit=32768 回写 per-model 缓存（纠正探活旧值）",
     fixed == 32768,
     f"got {fixed}",
+)
+
+print("\n[7] 恢复成功后缓存补回被裁 token（防裁剪视图掩盖 trigger）")
+
+
+async def run_guard_cache_comp():
+    """400 → 裁剪恢复 → 成功返回带 usage 的 AIMessage。
+    断言会话缓存 = usage.input_tokens + 被裁字符的 token 估算。"""
+    m._MAX_LEN_CACHE[("http://fake:8003/v1", "Qwen3.6-35B-A3B")] = 262144
+    m._session_prompt_tokens.pop("spike-session", None)
+    state = {"n": 0, "trimmed_tool_len": None}
+
+    async def handler(request):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise FakeBadRequest(VLLM_MSG)
+        state["trimmed_tool_len"] = len(request.messages[2].content)
+        return AIMessage(
+            content="ok",
+            usage_metadata={
+                "input_tokens": 123456,
+                "output_tokens": 100,
+                "total_tokens": 123556,
+            },
+        )
+
+    from src.core.model import model_call_guard
+
+    await model_call_guard.awrap_model_call(_make_request(), handler)
+    return m._session_prompt_tokens.get("spike-session"), state
+
+
+cache_val, st = asyncio.run(run_guard_cache_comp())
+_removed_est = (50000 - st["trimmed_tool_len"]) // 2
+check(
+    "恢复成功后缓存 = usage.input_tokens + 被裁 token 估算",
+    cache_val == 123456 + _removed_est,
+    f"got {cache_val}, expected {123456 + _removed_est}",
 )
 
 print(f"\n{'=' * 60}")
