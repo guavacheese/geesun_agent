@@ -219,13 +219,15 @@ check(
     f"got {type(channels.get(SUMMARIZATION_EVENT_KEY)).__name__}",
 )
 
-# ── 5. A 修复（2026-11-17）：同名替换消除双实例 ────────────────────────
-# 双写 _summarization_event 的真正根因（GY35362 取证，见 memory/2026-11-17.md）：
-# deepagents 主链无条件创建默认 SummarizationMiddleware，_SummarizationAccurate
-# 曾异名绕 factory 去重断言 → _apply_custom_middleware 不命中替换 → 两实例并存，
-# 同一步各自触发摘要各自写 event。恢复同名后走原位替换，列表只剩一个。
+# ── 5. name 策略（2026-11-17 修订）：异名保命，双实例由 reducer 兜底 ────
+# 演进史：① 异名绕 factory 断言 → 0.6.12 双实例并存双写（GY35362 brick）；
+# ② 同名想走 0.7 的 _apply_custom_middleware 原位替换 → 但生产 deepagents
+# 0.6.12 无该函数（user middleware 直接 append）→ 两实例同名共存撞 langchain
+# factory duplicate 断言 → 1.0.48 全量 500（生产事故）；③ 结论：0.6.12 下
+# 只能异名并存（reducer 兜 fold 不炸），根治走 patch create_summarization_
+# middleware 或 0.7 升级。
 
-print("\n[5] A 修复：同名替换（deepagents graph.py:210 _apply_custom_middleware）")
+print("\n[5] name 策略：异名保命（0.6.12）+ 同名替换仅 0.7+ 可用")
 from deepagents.graph import _apply_custom_middleware
 from src.services.agent import _SummarizationAccurate
 
@@ -239,41 +241,37 @@ class _StubMW:
         return self._n
 
 
-# 模拟 deepagents 主链：base 含默认 SummarizationMiddleware + 其它 core
-base = [_StubMW("FilesystemMiddleware"), _StubMW("SummarizationMiddleware"), _StubMW("PatchToolCallsMiddleware")]
 check(
-    "_SummarizationAccurate.name == 'SummarizationMiddleware'（同名）",
-    _SummarizationAccurate.__dict__.get("name") == "SummarizationMiddleware"
-    or _SummarizationAccurate.name == "SummarizationMiddleware",
-    f"got {_SummarizationAccurate.name!r}",
+    "_SummarizationAccurate.name 保持异名（0.6.12 安全）",
+    getattr(_SummarizationAccurate, "name", None) is not True
+    and type(_SummarizationAccurate).__dict__.get("name", "_SummarizationAccurate") != "SummarizationMiddleware"
+    and "SummarizationMiddleware" not in str(getattr(_SummarizationAccurate, "name", "")),
+    f"class dict name={_SummarizationAccurate.__dict__.get('name', '<unset>')}（property 未遮蔽=异名生效）",
 )
-merged = _apply_custom_middleware(base, [_SummarizationAccurate.__new__(_SummarizationAccurate)]) if False else None
+# 0.7+ 机制参考验证：同名实例在 _apply_custom_middleware 下原位替换
 # 用真实实例验证替换（__init__ 参数复杂，绕开：仅验证替换按 name 命中）
 class _SameName(SummarizationMiddleware):
     name = "SummarizationMiddleware"
 
 
 custom = _SameName.__new__(_SameName)  # 不跑 __init__，只测 name 匹配
+base = [_StubMW("FilesystemMiddleware"), _StubMW("SummarizationMiddleware"), _StubMW("PatchToolCallsMiddleware")]
 merged = _apply_custom_middleware(base, [custom])
 sm_entries = [(i, m) for i, m in enumerate(merged) if m.name == "SummarizationMiddleware"]
 check(
-    "同名 merge 后只剩一个 SummarizationMiddleware",
-    len(sm_entries) == 1,
-    f"got {len(sm_entries)} entries",
-)
-check(
-    "且是用户实例（原位替换，保留栈序）",
+    "参考：同名在 0.7+ _apply_custom_middleware 下原位替换（升级后可用）",
     len(sm_entries) == 1 and sm_entries[0][1] is custom and sm_entries[0][0] == 1,
     f"got pos={sm_entries[0][0] if sm_entries else '?'}",
 )
-# 对照：异名（旧行为）→ 并存 → 双写炸
+# 生产现状（0.6.12）：异名 → 并存 → reducer fold 兜底不炸
 class _OldName(SummarizationMiddleware):
     name = "_SummarizationAccurate"
 
 
-merged_old = _apply_custom_middleware(base, [_OldName.__new__(_OldName)])
+base2 = [_StubMW("FilesystemMiddleware"), _StubMW("SummarizationMiddleware"), _StubMW("PatchToolCallsMiddleware")]
+merged_old = _apply_custom_middleware(base2, [_OldName.__new__(_OldName)])
 check(
-    "对照：异名 merge 后两实例并存（旧行为 = 双写根因）",
+    "生产 0.6.12 现状：异名两实例并存（reducer 兜底，无双写炸）",
     sum(1 for m in merged_old if "SummarizationMiddleware" in m.name or m.name == "_SummarizationAccurate") == 2,
     f"got {[m.name for m in merged_old]}",
 )

@@ -203,10 +203,13 @@ class _SummarizationAccurate(SummarizationMiddleware):
     ② 摘要生成后注入"当前会话真实资源清单"，避免 agent 恢复后 read_file 猜路径。
     """
 
-    # 覆盖 AgentMiddleware.name property（默认 type(self).__name__）——
-    # 与 deepagents 默认实例同名才能命中 _apply_custom_middleware 的原位替换
-    name = "SummarizationMiddleware"
-
+    # ⚠ 不设 name="SummarizationMiddleware"：同名替换依赖 deepagents 0.7+ 的
+    # _apply_custom_middleware；生产 deepagents 0.6.12 无该函数（user middleware
+    # 直接 append），同名会导致默认实例+本实例同名共存 → langchain factory
+    # duplicate 断言 → 每个请求 500（1.0.48 生产事故，2026-11-17）。
+    # 异名 = 双实例并存（每步双摘要烧 token），由 GeesunAgentState 的
+    # last-write-wins reducer 兜底不炸；根治走 patch create_summarization_middleware
+    # 或 deepagents 0.7 升级（另立任务）。
     def __init__(self, *args, inventory_provider=None, partial_token_counter=None, **kwargs):
         super().__init__(*args, **kwargs)
         # 回调返回"当前会话真实资源清单"文本（uploads/reports 文件 + 沙箱状态），
