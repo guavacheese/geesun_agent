@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Sequence
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 # 进而导致已完成的会话刷新空白、进行中任务消息静默丢失。
 # 改用连接池后每条操作各自拿独立连接，从根本上消除该碰撞。
 POSTGRES_POOL_MAX_SIZE = 20
+
+# 同步接口桥的超时（秒）。store 单次查询都在毫秒级，真会等到的只有
+# "主事件循环被别的东西卡住"这种病态情况——必须尽快失败让上层看到 error，
+# 而不是把一个 worker 线程永久挂死（同步接口本身就跑在 to_thread 的线程里，
+# 挂住等于悄悄吃掉线程池）。
+_SYNC_STORE_TIMEOUT_SEC = 30.0
 
 
 # ─── 稳定 keyset 分页（供会话列表使用，绕过 BaseStore.asearch） ───
@@ -180,7 +187,11 @@ class ReconnectingAsyncPostgresStore:
 
     当 PostgreSQL 连接因网络中断、服务重启等原因断开时，
     自动关闭旧连接池并创建新实例，对调用方透明。
-    支持方法：aget / aput / asearch（覆盖当前代码中的全部使用场景）。
+
+    暴露**两套接口**，因为下游对同步/异步的需求并不一致：
+      · 异步：aget / aput / asearch / abatch + 本类自有的 keyset/消息台账方法；
+      · 同步：get / put / search / batch —— `BaseStore` 契约的另一半，
+        供 deepagents `StoreBackend` 使用（详见下方「同步接口」段注释）。
 
     注意：`aput(namespace, key, None)` 在 langgraph 内部会被翻译成
     `DELETE FROM store WHERE prefix=... AND key=...`（见
@@ -194,6 +205,9 @@ class ReconnectingAsyncPostgresStore:
         self._lock = asyncio.Lock()
         self._closed = False
         self._cm: Any = None  # 保持 from_conn_string 生成器存活，防 GC 关闭连接池
+        # 主事件循环引用：同步接口要把协程丢回这里执行（见「同步接口」段）。
+        # 惰性在首次建 store（必在事件循环内）时捕获。
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ── 内部生命周期 ──
 
@@ -204,6 +218,10 @@ class ReconnectingAsyncPostgresStore:
         AsyncConnection，从根本上消除并发复用同一条连接导致的
         "another command is already in progress" 错误（2026-08-24 根因修复）。
         """
+        # 建 store 必然发生在事件循环内 —— 顺手记住这个循环，供同步接口桥接。
+        # 只认 `get_running_loop()`：没有运行中的循环就不该建 store（会拿到
+        # 一个永不 tick 的默认循环，桥接过去等于死锁）。
+        self._loop = asyncio.get_running_loop()
         cm = AsyncPostgresStore.from_conn_string(
             self._dsn, pool_config={"max_size": POSTGRES_POOL_MAX_SIZE}
         )
@@ -339,6 +357,77 @@ class ReconnectingAsyncPostgresStore:
         所以「截断」「删指定消息」也能走同一条路径，一次往返完成。
         """
         return await self._call("abatch", ops)
+
+    # ── 同步接口（BaseStore 契约的另一半） ──
+    #
+    # 为什么必须有（2026-11-18 事故，会话 GY35362:c6a0eebd）：
+    #   deepagents 0.6.12 的 `StoreBackend` 只实现了 aread / awrite / aedit 三个
+    #   异步方法，**ls / glob / grep 只有同步实现**，且 `BackendProtocol.als` 的
+    #   默认实现是 `asyncio.to_thread(self.ls)`，`ls` 内部走 `store.search(...)`；
+    #   同步 `read` 走 `store.get(...)`。本包装器此前只实现异步接口，于是 agent
+    #   一旦对 /workspace/memories、/workspace/agent-memory 路由做 ls/glob（以及
+    #   "无 path 的 glob"——CompositeBackend 会遍历**全部**路由），就必然
+    #   `AttributeError: 'ReconnectingAsyncPostgresStore' object has no attribute
+    #   'search'`：两次 glob 用具级失败兜住，一次 ls 未捕获直接把 SSE 流打断成
+    #   「任务执行失败」。
+    #
+    # 桥接方式：deepagents 在 `asyncio.to_thread` 的 worker 线程里调这些同步方法，
+    # 所以用 `run_coroutine_threadsafe` 把协程丢回**主事件循环**（连接池绑在那个
+    # 循环上，换个循环复用 psycopg 池会直接炸 "attached to a different loop"）
+    # 并阻塞等结果。反过来，如果同步方法在主循环线程上被调用，`.result()` 就是
+    # 等自己 —— 必死锁，故显式抛错而不是挂死。
+
+    def _sync(self, label: str, coro_factory):
+        """把异步实现桥接到同步调用方；所有同步方法共用这一条通路。"""
+        if self._closed:
+            raise RuntimeError(f"store 已关闭，{label}() 不可用")
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError(
+                f"{label}(): store 尚未初始化 —— 同步接口要桥回主事件循环，"
+                f"须先完成一次异步调用（启动时的 setup()）"
+            )
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError(
+                f"{label}(): 禁止在主事件循环线程上调用同步 store 接口"
+                f"（run_coroutine_threadsafe(...).result() 会等自己 → 死锁），"
+                f"请改用 await a{label}()"
+            )
+        if loop.is_closed():
+            raise RuntimeError(f"{label}(): 主事件循环已关闭")
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        try:
+            return future.result(timeout=_SYNC_STORE_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"{label}(): 同步桥等待超过 {_SYNC_STORE_TIMEOUT_SEC}s"
+                f"（主事件循环疑似被阻塞），已放弃"
+            ) from None
+
+    def get(self, namespace, key):
+        """同步版 `aget`（deepagents `StoreBackend.read` 使用）。"""
+        return self._sync("get", lambda: self.aget(namespace, key))
+
+    def put(self, namespace, key, value):
+        """同步版 `aput`。"""
+        return self._sync("put", lambda: self.aput(namespace, key, value))
+
+    def search(self, namespace, **kwargs):
+        """同步版 `asearch`（deepagents `StoreBackend.ls/glob/grep` 使用）。
+
+        ⚠️ 语义约束与 `asearch` 完全一致（默认 limit=10 会静默截断、
+        前缀 LIKE 不认命名空间边界），这里只是执行方式不同。
+        """
+        return self._sync("search", lambda: self.asearch(namespace, **kwargs))
+
+    def batch(self, ops):
+        """同步版 `abatch`。"""
+        return self._sync("batch", lambda: self.abatch(ops))
 
     async def aget_message_watermark(self, prefix: str) -> tuple[int, Optional[str], int]:
         """增量写入的水印：`(已存最大序号, 该条目的 id, 旧格式残留条数)`。

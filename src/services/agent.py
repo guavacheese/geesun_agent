@@ -22,6 +22,7 @@ from deepagents.backends.protocol import (
     FileDownloadResponse,
     GlobResult,
     GrepResult,
+    LsResult,
     ReadResult,
     WriteResult,
 )
@@ -606,6 +607,12 @@ class ValidatedCompositeBackend(CompositeBackend):
         self._user_skill_prefix = (
             self.USER_SKILL_PREFIX_TEMPLATE.format(user_id=user_id) if user_id else ""
         )
+        # 记忆存储路由（StoreBackend）：不参与「无 path 的全路由枚举」，理由见
+        # `_glob_target` 与 `ls`/`als` 覆写处的注释（2026-11-18 glob/ls 崩链）。
+        self._store_route_prefixes = {
+            prefix for prefix, backend in routes.items()
+            if isinstance(backend, StoreBackend)
+        }
 
     # ─── 写权限判定（单一入口）───
 
@@ -663,6 +670,80 @@ class ValidatedCompositeBackend(CompositeBackend):
             )
         return None
 
+    # ─── D｜目录列举收敛：根目录给清单、记忆存储不参与全路由枚举（2026-11-18）───
+    #
+    # 事故（会话 GY35362:c6a0eebd，08:36）：
+    #   模型先 `ls("/")`（得到 `path_not_found`，白跑两步），再
+    #   `glob('/uploads/GY35362/c6a0eebd/*')` 且**没传 path** —— CompositeBackend
+    #   对 path=None 的 glob 会遍历**全部路由**，其中包括 /workspace/memories、
+    #   /workspace/agent-memory 两个 StoreBackend。deepagents 0.6.12 的
+    #   StoreBackend 只有同步 ls/glob（内部 `store.search`），而我们原来的 store
+    #   包装器只有异步接口 ⇒ `... object has no attribute 'search'`：两次 glob 被
+    #   工具层兜成失败，紧接一次 ls 未捕获，直接把 SSE 流打断成「任务执行失败」。
+    #
+    # 三层处理：
+    #   ① 根因在本类之外：`ReconnectingAsyncPostgresStore` 已补齐同步契约；
+    #   ② 本类让记忆存储**不参与无 path 的全路由枚举** —— 即便①修好，遍历
+    #      记忆命名空间也会把全部条目的每条消息分页拉进内存再本地匹配，
+    #      纯属浪费（agent 对记忆只有「按已知路径 read_file」这一种真实需求）；
+    #   ③ `ls` 加异常边界（工具层可失败，但不许把异常抛进 agent 流），且根目录
+    #      直接返回路由目录清单，不再被 default（sandbox）的 path_not_found 短路。
+
+    def _glob_target(self):
+        """无 path 的 glob 该作用在哪个 backend 上（剔除记忆存储路由）。
+
+        有 path 且非 "/" 时 CompositeBackend 只扫单个路由，原样返回 self；
+        否则返回一个路由表过滤后的 CompositeBackend 副本 —— glob/aglob 只用到
+        `default` + `routes`，构造副本比改自身状态安全（同一 backend 会被多个
+        并发工具调用共享）。
+        """
+        if not self._store_route_prefixes:
+            return self
+        return CompositeBackend(
+            default=self.default,
+            routes={
+                prefix: backend
+                for prefix, backend in self.routes.items()
+                if prefix not in self._store_route_prefixes
+            },
+        )
+
+    def _root_dir_entries(self) -> list[dict]:
+        """虚拟文件系统根目录的一级目录清单（去重、保留 `/xxx/` 形态）。
+
+        取 routes 表而不是真去问各 backend：路由表就是"这台虚拟 FS 长什么样"的
+        定义；问 default（沙箱）只会得到 path_not_found（sandbox 没有虚拟根）。
+        """
+        dirs: dict[str, None] = {}
+        for prefix in self.routes:
+            head = prefix.strip("/").split("/", 1)[0]
+            if head:
+                dirs[f"/{head}/"] = None
+        return [
+            {"path": path, "is_dir": True, "size": 0, "modified_at": ""}
+            for path in dirs
+        ]
+
+    def ls(self, path: str) -> LsResult:
+        """根目录走清单；其余原样转发，异常收敛成 error 结果。"""
+        if path in ("/", ""):
+            return LsResult(entries=self._root_dir_entries())
+        try:
+            return super().ls(path)
+        except Exception as e:  # noqa: BLE001  # 工具边界：失败要能被模型看见
+            logger.warning("[VALIDATED_CB] ls 异常: path=%s err=%s", path, e)
+            return LsResult(error=f"ls 失败: {e}")
+
+    async def als(self, path: str) -> LsResult:
+        """异步版 `ls`：同语义，改用 `super().als`。"""
+        if path in ("/", ""):
+            return LsResult(entries=self._root_dir_entries())
+        try:
+            return await super().als(path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[VALIDATED_CB] als 异常: path=%s err=%s", path, e)
+            return LsResult(error=f"ls 失败: {e}")
+
     def _reject_glob_scan(self, pattern: str, path: str | None) -> str | None:
         """B1: 拦截 '**' 全盘扫描（2026-08-18 根因修复）。
 
@@ -698,8 +779,9 @@ class ValidatedCompositeBackend(CompositeBackend):
         # B2 保险丝：同步 glob（CompositeBackend 内部 rglob/sandbox execute 均同步）
         # 放 ThreadPoolExecutor 执行并限时；超时不等待线程（shutdown(wait=False)），
         # 事件循环最多阻塞 GLOB_TIMEOUT_SEC，不会永久冻结。
+        target = self if (path and path != "/") else self._glob_target()
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(super().glob, pattern, path)
+        future = pool.submit(CompositeBackend.glob, target, pattern, path)
         try:
             return future.result(timeout=self.GLOB_TIMEOUT_SEC)
         except concurrent.futures.TimeoutError:
@@ -728,8 +810,10 @@ class ValidatedCompositeBackend(CompositeBackend):
             return GlobResult(error=f"拒绝执行: {hint}", matches=[])
 
         try:
+            target = self if (path and path != "/") else self._glob_target()
             return await asyncio.wait_for(
-                super().aglob(pattern, path), timeout=self.GLOB_TIMEOUT_SEC
+                CompositeBackend.aglob(target, pattern, path),
+                timeout=self.GLOB_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
             logger.warning(
