@@ -1,4 +1,4 @@
-"""Spike: model_call_guard 400 上下文超限恢复链（F0+F1，2026-11-17）。
+"""Spike: model_call_guard 400 上下文超限恢复链（F0+F1+G1/G2/G3，2026-11-18）。
 
 故障复现（生产 f508e75c，2026-11-17 15:18-15:31，5 轮 × 2 次）：
 旧兜底 `keep = max(4, len(msgs) - (attempt+1)*10)` 砍最老消息，而膨胀源
@@ -11,9 +11,16 @@
      ② _trim_large_tool_results 确定性裁剪（头 4096/尾 1024、幂等、只裁
         ToolMessage）；
      ③ guard 端到端：fake handler 首次抛 vLLM 400 → 恢复裁剪 → 重试成功；
-        全程 400 → 重试耗尽 → 保留原始错误上抛；
-[F0] ④ _proportional_margin（262144→16384 不变，32768→3276）；
-     ⑤ per-model 修正回写 _MAX_LEN_CACHE，settings.model_max_len 不被改写。
+[G1] ④ 全程 400 → 重试耗尽 → **换型** ContextOverflowError 上抛（激活
+        deepagents 0.6.12 summarization.py:1569 自带的摘要+offload 救援；
+        vLLM 文案不匹配 langchain_openai 的映射，原始异常穿不进该 except，
+        f508e75c 2026-11-18 08:24 实证）；
+[G2] ⑤ 400 的 real_input 回填每会话引擎缓存（重启冷启动 + 估算失真组合
+        曾让 trigger 永不触发）；
+[G3] ⑥ 裁剪量以 real_input 锚定（scale = real_input/est_before），本地估算
+        低估 2.6 倍时仍砍得够（旧实现 est gate 直接跳过砍量，两次重试全败）；
+[F0] ⑦ _proportional_margin（262144→16384 不变，32768→3276）；
+     ⑧ per-model 修正回写 _MAX_LEN_CACHE，settings.model_max_len 不被改写。
 
 运行: python tests/spikes/context_overflow_recovery.py
 """
@@ -214,20 +221,20 @@ check(
     isinstance(t, ToolMessage) and len(t.content) < 6000,
     f"len={len(getattr(t, 'content', ''))}",
 )
-check("重试 max_tokens 被收紧到安全值", calls["max_tokens"][-1] < 200000, str(calls["max_tokens"]))
-check(
-    "重试 max_tokens 用裁剪后输入重算（不再 floor 到 1024）",
-    calls["max_tokens"][-1] > m._MODEL_MIN_OUTPUT_TOKENS,
-    f"got {calls['max_tokens']}",
-)
-# 精确值核对：removed = 被裁字符数；expected = limit - (262145 - removed//2) - margin(16384)
+# G3 精确值核对（真值锚定口径）：est_before = 1+0+25000 = 25001（确定性），
+# scale = real_input/est_before；被裁真实 token = removed_chars × scale / 2；
+# safe_max = limit − (real_input − 被裁真实 token) − margin(16384)
 _trimmed_tool_len = len(calls["msgs"][2].content)
 _removed_chars = 50000 - _trimmed_tool_len
+_est_before = 1 + 0 + 50000 // 2  # Human("hi")=1 + AIMessage("")=0 + Tool 25000
+_scale = 262145 / _est_before
+_removed_real = int(_removed_chars * _scale / 2)
 _expected_safe_max = max(
-    m._MODEL_MIN_OUTPUT_TOKENS, 262144 - (262145 - _removed_chars // 2) - 16384
+    m._MODEL_MIN_OUTPUT_TOKENS, 262144 - (262145 - _removed_real) - 16384
 )
+check("重试 max_tokens 被收紧到安全值", calls["max_tokens"][-1] < 262144, str(calls["max_tokens"]))
 check(
-    "safe_max 数值 = limit − (real_input − 被裁token估算) − margin",
+    "safe_max 数值 = limit − (real_input − 被裁真实token[scale折算]) − margin（G3）",
     calls["max_tokens"][-1] == _expected_safe_max,
     f"got {calls['max_tokens'][-1]}, expected {_expected_safe_max}",
 )
@@ -237,7 +244,14 @@ check(
 )
 check("全局 settings.model_max_len 未被改写", settings.model_max_len == 262144)
 
-print("\n[5] guard 端到端：全程 400 → 重试耗尽 → 原始错误上抛")
+print("\n[4b] G2：400 的 real_input 回填每会话引擎缓存")
+check(
+    "会话缓存 = 400 真值 real_input（重启冷启动后下一轮 trigger 可用）",
+    m._session_prompt_tokens.get("spike-session") == 262145,
+    f"got {m._session_prompt_tokens.get('spike-session')}",
+)
+
+print("\n[5] guard 端到端：全程 400 → 重试耗尽 → G1 换型 ContextOverflowError 上抛")
 
 
 async def run_guard_exhausted():
@@ -253,14 +267,15 @@ async def run_guard_exhausted():
     try:
         await model_call_guard.awrap_model_call(_make_request(), handler)
         return "no-raise"
-    except FakeBadRequest as e:
-        return f"raised:{calls['n']}:{str(e)[:120]}"
+    except Exception as e:  # 换型断言：类型必须是 ContextOverflowError，且原文保留
+        return f"raised:{calls['n']}:{type(e).__module__}.{type(e).__name__}:{str(e)[:120]}"
 
 
 result = asyncio.run(run_guard_exhausted())
 check(
-    "重试 2 次耗尽后保留原始 FakeBadRequest 上抛（不吞不换型）",
-    result.startswith("raised:3:") and "maximum context length" in result,
+    "重试 2 次耗尽后换型 ContextOverflowError 上抛（vLLM 原文保留）",
+    result.startswith("raised:3:langchain_core.exceptions.ContextOverflowError")
+    and "maximum context length" in result,
     f"got {result}",
 )
 
@@ -334,11 +349,71 @@ async def run_guard_cache_comp():
 
 
 cache_val, st = asyncio.run(run_guard_cache_comp())
-_removed_est = (50000 - st["trimmed_tool_len"]) // 2
+_scale7 = 262145 / (1 + 0 + 50000 // 2)
+_removed_real7 = int((50000 - st["trimmed_tool_len"]) * _scale7 / 2)
 check(
-    "恢复成功后缓存 = usage.input_tokens + 被裁 token 估算",
-    cache_val == 123456 + _removed_est,
-    f"got {cache_val}, expected {123456 + _removed_est}",
+    "恢复成功后缓存 = usage.input_tokens + 被裁真实token折算（G3 scale 口径）",
+    cache_val == 123456 + _removed_real7,
+    f"got {cache_val}, expected {123456 + _removed_real7}",
+)
+
+print("\n[8] G3：本地估算低估 2.6 倍（f508e75c 同型）→ 仍砍得够")
+
+
+async def run_guard_g3():
+    """复刻 f508e75c 08:24 形态：150 条中小 ToolMessage（无单条 >8192，第 1 步
+    裁剪 0 字符），chars//2 本地估算 ≈97.5k 远低于 157k trigger 阈值，但引擎真值
+    262145。旧实现：est gate 跳过砍量 → 两次重试全败。新实现：real_input 锚定
+    gate + est_budget 换算 → 第 2 步真砍 → 第 3 次调用消息数变少。"""
+    m._MAX_LEN_CACHE[("http://fake:8003/v1", "Qwen3.6-35B-A3B")] = 262144
+    m._session_prompt_tokens.pop("spike-session", None)
+
+    msgs = [HumanMessage(content="hi")]
+    for i in range(150):
+        msgs.append(AIMessage(content="", tool_calls=[
+            {"name": "execute", "args": {}, "id": f"c{i}", "type": "tool_call"}
+        ]))
+        msgs.append(ToolMessage(content="X" * 1300, tool_call_id=f"c{i}"))
+
+    from langchain.agents.middleware import ModelRequest
+
+    req = ModelRequest(model=FakeChatModel(), messages=msgs, model_settings={})
+    seen_counts = []
+
+    async def handler(request):
+        seen_counts.append(len(request.messages))
+        raise FakeBadRequest(VLLM_MSG)  # 恒 400：耗尽走 G1，但裁剪量可断言
+
+    from src.core.model import model_call_guard
+
+    from langchain_core.exceptions import ContextOverflowError
+
+    try:
+        await model_call_guard.awrap_model_call(req, handler)
+        return "no-raise", seen_counts
+    except ContextOverflowError:
+        return "ctx-overflow", seen_counts
+
+
+result8, counts8 = asyncio.run(run_guard_g3())
+est_before8 = 1 + 150 * (1300 // 2)  # Human + 150×Tool（AIMessage content 空）
+scale8 = 262145 / est_before8
+real_budget8 = 262144 - 16384 - m._MODEL_MIN_OUTPUT_TOKENS
+est_budget8 = int(real_budget8 / scale8)
+# 第 2 步必须把本地 est 砍到 est_budget 以下（旧实现 est 97.5k + margin < limit
+# 直接跳过，消息数不变）
+check("G1 换型正常返回 ContextOverflowError", result8 == "ctx-overflow", str(result8))
+check(
+    "砍量实际发生（消息数减少，而非旧实现的 0 裁剪）",
+    len(counts8) == 3 and counts8[2] < counts8[0],
+    f"counts={counts8}",
+)
+kept8 = counts8[2] if len(counts8) > 2 else counts8[0]
+est_kept8 = (1 + (kept8 - 1) // 2 * 650)  # 粗口径：裁掉的按 650 est/组
+check(
+    "砍后本地 est ≤ est_budget（换算回真实口径 ≤ real_budget）",
+    est_kept8 <= est_budget8 + 700,  # 700 = 单组容差（cut 粒度为一对 AIM+Tool）
+    f"est_kept={est_kept8}, est_budget={est_budget8}, counts={counts8}",
 )
 
 print(f"\n{'=' * 60}")

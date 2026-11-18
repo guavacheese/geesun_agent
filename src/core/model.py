@@ -13,6 +13,7 @@ from langchain.agents.middleware import (
     ModelRequest,
     ModelResponse,
 )
+from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, AIMessageChunk
 from src.core.config import settings
 
@@ -609,7 +610,17 @@ def _parse_context_error(text: str) -> tuple[int, int] | None:
 # ① 多模式归类（9+ 文案 marker，不依赖单一 vLLM 文案）；
 # ② 确定性裁剪：大 ToolMessage 头尾保留、中间替换（幂等，不写 state）；
 # ③ 复用 _trim_input_for_budget 丢旧图（视觉 token 本地算 0，只能整条丢）；
-# ④ 失败保留原始错误上抛（不静默吞）。
+# ④ 重试耗尽后**换型上抛** langchain_core.exceptions.ContextOverflowError
+#    （G1，2026-11-18）：deepagents 0.6.12 summarization.py:1569 有自带的
+#    `except ContextOverflowError` 降级救援（全量摘要 + 历史 offload +
+#    _aclip_overflow_tail，比本 guard 的确定性裁剪强一个量级），但
+#    langchain_openai._handle_openai_bad_request（base.py:607）只认 4 个文案
+#    marker，vLLM 的 "This model's maximum context length is ... tokens" 一个
+#    都不匹配 → 落进 OpenAIInvalidRequestError（非 ContextOverflowError）→
+#    救援失联（f508e75c 2026-11-18 08:24 实证：本 guard 裁剪 0/4444 字符两次
+#    重试全败，deepagents 救援没接住，异常直穿 chat.py）。本 guard 归类能力
+#    已覆盖 vLLM 文案（_is_context_overflow_exc），耗尽后换成 ContextOverflowError
+#    上抛，把最后一道防线交回 deepagents 官方恢复链。
 # 分层职责：guard=确定性止血（本次请求视图内），Summarization trigger（agent.py
 # 0.6 阈值）=下轮接管真摘要压缩（写 _summarization_event + offload）。
 
@@ -893,10 +904,12 @@ async def model_call_guard(
     # 尾部（f508e75c 5 轮 × 2 次重试 real_input 恒 262145，全部无效）。
     _MAX_CTX_RETRIES = 2
     attempt = 0
-    # 恢复路径累计裁掉的字符数：① 用于裁剪后重算 safe_max（400 报的 real_input
-    # 是裁剪前全量值，直接算会把输出 floor 到 1024 截断长回答——2026-11-17 实测
-    # 推演缺陷）；② 成功后补回缓存，防裁剪视图掩盖真实体量（见 _capture_usage）
+    # 恢复路径累计裁掉的字符数 / 折算的真实 token 数：① 用于裁剪后重算 safe_max
+    # （400 报的 real_input 是裁剪前全量值，直接算会把输出 floor 到 1024 截断长
+    # 回答——2026-11-17 实测推演缺陷）；② 成功后补回缓存，防裁剪视图掩盖真实
+    # 体量（见 _capture_usage）
     recovered_removed_chars = 0
+    recovered_removed_tokens = 0
     while True:
         t0 = time.perf_counter()  # GenAI 指标：仅统计本次尝试的墙钟耗时（重试间不计）
         try:
@@ -914,14 +927,30 @@ async def model_call_guard(
                 f"messages={len(msgs)}, chars={total_chars}）——生成超长或引擎无响应，已中止"
             ) from None
         except Exception as e:
-            # 归类：非上下文超限，或重试耗尽 → 原样上抛（保留原始错误，不静默吞）
-            if not _is_context_overflow_exc(e) or attempt >= _MAX_CTX_RETRIES:
+            if not _is_context_overflow_exc(e):
+                # 归类：非上下文超限 → 原样上抛（保留原始错误，不静默吞）
                 _record_genai_metrics(
                     model_name=getattr(request.model, "model_name", None),
                     duration_s=time.perf_counter() - t0,
                     error_type=type(e).__name__,
                 )
                 raise
+            if attempt >= _MAX_CTX_RETRIES:
+                # G1（2026-11-18）：重试耗尽 → **换型** ContextOverflowError 上抛，
+                # 不再保留原始异常。deepagents 0.6.12 summarization.py:1569 的
+                # `except ContextOverflowError` 是官方最后救援（全量摘要+历史
+                # offload+_aclip_overflow_tail），但 langchain_openai 的 400 映射
+                # 只认 4 个文案 marker，vLLM 的 "This model's maximum context
+                # length is ... tokens" 全不匹配 → 原始异常穿不进该 except
+                # （f508e75c 08:24 实证：本 guard 裁剪 0/4444 字符两次重试全败，
+                # 救援失联，异常直穿 chat.py → 前端"任务执行失败"）。本 guard 的
+                # 归类覆盖 vLLM 文案，耗尽后换型上抛，防线交回官方恢复链。
+                _record_genai_metrics(
+                    model_name=getattr(request.model, "model_name", None),
+                    duration_s=time.perf_counter() - t0,
+                    error_type=type(e).__name__,
+                )
+                raise ContextOverflowError(str(e)) from e
             # 从错误文案提取 (real_limit, real_input)——提取不到也要继续恢复
             # （文案可能没有数字，但归类已确认是超限，恢复动作不依赖数值）
             parsed = _parse_context_error(str(e))
@@ -930,6 +959,14 @@ async def model_call_guard(
             _MAX_LEN_CACHE[_max_len_key] = real_limit
             max_len = real_limit
             margin = _proportional_margin(real_limit)
+            # G2（2026-11-18）：引擎真值回填会话缓存。发版重启清空进程内缓存 +
+            # 本地估算失真的组合会让 trigger 长期够不着阈值（f508e75c 实证：重启后
+            # 首调 chars//2 估算 100357 vs 引擎真值 262145，低估 2.6 倍 → 摘要永不
+            # 触发 → 直撞上限）。400 的 real_input 是引擎对当前完整输入的判决，
+            # 回填后下一轮 trigger 必然触发 Summarization；随后成功调用由
+            # _capture_usage 覆盖为最新真值。
+            if real_input and sid:
+                _session_prompt_tokens[sid] = real_input
             logger.warning(
                 "[DIAG] 400 上下文超限 → 确定性恢复 #%d: real_limit=%d, real_input=%d, "
                 "msgs=%d（裁剪 tool result → 丢旧图）",
@@ -937,37 +974,67 @@ async def model_call_guard(
             )
             # ── 恢复动作（确定性、幂等、只影响本次请求视图，不写 state）──
             chars_before = sum(len(str(getattr(m, "content", ""))) for m in msgs)
+            est_before = _estimate_tokens(msgs)
+            # G3（2026-11-18）：裁剪量以 400 真值 real_input 锚定，不信本地估算。
+            # 本地 chars//2 估算系统性失真（f508e75c 实测低估 2.6 倍——多模态/
+            # 中文混排），旧实现用它做第 2 步 gate（est 100k + margin < limit →
+            # 跳过砍量）和砍量决策（以为砍够其实远没够），两次重试必然仍 400。
+            # 偏差比例 scale = real_input / est_before（real_input 与 est_before
+            # 描述同一份裁剪前输入；裁剪后的 est 再乘回 scale 才是真实口径），
+            # 把真实 token 预算换算到本地估算口径（除以 scale）再交给
+            # _trim_input_for_budget，保证砍够。
+            scale = (
+                real_input / est_before
+                if (real_input > 0 and est_before > 0)
+                else 1.0
+            )
             # 第 1 步：裁超大 ToolMessage（头 4096/尾 1024；重试时阈值减半更激进）
             threshold = 8192 if attempt == 0 else 4096
             msgs = _trim_large_tool_results(msgs, threshold=threshold)
-            # 第 2 步：仍超预算 → 丢旧图 + 砍老消息（_trim_input_for_budget：
-            # 含图消息优先丢，本地对视觉 token 全瞎，只能整条丢）
-            est = sum(len(str(getattr(m, "content", ""))) // 2 for m in msgs)
-            if est + margin + _MODEL_MIN_OUTPUT_TOKENS > real_limit or attempt > 0:
+            est_after1 = _estimate_tokens(msgs)
+            # 第 2 步 gate：真实口径判断——裁剪后的 est 乘回 scale 才是真实 token
+            # 估计（旧 gate 用失真的本地 est，f508e75c 首轮直接跳过砍量）
+            real_after_trim1 = est_after1 * scale if real_input > 0 else est_after1
+            over_real = (
+                real_after_trim1 + margin + _MODEL_MIN_OUTPUT_TOKENS > real_limit
+            )
+            if over_real or attempt > 0:
+                # 真实预算（token）换算到本地估算口径：est_budget = real_budget / scale
+                real_budget = real_limit - margin - _MODEL_MIN_OUTPUT_TOKENS
+                est_budget = (
+                    max(_MODEL_MIN_OUTPUT_TOKENS, int(real_budget / scale))
+                    if (real_input > 0 and est_before > 0)
+                    else real_budget
+                )
                 msgs, _ = _trim_input_for_budget(
-                    msgs, real_limit, margin, _MODEL_MIN_OUTPUT_TOKENS,
+                    msgs, est_budget + margin + _MODEL_MIN_OUTPUT_TOKENS,
+                    margin, _MODEL_MIN_OUTPUT_TOKENS,
                 )
             chars_after = sum(len(str(getattr(m, "content", ""))) for m in msgs)
             removed_chars = max(0, chars_before - chars_after)
             recovered_removed_chars += removed_chars
+            # 被裁字符折算真实 token：real_tokens/char = real_input/total_chars
+            # = scale/2（est 口径是 0.5 token/char，偏差比例同乘）
+            removed_real_tokens = int(removed_chars * scale / 2)
+            recovered_removed_tokens += removed_real_tokens
             try:
                 request = request.override(messages=msgs)
             except Exception:
                 logger.warning("[DIAG] override(messages=...) 不支持，恢复降级")
-            # 重算 max_tokens：input 用「400 真值 − 被裁 token 估算」而不是裁剪前
+            # 重算 max_tokens：input 用「400 真值 − 被裁真实 token 折算」而不是裁剪前
             # 的 real_input——后者会让 safe_max 负数 floor 到 1024，长回答被腰斩
             input_after_trim = max(
-                0, real_input - removed_chars // 2,
+                0, real_input - removed_real_tokens,
             )
             safe_max = max(
                 _MODEL_MIN_OUTPUT_TOKENS,
                 real_limit - input_after_trim - margin,
             )
             logger.warning(
-                "[DIAG] 恢复重试 #%d: 裁剪 %d 字符（≈%d tokens）→ 输入估计 %d → "
-                "max_tokens=%d（旧算法会得 %d）",
-                attempt + 1, removed_chars, removed_chars // 2, input_after_trim,
-                safe_max,
+                "[DIAG] 恢复重试 #%d: 裁剪 %d 字符（真值折算 ≈%d tokens, scale=%.2f）"
+                "→ 输入估计 %d → max_tokens=%d（旧算法会得 %d）",
+                attempt + 1, removed_chars, removed_real_tokens, scale,
+                input_after_trim, safe_max,
                 max(_MODEL_MIN_OUTPUT_TOKENS, real_limit - real_input - margin),
             )
             request = request.override(model_settings={
@@ -979,13 +1046,13 @@ async def model_call_guard(
         # 成功路径（未抛异常）：捕获引擎真实 prompt_tokens 回写每会话缓存，再返回。
         # 恢复路径下 usage 对应裁剪后的请求视图，直接回写会把缓存压小、掩盖真实
         # state 体量 → trigger 永远够不着 → 每步白付一次 400 税（2026-11-17 推演
-        # 缺陷②）。补回被裁字符的 token 估算（chars//2 同口径，低估方向安全）。
-        _capture_usage(resp, request, extra_tokens=recovered_removed_chars // 2)
+        # 缺陷②）。补回被裁 token 的真值折算（G3 scale 口径，低估方向安全）。
+        _capture_usage(resp, request, extra_tokens=recovered_removed_tokens)
         if recovered_removed_chars:
             logger.warning(
                 "[DIAG] 400 恢复成功：缓存补回 ≈%d tokens（累计裁剪 %d 字符），"
                 "防裁剪视图掩盖 trigger",
-                recovered_removed_chars // 2, recovered_removed_chars,
+                recovered_removed_tokens, recovered_removed_chars,
             )
         # GenAI 指标打点（标准 semconv 名；metrics 未启用时 no-op 静默，零风险）
         real_in, real_out = _extract_tokens(resp)
