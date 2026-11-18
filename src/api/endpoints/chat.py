@@ -808,6 +808,61 @@ async def _write_setup_user_message(
     return True
 
 
+async def _write_session_notice(
+    store, *, user_id: str, session_id: str, content: str, role: str = "ai"
+) -> bool:
+    """A4（2026-11-18）：会话消息流**尾部**追加一条系统事件公告（硬终止说明等）。
+
+    ## 为什么必须放在 _persist_session 之后调用（顺序铁律）
+
+    本函数写入的是**checkpoint 历史里不存在的合成条目**（id 为新 uuid，模型
+    没说过这段话）。若在 _persist_session 之前写：
+      · 水位 `last_stored_id` 立刻指向这个历史里找不到的 id；
+      · _persist_session 的 by_id 追加规划在 history 里定位失败 → 退化 by_length
+        → 撞上 SummarizationMiddleware 压缩时误判"无新增" ⇒ 本轮 AI 回答一条
+        都写不进去（_write_setup_user_message docstring 记录过同款负向事故）。
+    放在 persist **之后**则安全：此时水位尾部是刚落盘的最后一条真实消息，
+    本条紧随其后；下一轮开头的 setup 预写会把 user 消息（显式 id、在 history
+    里认得出来）写在本条之后并成为新的 last_stored_id ⇒ by_id 链不断。
+
+    Returns: 是否真的写入（存量旧格式 / 水位读取失败时 False，由调用方兜底）。
+    """
+    namespace = ("messages", user_id, session_id)
+    prefix = ".".join(namespace)
+    try:
+        prev_count, _last_id, legacy_rows = await store.aget_message_watermark(prefix)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "[NOTICE] 读取消息水位失败，跳过公告写入: session=%s", session_id,
+        )
+        return False
+    if legacy_rows:
+        logger.warning(
+            "[NOTICE] 会话 %s 存量仍为旧格式（%d 条），跳过公告写入",
+            session_id, legacy_rows,
+        )
+        return False
+    entry = {
+        "id": str(uuid.uuid4()),
+        "role": role,
+        "content": content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _warn_oversized_items([entry], prefix=prefix)
+    try:
+        await store.awrite_messages(namespace, [(message_key(prev_count + 1), entry)])
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "[NOTICE] 公告写入失败: session=%s", session_id,
+        )
+        return False
+    logger.warning(
+        "[NOTICE] 已追加系统公告: session=%s key=%d role=%s content=%d 字符",
+        session_id, prev_count + 1, role, len(content),
+    )
+    return True
+
+
 async def _aget_state_with_retry(agent, thread_id: str, max_attempts: int = 3):
     """带重试地读取 agent 最终状态（防御性）。
 
@@ -930,6 +985,22 @@ class NoProgressAbortError(Exception):
     （2026-08-17/08-18 两次 Recursion limit 死循环实证：execute 全 OK、
     报告已生成，但模型不断"重新构建 diff.json"永不收敛）。
     由外层捕获后注入收敛 SystemMessage，让模型收敛交付而非烧满 200 步。
+    """
+
+
+class StagnationWrapupError(NoProgressAbortError):
+    """C 交付物停滞**第二次**攒满阈值后的"强制收尾轮"信号（2026-11-18 新增，B2）。
+
+    与父类的分工：NoProgressAbortError = 第一次停滞，注入"收敛提示"给模型
+    一次继续完成的机会；本类 = 收敛无效后的**软停**——不再直接 ToolLoopAbortError
+    硬终止（那会让用户只看到一条瞬态红条、对话戛然而止、成品留在沙箱里随
+    TTL 回收，GY22328:59bbcbe3 实证），而是注入"强制收尾"指令：停止探查、
+    先把沙箱已有成品 download_from_sandbox 拉回交付、再用文字总结。
+    只有**收尾轮仍停滞**（第三次攒满）才真正 ToolLoopAbortError 终止。
+    语义对齐 deer-flow loop_detection_middleware 的 hard stop 设计：
+    "[FORCED STOP] ... Producing final answer with results collected so far"，
+    但我们用"再注入一轮提示"实现而不是剥 tool_calls（LangGraph 图结构下
+    剥调用需要动 middleware，成本高且与 C 的外层检测位置不匹配）。
     """
 
 
@@ -1337,17 +1408,25 @@ def _salvage_disk_name(src: str, used: set[str]) -> str:
 
 
 async def _salvage_sandbox_artifacts(
-    sandbox, user_id: str, session_id: str, before: dict[str, int] | None
+    sandbox, user_id: str, session_id: str, before: dict[str, int] | None,
+    exclude: set[str] | None = None,
 ) -> list[dict]:
     """收尾兜底：把沙箱里**本轮新增/改写**的交付物拉回宿主持久卷。
 
-    仅在「交付型任务 + 宿主报告目录本轮零新文件 + B① 也没救回」时调用一次
-    （调用点有 `_salvage_done` 单次门）。返回已落盘条目（字段与 file_generated
-    事件同构），无物可回收返回 []。
+    仅在「交付型任务 + 宿主报告目录本轮零新文件 + B① 也没救回」时调用
+    （调用点每轮重置一次机会，见 while 循环顶部的 A3 注释）。返回已落盘
+    条目（字段与 file_generated 事件同构），无物可回收返回 []。
 
     `before` 为 None 表示**基线不可用**（开轮枚举失败）→ 直接放弃兜底：没有基线就
     分不清"本轮新产物"和"上一轮遗留"，硬拉会把旧文件算到本轮头上。
     注意 `{}` 与 None 语义不同：`{}` 是"沙箱当时确实没有候选文件"，可以正常兜底。
+
+    `exclude`（2026-11-18，A2）：本轮经 `upload_to_sandbox` /
+    `decrypt_and_upload_to_sandbox` 上传的沙箱路径集合。**必须排除**：
+    基线快照取在 run 启动前、而上传发生在 run 内 ⇒ 用户上传的 input.xlsx
+    天然落在"前后差集"里，会被当成"本轮新产物"拉回宿主并发 file_generated
+    卡片 —— 用户点开卡片看到的是自己刚上传的原件（GY22328:59bbcbe3 实测，
+    10:43:45 的下载记录就是用户点了这张假卡片），还顺带骗过 M3 完成门。
 
     与 `_pull_report_from_sandbox` 的分工：那个是"知道确切文件名，逐条试候选路径"；
     本函数是"不知道文件名，枚举沙箱前后差集"。两者都不抛异常——收尾兜底不能反过来
@@ -1360,7 +1439,10 @@ async def _salvage_sandbox_artifacts(
     except Exception as e:  # noqa: BLE001
         logger.warning("[FILE_GEN] 收尾兜底枚举失败: %s", e)
         return []
-    new_paths = [p for p, size in after.items() if before.get(p) != size]
+    new_paths = [
+        p for p, size in after.items()
+        if before.get(p) != size and (not exclude or p not in exclude)
+    ]
     if not new_paths:
         logger.info("[FILE_GEN] 收尾兜底：沙箱内无本轮新增交付物")
         return []
@@ -2246,7 +2328,9 @@ async def chat(
             )
         return 0
 
-    async def _finish_run(run_id: str, status: str) -> None:
+    async def _finish_run(
+        run_id: str, status: str, error: str | None = None
+    ) -> None:
         """收尾三元组：release → 落终态 → 通知订阅者。**三处的顺序都有语义**。
 
         · release 在持久化**之后**（2026-10-10 不变量）：否则用户此刻提交删除请求，
@@ -2257,10 +2341,14 @@ async def chat(
         · publish_end（= 前端看到的 `[DONE]`）在持久化**之后**：前端收到 [DONE] 会
           立刻允许编辑，此时消息必须已经落盘，否则编辑用的 from_index 会越界
           （2026-08 实测；P1-b 前这条约束由 yield 顺序保证，现在由本函数保证）。
+
+        `error`（2026-11-18，A4）：终态为 failed 时随 run 记录落库的错误说明
+        （run_registry.mark 的 error 字段），让 run 台账与 UI 红条一致、可复盘。
+        completed 路径传 None（等价旧行为）。
         """
         turn_registry.release(thread_id)
         try:
-            await run_registry.mark(store, run_id, status)
+            await run_registry.mark(store, run_id, status, error=error)
         except Exception:  # 落态失败不该阻断 [DONE]
             logger.exception(
                 "[RUN] 终态落盘失败（刷新后可能一直显示「进行中」）: run=%s status=%s",
@@ -2532,6 +2620,22 @@ async def chat(
         # 但「同一个脚本重写 5 次、零交付物」这件事在 C 的判据下是稳定的。
         _stagnation_calls = 0
         _stagnation_injections = 0
+        # B2（2026-11-18，GY22328:59bbcbe3）：第二次攒满阈值后是否已注入过"强制收尾轮"。
+        # False = 第一次二次触发走软停（StagnationWrapupError）；True = 再触发就真终止。
+        _stagnation_wrapup_used = False
+        # B1 证据签名（2026-11-18）：上次扫描时的沙箱结论类文件快照 {路径: 字节数}。
+        # None = 尚未建立基线（首次扫描只建基线不清计数，防把 run 内上传误判为进展）。
+        _sandbox_sig_last: dict[str, int] | None = None
+        # A2/B1 共用（2026-11-18）：本轮经 upload_to_sandbox / decrypt_and_upload_to_sandbox
+        # 上传的沙箱路径。B② 兜底必须排除（上传发生在 run 内 ⇒ 必然落在前后差集里，
+        # 不排除就会把用户上传的原件当"本轮新产物"拉回发卡片）；B1 证据签名同理排除。
+        # set.add 原地变更不需要 nonlocal。
+        _uploaded_sandbox_paths: set[str] = set()
+        # A4（2026-11-18）：本轮是否以 ToolLoopAbortError 硬终止（终止说明文案）。
+        # 置位后收尾阶段：① 终止说明持久化为 AI 消息（原来只发瞬态 SSE error，
+        # 刷新后对话戛然而止无解释）；② run 终态标 failed + error 字段落库
+        # （原来标 completed/error=null，与 UI 红条自相矛盾）。
+        _terminal_error: str | None = None
         # C 的进展豁免（2026-10-20，add0229b / 84433a68 事故残留）：
         # _progress_exempt_count —— 连续被判「后台任务在推进」而清零的次数，
         #                          超过 settings.loop_detect_progress_exempt_max
@@ -2559,6 +2663,7 @@ async def chat(
             nonlocal _last_debug_step, thinking_emitted, generating_emitted, _generated_files, _consecutive_tool_failures, _reasoning_started_at_ms, _reasoning_ended_at_ms
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             nonlocal _stagnation_calls, _stagnation_injections
+            nonlocal _stagnation_wrapup_used, _sandbox_sig_last, _terminal_error
             nonlocal _progress_exempt_count, _bg_job_running
             nonlocal _loop_forced_stop
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
@@ -2859,6 +2964,29 @@ async def chat(
                                     getattr(last_msg, "status", None),
                                 )
 
+                                # ─── A2/B1（2026-11-18）：记录本轮上传文件的沙箱路径 ───
+                                # 上传发生在 run 内、而 B② 基线快照取在 run 前 ⇒ 上传件
+                                # 必然落进"前后差集"。记录下来供两处排除：
+                                #   · B② 收尾兜底（防把用户上传的原件拉回发假卡片）；
+                                #   · B1 证据签名（防一次上传把停滞计数洗白）。
+                                # 解析失败静默跳过：exclude 漏一项的最坏后果只是回退到
+                                # 修复前行为（把上传件当新产物），不值得为此中断流。
+                                if (
+                                    tool_name in (
+                                        "upload_to_sandbox",
+                                        "decrypt_and_upload_to_sandbox",
+                                    )
+                                    and content_str
+                                ):
+                                    try:
+                                        _up_json = json.loads(content_str)
+                                        if isinstance(_up_json, dict):
+                                            _up_path = _up_json.get("sandbox_path")
+                                            if isinstance(_up_path, str) and _up_path.startswith("/"):
+                                                _uploaded_sandbox_paths.add(_up_path)
+                                    except (json.JSONDecodeError, TypeError):
+                                        pass
+
                                 # ─── tool 节点可观测性日志：工具名 + 成功/失败 + 结果截断 ───
                                 # 屏蔽 langgraph print 后工具调用过程不再出现在日志，
                                 # 排查时看不到 AI 在调什么工具（2026-08-13 补）
@@ -2976,6 +3104,78 @@ async def chat(
                                         )
                                     _stagnation_calls += 1
 
+                                # ─── B1：沙箱交付物证据签名（2026-11-18 新增）───
+                                # 原判据只认「/reports/ 新文件」，但极常见的合法工作形态是
+                                # 先在沙箱 /home/user/ 下生成成品（build_servo.py →
+                                # v1.xlsx，137 行、断言全 PASS）、反复自检、最后才
+                                # download_from_sandbox 交付 —— 整个窗口都被判成"停滞"
+                                # （GY22328:59bbcbe3 实证：第 30 次工具调用就被二次阈值
+                                # 硬杀在交付前一步，成品随沙箱 TTL 回收永失）。
+                                # 升级：_stagnation_calls 进入检查点（第 8 次，以及阈值-3
+                                # 起的每一步）时枚举沙箱**结论类**文件快照
+                                # （_sandbox_artifact_listing 只列 _SALVAGE_EXTS 结论类
+                                # 扩展名，.py/.log 天然不在内 —— "同一个脚本反复重写"
+                                # 的空转形态依旧被 C 抓住，不会重开 83345f0c 那类漏洞），
+                                # 与上次签名比对：
+                                #   · 首扫就有未交付的结论类文件（排除本轮上传件）⇒
+                                #     这本身就是"该交付而不是该终止"的信号，清零；
+                                #   · 新增/大小变化 ⇒ 客观进展，清零；
+                                #   · 枚举失败（空 dict 且无旧签名）fail-closed：不动
+                                #     签名不清零，宁可维持原判也不基于坏数据放行。
+                                # 成本：只在检查点扫描（每 15 次调用 ≤4 次），每次一次
+                                # 沙箱 find（亚秒级），与 B② 基线枚举同源。
+                                if (
+                                    sandbox is not None
+                                    and not _bg_progress_ok
+                                    and (
+                                        _stagnation_calls
+                                        == max(
+                                            1,
+                                            settings.no_progress_stagnation_calls - 7,
+                                        )
+                                        or _stagnation_calls
+                                        >= settings.no_progress_stagnation_calls - 3
+                                    )
+                                ):
+                                    _sig_now = {
+                                        p: s
+                                        for p, s in (
+                                            await asyncio.to_thread(
+                                                _sandbox_artifact_listing, sandbox
+                                            )
+                                        ).items()
+                                        if p not in _uploaded_sandbox_paths
+                                    }
+                                    if _sig_now or _sandbox_sig_last:
+                                        if _sandbox_sig_last is None:
+                                            # 首次扫描。基线取在停滞窗口内而非 run 前 ——
+                                            # 此刻沙箱里若已有结论类文件（上一轮遗留或本轮
+                                            # 已生成未交付），说明缺的不是"终止"而是"交付
+                                            # 提醒"，同样清零给交付机会。
+                                            _sandbox_sig_last = _sig_now
+                                            if _sig_now:
+                                                _stagnation_calls = 0
+                                                logger.info(
+                                                    "[C] 沙箱已有未交付的结论类文件（%d 个）→ "
+                                                    "停滞计数清零（证据签名首扫）: user=%s, session=%s",
+                                                    len(_sig_now), user_id, session_id,
+                                                )
+                                        elif (
+                                            set(_sig_now) != set(_sandbox_sig_last)
+                                            or any(
+                                                _sig_now[p] != _sandbox_sig_last[p]
+                                                for p in _sig_now
+                                                if p in _sandbox_sig_last
+                                            )
+                                        ):
+                                            _stagnation_calls = 0
+                                            logger.info(
+                                                "[C] 沙箱结论类文件证据变化（%d 个候选）→ "
+                                                "停滞计数清零（证据签名）: user=%s, session=%s",
+                                                len(_sig_now), user_id, session_id,
+                                            )
+                                            _sandbox_sig_last = _sig_now
+
                                 # ─── P0 无进展循环检测：工具成功但反复同一意图 ───
                                 # 模型在"工具全成功但任务未收敛"时空转（2026-08-17/18 两次
                                 # Recursion limit 实证：execute 全 OK、报告已生成，模型仍不断
@@ -3090,14 +3290,39 @@ async def chat(
                                         )
                                         break
                                     logger.warning(
-                                        "[C] 交付物停滞且收敛提示无效: 再攒满 %d 次仍无交付物 → 终止"
+                                        "[C] 交付物停滞且收敛提示无效: 再攒满 %d 次仍无交付物"
                                         " (user=%s, session=%s)",
                                         settings.no_progress_stagnation_calls,
                                         user_id, session_id,
                                     )
+                                    if not _stagnation_wrapup_used:
+                                        # ─── B2（2026-11-18）软停：强制收尾轮，不再直接硬终止 ───
+                                        # 原实现第二次攒满即 ToolLoopAbortError，用户只看到
+                                        # 一条瞬态红条，对话戛然而止、成品留在沙箱（GY22328:
+                                        # 59bbcbe3：v1.xlsx 已生成且验证通过，死在交付前
+                                        # 一步）。改为注入"强制收尾"指令（StagnationWrapupError
+                                        # 走收敛注入通道）：停止探查 → 先把沙箱已有成品拉回
+                                        # 交付 → 文字总结。只有**收尾轮仍停滞**（第三次攒满）
+                                        # 才真正终止。语义对齐 deer-flow hard stop 的
+                                        # "[FORCED STOP] ... Producing final answer with
+                                        # results collected so far"。
+                                        _stagnation_wrapup_used = True
+                                        _stagnation_calls = 0
+                                        logger.warning(
+                                            "[C] 二次停滞 → 注入强制收尾轮（软停，最后一次机会）"
+                                            " (user=%s, session=%s)",
+                                            user_id, session_id,
+                                        )
+                                        _pending_abort = StagnationWrapupError(
+                                            f"已第二次出现连续 {settings.no_progress_stagnation_calls} 次"
+                                            "工具调用无任何新交付物，系统要求立即收尾交付"
+                                        )
+                                        break
+                                    # 收尾轮仍停滞 → 真终止。A4：终态标 failed + 终止说明
+                                    # 持久化（见 _drain_astream 尾部 except 与收尾段）。
                                     raise ToolLoopAbortError(
-                                        f"已两次出现连续 {settings.no_progress_stagnation_calls} 次"
-                                        "工具调用无任何新交付物，且收敛提示无效，"
+                                        f"已连续 {settings.no_progress_stagnation_calls} 次"
+                                        "工具调用无任何新交付物，且收敛提示与强制收尾指令均无效，"
                                         "判定任务已无法继续，已提前终止"
                                     )
 
@@ -3379,11 +3604,17 @@ async def chat(
                 # ─── 工具连续失败超限：预期内主动终止，不打印堆栈（非程序 bug）───
                 # 只向前端发 error 事件（比 GraphRecursionError 快几十步）
                 logger.warning("工具连续失败超限提前终止: %s", e)
+                # A4（2026-11-18）：记录终止事实，收尾阶段 ① 终止说明持久化为 AI
+                # 消息（原来只发瞬态 SSE error，刷新后对话戛然而止、无任何解释，
+                # GY22328:59bbcbe3 实证）；② run 终态标 failed + error 落库
+                # （原来标 completed/error=null，与 UI 红条自相矛盾）。
+                _terminal_error = str(e)[:500]
                 await _pub({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'})
             except NoProgressAbortError as e:
                 # ─── 无进展循环 / 交付物停滞：中断本轮，注入收敛提示让模型收敛 ───
-                # 两个来源共用本分支：P0（同一意图连续重复）与 C（交付物停滞，
-                # 2026-10-17 新增）。触发后 _graph_input 被替换为收敛提示，
+                # 三个来源共用本分支：P0（同一意图连续重复）、C 第一次停滞（收敛提示，
+                # 2026-10-17 新增）、C 第二次停滞（B2 强制收尾轮，2026-11-18 新增，
+                # StagnationWrapupError 子类区分文案）。触发后 _graph_input 被替换，
                 # 外层 while 循环继续跑一轮；收敛轮再触发（超注入上限）则不再注入，
                 # 由 except Exception 兜底转 error 终止（防无限收敛轮）。
                 # 注意：必须用 HumanMessage 而非 SystemMessage——vLLM 要求所有
@@ -3391,7 +3622,12 @@ async def chat(
                 # 后不保证位置（2026-08-19 09:44:54 实测 400 'System message must
                 # be at the beginning'；资源清单 13dab48→f093303 同款教训）。
                 _no_progress_triggered = True  # 标记：收敛轮跳过 M3 零产出拦截
-                logger.warning("[P0/C] 无进展或交付物停滞，注入收敛提示: %s", e)
+                _is_wrapup = isinstance(e, StagnationWrapupError)
+                logger.warning(
+                    "[P0/C] %s: %s",
+                    "注入强制收尾提示" if _is_wrapup else "无进展或交付物停滞，注入收敛提示",
+                    e,
+                )
                 await _pub({'type': 'agent_status', 'status': 'no_progress', 'content': f'{str(e)[:200]}'})
                 # 收敛提示：让模型停止空转，验证已有产出并交付。
                 # ★ 第 4 条是 C 的**安全阀**（2026-10-17）：没有它，"一直没有新交付物"
@@ -3405,24 +3641,45 @@ async def chat(
                 #   payload，不是文本猜测。
                 if _bg_job_running:
                     _tail = (
-                        "4) 本轮有**后台任务仍在运行**（工具返回 status=running、"
+                        "5) 本轮有**后台任务仍在运行**（工具返回 status=running、"
                         "带 progress_hint）：请继续用**完全相同的参数**调用该工具续查/取结果，"
                         "不要重启任务、不要重新上传文件、也不要改用 execute 自己写脚本重跑；"
                         "只有在收到明确的完成或失败信号后才能判定该任务结束。"
                     )
                 else:
                     _tail = (
-                        "4) 若本轮任务本就是问答/分析类、**不需要产出文件**，"
+                        "5) 若本轮任务本就是问答/分析类、**不需要产出文件**，"
                         "   请直接用文字给出完整结论——没有文件也是合法的终点，不要再调用工具。"
                     )
-                _graph_input = {"messages": [HumanMessage(
-                    f"系统检测到任务长时间没有推进：{str(e)[:150]}。请立即收敛："
-                    "1) 检查 /reports/{user_id}/{session_id}/ 下是否已有可交付的报告文件，"
-                    "   如有则直接确认交付，停止重新生成；"
-                    "2) 若确需重跑，先说明与上一轮的具体差异，一次完成，不要重复相同命令；"
-                    "3) 若无法收敛，明确向用户说明卡点和已完成的产出；"
-                    + _tail
-                )]}
+                # A1（2026-11-18，GY22328:59bbcbe3）：原第 1 条只引导查 /reports/，
+                # 但"先在沙箱生成成品、反复自检、最后才 download"的形态下 /reports/
+                # 里当然什么都没有 —— 模型看完 ls 结果继续埋头自检（该会话 10:40:58
+                # 实测）。补第 2 条：沙箱已有成品就先拉回交付。
+                if _is_wrapup and not _bg_job_running:
+                    # B2 强制收尾轮：语气升级、目标收窄到"交付 + 总结"。
+                    _graph_input = {"messages": [HumanMessage(
+                        f"系统判定本任务已两次出现长期无交付物推进（{str(e)[:120]}）。"
+                        "这是**最后一轮机会**，请立即收尾："
+                        "1) 停止一切探查/自检/重新生成类工具调用，不要再开始新的工作；"
+                        "2) 若沙箱内已有成品交付文件（常见于 /home/user/ 下，"
+                        "   如 *.xlsx / *.docx / *.pptx / *.md），必须先用 "
+                        f"download_from_sandbox 拉回 /reports/{user_id}/{session_id}/ "
+                        "   完成交付；"
+                        "3) 然后用文字向用户总结：已完成的内容、已交付的文件名、"
+                        "   未完成的部分及原因。本轮之后系统将终止任务。"
+                    )]}
+                else:
+                    _graph_input = {"messages": [HumanMessage(
+                        f"系统检测到任务长时间没有推进：{str(e)[:150]}。请立即收敛："
+                        "1) 检查 /reports/{user_id}/{session_id}/ 下是否已有可交付的报告文件，"
+                        "   如有则直接确认交付，停止重新生成；"
+                        "2) 若沙箱内（如 /home/user/ 或其他工作目录）已有成品交付文件，"
+                        "   请立即用 download_from_sandbox 拉回 /reports/{user_id}/{session_id}/"
+                        "   完成交付，再做剩余自检；"
+                        "3) 若确需重跑，先说明与上一轮的具体差异，一次完成，不要重复相同命令；"
+                        "4) 若无法收敛，明确向用户说明卡点和已完成的产出；"
+                        + _tail
+                    )]}
                 # 重置无进展计数（收敛轮重新统计），基线重设
                 _last_tool_sig = None
                 _repeat_count = 0
@@ -3479,6 +3736,15 @@ async def chat(
             await run_registry.mark(store, run_id, run_registry.STATUS_RUNNING)
 
             while True:
+                # ─── A3（2026-11-18，GY22328:59bbcbe3）：兜底机会改"每轮一次" ───
+                # 原实现 `_salvage_done` 全轮次单次门，理由是"完成门重试轮重扫只是
+                # 多花一次沙箱往返且无新信息"。该理由在**硬终止轮**下致命：第一轮
+                # （收敛注入轮）结束时兜底已把上传件 input.xlsx 误捞回（消耗单次门），
+                # 第二轮（真正躺着急救成品的轮）被 C 硬终止时，兜底被单次门挡住 →
+                # v1.xlsx 随沙箱 TTL 回收永失。改为每轮重置；成本 = 零产出轮多一次
+                # find（亚秒级），幂等由 _emitted_files 保证（同路径不重复发卡片）。
+                # 误捞上传件的根因已由 A2（exclude）根治，这里重置不会复发假卡片。
+                _salvage_done = False
                 await _drain_astream(_graph_input)
                 _after_files = snapshot_report_files(settings.report_root, user_id, session_id)
                 _new_files = _after_files - _before_files
@@ -3486,8 +3752,8 @@ async def chat(
                 # ─── B② 收尾兜底：把沙箱里漏掉的产物拉回宿主 ───
                 # 位置放在 M3 完成门**之前**：兜底救回来的产物应当让本轮正常放行，而不是
                 # 先弹"未产出交付物"再补救（那是自相矛盾的 UX，正是本次要修的病）。
-                # 单次门 _salvage_done：完成门重试轮不重复扫（差集已取过，重扫只是多花
-                # 一次沙箱往返且无新信息）。
+                # `_salvage_done` 为**轮内**单次门，每轮在 while 顶部重置（A3，
+                # 2026-11-18：硬终止轮必须有第二次兜底机会，见 while 顶部注释）。
                 #
                 # 触发条件两个来源（2026-09-29 A+B 扩展）：
                 #   ① 原条件（词表判交付 + 宿主零产出）；② 本轮 execute 命中虚拟路径护栏。
@@ -3529,7 +3795,8 @@ async def chat(
                             str(_exec_violation.get("command_head", ""))[:160],
                         )
                     _salvaged = await _salvage_sandbox_artifacts(
-                        sandbox, user_id, session_id, _before_sandbox_files
+                        sandbox, user_id, session_id, _before_sandbox_files,
+                        exclude=_uploaded_sandbox_paths,
                     )
                     for _sf in _salvaged:
                         if _sf["file_path"] in _emitted_files:
@@ -3734,8 +4001,42 @@ async def chat(
                 reason="normal",
             )
             _persisted = True
+            # ─── A4（2026-11-18，GY22328:59bbcbe3）：硬终止说明持久化 ───
+            # ToolLoopAbortError 原来只发一条瞬态 SSE error（红条随刷新消失），
+            # store 里对话戛然而止于最后一条工具结果，用户没有任何解释。
+            # 这里在 _persist_session **之后**追加一条合成 AI 消息作为终止公告：
+            # 顺序铁律 —— 必须在 persist 之后（否则水位 last_stored_id 指向
+            # checkpoint 历史里不存在的合成 id，by_id 追加规划当场退化，见
+            # _write_session_notice docstring）；必须在 _finish_run 之前（前端
+            # 收到 [DONE] 时消息必须已落盘）。
+            if _terminal_error:
+                try:
+                    await _write_session_notice(
+                        store,
+                        user_id=user_id,
+                        session_id=session_id,
+                        content=(
+                            "⚠️ " + _terminal_error
+                            + "\n\n本轮工作可能有部分成果已完成但未及交付（成品此前只存在于"
+                            "沙箱中）。可以重发一次任务（系统已升级为：沙箱内已有成品会自动"
+                            "识别为进展并给机会交付），或联系管理员从沙箱快照恢复文件。"
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    # 终止说明写失败不阻断收尾：run 状态与 error 字段仍会如实落库。
+                    logger.exception(
+                        "[A4] 终止说明持久化失败（不阻断收尾）: session=%s", session_id,
+                    )
             # release → 落终态 → publish_end（= 前端看到的 `data: [DONE]`）
-            await _finish_run(run_id, run_registry.STATUS_COMPLETED)
+            # A4：本轮若以 ToolLoopAbortError 硬终止，终态如实标 failed + error 字段
+            # 落库 —— 原来无条件标 completed/error=null，与 UI 红条自相矛盾，复盘时
+            # run 台账还把事故轮记成"成功"。
+            await _finish_run(
+                run_id,
+                run_registry.STATUS_FAILED if _terminal_error
+                else run_registry.STATUS_COMPLETED,
+                error=_terminal_error,
+            )
             _finalized = True
         except BaseException as e:
             # 含 CancelledError（POST /cancel 与进程关停都走这条）。这里只做**分类与
