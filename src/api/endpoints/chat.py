@@ -1141,6 +1141,44 @@ def _mark_agent_skill_origin(skill_root: str, skill_name: str) -> None:
         logger.warning("[skill] 标记 agent 来源失败: %s/%s (%s)", skill_root, skill_name, e)
 
 
+def _detect_skill_write_failure(
+    tool_name: str | None,
+    content_str: str,
+    is_error: bool,
+    user_id: str,
+    file_path_virtual: str | None,
+) -> str | None:
+    """识别「agent 写 skill 失败」，命中返回技能目录名，判不出返回 None。
+
+    为什么需要这个（2026-11-19 GY18008/b89f416a 实证）：`__user_GY18008__` 被
+    root 旁路操作建成 root:root 后，write_file 建技能子目录连续 EACCES，但失败
+    只作为工具结果文本回给模型，日志/前端**零感知**——模型自由发挥把 SKILL.md
+    降级写进 /reports 当普通交付物，用户只看到"让我手动上传"，排障无从下手。
+    本函数把"写失败"从模型叙述里捞成一等的 ERROR 日志 + `skill_write_failed` 事件。
+
+    为什么主判据是结果文本而不是 file_path_virtual：真实报错文案是
+        Error writing file '/1122部件齐套生成/SKILL.md': [Errno 13] Permission
+        denied: '/data/agent/skills/__user_GY18008__/1122部件齐套生成'
+    ——虚拟路径前缀被 backend 截掉，`_classify_skill_path` 对它完全失明；
+    工具调用 args 里的 file_path 在本位置（ToolMessage 处理处）拿不到。
+    故双通道：先认已解析出的虚拟路径（正常形态），漏了再按技能根
+    （虚拟 `/skills/__user_{uid}__/` 或落盘 `/data/agent/skills/__user_{uid}__/`）
+    在结果文本里扫技能名。
+    """
+    if not is_error or tool_name not in _SKILL_WRITE_TOOLS:
+        return None
+    # 通道①：结果里能解析出本用户技能目录下的完整路径（报错包装形态通常截了前缀，认不出）
+    kind, rel = _classify_skill_path(file_path_virtual, user_id)
+    if kind == SKILL_KIND_USER and "/" in rel:
+        return rel.split("/", 1)[0]
+    # 通道②：结果文本含本用户技能根路径（虚拟或落盘形态同后缀，一个正则全认）。
+    # ⚠ 不要求技能名后还有 `/`：mkdir 失败的报错路径就是**目录本身**收尾
+    # （`.../skills/__user_GY18008__/1122部件齐套生成'`，见 b89f416a 原文），
+    # 要求尾斜杠会漏掉最常见的一类失败形态。
+    m = re.search(rf"skills/__user_{re.escape(user_id)}__/([^/\\\"']+)", content_str or "")
+    return m.group(1) if m else None
+
+
 
 def _sanitize_generated_path(file_path: str) -> str:
     """清洗工具返回的文件路径（对称前端 deriveGeneratedFiles 清洗，2026-08-24 根治脏路径）。
@@ -3429,6 +3467,31 @@ async def chat(
                                 is_user_skill = skill_kind == SKILL_KIND_USER
                                 is_agent_skill = skill_kind == SKILL_KIND_SHARED
                                 is_skill_path = is_user_skill or is_agent_skill
+                                # ─── skill 写失败透出（2026-11-19，判据见函数 docstring）───
+                                # 必须 continue：失败结果不是交付物，绝不能掉进下面的
+                                # file_generated 兜底（幽灵卡片），也不进成功分支的
+                                # skill_created / 进展计数（写失败不是进展）。
+                                _failed_skill = _detect_skill_write_failure(
+                                    tool_name,
+                                    content_str,
+                                    is_error,
+                                    user_id,
+                                    file_path_virtual,
+                                )
+                                if _failed_skill:
+                                    _err_excerpt = (content_str or "")[:300]
+                                    logger.error(
+                                        "[SKILL_GEN] skill 写入失败（未落盘）: skill=%s tool=%s | %s",
+                                        _failed_skill,
+                                        tool_name,
+                                        _err_excerpt,
+                                    )
+                                    await _pub({
+                                        'type': 'skill_write_failed',
+                                        'skill_name': _failed_skill,
+                                        'error': _err_excerpt,
+                                    })
+                                    continue
                                 if file_path_virtual and (is_report_path or is_skill_path):
                                     filename = None
                                     file_size = 0
