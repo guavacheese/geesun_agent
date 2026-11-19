@@ -70,6 +70,31 @@ fi
 # set -a 使 source 进来的变量自动 export，子进程（docker）才能继承。
 set -a; source "$ENV_FILE"; set +a
 
+# ── 数据目录属主规范化（每次发布都跑）────────────────────────
+# 为什么不是只在 init-host.sh 做：init 只跑一次，之后任何 root 身份的旁路操作
+# （docker cp、root 终端手工 mkdir、早期以 root 跑的容器）都会在 $DATA_ROOT 下
+# 造出 root 属主目录。agent 容器以 appuser(1001) 运行，在这些目录里 mkdir 会
+# EACCES——技能"agent 自创"链路首当其冲：2026-11-19 实证 GY18008 的
+# skills/__user_GY18008__ 自 10-26 起 root:root，agent 新建技能目录连续被拒，
+# 只能降级把 SKILL.md 写进 /reports 让用户手动上传。init-host.sh 的 chown
+# 管不到这种事后漂移，所以每次发布在这里归位一次。
+# skills 子树很小，整树 -R；uploads/reports/agent 可能很大，只修顶层属主
+# （深层 root 属主文件不影响 mkdir，遇到再单独处理，避免发布时全树扫描）。
+DATA_ROOT="${AGENT_DATA_ROOT:-/opt/geesun/data}"
+if [ "$(id -u)" -eq 0 ] && [ -d "$DATA_ROOT" ]; then
+  chown -R 1001:1001 "$DATA_ROOT/skills" 2>/dev/null \
+    && echo "==> 属主规范化：$DATA_ROOT/skills 已整树归位 1001:1001"
+  _top_fixed="$(find "$DATA_ROOT/uploads" "$DATA_ROOT/reports" "$DATA_ROOT/agent" \
+                  -maxdepth 1 ! -user 1001 -exec chown 1001:1001 {} + 2>/dev/null || true)"
+  _n_abn="$(find "$DATA_ROOT/uploads" "$DATA_ROOT/reports" "$DATA_ROOT/agent" \
+              -maxdepth 1 ! -user 1001 2>/dev/null | wc -l)"
+  if [ "$_n_abn" -gt 0 ]; then
+    echo "⚠️  $DATA_ROOT 顶层仍有非 1001 属主条目（$_n_abn 个），已尝试修复，请人工复查"
+  fi
+elif [ "$(id -u)" -ne 0 ]; then
+  echo "⚠️  非 root 运行，跳过数据目录属主规范化（如遇技能写入 EACCES 请用 root 重跑）"
+fi
+
 # ── 解析参数 ───────────────────────────────────────────────
 # 默认带全量子栈（生产标准，防漏带 phoenix/langfuse 触发 --prune 清服务 → agent 同步
 # OTel exporter 阻塞 → /docs healthcheck 超时 → 0/1 → 前端全站 502，2026-09-08 实锤）。
