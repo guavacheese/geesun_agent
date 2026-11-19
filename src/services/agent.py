@@ -41,6 +41,13 @@ from deepagents.middleware.skills import (
 from langchain.agents.middleware.types import AgentMiddleware, PrivateStateAttr
 from src.core import execution_guard
 from src.core.loop_detection import LoopDetectionMiddleware
+from src.core.subagent_budget import SubagentBudgetMiddleware
+# D3（2026-11-19）：显式声明 general-purpose 子代理时复用 deepagents 的默认
+# 文案常量（导入而非抄写——升级时文案自动跟随，只锁"有保险丝"这一行为）。
+from deepagents.middleware.subagents import (
+    DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+    DEFAULT_SUBAGENT_PROMPT,
+)
 from src.core.skill_md import validate_skill_md
 from src.core.terminal_response import TerminalResponseMiddleware
 
@@ -1562,7 +1569,42 @@ def _build_deep_agent(*, model, tools, backend, skills, middleware, checkpointer
     _SweepThenSummarize 组合件，name="SummarizationMiddleware"）已在 middleware
     列表里传入，由 0.7 _apply_custom_middleware 按 name 原位替换主链/gp 默认
     实例——列表内位置不影响最终栈序（替换发生在 core 槽位原位）。
+
+    D3（2026-11-19）：显式声明 general-purpose 子代理（subagents=），目的只有一个
+    ——给它挂 SubagentBudgetMiddleware 保险丝。要点与等价性论证（对照 0.7.24
+    graph.py L696-815 声明式 spec 处理流水线）：
+
+    · 为什么必须显式声明：0.7.24 没有任何途径给声明式子代理 bind recursion_limit
+      （SubAgent spec 无 config 字段、create_sub_agent 全程不 bind config），
+      而子代理经 ensure_config 自动继承父 recursion_limit ⇒ 主图 1000 步会被
+      单个 task 调用完整继承。deepagents 对显式同名 spec 的处理是**不再自动加
+      默认 gp**（graph.py L823），其余装配（默认 middleware 栈、tools/
+      permissions/interrupt_on 继承、profile 文案处理）与自动注入路径**同一条
+      流水线**（同一循环体 L687-815），故行为等价。
+    · 与自动注入路径的唯一差异要手动补齐：`_gp_inheritable` 只发生在自动路径
+      （L849），显式 spec 不会自动继承主链的自定义 SummarizationMiddleware
+      （_SweepThenSummarize）——下面按 name 显式挑出来放进 spec，否则子代理
+      会退回原生 SummarizationMiddleware，丢掉主链修过的 sweep-then-summarize
+      语义（3692c67/328ac0a/7942e6b 手术史同款病根）。
+    · 文案用导入常量（DEFAULT_GENERAL_PURPOSE_DESCRIPTION/DEFAULT_SUBAGENT_PROMPT）
+      而非抄写，升级自动跟随 deepagents 默认演化。
     """
+    # 与自动注入路径 _gp_inheritable 同语义：只继承与 gp 默认槽位同名的自定义
+    # 中间件（当前即 _SweepThenSummarize，name="SummarizationMiddleware"）。
+    _gp_middleware = [m for m in middleware if m.name == "SummarizationMiddleware"]
+    _gp_middleware.append(
+        SubagentBudgetMiddleware(max_model_calls=settings.subagent_max_model_calls)
+    )
+    _gp_spec: dict = {
+        "name": "general-purpose",
+        "description": DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+        "system_prompt": DEFAULT_SUBAGENT_PROMPT,
+        "middleware": _gp_middleware,
+        # model/tools/permissions/interrupt_on 一律不写：声明式流水线自动继承
+        # 主代理的（graph.py L698/L705/L779/L787），写了反而固化。
+    }
+    if skills:
+        _gp_spec["skills"] = skills
     return create_deep_agent(
         model=model,
         tools=tools,
@@ -1571,6 +1613,7 @@ def _build_deep_agent(*, model, tools, backend, skills, middleware, checkpointer
         skills=skills,
         memory=[AGENTS_MD_PATH],
         middleware=middleware,
+        subagents=[_gp_spec],
         interrupt_on={
             "write_file": False,
             "read_file": False,

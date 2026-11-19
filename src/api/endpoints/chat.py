@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Query, Request, HTTPException
 from fastapi.responses import StreamingResponse
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel
 from src.infra.database import message_key
 from src.infra.sandbox import create_sandbox, get_env_snapshot
@@ -2636,6 +2637,16 @@ async def chat(
         # 刷新后对话戛然而止无解释）；② run 终态标 failed + error 字段落库
         # （原来标 completed/error=null，与 UI 红条自相矛盾）。
         _terminal_error: str | None = None
+        # D2（2026-11-19，11-19 生产 GraphRecursionError×8 事故）：本轮是否烧穿
+        # recursion_limit（GraphRecursionError）。置位后：① B② 兜底无条件尝试拉回
+        # 沙箱产物（合法长任务撞限 ≠ 零产出，不该再受词表/生成列表条件限制）；
+        # ② while 循环直接 break，不进 M3 自动继续（刚烧穿配额，再推一轮只会再烧穿）；
+        # ③ 与 _terminal_error 配合走 A4 收尾（终止说明 + run 标 failed）。
+        _recursion_capped = False
+        # D2：终止说明的**全文**覆盖（A4 固定尾巴是 ToolLoopAbort 文案"重发一次
+        # 任务/联系管理员恢复"，对"步数耗尽"不合适——步数耗尽时产物已被兜底拉回、
+        # 正确建议是"拆小任务重发"）。None = A4 用默认组装文案。
+        _terminal_notice: str | None = None
         # C 的进展豁免（2026-10-20，add0229b / 84433a68 事故残留）：
         # _progress_exempt_count —— 连续被判「后台任务在推进」而清零的次数，
         #                          超过 settings.loop_detect_progress_exempt_max
@@ -2664,6 +2675,7 @@ async def chat(
             nonlocal _last_tool_sig, _repeat_count, _files_in_window, _no_progress_injections, _graph_input, _no_progress_triggered
             nonlocal _stagnation_calls, _stagnation_injections
             nonlocal _stagnation_wrapup_used, _sandbox_sig_last, _terminal_error
+            nonlocal _recursion_capped, _terminal_notice
             nonlocal _progress_exempt_count, _bg_job_running
             nonlocal _loop_forced_stop
             _consecutive_tool_failures = 0  # 每轮 astream 重新计数（完成门继续轮独立统计）
@@ -3610,6 +3622,52 @@ async def chat(
                 # （原来标 completed/error=null，与 UI 红条自相矛盾）。
                 _terminal_error = str(e)[:500]
                 await _pub({'type': 'error', 'content': f'Agent 处理异常: {str(e)[:200]}'})
+            except GraphRecursionError as e:
+                # ─── D2（2026-11-19，11-19 生产 GraphRecursionError×8 事故）───
+                # 合法长任务（改码→构建→验证）烧穿 super-step 配额。此前落下面
+                # `except Exception` 兜底：logger.exception 打整段堆栈（Grafana
+                # 「后台日志与错误」面板一片红）+ 只发瞬态 error 事件，且外层 M3
+                # 完成门还可能注入自动继续轮**再烧穿一遍**。改为结构化收尾：
+                #   · warning 级、不带堆栈——这不是程序 bug，是配置容量到顶；
+                #   · completion_blocked(recursion_capped) 结构化事件（前端
+                #     turn-store 已消费 completionBlocked，无需前端改动）；
+                #   · _recursion_capped → 外层 B② 无条件兜底拉回沙箱产物、
+                #     break 终止本轮，**不进** M3 自动继续（刚烧穿配额，再推
+                #     一轮只是重烧）；
+                #   · _terminal_error/_terminal_notice → 复用 A4 收尾链：终止
+                #     说明持久化 + run 标 failed + error 落库（原文案是
+                #     ToolLoopAbort 语境的"重发任务/联系管理员"，此处覆盖为
+                #     "拆小任务"语境，见 _terminal_notice 注释）。
+                logger.warning(
+                    "[D2] 单轮步数耗尽（recursion_limit=%d）: user=%s session=%s "
+                    "raw=%s generated=%d（即将尝试沙箱产物兜底）",
+                    _recursion_limit, user_id, session_id, str(e)[:200],
+                    len(_generated_files),
+                )
+                _recursion_capped = True
+                _terminal_error = (
+                    f"单轮步数上限达到（recursion_limit={_recursion_limit}），"
+                    "任务已被系统终止"
+                )
+                _terminal_notice = (
+                    "⚠️ 任务终止原因：本轮工作达到了**单轮步数上限**"
+                    f"（recursion_limit={_recursion_limit}），系统已停止本轮。\n\n"
+                    "终止前已生成的产物会尽量从沙箱拉回并附在本轮消息中；"
+                    "若本轮没有出现新的文件卡片，说明沙箱内暂无可回收产物。"
+                    "请把剩余工作拆成更小的任务再次发送（例如「接着上一步完成 X」），"
+                    "已完成的改动不会丢失（沙箱与检查点仍在）。"
+                )
+                await _pub({
+                    'type': 'completion_blocked',
+                    'code': 'recursion_capped',
+                    'title': '单轮步数已用尽',
+                    'reason': (
+                        f"本轮任务需要的步骤数超过单轮容量（上限 {_recursion_limit} 步），"
+                        "系统已终止本轮并尝试拉回已产出的文件。"
+                    ),
+                    'hint': '请把剩余工作拆成更小的任务分轮发送。',
+                    'terminated': True,
+                })
             except NoProgressAbortError as e:
                 # ─── 无进展循环 / 交付物停滞：中断本轮，注入收敛提示让模型收敛 ───
                 # 三个来源共用本分支：P0（同一意图连续重复）、C 第一次停滞（收敛提示，
@@ -3773,7 +3831,11 @@ async def chat(
                     not _salvage_done
                     and _before_sandbox_files is not None
                     and (
-                        (
+                        _recursion_capped  # D2：撞限轮无条件兜底——合法长任务撞限
+                        # ≠ 零产出，词表判交付（_is_deliverable）与流式识别
+                        # （_generated_files）都不该挡它；上传件误捞已由 A2
+                        # exclude 根治，多扫一次的代价亚秒级。
+                        or (
                             not _new_files
                             and not _generated_files
                             and _is_deliverable
@@ -3815,6 +3877,19 @@ async def chat(
                             settings.report_root, user_id, session_id
                         )
                         _new_files = _after_files - _before_files
+                # ─── D2（2026-11-19）：步数耗尽轮到此终止，不进 M3 自动继续 ───
+                # 撞限后 checkpoint 仍在、理论上注入条消息就能"续跑"，但续跑必须
+                # 由用户重发（拆小的）任务来发起：在这里自动再推一轮等于自动重烧
+                # 一整个上限配额（11-19 事故实测单轮 300 步 ≈ 几十次 LLM 调用，
+                # 自动续烧意味着一次交互墙钟翻倍，用户全程干等）。兜底产物已在
+                # 上面 emit；break 后走 A4 收尾链（终止说明落库 + run 标 failed）。
+                if _recursion_capped:
+                    logger.warning(
+                        "[D2] 步数耗尽轮终止（跳过 M3 完成门自动继续）: "
+                        "user=%s, session=%s, generated=%d, new_files=%d",
+                        user_id, session_id, len(_generated_files), len(_new_files),
+                    )
+                    break
                 # ─── 空响应降级优先于 M3 零产出拦截（2026-09-16）───
                 # 模型层一个字都没产出时，「/reports 为空」只是它的**后果**，
                 # 不能按"漏了 download_from_sandbox / write_file"归因（de18ad37 实锤）。
@@ -4015,7 +4090,11 @@ async def chat(
                         store,
                         user_id=user_id,
                         session_id=session_id,
-                        content=(
+                        # D2（2026-11-19）：_terminal_notice 允许各终止来源覆盖
+                        # 全文——默认尾巴是 ToolLoopAbort 语境（"成品只在沙箱、
+                        # 联系管理员恢复"），步数耗尽轮产物已被兜底拉回、正确建议
+                        # 是"拆小任务重发"，两套文案不能互相套用。
+                        content=_terminal_notice or (
                             "⚠️ " + _terminal_error
                             + "\n\n本轮工作可能有部分成果已完成但未及交付（成品此前只存在于"
                             "沙箱中）。可以重发一次任务（系统已升级为：沙箱内已有成品会自动"

@@ -123,6 +123,16 @@ class Settings(BaseSettings):
     recursion_limit: int = 300
     #: 服务端硬上限：任何来源（默认值/环境变量/未来客户端传入）超出即钳制
     max_recursion_limit: int = 1000
+    # ─── 子代理模型调用预算（D3，2026-11-19）───
+    # deepagents 0.7.24 无途径给子代理 bind recursion_limit（SubAgent spec 无
+    # config 字段，声明式路径全程不 bind config，见 src/core/subagent_budget.py
+    # 模块头实测论证）；而子代理经 ensure_config 自动继承父 recursion_limit——
+    # 主图上限提到 1000 后，放任不管就是一个 task 调用里 1000 步的墙钟黑洞。
+    # 行为等价替代：数子代理消息列表里的 AIMessage 条数，到量剥 tool_calls
+    # 逼出最终报告（deer-flow 子代理 max_turns=150 同款思路）。
+    # ★ 单位是**模型调用次数**（≈1 次/工具调用+收尾），不是 super-step。
+    #: general-purpose 子代理单次 task 的模型调用上限；0/负数非法（启动即报错）。
+    subagent_max_model_calls: int = 150
     # ─── P0 无进展循环检测（2026-08-19 新增）───
     # 工具"成功但无进展"死循环兜底：同一工具调用意图（工具名+参数指纹）
     # 连续出现 N 次且期间零新交付物 → 判定循环，注入收敛 SystemMessage。
