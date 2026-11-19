@@ -1,19 +1,21 @@
 """文件下载/预览 API — 提供 Agent 生成的报告和用户上传文件的访问。"""
 
+import asyncio
 import os
 import logging
 import mimetypes
 from datetime import datetime
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from src.api.deps import get_current_user
 from src.infra.reports import (
     find_session_file,
     list_session_reports,
     session_file_roots,
 )
+from src.infra.xlsx_drawing import normalize_xlsx_drawing_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,11 @@ TEXT_EXTENSIONS = {
     ".md", ".txt", ".log",
     ".py", ".js", ".ts", ".tsx", ".css", ".html", ".json", ".yaml", ".yml", ".sh",
 }
+
+# xlsx serve 侧 drawing 归一化的尺寸闸（2026-11-19，见 src/infra/xlsx_drawing.py）：
+# 归一化需整读进内存重建 zip，超过闸值的 xlsx 罕见且宁可退化为原样下发
+# （前端 SpreadsheetViewer 的 SheetJS 兜底仍在，预览不会因此炸）。
+_XLSX_NORM_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _validate_path(path: str) -> bool:
@@ -56,6 +63,7 @@ def _search_file(user_id: str, session_id: str, filename: str) -> str | None:
 @router.head("/files/{user_id}/{session_id}/{filename:path}")
 @router.get("/files/{user_id}/{session_id}/{filename:path}")
 async def download_file(
+    request: Request,
     user_id: str,
     session_id: str,
     filename: str,
@@ -117,11 +125,43 @@ async def download_file(
         file_path, mime_type,
     )
 
+    # ─── xlsx serve 侧 drawing 归一化（2026-11-19，exceljs 预览兼容护栏）───
+    # openpyxl 另存的 xlsx 有三处包形态偏差会让前端 exceljs 整个炸穿
+    # （详见 src/infra/xlsx_drawing.py 模块 docstring）。在唯一下发口做归一化，
+    # 一处覆盖沙箱拉回/收尾兜底/MCP download_from_sandbox 全部写盘路径**及存量
+    # 旧文件**（写侧挂钩做不到后者）。幂等 + 永不抛 + 返回同一对象=未改动；
+    # 已是标准形态的（Excel/WPS 原件）零开销原样 FileResponse。
+    # HEAD 与超尺寸闸之外的文件一律走原路径；归一化失败（原样返回）也走
+    # FileResponse，保持 Content-Length 与磁盘一致。
+    if (
+        request.method == "GET"
+        and ext == ".xlsx"
+        and os.path.getsize(file_path) <= _XLSX_NORM_MAX_BYTES
+    ):
+        raw = await asyncio.to_thread(_read_bytes, file_path)
+        if raw is not None:
+            normalized = await asyncio.to_thread(normalize_xlsx_drawing_bytes, raw)
+            if normalized is not raw:
+                return Response(
+                    content=normalized,
+                    media_type=mime_type,
+                    headers={"Content-Disposition": content_disposition},
+                )
+
     return FileResponse(
         path=file_path,
         media_type=mime_type,
         headers={"Content-Disposition": content_disposition},
     )
+
+
+def _read_bytes(path: str) -> bytes | None:
+    """读文件字节；任何异常返回 None（serve 归一化是护栏，不能反手把下载搞挂）。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 @router.get("/files/{user_id}/{session_id}")
