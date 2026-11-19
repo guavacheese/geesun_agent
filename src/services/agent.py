@@ -78,8 +78,30 @@ def _summarization_event_last_wins(old, new):
     return new if new is not None else old
 
 
+def _merge_skill_disclosures(old, new):
+    """`_skill_tools_disclosed` 的合并 reducer（1.0.53 回滚事故修复，2026-11-19）。
+
+    生产装配有两个 SkillsMiddleware 实例（create_deep_agent(skills=) 默认实例 +
+    _FreshSkillsMiddleware 追加实例，不同 name 不去重）。deepagents 0.7.24 起
+    wrap_model_call **无条件**返回 Command(update={_skill_tools_disclosed:
+    record})（skills.py:1342/1364）→ 同一 model task 同 super-step 双写；父类
+    声明是 LastValue（PrivateStateAttr 非 reducer）→ InvalidUpdateError，
+    每轮必炸（1.0.53 上线 14 分钟回滚；Postgres checkpoint_writes 实证同
+    task_id idx=1/2 两行同 key，thread GY34035:2b3a6c6d）。
+
+    本 reducer 使字段成为 BinaryOperatorAggregate channel（识别规则同
+    _summarization_event_last_wins：Annotated meta 末尾 2 参 callable）：
+    双写逐个 fold。语义 = 两实例披露记录（tool→skill 名映射）取并集、同键
+    后者赢——两实例读同一 state 做披露，record 本就同源，并集无信息损失。
+
+    None 容错为防御性（0.7.24 两个写点恒传 dict，含空 {}）；reducer 返回
+    dict 不会是 None，通道首值由 BinaryOperatorAggregate 直接落位。
+    """
+    return {**(old or {}), **(new or {})}
+
+
 class GeesunAgentState(DeepAgentState):
-    """geesun 侧 agent state schema：覆盖 deepagents 的 summarization 事件通道。
+    """geesun 侧 agent state schema：覆盖 deepagents 的两个并发写通道。
 
     ⚠ 必须经 create_deep_agent(state_schema=GeesunAgentState) 传入才生效——
     聚合语义见 _summarization_event_last_wins docstring。运行时 import 不可
@@ -91,6 +113,16 @@ class GeesunAgentState(DeepAgentState):
         NotRequired[SummarizationEvent | None],
         PrivateStateAttr,
         _summarization_event_last_wins,
+    ]
+
+    # 0.7.24 skills 披露双实例双写（事故复盘见 _merge_skill_disclosures
+    # docstring）。注解形态与 _summarization_event 同构：NotRequired 在
+    # Annotated 内层、reducer 居 meta 末尾——顺序错会被 langgraph 静默当作
+    # LastValue（tests/core/test_skill_disclosure_channel.py 行为级锁死）。
+    _skill_tools_disclosed: Annotated[
+        NotRequired[dict[str, str]],
+        PrivateStateAttr,
+        _merge_skill_disclosures,
     ]
 
 
