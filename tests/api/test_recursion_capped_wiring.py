@@ -150,11 +150,21 @@ def test_gp_spec_inherits_summarization_and_has_budget():
 
 def test_config_default_matches_documentation():
     """代码默认值必须与两处 .env.example 的说明一致（模板注释承诺"下列数值
-    即默认"的语义，config 漂移要在这里被抓）。"""
-    from src.core.config import Settings
+    即默认"的语义，config 漂移要在这里被抓）。
 
-    s = Settings.model_fields["subagent_max_model_calls"]
-    assert s.default == 150
+    为什么读源码而不是 import Settings：`from src.core.config import Settings`
+    会触发模块级 `settings = Settings()` 单例，required 字段（openai_api_key
+    等）缺失即 ValidationError——生产镜像内无服务 env 时整条测试直接崩
+    （1.0.53 镜像内复跑实测）。本文件其余用例都是源码级断言，本用例同构。
+    """
+    cfg = (PROJECT_ROOT / "src" / "core" / "config.py").read_text(encoding="utf-8")
     # recursion_limit 代码默认保持保守值，1000 是生产 .env 值（模板已注明）
-    assert Settings.model_fields["recursion_limit"].default == 300
-    assert Settings.model_fields["max_recursion_limit"].default == 1000
+    assert "recursion_limit: int = 300" in cfg
+    assert "max_recursion_limit: int = 1000" in cfg
+    assert "subagent_max_model_calls: int = 150" in cfg
+    # 模板存在时连带核（镜像内不带 .env.example，属预期缺省，不是失败）
+    for tpl in (PROJECT_ROOT / ".env.example", PROJECT_ROOT / "deploy" / ".env.example"):
+        if tpl.exists():
+            t = tpl.read_text(encoding="utf-8")
+            # 模板写的是生产推荐值 1000（代码默认 300 是保守兜底，见上）
+            assert "RECURSION_LIMIT=1000" in t or "recursion_limit=1000" in t, tpl.name
