@@ -69,12 +69,14 @@
 ==============================
 防 ``read_file → 转存 → 再 read_file`` 死循环（deer-flow 踩过，其
 ``ToolOutputConfig.exempt_tools`` 默认豁免 read_file）。本项默认豁免集合与 deepagents
-的 ``TOOLS_EXCLUDED_FROM_EVICTION``（``filesystem.py:696``）**完全一致**
-（ls / glob / grep / read_file / edit_file / write_file）——两者行为因此不会分叉，
+的 ``TOOLS_EXCLUDED_FROM_EVICTION``（0.7.24: ``middleware/filesystem.py:1623``）
+**完全一致**（ls / glob / grep / read_file / edit_file / write_file / delete，
+其中 ``delete`` 为 0.7 随 fs 中间件删除工具上线新增）——两者行为因此不会分叉，
 一致性由 ``tests/core/test_tool_output_budget.py`` 的依赖契约断言守着。
 
 诚实记录残留风险：豁免意味着这些工具的结果不受本闸门约束，其上界来自各自的自带
-限制（``read_file`` 在 ``filesystem.py:1059`` 按 80000 字符自行截断；ls / grep /
+限制（``read_file`` 经共享切片器 ``slice_read_response`` 分页截断，0.7 见
+``backends/filesystem.py:478``；ls / grep /
 glob 输出为结构化 JSON 且受工具参数约束），**并非零风险**，只是换了一层管辖。
 
 职责边界（明确不做什么）
@@ -157,8 +159,10 @@ _DEFAULT_FALLBACK_MAX_CHARS = 60_000
 _DEFAULT_PREVIEW_HEAD_CHARS = 2_000
 _DEFAULT_PREVIEW_TAIL_CHARS = 2_000
 
-# 与 deepagents ``TOOLS_EXCLUDED_FROM_EVICTION``（filesystem.py:696）逐项一致；
-# 一致性由 tests/core/test_tool_output_budget.py 的依赖契约断言守护。
+# 与 deepagents ``TOOLS_EXCLUDED_FROM_EVICTION``（0.7.24:
+# middleware/filesystem.py:1623）逐项一致（0.7 随 delete 工具上线新增 ``delete``）；
+# 一致性由 tests/core/test_tool_output_budget.py 的依赖契约断言守护——升级
+# deepagents 后若该断言变红，必须先比对上游增删理由，再同步本集合。
 _DEFAULT_EXEMPT_TOOLS = frozenset({
     "ls",
     "glob",
@@ -166,6 +170,7 @@ _DEFAULT_EXEMPT_TOOLS = frozenset({
     "read_file",
     "edit_file",
     "write_file",
+    "delete",
 })
 
 
@@ -366,9 +371,11 @@ class ToolOutputBudgetMiddleware(AgentMiddleware[AgentState]):
         """内容寻址的转存路径：``{tool_call_id}-{sha1 前 12 位}.txt``。
 
         **为什么带内容哈希**（两个作用，都不是美化）：
-        - 幂等：同一条结果被处置两次（如工具调用重跑）会落到同一路径，
-          ``FilesystemBackend.write`` 的"拒绝覆盖已存在文件"（``filesystem.py:487``）
-          恰好等价于"文件已经在盘上、内容一致" ⇒ 可安全判定为成功；
+        - 幂等：同一条结果被处置两次（如工具调用重跑）会落到同一路径。0.6 的
+          ``FilesystemBackend.write`` 拒绝覆盖已存在文件（error "already exists"，
+          恰等价于"同内容已在盘上"）；0.7 起改为 create-or-overwrite（O_TRUNC），
+          重复写直接成功——两种形态下"指针有效"都成立，因为路径由内容哈希决定，
+          重复写必然写回同一内容；
         - 防陈旧：若同一次工具调用产出**不同内容**，哈希不同 ⇒ 新路径，
           不可能出现"指针指向上一轮的旧内容"这种静默错误。
         """
@@ -381,8 +388,10 @@ class ToolOutputBudgetMiddleware(AgentMiddleware[AgentState]):
     def _write_ok(result: Any) -> bool:
         """写是否算成功。
 
-        唯一被当作成功的错误是"文件已存在"：文件名是内容寻址的（见
-        ``_externalize_path``），已存在即证明**同内容已在盘上**、指针有效。
+        无 error 即成功（0.7 起 ``FilesystemBackend.write`` 为 create-or-overwrite，
+        对内容寻址路径的重复写就返回无错误）。唯一被容忍的错误形态是
+        "文件已存在"（≤0.6 后端与自定义后端仍可能这样报错）：文件名是内容寻址的
+        （见 ``_externalize_path``），已存在即证明**同内容已在盘上**、指针有效。
         其余一切错误（白名单拒绝、磁盘满、权限）都算失败 → 走 fail-closed 截断。
         """
         if result is None:

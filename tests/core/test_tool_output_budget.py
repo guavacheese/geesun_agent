@@ -241,7 +241,7 @@ def test_exempt_tool_is_never_touched():
     """read_file 必须豁免 —— 否则 read → 转存 → 再 read 会死循环。"""
     mw = _mw()
     huge = "r" * 500_000
-    for name in ("read_file", "ls", "glob", "grep", "write_file", "edit_file"):
+    for name in ("read_file", "ls", "glob", "grep", "write_file", "edit_file", "delete"):
         msg = _tool_msg(huge, name=name)
         assert mw._process_sync(msg) is msg
 
@@ -407,9 +407,10 @@ def _agent_tree():
 
 
 def _middleware_order(tree) -> list[str]:
-    # 动作二（2026-11-17）：user middleware 列表构造于 create_agent、经
-    # _build_deep_agent(middleware=[...]) 传入；SummarizationMiddleware 不在
-    # 列表里——经 monkey-patch 挂到 deepagents graph.py:801 默认实例创建位。
+    # 动作三（2026-11-19，deepagents 0.7）：Summarization（经 _SweepThenSummarize
+    # 组合件）恢复进 user middleware 列表——0.7 _apply_custom_middleware 按
+    # name="SummarizationMiddleware" 原位替换进 core 槽位（列表内位置不影响
+    # 最终栈序，但组合件必须在列表里且 name 正确）。
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_build_deep_agent":
             for kw in node.keywords:
@@ -435,10 +436,10 @@ def test_middleware_is_registered_in_expected_position():
         "必须在 file_to_image 之后：先让它把图片 file block 转成 image_url，"
         "再做瘦身，否则待转的 base64 文本会被当超限结果处置"
     )
-    assert "summarization_mw" not in order, (
-        "动作二（2026-11-17）后 Summarization 不得再经 user middleware 传入："
-        "0.6.12 主链 graph.py:801 无条件创建默认实例，再传必然双实例"
-        "（GY35362 双写 brick）。现由 patch 挂到默认实例创建位"
+    assert "summary_composite" in order, (
+        "动作三（2026-11-19）：Summarization 必须经 user middleware 传入"
+        "（_SweepThenSummarize 组合件，name=SummarizationMiddleware），"
+        "由 0.7 _apply_custom_middleware 原位替换默认实例"
     )
     assert idx < order.index("model_call_guard"), (
         "必须在 model_call_guard 之前：它按总字符估 prompt_tokens 并动态收紧 max_tokens"
@@ -450,20 +451,21 @@ def test_middleware_is_registered_in_expected_position():
 
 
 def test_summarization_patch_preserves_budget_before_summarize_order():
-    """动作二接线的三重契约（AST/文本级，2026-11-17）。
+    """动作三接线的三重契约（AST/文本级，2026-11-19，deepagents 0.7）。
 
-    patch 后 Summarization 挂在 deepagents graph.py:801 槽位（user middleware
-    之前 = wrap 链更外层）。"budget 先瘦身、Summarization 才算得准"的不变量
-    由此改由 _SweepThenSummarize 组合件保证：sweep 的 wrap_model_call 在外层
-    手动包住 summarization 的 wrap_model_call。
+    0.7 _apply_custom_middleware 按 name 原位替换：组合件被换进默认
+    Summarization 槽位（core 栈，wrap 链更外层）。"budget 先瘦身、Summarization
+    才算得准"的不变量由 _SweepThenSummarize 组合件保证：sweep 的 wrap_model_call
+    在外层手动包住 summarization 的 wrap_model_call。
     """
     src = AGENT_PY.read_text(encoding="utf-8")
-    # ① patch 确实接管了 deepagents.graph 命名空间（graph.py:55 是 from-import，
-    #    patch deepagents.middleware.summarization 无效）
-    assert (
-        "deepagents.graph.create_summarization_middleware = "
-        "_patched_create_summarization_middleware"
-    ) in src, "patch 未落到 deepagents.graph 命名空间"
+    # ① 组合件 name 必须精确 == "SummarizationMiddleware"（0.7 _apply_custom_middleware
+    #    按 .name 字符串匹配；_DeepAgentsSummarizationMiddleware 的 name property
+    #    对子类回退 type(self).__name__，不覆盖 = 默认实例不被替换 = 双实例复发）
+    assert 'name = "SummarizationMiddleware"' in src, (
+        "_SweepThenSummarize 缺少 name 覆盖：0.7 按 name 匹配替换，"
+        "缺失会导致默认实例不被替换（双实例并存）"
+    )
     # ② 组合件内 sweep 先于 summarization（保序核心）
     assert re.search(
         r"self\._sweep\.wrap_model_call\(\s*request,\s*lambda req: self\._sum\.wrap_model_call",
@@ -473,11 +475,15 @@ def test_summarization_patch_preserves_budget_before_summarize_order():
         r"self\._sweep\.awrap_model_call\(\s*request,\s*lambda req: self\._sum\.awrap_model_call",
         src,
     ), "_SweepThenSummarize 异步组合序缺失或顺序颠倒"
-    # ③ create_agent 的 create_deep_agent 调用被 ctx.set/reset 包住
-    #    （否则 patched 透传原工厂，构建回退默认实例）
-    assert "_SUMMARY_MW_CTX.set(" in src and "_SUMMARY_MW_CTX.reset(" in src, (
-        "ContextVar set/reset 缺失：patch 拿不到 per-session 配置"
+    # ③ 组合件实例确实进了 user middleware 列表且挂在 summarization 槽位
+    assert re.search(r"summary_composite\s*=\s*_SweepThenSummarize\(\s*budget_mw,\s*summarization_mw\s*\)", src), (
+        "组合件构造缺失或参数顺序错误（必须 budget 外层、summarization 内层）"
     )
+    # ④ 0.6 时代的 monkey-patch 必须已摘除（防两套机制叠加）
+    assert "_patched_create_summarization_middleware" not in src, (
+        "monkey-patch 残留：0.7 走 user middleware 原位替换，patch 会叠加两套机制"
+    )
+    assert "_SUMMARY_MW_CTX" not in src, "ContextVar 传参残留（动作三已改为直接构造）"
 
 
 def _route_value(tree, route_key: str):
@@ -579,11 +585,17 @@ def test_real_backend_async_write_and_disk_landing(tmp_path, monkeypatch):
     ) == "async-body"
 
 
-def test_real_backend_existing_file_error_is_recognised_as_success(tmp_path, monkeypatch):
-    """内容寻址依赖的语义：``FilesystemBackend`` 拒绝覆盖已存在文件。
+def test_real_backend_duplicate_write_recognised_as_success(tmp_path, monkeypatch):
+    """内容寻址依赖的语义：对同一路径的**重复写**必须被判为成功。
 
-    ``_write_ok`` 必须把这条**唯一**的"已存在"错误判为成功（同内容已在盘上、
+    版本形态差异（0.7 迁移实测澄清）：
+    - ≤0.6 ``FilesystemBackend.write`` 拒绝覆盖已存在文件（error "already exists"）；
+    - 0.7 起为 create-or-overwrite（O_TRUNC，backends/filesystem.py:489），
+      重复写返回 error=None。
+    ``_write_ok`` 对两种形态都必须判成功（内容寻址路径下重复写=同内容在盘上、
     指针有效）；其余错误（白名单拒绝等）一律失败并走 fail-closed。
+    旧错误形态的兼容分支由 ``test_existing_file_is_treated_as_success``（假后端
+    注入 "already exists"）单独钉住，两条腿缺一不可。
     """
     from src.core.config import settings
     from src.services.agent import build_backend
@@ -593,8 +605,15 @@ def test_real_backend_existing_file_error_is_recognised_as_success(tmp_path, mon
 
     assert getattr(backend.write("/large_tool_results/dup.txt", "same"), "error", None) is None
     again = backend.write("/large_tool_results/dup.txt", "same")
-    assert "already exists" in str(getattr(again, "error", ""))
+    err = getattr(again, "error", None)
+    assert err is None or "already exists" in str(err), f"意外错误形态: {err!r}"
     assert ToolOutputBudgetMiddleware._write_ok(again) is True
+    # 无论覆盖还是拒绝，"指针有效"成立 ⟺ 盘上仍是那份内容。
+    # 注意映射：/large_tool_results/<f> 落盘为 <workspace>/tool_results/<u>/<s>/<f>
+    # （与上方 async 对照用例同一路径规则）。
+    assert (tmp_path / "tool_results" / "u1" / "s1" / "dup.txt").read_text(
+        encoding="utf-8"
+    ) == "same"
 
     rejected = backend.write("/etc/evil.txt", "x")
     assert ToolOutputBudgetMiddleware._write_ok(rejected) is False, (

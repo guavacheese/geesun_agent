@@ -3,9 +3,15 @@
 背景（生产事故 GY24428:5f65f8df）：
   模型二次 write_file 同一路径失败后，把原因猜成"脚本太长"，
   改用 heredoc 内联 execute 绕过 → 撞上 4 分 16 秒无心跳。
-  根因之一是 deepagents 的 WRITE_FILE_TOOL_DESCRIPTION 只有两句话
+  根因之一是 deepagents 0.6 的 WRITE_FILE_TOOL_DESCRIPTION 只有两句话
   （"Writes to a new file" / "Prefer to edit existing files"），
   既没说"已存在会失败"，也没说大 payload 的后果与出路。
+
+0.7.24 迁移演进（2026-11-19 实测）：FilesystemBackend.write 从 reject-overwrite
+改为 create-or-overwrite（backends/filesystem.py:489），上游工具描述也随之改为
+"replaces it entirely if it does"。契约方向随之翻转：从"必须告知会失败"变为
+"必须告知**直接覆盖、无保护兜底**（既有路径写错 = 原内容即刻丢失）"——动机不变：
+模型不得依赖不存在的护栏，也不得依赖会随库版本漂移的工具描述细节。
 
 判据不复读常量字符串，而是：
   1. 用 ast 从**真实源码**取出 PLC_AUDITOR_SYSTEM_PROMPT 的字面量；
@@ -55,11 +61,14 @@ def _deepagents_write_file_description() -> str | None:
 
 
 class TestWriteContractInSystemPrompt:
-    def test_states_write_file_cannot_overwrite(self):
+    def test_states_write_file_overwrite_semantics(self):
         p = _prompt()
         assert "write_file" in p
-        assert "File already exists" in p, "未告知 write_file 已存在会失败"
-        assert "edit_file" in p, "未给出正确出路（edit_file）"
+        assert "覆盖" in p, (
+            "必须告知 write_file 对既有路径直接覆盖的真实语义"
+            "（0.7: create-or-overwrite，无'已存在则报错'兜底）"
+        )
+        assert "edit_file" in p, "未给出修改既有文件的优先出路（edit_file）"
 
     def test_states_size_policy(self):
         p = _prompt()
@@ -75,7 +84,12 @@ class TestWriteContractInSystemPrompt:
 
 
 class TestOriginalDescriptionLackedThis:
-    """反证：deepagents 原描述确实不含这些知识 ⇒ 本次补充是必要的。"""
+    """反证：我们补充的独有知识上游描述仍不含 ⇒ 补充仍必要。
+
+    0.7 起上游描述已自带 "replaces it entirely if it does"（覆盖语义），
+    该项不再是差异点——但提示词仍写自己的版本，契约知识必须锚定在自有
+    prompt 里，不随库版本漂移。真正仍缺的是大小策略与反猜错指令。
+    """
 
     def test_upstream_description_is_insufficient(self):
         desc = _deepagents_write_file_description()
@@ -83,8 +97,10 @@ class TestOriginalDescriptionLackedThis:
             # 环境拿不到 deepagents：不判失败，但必须说明跳过原因
             print("SKIP: 本机不可访问 deepagents，跳过反证")
             return
-        assert "File already exists" not in desc, "上游若已含该知识则本条判据需重估"
-        assert "80 KB" not in desc and "80KB" not in desc
+        assert "80 KB" not in desc and "80KB" not in desc, (
+            "上游若已含大小策略则本条判据需重估"
+        )
+        assert "Command exited with code" not in desc
 
 
 class TestPromptStillHoldsOriginalContent:

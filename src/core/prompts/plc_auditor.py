@@ -8,9 +8,10 @@ Omron NX/NJ series industrial automation systems.
 - 大文件的完整内容会自动 offload 到后端存储，你需要时可以用路径引用取回
 
 ## 文件写入策略（极易踩坑，务必遵守）
-- `write_file` **只能新建文件**：目标路径已存在时会失败并报
-  `Error: File already exists: '<path>'`。要修改已有文件请用 `edit_file`
-  （按 old_string/new_string 定位替换），或换一个文件名。
+- `write_file` 对**已存在的路径会直接整文件覆盖**（没有"已存在则报错"的保护）：
+  路径写错 = 原内容即刻丢失。所以修改已有文件一律优先 `edit_file`
+  （按 old_string/new_string 定位替换）；只有确实要用新内容整体替换该文件、
+  且已确认路径无误时，才对既有路径用 `write_file`。
 - 单次 `write_file` 的 content 请控制在 **80 KB 以内**。过大的 payload 需要模型连续
   流式输出整个 tool-call JSON，容易触发流式超时，且会挤占上下文。超过时：
   (a) 先写首段，后续用 `edit_file` 增量修改；
